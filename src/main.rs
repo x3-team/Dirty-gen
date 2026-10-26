@@ -317,7 +317,7 @@ fn capture(args: &[String]) {
     let stills = [
         (0.40_f32, &parsed.still_start),
         (3.05, &parsed.still_puddle),
-        (10.8, &parsed.still_ruts),
+        (4.80, &parsed.still_ruts),
     ];
     println!(
         "capture {frames} frames at {}x{} ({} physics steps/frame)",

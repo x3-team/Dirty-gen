@@ -121,6 +121,18 @@ fn add_box(mesh: &mut CpuMesh, c: Vec3, h: Vec3, panel: f32) {
     );
 }
 
+fn add_cone(mesh: &mut CpuMesh, base: Vec3, height: f32, radius: f32, panel: f32, segs: usize) {
+    let apex = base + Vec3::Y * height;
+    for i in 0..segs {
+        let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+        let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+        let p0 = base + Vec3::new(t0.cos(), 0.0, t0.sin()) * radius;
+        let p1 = base + Vec3::new(t1.cos(), 0.0, t1.sin()) * radius;
+        add_tri(mesh, p0, apex, p1, panel);
+        add_tri(mesh, base, p1, p0, panel);
+    }
+}
+
 fn add_tube(mesh: &mut CpuMesh, a: Vec3, b: Vec3, radius: f32, panel: f32, segs: usize) {
     let axis = b - a;
     let len = axis.length();
@@ -676,23 +688,38 @@ pub fn environment_mesh() -> CpuMesh {
         Vec3::new(-16.0, 0.0, 14.0),
         Vec3::new(18.0, 0.0, -16.0),
         Vec3::new(14.0, 0.0, 16.0),
+        Vec3::new(-18.0, 0.0, -11.0),
+        Vec3::new(20.0, 0.0, 6.0),
     ];
     for (k, p) in trees.iter().enumerate() {
-        let h = 2.4 + hash(20 + k as u32);
+        let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
         add_tube(
             &mut m,
             *p,
-            *p + Vec3::Y * h,
-            0.12,
+            *p + Vec3::Y * trunk_h,
+            0.09,
             PANEL_TRUNK,
-            5,
+            6,
         );
-        add_box(
-            &mut m,
-            *p + Vec3::Y * (h + 0.7),
-            Vec3::new(1.1, 0.7, 1.0),
-            PANEL_TREE,
-        );
+        // Stacked cones so the crown has volume instead of a flat card.
+        let layers = [
+            (trunk_h * 0.42, 1.25, 1.45),
+            (trunk_h * 0.85, 1.0, 1.2),
+            (trunk_h * 1.25, 0.72, 0.95),
+        ];
+        for (i, (y, radius, height)) in layers.iter().enumerate() {
+            let j = hash(40 + k as u32 * 3 + i as u32);
+            let jx = (j - 0.5) * 0.2;
+            let jz = (hash(90 + k as u32 * 3 + i as u32) - 0.5) * 0.2;
+            add_cone(
+                &mut m,
+                *p + Vec3::new(jx, *y, jz),
+                *height,
+                *radius * (0.9 + j * 0.2),
+                PANEL_TREE,
+                6,
+            );
+        }
     }
     m
 }

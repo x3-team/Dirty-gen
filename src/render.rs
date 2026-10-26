@@ -14,7 +14,7 @@ use crate::mesh::{
     ParticleVertex, TerrainVertex,
 };
 
-const SHADOW: u32 = 1024;
+const SHADOW: u32 = 2048;
 const MODEL_SLOTS: u64 = 8;
 
 #[repr(C)]
@@ -693,10 +693,11 @@ impl Renderer {
             180.0,
         );
         let view_proj = proj * view;
-        let sun = Vec3::new(0.46, 0.80, 0.36).normalize();
+        // Low sun so rut walls and the buggy contact shadow separate from the ground.
+        let sun = Vec3::new(0.88, 0.32, 0.24).normalize();
         let light_target = Vec3::new(0.0, 0.0, -1.5);
-        let light_view = Mat4::look_at_rh(light_target + sun * 46.0, light_target, Vec3::Y);
-        let light_proj = Mat4::orthographic_rh(-26.0, 26.0, -26.0, 26.0, 1.0, 90.0);
+        let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
+        let light_proj = Mat4::orthographic_rh(-28.0, 28.0, -28.0, 28.0, 1.0, 110.0);
         let light_vp = light_proj * light_view;
         let frame = FrameData {
             view_proj: view_proj.to_cols_array_2d(),
@@ -704,10 +705,10 @@ impl Renderer {
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
             sun_dir: vec4(sun, 0.0),
-            sun_color: [1.2, 1.05, 0.82, 1.0],
-            sky_zenith: [0.18, 0.38, 0.72, 1.0],
-            sky_horizon: [0.78, 0.58, 0.42, 1.0],
-            amb: [0.24, 0.16, 0.11, 1.0],
+            sun_color: [1.15, 0.74, 0.42, 1.0],
+            sky_zenith: [0.13, 0.26, 0.52, 1.0],
+            sky_horizon: [0.50, 0.28, 0.18, 1.0],
+            amb: [0.10, 0.062, 0.038, 1.0],
             params: [
                 self.width as f32,
                 self.height as f32,
@@ -754,6 +755,8 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_terrain);
             draw_indexed(&mut pass, &self.terrain);
             pass.set_pipeline(&self.pipe_shadow_mesh);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
         }
 
@@ -1000,9 +1003,10 @@ fn build_particles(out: &mut Vec<ParticleVertex>, items: &[Particle], eye: Vec3,
         }
         let life = (p.life / p.max_life).clamp(0.0, 1.0);
         let (color, scale) = match p.kind {
-            0 => ([0.62, 0.70, 0.66, life * 0.5], 1.35),
-            1 => ([0.20, 0.10, 0.045, life * 0.95], 1.6),
-            _ => ([0.12, 0.055, 0.03, life * 0.9], 1.3),
+            // Dirty brown-gray. Pale spray stacked into white blobs.
+            0 => ([0.15, 0.09, 0.05, life * 0.7], 0.28),
+            1 => ([0.10, 0.05, 0.025, life * 0.9], 0.42),
+            _ => ([0.07, 0.035, 0.018, life * 0.85], 0.32),
         };
         let h = p.size * scale;
         let c = p.pos;

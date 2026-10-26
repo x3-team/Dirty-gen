@@ -310,12 +310,20 @@ pub fn demo_camera(t: f32, pos: Vec3, yaw: f32) -> CameraPose {
         (7.2, 2.15, 1.35, 2.6, 1.05)
     } else if t < 3.25 {
         (6.1, 1.85, 0.7, 1.6, 0.7)
-    } else if t < 4.6 {
+    } else if t < 4.55 {
         (5.4, 1.55, 1.55, 0.35, 0.55)
-    } else if t < 8.0 {
-        (7.2, 2.5, -1.25, 1.5, 0.7)
+    } else if t < 6.15 {
+        // Beside the bowl while the 14 cm grooves are under the tires.
+        let _ = (forward, right, pos);
+        // Across the track, so the 14 cm walls face the camera.
+        return CameraPose {
+            eye: Vec3::new(2.35, 0.52, -0.35),
+            target: Vec3::new(-0.15, -0.22, -1.15),
+        };
+    } else if t < 9.2 {
+        (7.4, 2.2, -1.4, 1.8, 0.55)
     } else {
-        (9.4, 3.8, 0.35, 5.5, 0.45)
+        (8.2, 2.05, 2.2, 3.4, 0.35)
     };
     let eye = pos - forward * dist + Vec3::Y * height + right * side;
     let target = pos + forward * look_ahead + Vec3::Y * lift;

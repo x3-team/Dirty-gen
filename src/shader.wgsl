@@ -103,7 +103,8 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let dims = vec2<f32>(textureDimensions(shadow_tex));
     let base = vec2<i32>(uv * dims);
     let ndl = clamp(dot(n, normalize(frame.sun_dir.xyz)), 0.0, 1.0);
-    let bias = 0.0018 + (1.0 - ndl) * 0.0045;
+    // Tight bias so the buggy leaves a contact shadow and a rut wall can occlude itself.
+    let bias = 0.00040 + (1.0 - ndl) * 0.00095;
     var blocked = 0.0;
     for (var y: i32 = -1; y <= 1; y = y + 1) {
         for (var x: i32 = -1; x <= 1; x = x + 1) {
@@ -114,25 +115,28 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
             }
         }
     }
-    return 1.0 - blocked / 9.0 * 0.72;
+    return 1.0 - blocked / 9.0 * 0.86;
 }
 
 fn shade(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough: f32, emit: vec3<f32>) -> vec3<f32> {
     let n = normalize(n_in);
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = clamp(dot(n, sun), 0.0, 1.0);
-    let hemi = mix(frame.amb.rgb, frame.sky_zenith.rgb, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
-    let shadow = shadow_factor(world + n * 0.04, n);
+    let hemi = mix(frame.amb.rgb, frame.sky_zenith.rgb * 0.65, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    let shadow = shadow_factor(world + n * 0.012, n);
     let view = normalize(frame.cam_pos.xyz - world);
     let halfv = normalize(sun + view);
-    let spec_pow = mix(10.0, 140.0, clamp(1.0 - rough, 0.0, 1.0));
-    let spec = pow(clamp(dot(n, halfv), 0.0, 1.0), spec_pow) * (1.0 - rough) * shadow;
-    var col = albedo * (hemi * 0.55 + frame.sun_color.rgb * ndl * shadow * 1.15);
-    col += frame.sun_color.rgb * spec * 0.45;
+    // Specular is reserved for smooth wet surfaces. Dry soil stays matte.
+    let gloss = smoothstep(0.22, 0.82, 1.0 - rough);
+    let spec_pow = mix(12.0, 160.0, gloss);
+    let spec = pow(clamp(dot(n, halfv), 0.0, 1.0), spec_pow) * gloss * shadow;
+    var col = albedo * (hemi * 0.62 + frame.sun_color.rgb * ndl * shadow * 1.25);
+    col += frame.sun_color.rgb * spec * 0.7;
     col += emit;
     let dist = length(world - frame.cam_pos.xyz);
-    let fog = smoothstep(32.0, 78.0, dist);
-    col = mix(col, frame.sky_horizon.rgb, fog);
+    let fog = smoothstep(58.0, 150.0, dist);
+    let fog_col = frame.sky_horizon.rgb * 0.28 + frame.sky_zenith.rgb * 0.12;
+    col = mix(col, fog_col, fog * 0.65);
     return col;
 }
 
@@ -169,6 +173,60 @@ fn height_at(ij: vec2<i32>) -> f32 {
     return textureLoad(height_tex, c, 0).r;
 }
 
+fn mat_at(ij: vec2<i32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(mat_tex));
+    let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(mat_tex, c, 0);
+}
+
+// World x = (i + 0.5) * cell - half. Inverse of the heightfield layout.
+fn world_to_ij(xz: vec2<f32>) -> vec2<f32> {
+    let cell = max(frame.params.z, 1e-4);
+    let half = cell * frame.params.w * 0.5;
+    return (xz + vec2<f32>(half)) / cell - vec2<f32>(0.5);
+}
+
+fn height_bilinear(xz: vec2<f32>) -> f32 {
+    let ij = world_to_ij(xz);
+    let i = floor(ij);
+    let f = fract(ij);
+    let i0 = vec2<i32>(i);
+    let h00 = height_at(i0);
+    let h10 = height_at(i0 + vec2<i32>(1, 0));
+    let h01 = height_at(i0 + vec2<i32>(0, 1));
+    let h11 = height_at(i0 + vec2<i32>(1, 1));
+    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+// Continuous slope of the real displaced height. Not the triangle normal,
+// which is constant across a 20 cm cell and flattens a 14 cm groove.
+fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
+    let e = max(frame.params.z * 0.32, 0.05);
+    let h_l = height_bilinear(xz - vec2<f32>(e, 0.0));
+    let h_r = height_bilinear(xz + vec2<f32>(e, 0.0));
+    let h_d = height_bilinear(xz - vec2<f32>(0.0, e));
+    let h_u = height_bilinear(xz + vec2<f32>(0.0, e));
+    var n = normalize(vec3<f32>((h_l - h_r) * 1.65, e * 2.0, (h_d - h_u) * 1.65));
+    let grit = noise(xz * 2.4);
+    let grit_x = noise(xz * 2.4 + vec2<f32>(0.45, 0.0));
+    let grit_z = noise(xz * 2.4 + vec2<f32>(0.0, 0.45));
+    n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * 0.10);
+    return n;
+}
+
+// Analytic water normal. Screen derivatives of the mesh are a hard grid.
+fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
+    let x = xz.x;
+    let z = xz.y;
+    let dx = 0.045 * cos(x * 1.15 + t * 1.05) * 1.15
+        + 0.030 * cos(x * 0.55 + z * 0.42 + t * 0.5) * 0.55
+        + 0.012 * cos(x * 2.1 - z * 0.35 - t * 1.4) * 2.1;
+    let dz = 0.040 * cos(z * 1.05 - t * 0.9) * 1.05
+        + 0.030 * cos(x * 0.55 + z * 0.42 + t * 0.5) * 0.42
+        + 0.012 * cos(z * 1.9 + x * 0.3 + t * 1.2) * 1.9;
+    return normalize(vec3<f32>(-dx, 1.0, -dz));
+}
+
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
     let ij = vec2<i32>(in.ij);
@@ -190,55 +248,46 @@ fn vs_shadow_terrain(in: TerrIn) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
-    let ij = vec2<i32>(in.ij);
-    let h = height_at(ij);
-    // Mostly smooth, with enough slope left that a rut still catches the sun.
-    var n = normalize(cross(dpdx(in.world), dpdy(in.world)));
-    if (n.y < 0.0) {
-        n = -n;
-    }
-    n = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), n, 0.48));
-    let bump = noise(in.world.xz * 3.1);
-    let bump_r = noise(in.world.xz * 3.1 + vec2<f32>(0.35, 0.0));
-    let bump_u = noise(in.world.xz * 3.1 + vec2<f32>(0.0, 0.35));
-    n = normalize(n + vec3<f32>((bump - bump_r), 0.0, (bump - bump_u)) * 0.55);
+    let xz = in.world.xz;
+    let h = height_bilinear(xz);
+    let n = terrain_normal(xz);
 
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
     let wet = mat.r;
     let water = mat.g * 0.34;
     let darken = mat.b;
-    let rough = clamp(mat.a, 0.05, 1.0);
 
-    let grit = noise(in.world.xz * 1.7) * 0.65 + noise(in.world.xz * 6.5) * 0.35;
-    let dry = vec3<f32>(0.20, 0.11, 0.055) * (0.88 + grit * 0.22);
-    let soaked = vec3<f32>(0.035, 0.018, 0.012);
-    var albedo = mix(dry, soaked, smoothstep(0.15, 0.92, wet));
-    albedo = mix(albedo, albedo * vec3<f32>(0.32, 0.26, 0.20), smoothstep(0.08, 0.62, darken));
+    let grit = noise(xz * 1.4) * 0.6 + noise(xz * 4.8) * 0.4;
+    // Dark saturated soil. The noon tan read as flat beige.
+    let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
+    let soaked = vec3<f32>(0.022, 0.011, 0.007);
+    var albedo = mix(dry, soaked, smoothstep(0.12, 0.88, wet));
+    albedo = mix(albedo, albedo * vec3<f32>(0.28, 0.22, 0.16), smoothstep(0.06, 0.55, darken));
 
+    let reach = max(frame.params.z * 1.7, 0.22);
     let avg = (
-        height_at(ij + vec2<i32>(1, 0)) + height_at(ij + vec2<i32>(-1, 0))
-        + height_at(ij + vec2<i32>(0, 1)) + height_at(ij + vec2<i32>(0, -1))
+        height_bilinear(xz + vec2<f32>(reach, 0.0))
+        + height_bilinear(xz - vec2<f32>(reach, 0.0))
+        + height_bilinear(xz + vec2<f32>(0.0, reach))
+        + height_bilinear(xz - vec2<f32>(0.0, reach))
     ) * 0.25;
-    let rut = clamp((avg - h) / 0.07, 0.0, 1.0);
-    albedo *= mix(1.0, 0.55, rut);
+    // Floor of the groove goes dark. The walls keep their albedo so the low sun
+    // lights one face and leaves the other in shade.
+    let rut = smoothstep(0.012, 0.08, avg - h);
+    let berm = smoothstep(0.008, 0.045, h - avg);
+    let floor = rut * smoothstep(0.55, 0.92, n.y);
+    albedo *= mix(1.0, 0.32, floor);
+    albedo = mix(albedo, vec3<f32>(0.22, 0.12, 0.055) * (0.9 + grit * 0.2), berm * 0.95);
 
-    var rough_out = mix(rough, 0.08, smoothstep(0.01, 0.06, water));
-    var col = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+    // Wet rim on the soil. The sky reflection is the water sheet, not this grid.
+    let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
+    albedo = mix(albedo, vec3<f32>(0.012, 0.008, 0.006), rim * 0.85);
 
-    if (water > 0.012) {
-        let view = normalize(frame.cam_pos.xyz - in.world);
-        let sun = normalize(frame.sun_dir.xyz);
-        let refl = reflect(-view, n);
-        let fres = pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 3.0);
-        let mirror = sky_color(refl);
-        let spec = pow(clamp(dot(n, normalize(sun + view)), 0.0, 1.0), 180.0);
-        let glaze = mix(vec3<f32>(0.03, 0.045, 0.04), mirror, 0.35 + fres * 0.6);
-        col = mix(col, glaze, smoothstep(0.012, 0.05, water) * (0.45 + fres * 0.4));
-        col += frame.sun_color.rgb * spec * shadow_factor(in.world, n) * 0.8;
-        rough_out = 0.05;
-    }
-    return present(col);
+    let wet_amt = smoothstep(0.18, 0.8, wet);
+    let sheen = wet_amt * mix(0.2, 1.0, max(rut, smoothstep(0.02, 0.08, water)));
+    let rough_out = mix(0.98, 0.055, sheen);
+    return present(shade(in.world, n, albedo, rough_out, vec3<f32>(0.0)));
 }
 
 struct WaterOut {
@@ -248,13 +297,28 @@ struct WaterOut {
     @location(2) depth: f32,
 }
 
+fn water_surface_y(ij: vec2<i32>) -> f32 {
+    // Wide smooth so the sheet is not a faceted copy of the 20 cm soil grid.
+    var acc = 0.0;
+    var wsum = 0.0;
+    for (var dy: i32 = -2; dy <= 2; dy = dy + 1) {
+        for (var dx: i32 = -2; dx <= 2; dx = dx + 1) {
+            let c = ij + vec2<i32>(dx, dy);
+            let depth = mat_at(c).g * 0.34;
+            let y = height_at(c) + depth * 0.97;
+            let w = exp(-f32(dx * dx + dy * dy) * 0.32) * mix(0.12, 1.0, step(0.004, depth));
+            acc = acc + y * w;
+            wsum = wsum + w;
+        }
+    }
+    return acc / max(wsum, 1e-4);
+}
+
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
     let ij = vec2<i32>(in.ij);
-    let h = height_at(ij);
-    let mat = textureLoad(mat_tex, clamp(ij, vec2<i32>(0), vec2<i32>(textureDimensions(mat_tex)) - vec2<i32>(1)), 0);
-    let depth = mat.g * 0.34;
-    let world = vec3<f32>(in.xz.x, h + depth * 0.92, in.xz.y);
+    let depth = mat_at(ij).g * 0.34;
+    let world = vec3<f32>(in.xz.x, water_surface_y(ij), in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
     o.world = world;
@@ -265,26 +329,26 @@ fn vs_water(in: TerrIn) -> WaterOut {
 
 @fragment
 fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
-    if (in.depth < 0.008) {
+    if (in.depth < 0.007) {
         discard;
     }
-    var n = normalize(cross(dpdx(in.world), dpdy(in.world)));
-    if (n.y < 0.0) {
-        n = -n;
-    }
-    n = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), n, 0.22));
-    let rip = sin(in.world.x * 5.5 + frame.misc.x * 2.2) * cos(in.world.z * 4.8 - frame.misc.x * 1.7);
-    n = normalize(n + vec3<f32>(rip, 0.0, cos(in.world.x * 4.0 + in.world.z * 3.2)) * 0.03);
-
+    let n = ripple_normal(in.world.xz, frame.misc.x);
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
-    let fres = pow(1.0 - clamp(dot(normalize(n), view), 0.0, 1.0), 3.2);
-    let mirror = sky_color(reflect(-view, n));
-    let spec = pow(clamp(dot(n, normalize(sun + view)), 0.0, 1.0), 240.0);
-    var col = mix(vec3<f32>(0.04, 0.06, 0.055), mirror, 0.25 + fres * 0.7);
-    col += frame.sun_color.rgb * spec * shadow_factor(in.world, n);
-    let shore = smoothstep(0.008, 0.03, in.depth);
-    let alpha = shore * (0.42 + fres * 0.5);
+    let ndotv = clamp(dot(n, view), 0.0, 1.0);
+    let fres = pow(1.0 - ndotv, 4.0);
+    // Muddy water: sky reflection stays continuous, and the bed stays visible.
+    let mirror = sky_color(reflect(-view, n)) * vec3<f32>(0.55, 0.64, 0.72);
+    let spec = pow(clamp(dot(n, normalize(sun + view)), 0.0, 1.0), 80.0);
+    let depth_t = smoothstep(0.012, 0.10, in.depth);
+    let absorption = mix(vec3<f32>(0.018, 0.016, 0.012), vec3<f32>(0.010, 0.016, 0.014), depth_t);
+    var col = mix(absorption, mirror, (0.16 + fres * 0.7) * mix(0.55, 1.0, depth_t));
+    col += frame.sun_color.rgb * spec * shadow_factor(in.world, n) * 0.28;
+    let shore = smoothstep(0.007, 0.05, in.depth);
+    // The sheet stays reflective, but a steep bed (the rut wall) shows through.
+    let bed_slope = 1.0 - terrain_normal(in.world.xz).y;
+    let open = smoothstep(0.05, 0.22, bed_slope);
+    let alpha = shore * mix(0.30, 0.46, depth_t) * mix(1.0, 0.4, open);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
@@ -323,23 +387,32 @@ fn vs_shadow_mesh(in: MeshIn) -> @builtin(position) vec4<f32> {
     return frame.light_vp * world;
 }
 
+
+fn mud_normal(n: vec3<f32>, p: vec3<f32>, amount: f32) -> vec3<f32> {
+    let e = 0.04;
+    let h0 = noise(p.xz * 7.0 + vec2<f32>(p.y * 2.0, 0.0));
+    let hx = noise((p.xz + vec2<f32>(e, 0.0)) * 7.0 + vec2<f32>(p.y * 2.0, 0.0));
+    let hz = noise((p.xz + vec2<f32>(0.0, e)) * 7.0 + vec2<f32>(p.y * 2.0, 0.0));
+    return normalize(n + vec3<f32>(h0 - hx, 0.0, h0 - hz) * amount * 1.6);
+}
+
 fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     // rgb albedo, a roughness. Panel ids match the vehicle solver.
     let grit = hash12(floor(world.xz * 8.0 + vec2<f32>(world.y, world.y * 0.3)));
     if (panel < 0.5) {
         return vec4<f32>(vec3<f32>(0.16, 0.17, 0.18) * (0.9 + grit * 0.15), 0.38);
     } else if (panel < 1.5) {
-        return vec4<f32>(vec3<f32>(0.78, 0.24, 0.035) * (0.92 + grit * 0.12), 0.42);
+        return vec4<f32>(vec3<f32>(0.78, 0.24, 0.035) * (0.92 + grit * 0.12), 0.72);
     } else if (panel < 2.5) {
-        return vec4<f32>(vec3<f32>(0.72, 0.20, 0.03), 0.45);
+        return vec4<f32>(vec3<f32>(0.72, 0.20, 0.03), 0.74);
     } else if (panel < 3.5) {
-        return vec4<f32>(vec3<f32>(0.70, 0.19, 0.028), 0.45);
+        return vec4<f32>(vec3<f32>(0.70, 0.19, 0.028), 0.74);
     } else if (panel < 4.5) {
-        return vec4<f32>(vec3<f32>(0.62, 0.16, 0.025), 0.48);
+        return vec4<f32>(vec3<f32>(0.62, 0.16, 0.025), 0.76);
     } else if (panel < 5.5) {
         return vec4<f32>(vec3<f32>(0.10, 0.09, 0.08), 0.7);
     } else if (panel < 9.5) {
-        return vec4<f32>(vec3<f32>(0.66, 0.18, 0.03), 0.5);
+        return vec4<f32>(vec3<f32>(0.66, 0.18, 0.03), 0.7);
     } else if (panel < 10.5) {
         return vec4<f32>(vec3<f32>(0.18, 0.18, 0.19), 0.55);
     } else if (panel < 11.5) {
@@ -350,18 +423,24 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         return vec4<f32>(0.7, 0.02, 0.015, 0.2);
     } else if (panel < 40.5) {
         let g = noise(world.xz * 0.35);
-        return vec4<f32>(vec3<f32>(0.16, 0.09, 0.045) * (0.85 + g * 0.3), 0.92);
+        return vec4<f32>(vec3<f32>(0.09, 0.048, 0.024) * (0.85 + g * 0.3), 0.96);
     } else if (panel < 41.5) {
         let g = noise(world.xz * 0.2);
-        return vec4<f32>(vec3<f32>(0.22, 0.24, 0.16) * (0.8 + g * 0.35), 0.9);
+        return vec4<f32>(vec3<f32>(0.11, 0.12, 0.07) * (0.8 + g * 0.3), 0.95);
     } else if (panel < 42.5) {
-        return vec4<f32>(vec3<f32>(0.28, 0.25, 0.20), 0.85);
+        return vec4<f32>(vec3<f32>(0.16, 0.14, 0.11), 0.9);
     } else if (panel < 43.5) {
-        return vec4<f32>(vec3<f32>(0.12, 0.24, 0.08), 0.7);
+        return vec4<f32>(vec3<f32>(0.07, 0.16, 0.05), 0.75);
     } else if (panel < 44.5) {
-        return vec4<f32>(vec3<f32>(0.16, 0.28, 0.10), 0.75);
+        let g = noise(world.xz * 0.9 + vec2<f32>(world.y, 0.2));
+        let h = clamp((world.y - 1.0) / 3.2, 0.0, 1.0);
+        let leaf = mix(vec3<f32>(0.035, 0.10, 0.03), vec3<f32>(0.09, 0.18, 0.045), h);
+        return vec4<f32>(leaf * (0.78 + g * 0.35), 0.88);
+    } else if (panel < 45.5) {
+        let g = noise(world.xz * 3.0 + vec2<f32>(world.y * 2.0, 0.0));
+        return vec4<f32>(vec3<f32>(0.10, 0.058, 0.032) * (0.8 + g * 0.35), 0.92);
     }
-    return vec4<f32>(vec3<f32>(0.22, 0.14, 0.08), 0.8);
+    return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
 
 @fragment
@@ -372,37 +451,52 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     var rough = paint.a;
     var emit = vec3<f32>(0.0);
 
+    var nrm = in.nrm;
     if (model.extra.x > 0.5) {
-        let ang = in.uv.x * 6.28318;
-        let groove = smoothstep(0.25, 0.75, 0.5 + 0.5 * sin(ang * 22.0));
+        let ang = in.uv.x * 6.2831853;
+        let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
         let sidewall = select(0.0, 1.0, in.uv.y > 1.5);
-        albedo = vec3<f32>(0.012, 0.012, 0.013);
-        albedo = mix(albedo, vec3<f32>(0.03, 0.03, 0.032), groove * 0.5);
-        let mud = model.extra.y;
-        let packed = clamp(mud * (0.25 + 0.85 * groove) * (1.0 - sidewall * 0.65), 0.0, 1.0);
-        let clump = smoothstep(0.55, 0.9, hash12(floor(vec2<f32>(ang * 8.0, in.uv.y * 6.0))));
-        let mask = clamp(packed * (0.45 + 0.7 * clump), 0.0, 1.0);
-        albedo = mix(albedo, vec3<f32>(0.09, 0.045, 0.025), mask);
-        rough = mix(0.85, 0.25, mask);
+        let mud = clamp(model.extra.y, 0.0, 1.2);
+        // Existing adhesion. ~0.4 of the cap already cakes the tread.
+        let load = smoothstep(0.04, 0.28, mud);
+        let wp = in.world;
+        let n = noise(wp.xy * 9.0 + vec2<f32>(wp.z * 4.0, ang));
+        let n2 = noise(wp.yz * 16.0 + vec2<f32>(ang, 2.0));
+        let clump = smoothstep(0.48, 0.82, n * 0.65 + n2 * 0.35);
+        var mask = load * (0.88 + 0.12 * clump);
+        mask = mask * mix(0.94 + 0.06 * groove, 0.7 + 0.25 * clump, sidewall);
+        mask = clamp(mask, 0.0, 1.0);
+        albedo = mix(vec3<f32>(0.02, 0.018, 0.016), vec3<f32>(0.12, 0.058, 0.028), mask);
+        rough = mix(0.92, mix(0.28, 0.07, groove * (1.0 - sidewall)), mask);
+        nrm = mud_normal(in.nrm, in.world, mask);
     } else if (panel >= 0 && panel < 12) {
         let m = mud_of(panel);
-        let cover = clamp(m.x, 0.0, 1.4);
-        let drip = m.y;
-        let streak = m.z;
-        let wet = m.w;
-        let bands = 0.5 + 0.5 * sin(in.uv.x * 17.0 + in.uv.y * 11.0 + streak * 5.0);
-        let run = smoothstep(0.62, 0.92, bands) * drip;
-        let down = smoothstep(0.1, 0.9, 0.55 - in.uv.y);
-        let cell = floor(in.uv * vec2<f32>(7.0, 5.0) + vec2<f32>(streak * 2.0, cover * 3.0));
-        let clump = smoothstep(0.42, 0.88, hash12(cell));
-        var mask = cover * (0.35 + 0.65 * clump);
-        mask = mask + run * cover * down * 0.45;
-        mask = clamp(mask, 0.0, 1.0);
-        let mud_col = mix(vec3<f32>(0.16, 0.09, 0.045), vec3<f32>(0.07, 0.035, 0.02), clamp(wet, 0.0, 1.0));
-        albedo = mix(albedo, mud_col, smoothstep(0.04, 0.4, mask));
-        let thin = smoothstep(0.78, 0.96, bands) * drip * smoothstep(0.08, 0.45, cover);
-        albedo = mix(albedo, mud_col * 0.75, thin * 0.55);
-        rough = mix(rough, mix(0.55, 0.12, wet), clamp(mask + thin, 0.0, 1.0));
+        let cover = clamp(m.x, 0.0, 1.3);
+        let drip = clamp(m.y, 0.0, 1.0);
+        let streak = clamp(m.z, 0.0, 1.0);
+        let wet = clamp(m.w, 0.0, 1.0);
+        let p = in.world;
+        // World-space clumps. A sine of uv reads as a decal stripe.
+        let lump = noise(p.xz * 8.5 + vec2<f32>(p.y * 3.5, f32(panel))) * 0.6
+            + noise(vec2<f32>(p.x * 3.0 + p.z, p.y * 11.0)) * 0.4;
+        let coat = smoothstep(0.52 - cover * 0.7, 0.74 - cover * 0.28, lump);
+        let grit = 0.78 + 0.22 * noise(p.xz * 22.0 + vec2<f32>(p.y * 9.0, 2.0));
+        var mask = coat * grit * smoothstep(0.02, 0.22, cover);
+        // A few thin gravity drips. Wide columns read as stripes, so these stay narrow.
+        let down = smoothstep(1.6, 0.2, in.uv.y);
+        let col_u = floor(in.uv.x * 2.4 + f32(panel) * 1.3);
+        let pick = hash12(vec2<f32>(col_u, f32(panel) + 3.0));
+        let column = smoothstep(0.84, 0.92, pick);
+        let fx = fract(in.uv.x * 2.4 + f32(panel) * 1.3);
+        let bead = smoothstep(0.10, 0.0, abs(fx - 0.5));
+        let drip_mask = column * bead * smoothstep(0.06, 0.4, drip) * (0.2 + 0.8 * down);
+        let smear = noise(vec2<f32>(p.x * 5.0 + p.z * 3.0, p.y * 0.45 + streak));
+        let streak_mask = smoothstep(0.78, 0.92, smear) * streak * smoothstep(0.1, 0.45, cover) * down;
+        mask = clamp(max(mask, max(drip_mask, streak_mask * 0.75)), 0.0, 1.0);
+        let mud_col = mix(vec3<f32>(0.09, 0.048, 0.024), vec3<f32>(0.04, 0.02, 0.012), wet);
+        albedo = mix(albedo, mud_col, mask);
+        rough = mix(rough, mix(0.42, 0.07, wet), mask);
+        nrm = mud_normal(in.nrm, p, mask);
     }
 
     if (in.panel > 15.5 && in.panel < 16.5) {
@@ -412,7 +506,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         emit = vec3<f32>(0.9, 0.02, 0.01);
     }
 
-    return present(shade(in.world, in.nrm, albedo, rough, emit));
+    return present(shade(in.world, nrm, albedo, rough, emit));
 }
 
 struct PartIn {
@@ -442,7 +536,7 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     if (d > 0.5) {
         discard;
     }
-    let fall = smoothstep(0.5, 0.12, d);
-    let rgb = pow(in.color.rgb, vec3<f32>(1.0 / 2.2));
-    return vec4<f32>(rgb, in.color.a * fall);
+    let fall = smoothstep(0.5, 0.05, d);
+    // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
+    return vec4<f32>(in.color.rgb, in.color.a * fall);
 }
