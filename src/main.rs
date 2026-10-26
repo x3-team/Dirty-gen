@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glam::Vec3;
-use silt::world::{demo_camera, demo_input, CameraPose, Input, World};
+use silt::world::{demo_camera, demo_drive, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -71,6 +71,7 @@ struct App {
     keys: Keys,
     orbit_yaw: f32,
     orbit_pitch: f32,
+    chase_cam: bool,
     acc: f32,
     last: Instant,
     srgb: bool,
@@ -150,6 +151,12 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
+                {
+                    self.chase_cam = !self.chase_cam;
+                }
                 let down = event.state == ElementState::Pressed;
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
@@ -213,7 +220,12 @@ impl App {
         let Some(surface) = self.surface.as_ref() else {
             return;
         };
-        let pose = lift_camera(&self.world, chase(&self.world, self.orbit_yaw, self.orbit_pitch));
+        let pose = if self.chase_cam {
+            chase(&self.world, self.orbit_yaw, self.orbit_pitch)
+        } else {
+            demo_camera(self.world.time, self.world.vehicle.pos, self.world.vehicle.yaw)
+        };
+        let pose = lift_camera(&self.world, pose);
         let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
@@ -242,7 +254,11 @@ fn chase(world: &World, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
     let height = 2.7 + orbit_pitch * 2.4;
     let eye = pos - forward * dist + Vec3::Y * height + right * 0.85;
     let target = pos + forward * 1.8 + Vec3::Y * 0.55;
-    CameraPose { eye, target }
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
 }
 
 fn lift_camera(world: &World, mut pose: CameraPose) -> CameraPose {
@@ -275,6 +291,7 @@ fn run_window() {
         },
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
+        chase_cam: false,
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
@@ -316,9 +333,9 @@ fn capture(args: &[String]) {
     std::fs::create_dir_all(&dir).expect("frame dir");
     let mut saved = [false; 3];
     let stills = [
-        (0.40_f32, &parsed.still_start),
-        (3.05, &parsed.still_puddle),
-        (10.80, &parsed.still_ruts),
+        (0.35_f32, &parsed.still_start),
+        (6.60, &parsed.still_puddle),
+        (10.70, &parsed.still_ruts),
     ];
     println!(
         "capture {frames} frames at {}x{} ({} physics steps/frame)",
@@ -348,7 +365,7 @@ fn capture(args: &[String]) {
                 next += 1;
                 continue;
             }
-            let input = demo_input(world.time);
+            let input = demo_drive(&world);
             world.step(1.0 / 60.0, &input);
         }
         if next != stills.len() {
@@ -371,7 +388,7 @@ fn capture(args: &[String]) {
             }
         }
         for _ in 0..steps {
-            let input = demo_input(world.time);
+            let input = demo_drive(&world);
             world.step(1.0 / 60.0, &input);
         }
         if frame % 30 == 0 {

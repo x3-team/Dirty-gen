@@ -9,4 +9,4 @@ pub mod soil;
 pub mod vehicle;
 pub mod world;
 
-pub use world::{demo_camera, demo_input, dig_input, CameraPose, Input, World};
+pub use world::{demo_camera, demo_drive, dig_input, CameraPose, Input, World};

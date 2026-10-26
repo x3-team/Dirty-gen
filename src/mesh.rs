@@ -13,6 +13,7 @@ pub const PANEL_TAIL: f32 = 17.0;
 pub const PANEL_SKIRT: f32 = 40.0;
 pub const PANEL_HILL: f32 = 41.0;
 pub const PANEL_ROCK: f32 = 42.0;
+#[allow(dead_code)]
 pub const PANEL_REED: f32 = 43.0;
 pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
@@ -635,28 +636,7 @@ fn add_horizon(mesh: &mut CpuMesh) {
     }
 }
 
-/// Two short crossed cards. Tall thin boxes read as neon sticks.
-fn add_tuft(mesh: &mut CpuMesh, base: Vec3, height: f32, panel: f32) {
-    let root = base + Vec3::new(0.0, -0.05, 0.0);
-    let w = height * 1.25;
-    for k in 0..2 {
-        let a = k as f32 * std::f32::consts::FRAC_PI_2 + 0.35;
-        let d = Vec3::new(a.cos(), 0.0, a.sin());
-        let tip = Vec3::Y * height + d * (height * 0.12);
-        add_quad(
-            mesh,
-            [
-                root - d * w,
-                root + d * w,
-                root + d * (w * 0.22) + tip,
-                root - d * (w * 0.22) + tip,
-            ],
-            panel,
-        );
-    }
-}
-
-/// Horizon, rocks and reeds so the mud has somewhere to sit.
+/// Horizon and rocks so the mud has somewhere to sit.
 pub fn environment_mesh() -> CpuMesh {
     let mut m = CpuMesh::new();
     let y = -0.02;
@@ -708,15 +688,15 @@ pub fn environment_mesh() -> CpuMesh {
     // sits on the ground instead of floating as boxes.
     add_horizon(&mut m);
 
-    // Rocks off the drive line (the scripted run stays near x = 0).
+    // Rocks outside the berm. The loop itself is the heightfield.
     let rocks = [
-        Vec3::new(6.4, 0.15, -12.5),
-        Vec3::new(-7.2, 0.12, -6.0),
-        Vec3::new(8.5, 0.18, 3.2),
-        Vec3::new(-9.0, 0.1, 7.5),
-        Vec3::new(5.2, 0.08, 8.8),
-        Vec3::new(-5.6, 0.14, 12.4),
-        Vec3::new(11.0, 0.2, -2.0),
+        Vec3::new(10.4, 0.14, -3.2),
+        Vec3::new(-10.6, 0.12, 1.4),
+        Vec3::new(8.8, 0.16, 13.2),
+        Vec3::new(-9.4, 0.12, -7.6),
+        Vec3::new(1.6, 0.12, 14.2),
+        Vec3::new(-12.2, 0.16, 8.4),
+        Vec3::new(12.4, 0.14, 6.5),
     ];
     for (k, p) in rocks.iter().enumerate() {
         let s = 0.28 + hash(k as u32) * 0.35;
@@ -726,20 +706,6 @@ pub fn environment_mesh() -> CpuMesh {
             Vec3::new(s, s * 0.55, s * (0.7 + hash(k as u32 + 3) * 0.5)),
             PANEL_ROCK,
         );
-    }
-
-    // Short tufts. Tall boxes read as neon sticks.
-    let puddle = Vec3::new(0.0, 0.0, 0.4);
-    for k in 0..10 {
-        let ang = k as f32 / 10.0 * std::f32::consts::TAU + 0.4;
-        let rad = 9.2 + hash(k) * 1.6;
-        let x = puddle.x + ang.cos() * rad;
-        if x.abs() < 3.0 {
-            continue;
-        }
-        let z = puddle.z + ang.sin() * rad;
-        let h = 0.11 + hash(k * 3) * 0.08;
-        add_tuft(&mut m, Vec3::new(x, 0.0, z), h, PANEL_REED);
     }
 
     let trees = [

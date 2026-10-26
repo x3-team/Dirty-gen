@@ -56,7 +56,7 @@ fn scripted_drive_cuts_ruts_and_picks_up_mud() {
     let rut0 = world.soil.max_rut_depth();
     let mud0 = world.vehicle.body_mud_mass();
     let span0 = world.soil.rut_track_span();
-    world.run_seconds(12.0, silt::demo_input);
+    world.run_seconds_with(12.0, silt::demo_drive);
     let rut1 = world.soil.max_rut_depth();
     let mud1 = world.vehicle.body_mud_mass();
     let wheels = world.vehicle.wheel_mud_mass();
@@ -87,16 +87,22 @@ fn scripted_drive_cuts_ruts_and_picks_up_mud() {
         "never bogged in the puddle"
     );
     assert!(
-        world.vehicle.pos.z < -6.0,
-        "did not reverse clear of the puddle, z {}",
-        world.vehicle.pos.z
+        world.telemetry.distance > 16.0,
+        "did not drive the loop, distance {}",
+        world.telemetry.distance
+    );
+    let left_start = world.vehicle.pos.x.abs() > 2.0 || (world.vehicle.pos.z + 8.2).abs() > 4.0;
+    assert!(
+        left_start,
+        "buggy never left the gate, pos {:?}",
+        world.vehicle.pos
     );
 }
 
 #[test]
 fn holding_throttle_digs_in() {
     let mut escaped = World::demo();
-    escaped.run_seconds(7.5, silt::demo_input);
+    escaped.run_seconds_with(7.5, silt::demo_drive);
     let mut dug = World::demo();
     dug.run_seconds(7.5, dig_input);
     eprintln!(

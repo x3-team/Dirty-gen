@@ -85,18 +85,20 @@ impl Particles {
     }
 
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
-        let n = ((speed * water * 28.0).clamp(1.0, 7.0)) as i32;
-        for _ in 0..n {
+        let n = ((speed * water * 16.0).clamp(2.0, 5.0)) as i32;
+        for i in 0..n {
             let jx = (self.rnd() - 0.5) * 1.4;
             let jz = (self.rnd() - 0.5) * 0.8;
-            let up = 1.2 + speed * 0.28 + self.rnd() * 1.1;
-            let vel = forward * (speed * 0.25 + self.rnd() * 0.6)
+            // A couple of slower droplets trail the leading spray.
+            let trail = if i == n - 1 { 0.45 } else { 1.0 };
+            let up = (1.15 + speed * 0.22 + self.rnd() * 0.9) * trail;
+            let vel = forward * (speed * 0.22 + self.rnd() * 0.45) * trail
                 + right * jx
                 + Vec3::Y * up
                 + forward * jz;
-            let life = 0.45 + self.rnd() * 0.45;
-            let size = 0.05 + water * 0.35 + self.rnd() * 0.06;
-            self.spawn(origin + Vec3::Y * 0.05, vel, life, size, 0);
+            let life = 0.50 + self.rnd() * 0.50;
+            let size = 0.18 + water * 0.22 + self.rnd() * 0.10;
+            self.spawn(origin + Vec3::Y * 0.28, vel, life, size, 0);
         }
     }
 
@@ -105,7 +107,7 @@ impl Particles {
         let up = 1.4 + self.rnd() * 1.6;
         let vel = forward * (0.4 + speed * 0.15) + right * jx + Vec3::Y * up;
         let life = 0.55 + self.rnd() * 0.4;
-        let size = 0.045 + self.rnd() * 0.04;
+        let size = 0.10 + self.rnd() * 0.08;
         self.spawn(origin + Vec3::Y * 0.08, vel, life, size, 1);
     }
 

@@ -3,7 +3,7 @@
 use glam::Vec3;
 
 use crate::particles::Particles;
-use crate::soil::SoilField;
+use crate::soil::{track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS};
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +40,8 @@ pub struct Telemetry {
 pub struct CameraPose {
     pub eye: Vec3,
     pub target: Vec3,
+    /// Full width of an orthographic frame, in metres. Empty means a perspective lens.
+    pub ortho_width: Option<f32>,
 }
 
 pub struct World {
@@ -234,6 +236,15 @@ impl World {
             self.step(dt, &input);
         }
     }
+
+    pub fn run_seconds_with(&mut self, seconds: f32, input_fn: impl Fn(&Self) -> Input) {
+        let dt = 1.0 / 60.0;
+        let steps = (seconds / dt).round() as u32;
+        for _ in 0..steps {
+            let input = input_fn(self);
+            self.step(dt, &input);
+        }
+    }
 }
 
 fn panel_drip_point(index: usize) -> Vec3 {
@@ -251,29 +262,40 @@ fn panel_drip_point(index: usize) -> Vec3 {
     }
 }
 
-/// Idle, drive into the puddle, spin in the bog, reverse out.
-pub fn demo_input(t: f32) -> Input {
-    if t < 1.15 {
-        Input::default()
-    } else if t < 3.28 {
-        // Into the puddle. Speed falls as the water deepens.
-        Input {
-            throttle: 1.0,
-            brake: 0.0,
-            steer: 0.0,
-        }
-    } else if t < 8.0 {
-        Input {
-            throttle: -1.0,
-            brake: 0.0,
-            steer: 0.0,
-        }
+/// One lap of the mud loop. Pure pursuit on the stadium centerline.
+/// Deterministic: same pose always produces the same pedal and wheel.
+pub fn demo_drive(world: &World) -> Input {
+    if world.time < 0.50 {
+        return Input::default();
+    }
+    let pos = world.vehicle.pos;
+    let yaw = world.vehicle.yaw;
+    let speed = world.vehicle.speed();
+    let s = closest_s(pos);
+    let off = track_offset(pos.x, pos.z);
+    // Short lookahead when the buggy drifts, so it stays on the ribbon
+    // instead of riding the berm or cutting the infield pond.
+    let look = if off.abs() > 0.65 { 1.8 } else { 3.0 };
+    let ahead = point_on_track(s + look);
+    let desired = (ahead.x - pos.x).atan2(ahead.z - pos.z);
+    let mut err = wrap_pi(desired - yaw);
+    // Positive offset is outside the loop (left of the clockwise heading).
+    err += (off * 0.22).clamp(-0.55, 0.55);
+    let steer = (err / 0.30).clamp(-1.0, 1.0);
+    let under = world.soil.sample(pos.x, pos.z);
+    // Ease off on the straight, and brake in standing water so the tires
+    // slip, throw spray, and cut a rut before the buggy climbs back out.
+    let (throttle, brake) = if under.water > 0.05 && speed > 0.62 {
+        (0.0, 1.0)
+    } else if speed > 3.05 {
+        (0.1, 0.0)
     } else {
-        Input {
-            throttle: 0.0,
-            brake: 1.0,
-            steer: 0.0,
-        }
+        (1.0, 0.0)
+    };
+    Input {
+        throttle,
+        brake,
+        steer,
     }
 }
 
@@ -303,32 +325,94 @@ pub fn dig_input(t: f32) -> Input {
     }
 }
 
-pub fn demo_camera(t: f32, pos: Vec3, yaw: f32) -> CameraPose {
-    let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
-    let right = Vec3::new(forward.z, 0.0, -forward.x);
-    if t >= 9.0 {
-        // After the buggy has left the puddle. Low, behind the rear tires,
-        // aimed at the dry cut beside the contact so the groove is the subject.
-        let axle = pos - forward * 1.18;
-        // Low and behind the outer bank, far enough that the tire is not the frame.
-        let lip = axle + right * 1.00 - forward * 0.14;
-        let eye = lip - forward * 1.7 + right * 0.55;
-        return CameraPose {
-            eye: Vec3::new(eye.x, 0.36, eye.z),
-            target: lip + Vec3::Y * 0.01,
-        };
+/// Fixed oblique orthographic view of the whole loop. The chase camera is a toggle.
+pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
+    let target = Vec3::new(0.0, 0.4, 1.4);
+    let eye = target + Vec3::new(-14.5, 12.2, -13.0);
+    CameraPose {
+        eye,
+        target,
+        ortho_width: Some(25.5),
     }
-    let (dist, height, side, look_ahead, lift) = if t < 1.15 {
-        (7.2, 2.15, 1.35, 2.6, 1.05)
-    } else if t < 3.6 {
-        // Low and off to the side so the shore and the sky glint read.
-        (7.8, 1.02, -2.7, 2.8, 0.16)
-    } else if t < 6.5 {
-        (6.4, 1.65, 1.7, 1.3, 0.42)
+}
+
+fn track_perimeter() -> f32 {
+    let straight = TRACK_ZN - TRACK_ZS;
+    let half = std::f32::consts::PI * TRACK_R;
+    2.0 * straight + 2.0 * half
+}
+
+/// Clockwise from the south point: west along the south cap, north up the west straight.
+fn point_on_track(s: f32) -> Vec3 {
+    let straight = TRACK_ZN - TRACK_ZS;
+    let q = std::f32::consts::FRAC_PI_2 * TRACK_R;
+    let half = std::f32::consts::PI * TRACK_R;
+    let total = track_perimeter();
+    let s = s.rem_euclid(total);
+    if s < q {
+        let a = -std::f32::consts::FRAC_PI_2 - (s / q) * std::f32::consts::FRAC_PI_2;
+        Vec3::new(TRACK_R * a.cos(), 0.0, TRACK_ZS + TRACK_R * a.sin())
+    } else if s < q + straight {
+        let t = (s - q) / straight;
+        Vec3::new(-TRACK_R, 0.0, TRACK_ZS + t * straight)
+    } else if s < q + straight + half {
+        let u = (s - q - straight) / half;
+        let a = std::f32::consts::PI - u * std::f32::consts::PI;
+        Vec3::new(TRACK_R * a.cos(), 0.0, TRACK_ZN + TRACK_R * a.sin())
+    } else if s < q + 2.0 * straight + half {
+        let t = (s - q - straight - half) / straight;
+        Vec3::new(TRACK_R, 0.0, TRACK_ZN - t * straight)
     } else {
-        (7.5, 1.95, -1.5, 1.5, 0.48)
-    };
-    let eye = pos - forward * dist + Vec3::Y * height + right * side;
-    let target = pos + forward * look_ahead + Vec3::Y * lift;
-    CameraPose { eye, target }
+        let u = (s - q - 2.0 * straight - half) / q;
+        let a = -u * std::f32::consts::FRAC_PI_2;
+        Vec3::new(TRACK_R * a.cos(), 0.0, TRACK_ZS + TRACK_R * a.sin())
+    }
+}
+
+fn closest_s(pos: Vec3) -> f32 {
+    let total = track_perimeter();
+    let n = 96;
+    let mut best_s = 0.0;
+    let mut best_d = f32::MAX;
+    for i in 0..n {
+        let s = total * (i as f32) / n as f32;
+        let p = point_on_track(s);
+        let d = (p.x - pos.x).powi(2) + (p.z - pos.z).powi(2);
+        if d < best_d {
+            best_d = d;
+            best_s = s;
+        }
+    }
+    let mut s = best_s;
+    let mut step = total / n as f32;
+    for _ in 0..5 {
+        step *= 0.5;
+        let dl = {
+            let p = point_on_track(s - step);
+            (p.x - pos.x).powi(2) + (p.z - pos.z).powi(2)
+        };
+        let dr = {
+            let p = point_on_track(s + step);
+            (p.x - pos.x).powi(2) + (p.z - pos.z).powi(2)
+        };
+        if dl < dr && dl < best_d {
+            s -= step;
+            best_d = dl;
+        } else if dr < best_d {
+            s += step;
+            best_d = dr;
+        }
+    }
+    s.rem_euclid(total)
+}
+
+fn wrap_pi(mut a: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    while a > pi {
+        a -= pi * 2.0;
+    }
+    while a < -pi {
+        a += pi * 2.0;
+    }
+    a
 }

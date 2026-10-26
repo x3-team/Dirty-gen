@@ -5,6 +5,12 @@ use glam::Vec3;
 pub const MAP_SIZE: f32 = 40.0;
 pub const MAP_RES: usize = 192;
 
+/// Stadium centerline. South cap sits on `TRACK_ZS`, north cap on `TRACK_ZN`.
+/// The scripted buggy and the heightfield share these so the lap stays on the mud.
+pub const TRACK_R: f32 = 6.35;
+pub const TRACK_ZS: f32 = -0.90;
+pub const TRACK_ZN: f32 = 3.40;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SoilSample {
     pub height: f32,
@@ -162,25 +168,55 @@ impl SoilField {
         let res = field.res;
         let cell = field.cell;
         let half = field.size * 0.5;
-        let puddle = Vec3::new(0.0, 0.0, 0.4);
+        // Shallow bowls on the racing line. The deep bog sits in the infield,
+        // on the straight dig line, so a lap can splash without parking in it.
+        // (cx, cz, across, along, depth). Along is the short axis so the lap punches through.
+        // Centers sit on the line the scripted lap actually drives.
+        let puddles = [
+            (-6.15, 5.05_f32, 2.35_f32, 2.55_f32, 0.40_f32),
+            (TRACK_R, 2.4, 2.3, 1.8, 0.38),
+            (1.15, 9.25, 2.15, 2.05, 0.40),
+        ];
+        let crests = [
+            (-TRACK_R, -0.55_f32, 2.05_f32, 0.38_f32),
+            (5.15, -5.15, 2.05, 0.34),
+            (-3.1, TRACK_ZN + 4.85, 2.15, 0.44),
+        ];
 
         for j in 0..res {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
                 let z = (j as f32 + 0.5) * cell - half;
-                let mut h = 0.0;
-                h += (fbm2(x * 0.09, z * 0.09) - 0.5) * 0.22;
-                h += (fbm2(x * 0.28 + 4.0, z * 0.28) - 0.5) * 0.06;
-                // Keep the start line a little higher and drier.
-                let start_boost = ((-z - 4.0) / 8.0).clamp(0.0, 1.0);
-                h += start_boost * 0.06;
+                let off = track_offset(x, z);
+                let n = fbm2(x * 0.11, z * 0.11);
+                let mut h = 0.10 + (n - 0.5) * 0.07;
+                h += (fbm2(x * 0.37 + 3.0, z * 0.37) - 0.5) * 0.025;
 
                 if with_puddle {
-                    let dx = x - puddle.x;
-                    let dz = z - puddle.z;
-                    let d = (dx * dx + dz * dz).sqrt();
-                    let bowl = (1.0 - (d / 7.2).clamp(0.0, 1.0)).powf(1.65) * 0.34;
-                    h -= bowl;
+                    // Worn ribbon. Kept above the water line so the lane is mud, not a lake.
+                    let lane = smooth01(1.55, 0.2, off.abs());
+                    h -= lane * 0.045;
+                    let berm = smooth01(0.7, 1.55, off) * smooth01(3.1, 1.7, off);
+                    let gate = if z < TRACK_ZS + 0.5 {
+                        smooth01(1.1, 3.4, x.abs())
+                    } else {
+                        1.0
+                    };
+                    h += berm * gate * (0.78 + (n - 0.5) * 0.1);
+                    for (cx, cz, rad, amp) in crests {
+                        h += gauss(x, z, cx, cz, rad) * amp;
+                    }
+                    h = h.max(0.035);
+                    // Infield pond. Flat floor, clear of the racing line, on the dig ray.
+                    h -= bog_bowl(x, z, 0.0, 1.05, 4.2, 0.52);
+                    // North lip of the pond. The straight dig beaches here; the lap stays outside.
+                    if x.abs() < 2.7 {
+                        let lip = gauss(x, z, 0.0, 2.55, 1.05);
+                        h += lip * 0.62 * smooth01(2.7, 1.4, x.abs());
+                    }
+                    for (cx, cz, rx, rz, depth) in puddles {
+                        h -= bowl(x, z, cx, cz, rx, rz, depth);
+                    }
                 }
                 let idx = j * res + i;
                 field.height[idx] = h;
@@ -188,21 +224,26 @@ impl SoilField {
             }
         }
 
-        // Fill the bowl up to a shore line so the puddle has a crisp edge.
         let water_line = if with_puddle { -0.02 } else { -10.0 };
         for j in 0..res {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
                 let z = (j as f32 + 0.5) * cell - half;
-                let dx = x - puddle.x;
-                let dz = z - puddle.z;
-                let d = (dx * dx + dz * dz).sqrt();
+                let off = track_offset(x, z);
                 let idx = j * res + i;
                 let h = field.height[idx];
-                let mut wet = 0.20 + 0.10 * fbm2(x * 0.17, z * 0.17);
+                let mut wet = 0.18 + 0.08 * fbm2(x * 0.17, z * 0.17);
                 if with_puddle {
-                    let halo = (1.0 - (d / 10.5).clamp(0.0, 1.0)).powf(1.25);
-                    wet = (wet + halo * 0.85).clamp(0.0, 1.0);
+                    let lane = smooth01(1.6, 0.25, off.abs());
+                    wet = lerp(wet, 0.96, lane);
+                    let berm = smooth01(0.85, 1.6, off) * smooth01(3.0, 1.75, off);
+                    wet = lerp(wet, 0.2, berm);
+                    for (cx, cz, rx, rz, _) in puddles {
+                        let d = (((x - cx) / rx).powi(2) + ((z - cz) / rz).powi(2)).sqrt();
+                        wet = wet.max(smooth01(1.35, 0.45, d));
+                    }
+                    let bog = ((x).powi(2) + (z - 1.05).powi(2)).sqrt() / 4.2;
+                    wet = wet.max(smooth01(1.2, 0.45, bog));
                 }
                 let mut water = 0.0;
                 if h < water_line {
@@ -210,11 +251,25 @@ impl SoilField {
                     wet = 1.0;
                 }
                 field.water[idx] = water;
-                field.wetness[idx] = wet;
-                field.base_wetness[idx] = if water > 0.0 { 0.95 } else { wet.min(0.75) };
-                field.loose[idx] = if wet > 0.75 { 0.012 } else { 0.0 };
-                field.darken[idx] = 0.05 + 0.08 * fbm2(x * 0.33 + 2.0, z * 0.33);
-                field.roughness[idx] = lerp(0.93, 0.38, wet) * lerp(0.85, 1.1, fbm2(x * 0.5, z * 0.4));
+                field.wetness[idx] = wet.clamp(0.0, 1.0);
+                field.base_wetness[idx] = if water > 0.0 {
+                    0.95
+                } else {
+                    wet.min(0.75)
+                };
+                let on_lane = with_puddle && off.abs() < 1.35;
+                field.loose[idx] = if water > 0.02 {
+                    0.02
+                } else if on_lane {
+                    0.045
+                } else if wet > 0.75 {
+                    0.012
+                } else {
+                    0.0
+                };
+                field.darken[idx] = 0.04 + 0.06 * fbm2(x * 0.33 + 2.0, z * 0.33);
+                field.roughness[idx] =
+                    lerp(0.93, 0.38, wet) * lerp(0.85, 1.1, fbm2(x * 0.5, z * 0.4));
                 field.roughness[idx] = field.roughness[idx].clamp(0.18, 1.0);
             }
         }
@@ -541,6 +596,51 @@ fn bilerp(a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32) -> f32 {
     let ab = a + (b - a) * tx;
     let cd = c + (d - c) * tx;
     ab + (cd - ab) * ty
+}
+
+/// Signed metres outside the stadium centerline. Negative is the infield.
+pub fn track_offset(x: f32, z: f32) -> f32 {
+    if z <= TRACK_ZS {
+        let dx = x;
+        let dz = z - TRACK_ZS;
+        (dx * dx + dz * dz).sqrt() - TRACK_R
+    } else if z >= TRACK_ZN {
+        let dx = x;
+        let dz = z - TRACK_ZN;
+        (dx * dx + dz * dz).sqrt() - TRACK_R
+    } else {
+        x.abs() - TRACK_R
+    }
+}
+
+fn smooth01(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn gauss(x: f32, z: f32, cx: f32, cz: f32, rad: f32) -> f32 {
+    let dx = x - cx;
+    let dz = z - cz;
+    (-(dx * dx + dz * dz) / (rad * rad).max(0.05)).exp()
+}
+
+/// Elliptical bowl. `rx`/`rz` are the zero-depth radii.
+fn bowl(x: f32, z: f32, cx: f32, cz: f32, rx: f32, rz: f32, depth: f32) -> f32 {
+    let dx = (x - cx) / rx.max(0.2);
+    let dz = (z - cz) / rz.max(0.2);
+    let d = (dx * dx + dz * dz).sqrt();
+    (1.0 - d.clamp(0.0, 1.0)).powf(1.35) * depth
+}
+
+/// Wide floor and a soft shore, so a straight dig sinks instead of skipping the rim.
+fn bog_bowl(x: f32, z: f32, cx: f32, cz: f32, rad: f32, depth: f32) -> f32 {
+    let d = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt() / rad.max(0.2);
+    if d >= 1.0 {
+        return 0.0;
+    }
+    let shore = smooth01(1.0, 0.8, d);
+    let floor = smooth01(0.8, 0.4, d);
+    (shore * 0.35 + floor * 0.65) * depth
 }
 
 fn hash2(x: f32, y: f32) -> f32 {

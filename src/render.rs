@@ -686,18 +686,20 @@ impl Renderer {
             .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
 
         let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(
-            46f32.to_radians(),
-            self.width as f32 / self.height as f32,
-            0.15,
-            180.0,
-        );
+        let aspect = self.width as f32 / self.height as f32;
+        let proj = if let Some(width) = cam.ortho_width {
+            let half_w = width * 0.5;
+            let half_h = half_w / aspect.max(0.1);
+            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.2, 260.0)
+        } else {
+            Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
+        };
         let view_proj = proj * view;
         // Low sun so rut walls and the buggy contact shadow separate from the ground.
         let sun = Vec3::new(0.88, 0.32, 0.24).normalize();
-        let light_target = Vec3::new(0.0, 0.0, -1.5);
+        let light_target = Vec3::new(0.0, 0.0, 2.0);
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
-        let light_proj = Mat4::orthographic_rh(-28.0, 28.0, -28.0, 28.0, 1.0, 110.0);
+        let light_proj = Mat4::orthographic_rh(-36.0, 36.0, -36.0, 36.0, 1.0, 130.0);
         let light_vp = light_proj * light_view;
         let frame = FrameData {
             view_proj: view_proj.to_cols_array_2d(),
@@ -1004,9 +1006,10 @@ fn build_particles(out: &mut Vec<ParticleVertex>, items: &[Particle], eye: Vec3,
         let life = (p.life / p.max_life).clamp(0.0, 1.0);
         let (color, scale) = match p.kind {
             // Dirty brown-gray. Pale spray stacked into white blobs.
-            0 => ([0.15, 0.09, 0.05, life * 0.7], 0.28),
-            1 => ([0.10, 0.05, 0.025, life * 0.9], 0.42),
-            _ => ([0.07, 0.035, 0.018, life * 0.85], 0.32),
+            // Large enough to read as droplets from the isometric frame.
+            0 => ([0.34, 0.17, 0.07, life * 0.95], 1.65),
+            1 => ([0.22, 0.11, 0.045, life * 0.92], 1.45),
+            _ => ([0.11, 0.055, 0.025, life * 0.85], 0.7),
         };
         let h = p.size * scale;
         let c = p.pos;

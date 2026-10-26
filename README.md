@@ -1,6 +1,6 @@
 # Silt
 
-Silt — движок грязи и бездорожья. Это первый играбельный срез: одно поле, одна лужа и полноприводный багги. Колёса продавливают колею, которая остаётся, след темнеет, грязь липнет к шинам и панелям и может стекать, а глубокая жижа на малой скорости сажает машину. Газ может вытянуть её или закопать глубже.
+Silt — движок грязи и бездорожья. Этот срез — короткий замкнутый грунтовый круг: несколько луж, брустверы, колея, которая остаётся, и полноприводный багги. Камера по умолчанию — фиксированный изометрический вид на весь круг. Колёса продавливают колею, след темнеет, грязь липнет к шинам и панелям, а глубокая жижа на малой скорости сажает машину.
 
 The solver is ours. Soil is a heightfield, not a stock vehicle package and not a 3D SPH sim. Chassis collision only keeps the body from diving through the world; the forces in the mud come from Bekker, Janosi–Hanamoto and a Bingham-like drag.
 
@@ -23,13 +23,13 @@ cargo run --release -- capture --software \
   --still-ruts mud-demo-ruts.png
 ```
 
-`--stills-only` jumps the same scripted drive and writes just the three stills. The script is deterministic: idle, into the puddle, reverse out, then brake. Tests use the same inputs.
+`--stills-only` jumps the same scripted drive and writes just the three stills. The script is deterministic: idle on the gate, then one lap that crosses a puddle, crests a berm, and leaves the rut in view. Tests use the same inputs. The capture camera is the fixed isometric frame.
 
 ```bash
 cargo test
 ```
 
-`scripted_drive` checks that a scripted run cuts a deeper rut, puts mud on the body, throws splash, and that stopping in the water and spinning digs the buggy in while the reverse-out run gets clear.
+`scripted_drive` checks that the lap cuts a deeper rut, puts mud on the body, throws splash, and slows in the soft water. Stopping in the infield pond and spinning digs the buggy in.
 
 ## Controls
 
@@ -38,11 +38,12 @@ cargo test
 | W / Up | Throttle |
 | S / Down | Brake, then reverse once the buggy is slow |
 | A / Left, D / Right | Steer |
+| C | Toggle the chase camera. The default is a fixed isometric view of the loop |
 | Q / E | Orbit the chase camera |
-| R / F | Raise / lower the camera |
+| R / F | Raise / lower the chase camera |
 | Esc | Quit |
 
-The chase camera sits behind the buggy so the body and the ruts stay in view.
+The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the buggy.
 
 ## What the soil does
 
@@ -60,7 +61,7 @@ The buggy is a short-travel 4x4: four wheels, a spring matched to the Bekker loa
 
 ## Not in this slice
 
-Motocross bikes, a race or lap mode, a track editor, menus, multiplayer, and a large world are intentionally absent. The field is one puddle and the ground around it, so the soil model can be seen running in real time.
+Motocross bikes, a race mode, a track editor, menus, multiplayer, and a large world are intentionally absent. The field is one short loop — a few puddles, low berms, and the ground around them — so the soil model can be seen running in real time.
 
 ## Layout
 
