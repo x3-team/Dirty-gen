@@ -1,1 +1,71 @@
-# Dirty-gen
+# Silt
+
+Silt — движок грязи и бездорожья. Это первый играбельный срез: одно поле, одна лужа и полноприводный багги. Колёса продавливают колею, которая остаётся, след темнеет, грязь липнет к шинам и панелям и может стекать, а глубокая жижа на малой скорости сажает машину. Газ может вытянуть её или закопать глубже.
+
+The solver is ours. Soil is a heightfield, not a stock vehicle package and not a 3D SPH sim. Chassis collision only keeps the body from diving through the world; the forces in the mud come from Bekker, Janosi–Hanamoto and a Bingham-like drag.
+
+## Build and run
+
+Rust 1.85 or newer (the repo pins 1.99.1 via `rust-toolchain.toml` when rustup is installed).
+
+```bash
+cargo run --release
+```
+
+That opens a window. On a machine with no discrete GPU, lavapipe can drive an offscreen capture. `--software` points Vulkan at lavapipe when that ICD is installed and clears `DISPLAY` so a broken X server is not picked up:
+
+```bash
+cargo run --release -- capture --software \
+  --width 1280 --height 720 --fps 30 --seconds 12 \
+  --video mud-demo.mp4 \
+  --still-start mud-demo-start.png \
+  --still-puddle mud-demo-puddle.png \
+  --still-ruts mud-demo-ruts.png
+```
+
+`--stills-only` jumps the same scripted drive and writes just the three stills. The script is deterministic: idle, into the puddle, reverse out, then brake. Tests use the same inputs.
+
+```bash
+cargo test
+```
+
+`scripted_drive` checks that a scripted run cuts a deeper rut, puts mud on the body, throws splash, and that stopping in the water and spinning digs the buggy in while the reverse-out run gets clear.
+
+## Controls
+
+| Key | Action |
+| --- | --- |
+| W / Up | Throttle |
+| S / Down | Brake, then reverse once the buggy is slow |
+| A / Left, D / Right | Steer |
+| Q / E | Orbit the chase camera |
+| R / F | Raise / lower the camera |
+| Esc | Quit |
+
+The chase camera sits behind the buggy so the body and the ruts stay in view.
+
+## What the soil does
+
+The field is a grid (40 m, 192 cells on a side). Each cell stores height, loose mud, wetness and water depth.
+
+- **Bekker** pressure–sinkage turns wheel load into how far the tire sinks. Wetter, looser ground has a smaller modulus, so the same weight sinks further.
+- **Janosi–Hanamoto** shear is the traction. It saturates with slip. On firm ground a simple tire curve still does most of the work; once the rut is deep, the soil term takes over.
+- **Slip-sinkage** digs a plastic rut while the tire is spinning. The displaced soil is piled into berms. The rut stays after the wheel has gone.
+- **Bingham-like drag** is why low speed bogs. Fresh mud resists, but a spinning tire can still creep. Viscosity is what kills speed when you hit the water with momentum. If you stop in the deep part and keep the throttle in, the tire digs a hole and the lip of that hole holds the buggy. Reverse while you are still rolling and you can leave.
+- **Tracks** darken the albedo and change roughness along the contact patch. That is stored in the field, not a decal.
+- **Shallow water** is a small pipe scheme. The puddle wets the cells under it. A wheel throws that water forward and raises splash particles.
+- **Adhesion** is an ODE on each tire and on a handful of body panels (nose, sides, belly, fenders, and so on). Pickup grows with slip and speed, mass drips off, and the panel state drives the mud mask: clumps and streaks, not one flat brown multiply.
+
+The buggy is a short-travel 4x4: four wheels, a spring matched to the Bekker load, equal drive torque, steer on the front axle. It is not a multibody A-arm model.
+
+## Not in this slice
+
+Motocross bikes, a race or lap mode, a track editor, menus, multiplayer, and a large world are intentionally absent. The field is one puddle and the ground around it, so the soil model can be seen running in real time.
+
+## Layout
+
+- `src/soil.rs` — heightfield, Bekker, Janosi, water, rut stamp
+- `src/vehicle.rs` — buggy, suspension, tire / terramechanics blend, mud ODE
+- `src/particles.rs` — splash, clods, drips
+- `src/world.rs` — coupling and the scripted demo
+- `src/render.rs`, `src/shader.wgsl`, `src/mesh.rs` — wgpu forward renderer

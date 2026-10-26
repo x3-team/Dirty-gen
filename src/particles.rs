@@ -1,0 +1,159 @@
+//! Short-lived splash, flung clods and drips. Ballistic, not a fluid solve.
+
+use glam::Vec3;
+
+use crate::soil::SoilField;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Particle {
+    pub pos: Vec3,
+    pub vel: Vec3,
+    pub life: f32,
+    pub max_life: f32,
+    pub size: f32,
+    /// 0 spray, 1 clod, 2 drip.
+    pub kind: u8,
+    pub alive: bool,
+}
+
+impl Default for Particle {
+    fn default() -> Self {
+        Self {
+            pos: Vec3::ZERO,
+            vel: Vec3::ZERO,
+            life: 0.0,
+            max_life: 1.0,
+            size: 0.08,
+            kind: 0,
+            alive: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Particles {
+    pub items: Vec<Particle>,
+    rng: u32,
+}
+
+impl Particles {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::with_capacity(1024),
+            rng: 0x51_17_u32,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    pub fn alive_count(&self) -> usize {
+        self.items.iter().filter(|p| p.alive && p.life > 0.0).count()
+    }
+
+    fn rnd(&mut self) -> f32 {
+        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        (self.rng >> 8) as f32 / 16_777_216.0
+    }
+
+    pub fn spawn(&mut self, pos: Vec3, vel: Vec3, life: f32, size: f32, kind: u8) {
+        if self.items.len() > 900 {
+            if let Some(slot) = self.items.iter_mut().find(|p| !p.alive || p.life <= 0.0) {
+                *slot = Particle {
+                    pos,
+                    vel,
+                    life,
+                    max_life: life,
+                    size,
+                    kind,
+                    alive: true,
+                };
+                return;
+            }
+            return;
+        }
+        self.items.push(Particle {
+            pos,
+            vel,
+            life,
+            max_life: life,
+            size,
+            kind,
+            alive: true,
+        });
+    }
+
+    pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
+        let n = ((speed * water * 28.0).clamp(1.0, 7.0)) as i32;
+        for _ in 0..n {
+            let jx = (self.rnd() - 0.5) * 1.4;
+            let jz = (self.rnd() - 0.5) * 0.8;
+            let up = 1.2 + speed * 0.28 + self.rnd() * 1.1;
+            let vel = forward * (speed * 0.25 + self.rnd() * 0.6)
+                + right * jx
+                + Vec3::Y * up
+                + forward * jz;
+            let life = 0.45 + self.rnd() * 0.45;
+            let size = 0.05 + water * 0.35 + self.rnd() * 0.06;
+            self.spawn(origin + Vec3::Y * 0.05, vel, life, size, 0);
+        }
+    }
+
+    pub fn clod(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32) {
+        let jx = (self.rnd() - 0.5) * 1.8;
+        let up = 1.4 + self.rnd() * 1.6;
+        let vel = forward * (0.4 + speed * 0.15) + right * jx + Vec3::Y * up;
+        let life = 0.55 + self.rnd() * 0.4;
+        let size = 0.045 + self.rnd() * 0.04;
+        self.spawn(origin + Vec3::Y * 0.08, vel, life, size, 1);
+    }
+
+    pub fn drip(&mut self, origin: Vec3) {
+        let vel = Vec3::new(
+            (self.rnd() - 0.5) * 0.15,
+            -0.2 - self.rnd() * 0.4,
+            (self.rnd() - 0.5) * 0.15,
+        );
+        let size = 0.03 + self.rnd() * 0.02;
+        self.spawn(origin, vel, 0.7, size, 2);
+    }
+
+    pub fn update(&mut self, soil: &mut SoilField, dt: f32) {
+        for p in &mut self.items {
+            if !p.alive {
+                continue;
+            }
+            p.life -= dt;
+            if p.life <= 0.0 {
+                p.alive = false;
+                continue;
+            }
+            let drag = match p.kind {
+                0 => 1.6,
+                1 => 0.8,
+                _ => 0.4,
+            };
+            p.vel.y -= 9.81 * dt;
+            p.vel *= (1.0 - dt * drag).max(0.0);
+            p.pos += p.vel * dt;
+            let h = soil.sample(p.pos.x, p.pos.z).height;
+            if p.pos.y < h + 0.02 {
+                if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
+                    match p.kind {
+                        0 => {
+                            soil.wetness[idx] = (soil.wetness[idx] + 0.03).min(1.0);
+                            soil.darken[idx] = (soil.darken[idx] + 0.02).min(1.0);
+                        }
+                        1 | 2 => {
+                            soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
+                            soil.loose[idx] = (soil.loose[idx] + 0.004).min(0.16);
+                        }
+                        _ => {}
+                    }
+                }
+                p.alive = false;
+            }
+        }
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "silt"
+version = "0.1.0"
+edition = "2021"
+description = "Silt — real-time mud and off-road terramechanics"
+license = "MIT"
+
+[lib]
+name = "silt"
+path = "src/lib.rs"
+
+[dependencies]
+bytemuck = { version = "1.18", features = ["derive"] }
+env_logger = "0.11"
+glam = { version = "0.29", features = ["bytemuck"] }
+png = "0.17"
+pollster = "0.4"
+wgpu = "23"
+winit = "0.30"
