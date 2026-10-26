@@ -442,7 +442,7 @@ impl Renderer {
             color_format,
             Some(depth_state(false, wgpu::CompareFunction::Less)),
             true,
-            Some(wgpu::Face::Back),
+            None,
         );
         let pipe_mesh = pipeline(
             &device,

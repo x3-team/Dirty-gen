@@ -306,24 +306,27 @@ pub fn dig_input(t: f32) -> Input {
 pub fn demo_camera(t: f32, pos: Vec3, yaw: f32) -> CameraPose {
     let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
     let right = Vec3::new(forward.z, 0.0, -forward.x);
+    if t >= 9.0 {
+        // After the buggy has left the puddle. Low, behind the rear tires,
+        // aimed at the dry cut beside the contact so the groove is the subject.
+        let axle = pos - forward * 1.18;
+        // Low and behind the outer bank, far enough that the tire is not the frame.
+        let lip = axle + right * 1.00 - forward * 0.14;
+        let eye = lip - forward * 1.7 + right * 0.55;
+        return CameraPose {
+            eye: Vec3::new(eye.x, 0.36, eye.z),
+            target: lip + Vec3::Y * 0.01,
+        };
+    }
     let (dist, height, side, look_ahead, lift) = if t < 1.15 {
         (7.2, 2.15, 1.35, 2.6, 1.05)
-    } else if t < 3.25 {
-        (6.1, 1.85, 0.7, 1.6, 0.7)
-    } else if t < 4.55 {
-        (5.4, 1.55, 1.55, 0.35, 0.55)
-    } else if t < 6.15 {
-        // Beside the bowl while the 14 cm grooves are under the tires.
-        let _ = (forward, right, pos);
-        // Across the track, so the 14 cm walls face the camera.
-        return CameraPose {
-            eye: Vec3::new(2.35, 0.52, -0.35),
-            target: Vec3::new(-0.15, -0.22, -1.15),
-        };
-    } else if t < 9.2 {
-        (7.4, 2.2, -1.4, 1.8, 0.55)
+    } else if t < 3.6 {
+        // Low and off to the side so the shore and the sky glint read.
+        (7.8, 1.02, -2.7, 2.8, 0.16)
+    } else if t < 6.5 {
+        (6.4, 1.65, 1.7, 1.3, 0.42)
     } else {
-        (8.2, 2.05, 2.2, 3.4, 0.35)
+        (7.5, 1.95, -1.5, 1.5, 0.48)
     };
     let eye = pos - forward * dist + Vec3::Y * height + right * side;
     let target = pos + forward * look_ahead + Vec3::Y * lift;

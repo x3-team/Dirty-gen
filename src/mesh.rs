@@ -549,26 +549,33 @@ pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
 }
 
 pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
-    let mut verts = Vec::with_capacity(res * res);
+    // The solver stores one height per ~20 cm. A rut is often a single cell,
+    // which is one kink and reads as a tint. Draw a finer mesh and sample the
+    // same heightfield so the displaced walls have real triangles.
+    let sub = 3usize;
+    let n = (res - 1) * sub + 1;
+    let mut verts = Vec::with_capacity(n * n);
     let half = size * 0.5;
     let cell = size / res as f32;
-    for j in 0..res {
-        for i in 0..res {
-            let x = (i as f32 + 0.5) * cell - half;
-            let z = (j as f32 + 0.5) * cell - half;
+    for j in 0..n {
+        for i in 0..n {
+            let fi = i as f32 / sub as f32;
+            let fj = j as f32 / sub as f32;
+            let x = (fi + 0.5) * cell - half;
+            let z = (fj + 0.5) * cell - half;
             verts.push(TerrainVertex {
                 xz: [x, z],
-                ij: [i as f32, j as f32],
+                ij: [fi, fj],
             });
         }
     }
-    let mut indices = Vec::with_capacity((res - 1) * (res - 1) * 6);
-    for j in 0..res - 1 {
-        for i in 0..res - 1 {
-            let a = (j * res + i) as u32;
-            let b = ((j + 1) * res + i) as u32;
-            let c = ((j + 1) * res + i + 1) as u32;
-            let d = (j * res + i + 1) as u32;
+    let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = (j * n + i) as u32;
+            let b = ((j + 1) * n + i) as u32;
+            let c = ((j + 1) * n + i + 1) as u32;
+            let d = (j * n + i + 1) as u32;
             // +Z then +X winds upward.
             indices.extend_from_slice(&[a, b, c, a, c, d]);
         }
@@ -580,6 +587,73 @@ fn hash(n: u32) -> f32 {
     let mut x = n.wrapping_mul(747796405).wrapping_add(2891336453);
     x = (x >> 16) ^ x;
     (x & 0x00ff_ffff) as f32 / 16_777_215.0
+}
+
+/// Low ring of ground. The inner edge is buried in the skirt so the
+/// skyline grows out of the field instead of sitting on floating boxes.
+fn add_horizon(mesh: &mut CpuMesh) {
+    let segs = 72usize;
+    let rings = 7usize;
+    let r0 = 26.0;
+    let r1 = 58.0;
+    let mut crest = vec![0.0_f32; segs];
+    for i in 0..segs {
+        let a = hash(i as u32 * 17 + 3);
+        let b = hash(i as u32 * 17 + 11);
+        crest[i] = 2.6 + a * 2.0 + (b - 0.5) * 0.35;
+    }
+    let src = crest.clone();
+    for i in 0..segs {
+        let prev = src[(i + segs - 1) % segs];
+        let next = src[(i + 1) % segs];
+        crest[i] = src[i] * 0.5 + prev * 0.25 + next * 0.25;
+    }
+    for j in 0..rings {
+        let t0 = j as f32 / rings as f32;
+        let t1 = (j + 1) as f32 / rings as f32;
+        let rad0 = r0 + (r1 - r0) * t0;
+        let rad1 = r0 + (r1 - r0) * t1;
+        let hump = |t: f32| (t * std::f32::consts::PI).sin();
+        for i in 0..segs {
+            let i1 = (i + 1) % segs;
+            let a0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+            let a1 = i1 as f32 / segs as f32 * std::f32::consts::TAU;
+            let y_at = |t: f32, c: f32| -0.18 + hump(t) * c;
+            let p = |rad: f32, ang: f32, y: f32| Vec3::new(ang.cos() * rad, y, ang.sin() * rad);
+            // Inner edge, then the next segment, then the outer edge: +Y normal.
+            add_quad(
+                mesh,
+                [
+                    p(rad0, a0, y_at(t0, crest[i])),
+                    p(rad0, a1, y_at(t0, crest[i1])),
+                    p(rad1, a1, y_at(t1, crest[i1])),
+                    p(rad1, a0, y_at(t1, crest[i])),
+                ],
+                PANEL_HILL,
+            );
+        }
+    }
+}
+
+/// Two short crossed cards. Tall thin boxes read as neon sticks.
+fn add_tuft(mesh: &mut CpuMesh, base: Vec3, height: f32, panel: f32) {
+    let root = base + Vec3::new(0.0, -0.05, 0.0);
+    let w = height * 1.25;
+    for k in 0..2 {
+        let a = k as f32 * std::f32::consts::FRAC_PI_2 + 0.35;
+        let d = Vec3::new(a.cos(), 0.0, a.sin());
+        let tip = Vec3::Y * height + d * (height * 0.12);
+        add_quad(
+            mesh,
+            [
+                root - d * w,
+                root + d * w,
+                root + d * (w * 0.22) + tip,
+                root - d * (w * 0.22) + tip,
+            ],
+            panel,
+        );
+    }
 }
 
 /// Horizon, rocks and reeds so the mud has somewhere to sit.
@@ -630,17 +704,9 @@ pub fn environment_mesh() -> CpuMesh {
         PANEL_SKIRT,
     );
 
-    let hills = [
-        (Vec3::new(-34.0, -0.2, 36.0), Vec3::new(14.0, 1.6, 8.0)),
-        (Vec3::new(32.0, -0.3, 42.0), Vec3::new(16.0, 2.1, 9.0)),
-        (Vec3::new(46.0, -0.4, -6.0), Vec3::new(10.0, 1.4, 12.0)),
-        (Vec3::new(-48.0, -0.3, -10.0), Vec3::new(12.0, 1.8, 10.0)),
-        (Vec3::new(4.0, -0.5, 52.0), Vec3::new(18.0, 2.4, 7.0)),
-        (Vec3::new(-8.0, -0.4, -48.0), Vec3::new(16.0, 1.5, 8.0)),
-    ];
-    for (c, h) in hills {
-        add_box(&mut m, c + Vec3::Y * h.y * 0.2, h * Vec3::new(1.0, 0.55, 1.0), PANEL_HILL);
-    }
+    // Low rolling silhouette. The inner ring is tucked into the skirt so it
+    // sits on the ground instead of floating as boxes.
+    add_horizon(&mut m);
 
     // Rocks off the drive line (the scripted run stays near x = 0).
     let rocks = [
@@ -662,26 +728,18 @@ pub fn environment_mesh() -> CpuMesh {
         );
     }
 
-    // Reeds around the puddle, kept off the center line the buggy drives.
+    // Short tufts. Tall boxes read as neon sticks.
     let puddle = Vec3::new(0.0, 0.0, 0.4);
-    for k in 0..16 {
-        let ang = k as f32 / 16.0 * std::f32::consts::TAU + 0.2;
-        let rad = 8.4 + hash(k) * 1.3;
+    for k in 0..10 {
+        let ang = k as f32 / 10.0 * std::f32::consts::TAU + 0.4;
+        let rad = 9.2 + hash(k) * 1.6;
         let x = puddle.x + ang.cos() * rad;
-        if x.abs() < 2.4 {
+        if x.abs() < 3.0 {
             continue;
         }
         let z = puddle.z + ang.sin() * rad;
-        for s in 0..3 {
-            let jx = (hash(k * 5 + s) - 0.5) * 0.35;
-            let h = 0.7 + hash(k * 7 + s) * 0.6;
-            add_box(
-                &mut m,
-                Vec3::new(x + jx, h * 0.5, z + (s as f32 - 1.0) * 0.12),
-                Vec3::new(0.025, h * 0.5, 0.025),
-                PANEL_REED,
-            );
-        }
+        let h = 0.11 + hash(k * 3) * 0.08;
+        add_tuft(&mut m, Vec3::new(x, 0.0, z), h, PANEL_REED);
     }
 
     let trees = [

@@ -247,8 +247,9 @@ fn chase(world: &World, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
 
 fn lift_camera(world: &World, mut pose: CameraPose) -> CameraPose {
     let h = world.soil.sample(pose.eye.x, pose.eye.z).height;
-    if pose.eye.y < h + 0.4 {
-        pose.eye.y = h + 0.4;
+    // Clearance stays small so the rut still can sit just above the soil.
+    if pose.eye.y < h + 0.05 {
+        pose.eye.y = h + 0.05;
     }
     pose
 }
@@ -317,7 +318,7 @@ fn capture(args: &[String]) {
     let stills = [
         (0.40_f32, &parsed.still_start),
         (3.05, &parsed.still_puddle),
-        (4.80, &parsed.still_ruts),
+        (10.80, &parsed.still_ruts),
     ];
     println!(
         "capture {frames} frames at {}x{} ({} physics steps/frame)",
