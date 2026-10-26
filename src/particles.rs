@@ -85,21 +85,23 @@ impl Particles {
     }
 
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
-        let n = ((speed * water * 16.0).clamp(2.0, 5.0)) as i32;
-        for i in 0..n {
-            let jx = (self.rnd() - 0.5) * 1.4;
-            let jz = (self.rnd() - 0.5) * 0.8;
-            // A couple of slower droplets trail the leading spray.
-            let trail = if i == n - 1 { 0.45 } else { 1.0 };
-            let up = (1.15 + speed * 0.22 + self.rnd() * 0.9) * trail;
-            let vel = forward * (speed * 0.22 + self.rnd() * 0.45) * trail
-                + right * jx
-                + Vec3::Y * up
-                + forward * jz;
-            let life = 0.50 + self.rnd() * 0.50;
-            let size = 0.18 + water * 0.22 + self.rnd() * 0.10;
-            self.spawn(origin + Vec3::Y * 0.28, vel, life, size, 0);
+        let _ = water;
+        // One droplet, and not on top of one that is already in the air.
+        // A spawn every step became a pale cloud from the isometric camera.
+        let side = if self.rnd() > 0.5 { 1.0 } else { -1.0 };
+        let pos = origin
+            - forward * (0.1 + self.rnd() * 0.16)
+            + right * side * (0.3 + self.rnd() * 0.14)
+            + Vec3::Y * (0.48 + self.rnd() * 0.18);
+        let crowded = self.items.iter().any(|p| {
+            p.alive && p.kind == 0 && (p.pos - pos).length() < 0.36
+        });
+        if crowded {
+            return;
         }
+        let kick = (0.4 + speed * 0.12).clamp(0.3, 1.15);
+        let vel = -forward * kick + right * side * 0.3 + Vec3::Y * (0.9 + self.rnd() * 0.4);
+        self.spawn(pos, vel, 0.42, 0.2, 0);
     }
 
     pub fn clod(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32) {

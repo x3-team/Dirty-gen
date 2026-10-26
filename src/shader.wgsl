@@ -261,8 +261,8 @@ fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
     let dz = 0.012 * cos(x * 0.72 + z * 0.18 + t * 0.55) * 0.18
         + 0.009 * cos(z * 0.95 - x * 0.22 - t * 0.42) * 0.95
         + 0.005 * cos(x * 1.5 + z * 1.25 + t * 0.8) * 1.25;
-    // Exaggerated so a long wave still shades from above. The mesh stays nearly flat.
-    return normalize(vec3<f32>(-dx * 22.0, 1.0, -dz * 22.0));
+    // A small tilt. Large normals turned the pond into a chrome dome.
+    return normalize(vec3<f32>(-dx * 1.6, 1.0, -dz * 1.6));
 }
 
 fn terrain_height(xz: vec2<f32>) -> f32 {
@@ -308,7 +308,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
     let soaked = vec3<f32>(0.04, 0.022, 0.012);
     var albedo = mix(dry, soaked, smoothstep(0.12, 0.88, wet));
-    albedo = mix(albedo, albedo * vec3<f32>(0.28, 0.22, 0.16), smoothstep(0.06, 0.55, darken));
+    // Driven cells are the floor of the groove. Dark, not a faint tint.
+    let driven = smoothstep(0.4, 0.78, darken);
+    albedo = mix(albedo, vec3<f32>(0.018, 0.01, 0.006), driven * 0.82);
 
     let reach = max(frame.params.z * 1.7, 0.22);
     let avg = (
@@ -323,7 +325,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let berm = smoothstep(0.006, 0.035, h - avg);
     let floor = rut * smoothstep(0.45, 0.9, n.y);
     albedo *= mix(1.0, 0.07, floor);
-    albedo = mix(albedo, vec3<f32>(0.42, 0.22, 0.10) * (0.9 + grit * 0.2), berm * 0.85);
+    albedo = mix(albedo, vec3<f32>(0.50, 0.28, 0.12) * (0.92 + grit * 0.16), berm * 0.92);
 
     // Wet rim on the soil. The sky reflection is the water sheet, not this grid.
     let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
@@ -333,7 +335,10 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // so the bottom of the groove reads as damp soil, not a flat tint.
     let wet_amt = smoothstep(0.08, 0.40, wet);
     let sheen = wet_amt * mix(0.45, 1.0, max(rut, smoothstep(0.015, 0.07, water)));
-    let rough_out = mix(0.98, 0.055, sheen);
+    // Standing water is drawn as its own sheet. A mirror bed under that film
+    // is the gray metal disc.
+    let drowned = smoothstep(0.012, 0.05, water);
+    let rough_out = mix(mix(0.98, 0.34, sheen * (1.0 - drowned)), 0.96, drowned);
     return present(shade(in.world, n, albedo, rough_out, vec3<f32>(0.0)));
 }
 
@@ -392,22 +397,24 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         discard;
     }
     let n = ripple_normal(in.world.xz, frame.misc.x);
+    // Keep the surface facing up. A bowed normal is what made the gray metal disc.
+    let nrm = normalize(vec3<f32>(n.x * 0.25, 1.0, n.z * 0.25));
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
-    let ndotv = clamp(dot(n, view), 0.0, 1.0);
-    // Overhead fresnel is weak. A flat sky mix from above turns the pool into a pale disc.
-    let fres = pow(1.0 - ndotv, 2.4);
-    // Dull the sky sample. Clouds in the reflection were turning pools into pale discs.
-    let mirror = sky_color(reflect(-view, n)) * vec3<f32>(0.22, 0.28, 0.34);
-    let spec = pow(clamp(dot(n, normalize(sun + view)), 0.0, 1.0), 24.0);
-    let depth_t = smoothstep(0.01, 0.12, in.depth);
-    let shore_col = vec3<f32>(0.07, 0.04, 0.018);
-    let deep_col = vec3<f32>(0.028, 0.02, 0.012);
+    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
+    let fres = pow(1.0 - ndotv, 4.0);
+    let depth_t = smoothstep(0.012, 0.14, in.depth);
+    // Red-heavy mud. A gray mix here is what read as a metal disc from above.
+    let shore_col = vec3<f32>(0.055, 0.026, 0.012);
+    let deep_col = vec3<f32>(0.022, 0.010, 0.005);
     let absorption = mix(shore_col, deep_col, depth_t);
-    var col = mix(absorption, mirror, clamp(0.05 + fres * 0.5, 0.05, 0.30));
-    col += frame.sun_color.rgb * spec * shadow_factor(in.world, n) * 0.32;
-    let shore = smoothstep(0.004, 0.06, in.depth);
-    let alpha = shore * mix(0.72, 0.92, depth_t);
+    // Flat dull sky. sky_color carries the sun disc and white clouds.
+    let quiet = vec3<f32>(0.10, 0.11, 0.12);
+    var col = mix(absorption, quiet, 0.04 + fres * 0.03);
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 48.0);
+    col += vec3<f32>(0.04, 0.025, 0.012) * spec * shadow_factor(in.world, nrm) * 0.04;
+    let shore = smoothstep(0.002, 0.07, in.depth);
+    let alpha = shore * mix(0.88, 0.98, depth_t);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);

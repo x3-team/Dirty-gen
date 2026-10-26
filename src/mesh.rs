@@ -12,6 +12,7 @@ pub const PANEL_LIGHT: f32 = 16.0;
 pub const PANEL_TAIL: f32 = 17.0;
 pub const PANEL_SKIRT: f32 = 40.0;
 pub const PANEL_HILL: f32 = 41.0;
+#[allow(dead_code)]
 pub const PANEL_ROCK: f32 = 42.0;
 #[allow(dead_code)]
 pub const PANEL_REED: f32 = 43.0;
@@ -636,7 +637,7 @@ fn add_horizon(mesh: &mut CpuMesh) {
     }
 }
 
-/// Horizon and rocks so the mud has somewhere to sit.
+/// Horizon ring so the mud has somewhere to sit.
 pub fn environment_mesh() -> CpuMesh {
     let mut m = CpuMesh::new();
     let y = -0.02;
@@ -687,26 +688,6 @@ pub fn environment_mesh() -> CpuMesh {
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
     // sits on the ground instead of floating as boxes.
     add_horizon(&mut m);
-
-    // Rocks outside the berm. The loop itself is the heightfield.
-    let rocks = [
-        Vec3::new(10.4, 0.14, -3.2),
-        Vec3::new(-10.6, 0.12, 1.4),
-        Vec3::new(8.8, 0.16, 13.2),
-        Vec3::new(-9.4, 0.12, -7.6),
-        Vec3::new(1.6, 0.12, 14.2),
-        Vec3::new(-12.2, 0.16, 8.4),
-        Vec3::new(12.4, 0.14, 6.5),
-    ];
-    for (k, p) in rocks.iter().enumerate() {
-        let s = 0.28 + hash(k as u32) * 0.35;
-        add_box(
-            &mut m,
-            *p,
-            Vec3::new(s, s * 0.55, s * (0.7 + hash(k as u32 + 3) * 0.5)),
-            PANEL_ROCK,
-        );
-    }
 
     let trees = [
         Vec3::new(-16.0, 0.0, 14.0),
