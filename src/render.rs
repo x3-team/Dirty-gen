@@ -5,11 +5,13 @@
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
-use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::bike::{Bike, BIKE_RADIUS};
+use silt::cockpit::wheel_local;
+use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
+use crate::cockpit_mesh;
 use crate::mesh::{
     bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
     terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
@@ -81,6 +83,8 @@ pub struct Renderer {
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
+    cockpit: GpuMesh,
+    cockpit_wheel: GpuMesh,
     susp_v: wgpu::Buffer,
     susp_i: wgpu::Buffer,
     bike_susp_v: wgpu::Buffer,
@@ -654,6 +658,8 @@ impl Renderer {
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
+        let cockpit = upload_cpu(&device, &cockpit_mesh::shell(), "cockpit");
+        let cockpit_wheel = upload_cpu(&device, &cockpit_mesh::wheel(), "cockpit-wheel");
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
             size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -727,6 +733,8 @@ impl Renderer {
             wheel,
             bike_body,
             env,
+            cockpit,
+            cockpit_wheel,
             susp_v,
             susp_i,
             bike_susp_v,
@@ -837,10 +845,16 @@ impl Renderer {
             .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.bike_susp_v, 0, bytemuck::cast_slice(&bike_susp.vertices));
-        self.queue
-            .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
+        self.queue.write_buffer(
+            &self.bike_susp_v,
+            0,
+            bytemuck::cast_slice(&bike_susp.vertices),
+        );
+        self.queue.write_buffer(
+            &self.bike_susp_i,
+            0,
+            bytemuck::cast_slice(&bike_susp.indices),
+        );
 
         let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
         let aspect = self.width as f32 / self.height as f32;
@@ -849,7 +863,9 @@ impl Renderer {
             let half_h = half_w / aspect.max(0.1);
             Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.2, 260.0)
         } else {
-            Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
+            let fov = cam.fov_deg.unwrap_or(46.0).to_radians();
+            let near = cam.near.unwrap_or(0.15).max(0.02);
+            Mat4::perspective_rh(fov, aspect, near, 180.0)
         };
         let view_proj = proj * view;
         // Low sun so rut walls and the buggy contact shadow separate from the ground.
@@ -934,6 +950,9 @@ impl Renderer {
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
             self.draw_bike(&mut pass, bike_susp_count);
+            if cam.cockpit {
+                self.draw_cockpit(&mut pass);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
@@ -973,6 +992,9 @@ impl Renderer {
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
             self.draw_bike(&mut pass, bike_susp_count);
+            if cam.cockpit {
+                self.draw_cockpit(&mut pass);
+            }
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
@@ -1159,6 +1181,19 @@ impl Renderer {
                 bytemuck::bytes_of(slot),
             );
         }
+        let steered = model(body * wheel_local(vehicle.wheels[0].steer), mud, [0.0; 4]);
+        self.queue.write_buffer(
+            &self.model_buf,
+            11 * self.model_stride as u64,
+            bytemuck::bytes_of(&steered),
+        );
+    }
+
+    fn draw_cockpit(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        draw_indexed(pass, &self.cockpit);
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 11]);
+        draw_indexed(pass, &self.cockpit_wheel);
     }
 
     fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
