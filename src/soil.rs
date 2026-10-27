@@ -350,7 +350,14 @@ impl SoilField {
         Some(j as usize * self.res + i as usize)
     }
 
-    /// Plastic rut, berms, albedo and roughness stamp for one wheel.
+    /// Plastic rut under one tire.
+    ///
+    /// `lane` is the visible groove, stamped once per side of the axle along
+    /// the path the chassis drove. Front and rear share that slot. The cut is
+    /// a flat ribbon wider than one heightfield cell: a thinner kernel
+    /// stair-steps into a row of pits, and those pits read as a nest of scars
+    /// on the berm. The per-tire call is only a scuff under the tread, plus
+    /// the slow dig when a tire spins in place.
     pub fn stamp_wheel(
         &mut self,
         center: Vec3,
@@ -361,6 +368,7 @@ impl SoilField {
         sinkage: f32,
         slip: f32,
         dt: f32,
+        lane: bool,
     ) {
         if sinkage < 0.004 {
             return;
@@ -376,7 +384,30 @@ impl SoilField {
         let groove = (sinkage * 0.82).min(0.055);
         let spun = sinkage * (0.48 + 0.90 * slip_n);
         let want = spun.max(groove).min(0.40);
-        let reach = len * 0.5 + width + self.cell * 2.0;
+        // A rolling per-tire stamp stops at a scuff the shader does not darken.
+        // The visible pair is the `lane` call. Spinning still reaches `want`.
+        let fast = if lane { groove } else { groove.min(0.008) };
+        let sigma = (width * 0.42).max(self.cell * 0.34);
+        // Flat floor, about two cells wide, then a short shoulder. A gaussian
+        // narrower than the grid left a dotted scar beside every tire.
+        let half_w = if lane { self.cell * 1.15 } else { sigma * 1.6 };
+        let shoulder = if lane { self.cell * 0.7 } else { 0.0 };
+        let half_l = if lane {
+            (len * 0.5).max(self.cell * 2.2)
+        } else {
+            len * 0.5
+        };
+        let along_reach = if lane {
+            half_l + self.cell * 0.8
+        } else {
+            half_l + self.cell * 0.35
+        };
+        let lateral_reach = if lane {
+            half_w + shoulder + self.cell * 1.2
+        } else {
+            sigma * 3.0
+        };
+        let reach = along_reach + lateral_reach;
         let half = self.size * 0.5;
         let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
         let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
@@ -385,11 +416,13 @@ impl SoilField {
         let res = self.res as isize;
 
         let mut vol = 0.0_f32;
-        let mut left_cells = [0usize; 64];
-        let mut right_cells = [0usize; 64];
+        let mut left_cells = [0usize; 96];
+        let mut right_cells = [0usize; 96];
         let mut n_left = 0;
         let mut n_right = 0;
         let area = self.cell * self.cell;
+        let lip_in = half_w + shoulder * 0.85;
+        let lip_out = half_w + shoulder + self.cell * 0.75;
 
         for j in j0.max(1)..j1.min(res - 1) {
             for i in i0.max(1)..i1.min(res - 1) {
@@ -399,40 +432,58 @@ impl SoilField {
                 let rel_z = cz - center.z;
                 let lx = rel_x * right.x + rel_z * right.z;
                 let lz = rel_x * forward.x + rel_z * forward.z;
-                let half_w = width * 0.5;
-                let half_l = len * 0.5;
-                // Cells the tire overlaps, not only those whose centre sits inside
-                // the tread. Otherwise a 28 cm tire writes one dashed cell.
-                let tread = half_w + self.cell * 0.5;
-                let along_reach = half_l + self.cell * 0.5;
+                let along = if lane {
+                    let u = (lz.abs() / along_reach.max(0.05)).clamp(0.0, 1.0);
+                    if u < 0.78 {
+                        1.0
+                    } else {
+                        ((1.0 - u) / 0.22).clamp(0.0, 1.0)
+                    }
+                } else {
+                    1.0 - (lz.abs() / along_reach.max(0.05)).clamp(0.0, 1.0)
+                };
+                if along <= 0.0 {
+                    continue;
+                }
                 let idx = j as usize * self.res + i as usize;
+                let ax = lx.abs();
+                let across = if lane {
+                    if ax <= half_w {
+                        1.0
+                    } else if shoulder > 0.0 && ax <= half_w + shoulder {
+                        1.0 - (ax - half_w) / shoulder
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (-0.5 * (lx / sigma.max(0.02)).powi(2)).exp()
+                };
 
-                let on_tread = lx.abs() <= tread && lz.abs() <= along_reach;
-                let on_berm = lx.abs() > tread
-                    && lx.abs() < tread + self.cell * 0.85
-                    && lz.abs() <= along_reach;
-
-                if on_tread {
-                    let across = 1.0 - (lx.abs() / tread).clamp(0.0, 1.0);
-                    let along = 1.0 - (lz.abs() / along_reach.max(0.05)).clamp(0.0, 1.0);
-                    let wgt = (across * along).clamp(0.0, 1.0);
+                if across > 0.2 {
                     let already = (self.initial_height[idx] - self.height[idx]).max(0.0);
-                    if already < want && wgt > 0.04 {
-                        let room = (want - already).min(0.40 - already).max(0.0);
-                        // Groove depth in one pass. Deeper than `groove` stays slow.
-                        let rate = if already < groove { 48.0 } else { 2.2 };
-                        let drop = room * (1.0 - (-dt * rate).exp()) * (0.62 + 0.38 * wgt);
+                    let local_want = if lane {
+                        want * across
+                    } else if spun > groove {
+                        want * across
+                    } else {
+                        fast * across
+                    };
+                    let local_groove = fast * across;
+                    if already < local_want {
+                        let room = (local_want - already).min(0.40 - already).max(0.0);
+                        let rate = if already < local_groove { 48.0 } else { 2.2 };
+                        let drop = room * (1.0 - (-dt * rate).exp()) * along;
                         self.height[idx] -= drop;
                         self.loose[idx] = (self.loose[idx] + drop * 0.45).min(0.16);
                         vol += drop * area;
                     }
-                    // Tracks stay dark and change roughness even when the rut is already at depth.
                     let wet = self.wetness[idx];
-                    self.darken[idx] = (self.darken[idx] + 16.0 * wgt * dt * (0.45 + wet)).min(1.0);
+                    self.darken[idx] =
+                        (self.darken[idx] + 16.0 * across * along * dt * (0.45 + wet)).min(1.0);
                     let target_r = lerp(0.62, 0.16, wet);
-                    let blend = (5.0 * dt * wgt).min(0.45);
+                    let blend = (5.0 * dt * across * along).min(0.45);
                     self.roughness[idx] = lerp(self.roughness[idx], target_r, blend);
-                } else if on_berm {
+                } else if lane && ax > lip_in && ax < lip_out {
                     if lx > 0.0 {
                         if n_right < right_cells.len() {
                             right_cells[n_right] = idx;
@@ -446,24 +497,24 @@ impl SoilField {
             }
         }
 
-        // Most of the cut soil sits on the shoulder, so the berm is the light lip
-        // beside each groove. A wide scatter made a film instead of a ridge.
-        let berm_vol = vol * 0.9;
-        let n_berm = (n_left + n_right).max(1) as f32;
-        let dh = berm_vol / (n_berm * area);
-        for k in 0..n_left {
-            let idx = left_cells[k];
-            self.height[idx] += dh;
-            self.roughness[idx] = lerp(self.roughness[idx], 0.96, 0.25);
-            self.darken[idx] = lerp(self.darken[idx], 0.28, 0.15);
-            self.loose[idx] = (self.loose[idx] + dh * 0.4).min(0.18);
+        // A thin lip on the lane ribbon only. Per-tire scuffs do not pile a
+        // second ridge, or the berm reads as extra grooves.
+        if !lane || n_left + n_right == 0 {
+            return;
         }
-        for k in 0..n_right {
-            let idx = right_cells[k];
-            self.height[idx] += dh;
-            self.roughness[idx] = lerp(self.roughness[idx], 0.96, 0.25);
-            self.darken[idx] = lerp(self.darken[idx], 0.28, 0.15);
-            self.loose[idx] = (self.loose[idx] + dh * 0.4).min(0.18);
+        let berm_vol = vol * 0.85;
+        let n_berm = (n_left + n_right) as f32;
+        let dh = berm_vol / (n_berm * area);
+        for idx in left_cells.iter().take(n_left).chain(right_cells.iter().take(n_right)) {
+            let pile = (self.height[*idx] - self.initial_height[*idx]).max(0.0);
+            let add = dh.min((0.032 - pile).max(0.0));
+            if add <= 0.0 {
+                continue;
+            }
+            self.height[*idx] += add;
+            self.roughness[*idx] = lerp(self.roughness[*idx], 0.96, 0.25);
+            self.darken[*idx] = lerp(self.darken[*idx], 0.28, 0.15);
+            self.loose[*idx] = (self.loose[*idx] + add * 0.4).min(0.18);
         }
     }
 

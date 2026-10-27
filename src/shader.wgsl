@@ -368,25 +368,17 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Compacted soil is a little darker. This is not the groove.
     albedo *= mix(1.0, 0.86, smoothstep(0.25, 0.8, darken));
 
-    // The floor is the stamp: soil the tire removed, sitting below the shoulder
-    // one tyre-width away. The other tire is 1.5 m over, so it stays its own groove.
-    // A broad slope has no shoulder and is left alone.
-    let reach = max(frame.params.z * 1.7, 0.34);
+    // The floor is soil the tire removed. Comparing with a neighbour turned the
+    // two edges of one cut into extra dark lines, which read as a nest of scars.
     let stamp = stamp_bilinear(xz);
-    let s_px = stamp_bilinear(xz + vec2<f32>(reach, 0.0));
-    let s_nx = stamp_bilinear(xz - vec2<f32>(reach, 0.0));
-    let s_pz = stamp_bilinear(xz + vec2<f32>(0.0, reach));
-    let s_nz = stamp_bilinear(xz - vec2<f32>(0.0, reach));
-    let shoulder = max(max(s_px, s_nx), max(s_pz, s_nz));
-    let low = min(min(s_px, s_nx), min(s_pz, s_nz));
-    let drop = max(shoulder - stamp, 0.0);
-    // The floor is soil the tire removed. A few centimetres reads from this camera;
-    // a millimetre scuff does not. It stops there, so a crater is not a blacker trench.
-    let groove = smoothstep(0.016, 0.038, drop);
+    let cut = max(-stamp, 0.0);
+    // Shallow shoulders of the kernel stay the lane colour. Only the tyre
+    // centre, a few centimetres down, reads as the groove.
+    let groove = smoothstep(0.030, 0.046, cut);
     // Dark mud in the cut. A wide sheen here turned the floor into a tan stripe.
     albedo = mix(albedo, vec3<f32>(0.010, 0.0045, 0.002), groove * 0.88);
-    let pile = max(stamp - low, 0.0);
-    let lip = smoothstep(0.008, 0.02, pile) * (1.0 - groove);
+    let pile = max(stamp, 0.0);
+    let lip = smoothstep(0.012, 0.026, pile) * (1.0 - groove);
     // Loose soil on the shoulder. Lighter than the lane, only where the stamp piled it.
     albedo = mix(albedo, vec3<f32>(0.15, 0.078, 0.034), lip * 0.92);
 

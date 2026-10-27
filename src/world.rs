@@ -66,6 +66,60 @@ pub struct World {
     did_launch: bool,
 }
 
+/// Wheels on one side of the axle, averaged into a single groove.
+#[derive(Clone, Copy)]
+struct LaneAccum {
+    center: Vec3,
+    forward: Vec3,
+    right: Vec3,
+    sink: f32,
+    slip: f32,
+    n: u32,
+}
+
+impl Default for LaneAccum {
+    fn default() -> Self {
+        Self {
+            center: Vec3::ZERO,
+            forward: Vec3::Z,
+            right: Vec3::X,
+            sink: 0.0,
+            slip: 0.0,
+            n: 0,
+        }
+    }
+}
+
+impl LaneAccum {
+    fn add(&mut self, center: Vec3, forward: Vec3, right: Vec3, sink: f32, slip: f32) {
+        if self.n == 0 || sink >= self.sink {
+            self.forward = forward;
+            self.right = right;
+            self.sink = sink;
+            self.slip = slip.abs();
+        }
+        self.center += center;
+        self.n += 1;
+    }
+
+    fn stamp(&self, soil: &mut SoilField, radius: f32, width: f32, dt: f32) {
+        if self.n == 0 || self.sink < 0.004 {
+            return;
+        }
+        soil.stamp_wheel(
+            self.center / self.n as f32,
+            radius,
+            width,
+            self.forward,
+            self.right,
+            self.sink,
+            self.slip,
+            dt,
+            true,
+        );
+    }
+}
+
 impl World {
     pub fn demo() -> Self {
         let mut world = Self {
@@ -161,10 +215,15 @@ impl World {
                 .bike
                 .contacts(&self.soil, input.throttle, input.brake, h);
             if self.bike.jump_hold <= 0.0 {
+                // The bike stays on the track, but its groove is not a third
+                // slot beside the buggy's pair. A rolling scuff is all it cuts.
+                // Spinning in place still passes the real slip and can dig.
+                let crawling = self.bike.speed() < 1.1;
                 for c in &contacts {
                     if c.sinkage < 0.004 {
                         continue;
                     }
+                    let slip = if crawling { c.slip } else { 0.0 };
                     self.soil.stamp_wheel(
                         c.wheel_center,
                         BIKE_RADIUS,
@@ -172,8 +231,9 @@ impl World {
                         c.forward,
                         c.right,
                         c.sinkage,
-                        c.slip,
+                        slip,
                         h,
+                        false,
                     );
                 }
             }
@@ -190,11 +250,15 @@ impl World {
             .vehicle
             .compute_contacts(&self.soil, input.throttle, input.brake, dt);
 
+        let mut sides = [LaneAccum::default(), LaneAccum::default()];
+        // At speed the visible cut is the lane ribbon. The per-tire slip dig
+        // is for a tire that is spinning in place, not a second slot per wheel.
+        let crawling = self.vehicle.speed() < 1.1;
         for c in &contacts {
             if !c.active {
                 continue;
             }
-            let slip_stamp = c.slip;
+            let slip_stamp = if crawling { c.slip } else { 0.0 };
             self.soil.stamp_wheel(
                 c.wheel_center,
                 WHEEL_RADIUS,
@@ -204,7 +268,11 @@ impl World {
                 c.sinkage,
                 slip_stamp,
                 dt,
+                false,
             );
+            // One groove per side of the axle. Front and rear share it, so a
+            // turn does not chew a second slot into the berm.
+            sides[c.index % 2].add(c.wheel_center, c.forward, c.right, c.sinkage, slip_stamp);
             if c.sample.water > 0.008 {
                 let speed = c.speed.max(0.2);
                 self.soil.displace_water(
@@ -214,6 +282,10 @@ impl World {
                     c.sample.water.min(0.05) * 0.25 * (0.4 + speed * 0.15),
                 );
             }
+        }
+        let width = crate::vehicle::WHEEL_WIDTH;
+        for side in &sides {
+            side.stamp(&mut self.soil, WHEEL_RADIUS, width, dt);
         }
 
         let planted = contacts.iter().filter(|c| c.active).count();
