@@ -103,6 +103,17 @@ impl Debris {
         &self.bits
     }
 
+    /// Puts one bit in a free slot. Mesh tests use this to build a single piece.
+    pub fn place(&mut self, bit: Bit) {
+        if let Some(slot) = self.bits.iter_mut().find(|b| !b.alive) {
+            *slot = bit;
+            return;
+        }
+        if self.bits.len() < CAP {
+            self.bits.push(bit);
+        }
+    }
+
     pub fn stuck_count(&self) -> usize {
         self.bits
             .iter()
@@ -273,7 +284,8 @@ impl Debris {
     fn spawn_cluster(&mut self, mount: u8, origin: Vec3, axis: Vec3, side: Vec3, hang: bool) {
         let axis = axis.normalize_or_zero();
         let side = reorth(side, axis);
-        let clod = 0.11 + self.rnd() * 0.07;
+        // A cake of mud, not a rock. The mesh turns this radius into lobes.
+        let clod = 0.032 + self.rnd() * 0.030;
         self.push(KIND_CLOD, mount, origin, axis, side, clod);
         let clod2 = clod * (0.55 + self.rnd() * 0.25);
         let nudge = 0.04 + self.rnd() * 0.03;
@@ -283,17 +295,17 @@ impl Debris {
             let tilt = (self.rnd() - 0.5) * 0.85;
             let a = (axis + side * tilt).normalize_or_zero();
             let len = if hang {
-                0.36 + self.rnd() * 0.28
+                0.16 + self.rnd() * 0.24
             } else {
-                0.28 + self.rnd() * 0.22
+                0.07 + self.rnd() * 0.13
             };
             let root = origin + side * spread + axis * (0.01 + self.rnd() * 0.02);
             self.push(KIND_GRASS, mount, root, a, side, len);
         }
         let twig_len = if hang {
-            0.48 + self.rnd() * 0.36
+            0.22 + self.rnd() * 0.40
         } else {
-            0.36 + self.rnd() * 0.30
+            0.11 + self.rnd() * 0.18
         };
         let ta = (axis + side * (self.rnd() - 0.5) * 0.6).normalize_or_zero();
         self.push(
