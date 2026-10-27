@@ -7,6 +7,7 @@ use crate::body_damage::BodyDamage;
 use crate::debris::Debris;
 use crate::dust::Dust;
 use crate::exhaust::{Exhaust, Tailpipe};
+use crate::fuel_show::FuelShow;
 use crate::particles::Particles;
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
@@ -70,6 +71,7 @@ pub struct World {
     pub dust: Dust,
     pub debris: Debris,
     pub exhaust: Exhaust,
+    pub fuel: FuelShow,
     pub time: f32,
     pub telemetry: Telemetry,
     pub damage: BodyDamage,
@@ -144,6 +146,7 @@ impl World {
             dust: Dust::new(),
             debris: Debris::new(),
             exhaust: Exhaust::new(),
+            fuel: FuelShow::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -165,6 +168,7 @@ impl World {
         world.dust.clear();
         world.debris.clear();
         world.exhaust.clear();
+        world.fuel = FuelShow::new();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -186,6 +190,7 @@ impl World {
             dust: Dust::new(),
             debris: Debris::new(),
             exhaust: Exhaust::new(),
+            fuel: FuelShow::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -209,6 +214,7 @@ impl World {
         world.dust.clear();
         world.debris.clear();
         world.exhaust.clear();
+        world.fuel = FuelShow::new();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -241,6 +247,13 @@ impl World {
             .hook_tailpipe(Tailpipe::buggy(&self.vehicle), input.throttle, dt);
         self.exhaust.sim(dt);
         self.time += dt;
+        self.fuel.tick(
+            dt,
+            &self.vehicle,
+            &self.soil,
+            &mut self.particles,
+            self.telemetry.impact_time,
+        );
     }
 
     /// Integrate the bike only. Does not advance `time`, water, or particles.

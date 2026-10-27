@@ -12,6 +12,7 @@ pub mod contact;
 pub mod debris;
 pub mod dust;
 pub mod exhaust;
+pub mod fuel_show;
 pub mod lap;
 pub mod lens;
 pub mod particles;

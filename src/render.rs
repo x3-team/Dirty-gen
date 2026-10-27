@@ -102,6 +102,7 @@ pub struct Renderer {
     bike_susp_v: wgpu::Buffer,
     bike_susp_i: wgpu::Buffer,
     particles: wgpu::Buffer,
+    fuel_v: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
     chunk_i: wgpu::Buffer,
     debris_v: wgpu::Buffer,
@@ -117,6 +118,7 @@ pub struct Renderer {
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
     pipe_dust: wgpu::RenderPipeline,
+    pipe_fuel: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -627,6 +629,26 @@ impl Renderer {
             true,
             None,
         );
+        let fuel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fuel-show"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fuel_show.wgsl").into()),
+        });
+        let pipe_fuel = pipeline(
+            &device,
+            &fuel_shader,
+            &solo_layout,
+            "vs_fuel",
+            Some("fs_fuel"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
         let pipe_shadow_terrain = pipeline(
             &device,
             &shader,
@@ -732,6 +754,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let fuel_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fuel"),
+            size: (6144 * std::mem::size_of::<ParticleVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let chunk_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunks-v"),
             size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -821,6 +849,7 @@ impl Renderer {
             bike_susp_v,
             bike_susp_i,
             particles,
+            fuel_v,
             chunk_v,
             chunk_i,
             debris_v,
@@ -835,6 +864,7 @@ impl Renderer {
             pipe_mesh,
             pipe_particle,
             pipe_dust,
+            pipe_fuel,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
@@ -1024,6 +1054,17 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.debris_i, 0, bytemuck::cast_slice(&stuck.indices));
         }
+        // Dust keeps the shared particle buffer. The ribbon uses its own so a
+        // frame can draw both.
+        let mut fuel_verts = silt::fuel_show::vertices(&world.fuel, cam.eye, &world.soil);
+        if fuel_verts.len() > 6000 {
+            fuel_verts.truncate(6000);
+        }
+        let fuel_count = fuel_verts.len() as u32;
+        if fuel_count > 0 {
+            self.queue
+                .write_buffer(&self.fuel_v, 0, bytemuck::cast_slice(&fuel_verts));
+        }
 
         let mut encoder = self
             .device
@@ -1124,6 +1165,12 @@ impl Renderer {
                 pass.draw(0..dust_count, 0..1);
             }
             self.draw_debris(&mut pass, debris_count);
+            if fuel_count > 0 {
+                pass.set_pipeline(&self.pipe_fuel);
+                pass.set_bind_group(0, &self.frame_bg, &[]);
+                pass.set_vertex_buffer(0, self.fuel_v.slice(..));
+                pass.draw(0..fuel_count, 0..1);
+            }
         }
 
         self.exhaust_fx.draw(
