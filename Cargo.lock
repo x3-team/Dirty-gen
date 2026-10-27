@@ -1719,6 +1719,7 @@ dependencies = [
  "console_error_panic_hook",
  "env_logger",
  "glam",
+ "js-sys",
  "png",
  "pollster",
  "wasm-bindgen",

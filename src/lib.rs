@@ -4,6 +4,7 @@
 //! shallow water. Wheel forces come from Bekker pressure-sinkage, Janosi-Hanamoto
 //! shear and a Bingham-like drag. Rendering lives in the `silt` binary.
 
+pub mod audio;
 pub mod bike;
 pub mod particles;
 pub mod soil;
