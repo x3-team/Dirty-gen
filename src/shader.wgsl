@@ -622,6 +622,26 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        // Grass stuck in wet mud. Olive at the root, dull yellow-green at the tip.
+        let tip = clamp(uv.y, 0.0, 1.0);
+        let root = vec3<f32>(0.045, 0.024, 0.01);
+        let mid = vec3<f32>(0.15, 0.22, 0.04);
+        let end = vec3<f32>(0.32, 0.40, 0.07);
+        let blade = mix(mid, end, smoothstep(0.45, 1.0, tip));
+        let col = mix(root, blade, smoothstep(0.0, 0.2, tip));
+        return vec4<f32>(col, mix(0.28, 0.8, tip));
+    } else if (panel < 48.5) {
+        // Thin tan twig. Pale where it leaves the clod, muddy at the root.
+        let tip = clamp(uv.y, 0.0, 1.0);
+        let knot = noise(world.xz * 8.0 + vec2<f32>(world.y * 5.0, uv.x));
+        let bark = mix(vec3<f32>(0.12, 0.06, 0.025), vec3<f32>(0.58, 0.38, 0.16), smoothstep(0.02, 0.22, tip));
+        return vec4<f32>(bark * (0.84 + knot * 0.22), 0.62);
+    } else if (panel < 49.5) {
+        // Clod stuck to a panel or tire. Dark chocolate, not the flung impact clod.
+        let g = noise(world.xz * 4.0 + vec2<f32>(world.y * 2.4, 0.3));
+        let col = mix(vec3<f32>(0.016, 0.008, 0.004), vec3<f32>(0.05, 0.026, 0.012), g);
+        return vec4<f32>(col, 0.08);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -722,6 +742,36 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         lit += gloss * fres * 0.08;
         let belly = smoothstep(0.2, -0.45, n.y);
         lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+    }
+    // Grass and twigs stay their own color. Sky fill turns a thin blade gray.
+    if (in.panel > 46.5 && in.panel < 48.5) {
+        let n = normalize(nrm);
+        let sun = normalize(frame.sun_dir.xyz);
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.015, n);
+        let wrap = 0.34 + ndl * shadow * 0.72;
+        lit = albedo * wrap;
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let ndotv = clamp(dot(n, view), 0.0, 1.0);
+        let root = 1.0 - clamp(in.uv.y, 0.0, 1.0);
+        if (in.panel < 47.5) {
+            lit += vec3<f32>(0.06, 0.03, 0.01) * pow(1.0 - ndotv, 2.2) * root * shadow;
+        }
+    }
+    if (in.panel > 48.5 && in.panel < 49.5) {
+        var n = normalize(nrm);
+        let sun = normalize(frame.sun_dir.xyz);
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let ndotv = clamp(dot(n, view), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        let tone = clamp((albedo.r - 0.014) / 0.04, 0.0, 1.0);
+        let body = mix(vec3<f32>(0.012, 0.005, 0.002), vec3<f32>(0.028, 0.013, 0.006), tone);
+        lit = body * (0.8 + (ndl * 0.35 + 0.65) * shadow * 0.35);
+        let gloss = vec3<f32>(0.20, 0.09, 0.03);
+        let shine = 0.4 + shadow * 0.6;
+        lit += gloss * pow(ndotv, 18.0) * 0.55 * shine;
+        lit += gloss * pow(1.0 - ndotv, 3.0) * 0.06;
     }
     return present(lit);
 }

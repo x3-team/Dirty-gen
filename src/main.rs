@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod debris_mesh;
 mod mesh;
 mod render;
 
