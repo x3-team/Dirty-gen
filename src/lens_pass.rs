@@ -370,6 +370,9 @@ mod tests {
             eye: pos - forward * 7.4 + Vec3::Y * 2.7 + right * 0.85,
             target: pos + forward * 1.8 + Vec3::Y * 0.55,
             ortho_width: None,
+            fov_deg: None,
+            near: None,
+            cockpit: false,
         }
     }
 }

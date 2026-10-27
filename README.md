@@ -48,7 +48,7 @@ cargo test
 
 The isometric camera stays put so the whole loop, the puddles and the rut read at once. A small map in the top-right corner shows that oval and a dot for each vehicle. The chase camera follows the vehicle selected with V. The cockpit is the buggy's own seats: the wheel, the wet dash and the muddy hood, from the driver, the passenger, and the outside angles. C walks into that view without dropping the other two. L toggles the mud on the glass. C is only the camera cycle. R replays the first closed lap from a fresh start, walking the side, top, bumper, and rear three-quarter cameras.
 
-Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
+Opening the window plays that lap with both vehicles. The page opens on a start screen: pick the buggy or the bike, then Start hands that one the keys. Restart returns both to the lap. On a phone the wheel sits on the left and the gas and brake on the right; those pedals take the selected vehicle the same way a drive key does. The other vehicle keeps the lap. The capture is the same lap, with nobody at the wheel.
 
 ## Браузер
 
@@ -75,7 +75,7 @@ trunk serve --release
 | T / F | выше / ниже |
 | Esc | выход |
 
-Адрес с `?gl` принудительно включает WebGL2.
+Адрес с `?gl` принудительно включает WebGL2. На странице сначала экран старта: багги или мотоцикл, затем «Старт». «Заново» возвращает обе машины на круг. На телефоне руль слева, газ и тормоз справа.
 
 ## What the soil does
 
@@ -97,7 +97,7 @@ A motocross bike runs the same loop, just inside the buggy's line. It is the sam
 
 ## Not in this slice
 
-A race mode, a track editor, menus, multiplayer, and a large world are intentionally absent. The field is one short loop — a few puddles, low berms, and the ground around them — so the soil model can be seen running in real time.
+A race mode, a track editor, multiplayer, and a large world are intentionally absent. The field is one short loop — a few puddles, low berms, and the ground around them — so the soil model can be seen running in real time. The page does have a start screen and on-screen pedals.
 
 ## Layout
 
