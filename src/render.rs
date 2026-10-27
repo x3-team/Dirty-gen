@@ -5,14 +5,17 @@
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
+use silt::bike::Bike;
 use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
-use silt::bike::{Bike, BIKE_RADIUS};
-use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
+use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP};
 use silt::world::{CameraPose, World};
 
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    environment_mesh, mud_chunks, terrain_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+};
+use crate::vehicle_mesh::{
+    bike_body, bike_suspension, bike_wheel, buggy_body, buggy_suspension, buggy_wheel,
+    BIKE_SUSP_INDICES, BIKE_SUSP_VERTS, BUGGY_SUSP_INDICES, BUGGY_SUSP_VERTS,
 };
 
 const SHADOW: u32 = 2048;
@@ -79,6 +82,7 @@ pub struct Renderer {
     terrain: GpuMesh,
     body: GpuMesh,
     wheel: GpuMesh,
+    bike_wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
     susp_v: wgpu::Buffer,
@@ -217,7 +221,7 @@ impl Renderer {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(silt_shader_source().into()),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -651,30 +655,31 @@ impl Renderer {
         let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
         let body_cpu = buggy_body();
         let body = upload_cpu(&device, &body_cpu, "body");
-        let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
+        let wheel = upload_cpu(&device, &buggy_wheel(), "wheel");
+        let bike_wheel = upload_cpu(&device, &bike_wheel(), "bike-wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
-            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
+            size: (BUGGY_SUSP_VERTS * std::mem::size_of::<MeshVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-i"),
-            size: (32768 * 4) as u64,
+            size: (BUGGY_SUSP_INDICES * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-v"),
-            size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
+            size: (BIKE_SUSP_VERTS * std::mem::size_of::<MeshVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bike_susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-i"),
-            size: (16384 * 4) as u64,
+            size: (BIKE_SUSP_INDICES * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -725,6 +730,7 @@ impl Renderer {
             terrain,
             body,
             wheel,
+            bike_wheel,
             bike_body,
             env,
             susp_v,
@@ -829,7 +835,7 @@ impl Renderer {
         readback: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
-        let susp = suspension_mesh(&world.vehicle);
+        let susp = buggy_suspension(&world.vehicle);
         let susp_index_count = susp.indices.len() as u32;
         self.queue
             .write_buffer(&self.susp_v, 0, bytemuck::cast_slice(&susp.vertices));
@@ -837,10 +843,16 @@ impl Renderer {
             .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.bike_susp_v, 0, bytemuck::cast_slice(&bike_susp.vertices));
-        self.queue
-            .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
+        self.queue.write_buffer(
+            &self.bike_susp_v,
+            0,
+            bytemuck::cast_slice(&bike_susp.vertices),
+        );
+        self.queue.write_buffer(
+            &self.bike_susp_i,
+            0,
+            bytemuck::cast_slice(&bike_susp.indices),
+        );
 
         let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
         let aspect = self.width as f32 / self.height as f32;
@@ -1205,7 +1217,7 @@ impl Renderer {
         draw_indexed(pass, &self.bike_body);
         for i in 0..2 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (8 + i)]);
-            draw_indexed(pass, &self.wheel);
+            draw_indexed(pass, &self.bike_wheel);
         }
         pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 10]);
         pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
@@ -1228,12 +1240,10 @@ impl Renderer {
 fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
     let local = bike.wheel_center_local(index);
     let wheel = bike.wheels[index];
-    let radius = BIKE_RADIUS / WHEEL_RADIUS;
     let world = body
         * Mat4::from_translation(local)
         * Mat4::from_rotation_y(wheel.steer)
-        * Mat4::from_rotation_x(wheel.spin)
-        * Mat4::from_scale(Vec3::new(0.62, radius, radius));
+        * Mat4::from_rotation_x(wheel.spin);
     model(
         world,
         mud,
@@ -1575,3 +1585,53 @@ fn fs_blit_tosrgb(in: V) -> @location(0) vec4<f32> {
     return vec4<f32>(pow(c.rgb, vec3<f32>(2.2)), c.a);
 }
 "#;
+
+fn silt_shader_source() -> String {
+    include_str!("shader.wgsl")
+        .replace(
+            "// MUD_FIELD_LOOK_HOOK",
+            include_str!("mud_field_look.wgsl"),
+        )
+        .replace(
+            "// MUD_VEHICLE_LOOK_HOOK",
+            include_str!("vehicle_shade.wgsl"),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::silt_shader_source;
+
+    #[test]
+    fn look_helpers_are_declared_before_use() {
+        let src = silt_shader_source();
+        let field = src.find("fn rut_chevron_scale").expect("rut helper");
+        let terrain = src.find("fn vs_terrain").expect("vs_terrain");
+        let paint = src.find("fn vehicle_panel_paint").expect("vehicle paint");
+        let mesh = src.find("fn fs_mesh").expect("fs_mesh");
+        assert!(
+            field < terrain,
+            "field look must precede the terrain vertex stage"
+        );
+        assert!(paint < mesh, "vehicle paint must precede fs_mesh");
+        assert!(
+            src.contains("fn puddle_color") && src.contains("fn vehicle_wheel"),
+            "mud and wheel helpers are part of the shader"
+        );
+    }
+
+    #[test]
+    fn shader_is_valid_wgsl() {
+        let src = silt_shader_source();
+        let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|err| {
+            panic!("wgsl parse failed: {err:?}");
+        });
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        if let Err(err) = validator.validate(&module) {
+            panic!("wgsl validation failed: {err:?}");
+        }
+    }
+}

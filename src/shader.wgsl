@@ -329,6 +329,8 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
     return height_bilinear(xz);
 }
 
+// MUD_FIELD_LOOK_HOOK
+
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
     // Sample the same heightfield. Integer ij would flatten every subdivided
@@ -377,6 +379,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let groove = smoothstep(0.030, 0.046, cut);
     // Dark mud in the cut. A wide sheen here turned the floor into a tan stripe.
     albedo = mix(albedo, vec3<f32>(0.010, 0.0045, 0.002), groove * 0.88);
+    albedo *= rut_chevron_scale(xz, in.world, groove);
     let pile = max(stamp, 0.0);
     let lip = smoothstep(0.012, 0.026, pile) * (1.0 - groove);
     // Loose soil on the shoulder. Lighter than the lane, only where the stamp piled it.
@@ -453,7 +456,7 @@ fn water_bed(xz: vec2<f32>) -> f32 {
 fn vs_water(in: TerrIn) -> WaterOut {
     let bed = water_bed(in.xz);
     let depth = covered_depth(in.xz);
-    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
+    let rip = ripple_height(in.xz, frame.misc.x) * 0.42 * smoothstep(0.0, 0.03, depth);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
     // cut the tire like a clip plane.
@@ -478,8 +481,6 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
-    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.4);
     // Stored water tops out near a decimetre after the shader scale.
     // The middle goes to dark mud inside that range, not to black.
     let depth_t = smoothstep(0.006, 0.075, in.depth);
@@ -488,10 +489,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let shore_col = vec3<f32>(0.085, 0.036, 0.013);
     let deep_col = vec3<f32>(0.026, 0.010, 0.0036);
     let absorption = mix(shore_col, deep_col, depth_t);
-    // Quiet reflection. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.10, 0.042, 0.015);
-    let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);
-    var col = mix(absorption, quiet, reflect_amt);
+    var col = puddle_color(in.world, nrm, depth_t, absorption);
     let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
     col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);
     let shore = smoothstep(0.002, 0.07, in.depth);
@@ -626,32 +624,26 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
 
+// MUD_VEHICLE_LOOK_HOOK
+
 @fragment
 fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     let panel = i32(in.panel + 0.5);
     var paint = panel_paint(in.panel, in.uv, in.world);
+    let vehicle_paint = vehicle_panel_paint(in.panel, in.world);
+    if (vehicle_paint.a >= 0.0) {
+        paint = vehicle_paint;
+    }
     var albedo = paint.rgb;
     var rough = paint.a;
     var emit = vec3<f32>(0.0);
 
     var nrm = in.nrm;
     if (model.extra.x > 0.5) {
-        let ang = in.uv.x * 6.2831853;
-        let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
-        let sidewall = select(0.0, 1.0, in.uv.y > 1.5);
-        let mud = clamp(model.extra.y, 0.0, 1.2);
-        // Existing adhesion. ~0.4 of the cap already cakes the tread.
-        let load = smoothstep(0.04, 0.28, mud);
-        let wp = in.world;
-        let n = noise(wp.xy * 9.0 + vec2<f32>(wp.z * 4.0, ang));
-        let n2 = noise(wp.yz * 16.0 + vec2<f32>(ang, 2.0));
-        let clump = smoothstep(0.48, 0.82, n * 0.65 + n2 * 0.35);
-        var mask = load * (0.88 + 0.12 * clump);
-        mask = mask * mix(0.94 + 0.06 * groove, 0.7 + 0.25 * clump, sidewall);
-        mask = clamp(mask, 0.0, 1.0);
-        albedo = mix(vec3<f32>(0.02, 0.018, 0.016), vec3<f32>(0.12, 0.058, 0.028), mask);
-        rough = mix(0.92, mix(0.28, 0.07, groove * (1.0 - sidewall)), mask);
-        nrm = mud_normal(in.nrm, in.world, mask);
+        let hit = vehicle_wheel(in.panel, in.uv, in.world, in.nrm);
+        albedo = hit.albedo;
+        rough = hit.rough;
+        nrm = hit.nrm;
     } else if (panel >= 0 && panel < 12) {
         let m = mud_of(panel);
         let cover = clamp(m.x, 0.0, 1.3);
@@ -676,10 +668,20 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let smear = noise(vec2<f32>(p.x * 5.0 + p.z * 3.0, p.y * 0.45 + streak));
         let streak_mask = smoothstep(0.78, 0.92, smear) * streak * smoothstep(0.1, 0.45, cover) * down;
         mask = clamp(max(mask, max(drip_mask, streak_mask * 0.75)), 0.0, 1.0);
-        let mud_col = mix(vec3<f32>(0.09, 0.048, 0.024), vec3<f32>(0.04, 0.02, 0.012), wet);
-        albedo = mix(albedo, mud_col, mask);
-        rough = mix(rough, mix(0.42, 0.07, wet), mask);
-        nrm = mud_normal(in.nrm, p, mask);
+        let hit = coat_body_mud(albedo, rough, nrm, p, mask, wet);
+        albedo = hit.albedo;
+        rough = hit.rough;
+        nrm = hit.nrm;
+    } else if (in.panel > 18.5 && in.panel < 19.5) {
+        let p = in.world;
+        let lump = noise(p.xz * 7.0 + vec2<f32>(p.y * 4.0, 2.0));
+        let under = smoothstep(0.2, -0.35, nrm.y);
+        let low = smoothstep(0.55, -0.05, p.y);
+        let mask = clamp(under * 0.8 + low * smoothstep(0.45, 0.8, lump) * 0.65, 0.0, 1.0);
+        let hit = coat_body_mud(albedo, rough, nrm, p, mask, 0.7);
+        albedo = hit.albedo;
+        rough = hit.rough;
+        nrm = hit.nrm;
     }
 
     if (in.panel > 15.5 && in.panel < 16.5) {
@@ -690,38 +692,12 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
-    // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
     if (in.panel > 45.5 && in.panel < 46.5) {
-        var n = normalize(nrm);
-        // Soft skin. A strong bump turns the highlight into gravel.
-        let e = 0.06;
-        let h0 = noise(in.world.xz * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        let hx = noise((in.world.xz + vec2<f32>(e, 0.0)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        let hz = noise((in.world.xz + vec2<f32>(0.0, e)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        n = normalize(n + vec3<f32>(h0 - hx, 0.04, h0 - hz) * 0.28);
-        let sun = normalize(frame.sun_dir.xyz);
-        let view = normalize(frame.cam_pos.xyz - in.world);
-        let ndl = clamp(dot(n, sun), 0.0, 1.0);
-        let ndotv = clamp(dot(n, view), 0.0, 1.0);
-        let shadow = shadow_factor(in.world + n * 0.02, n);
-        // Darker than the berm. A crown in the soil's own brown reads as a dry stone.
-        let tone = clamp((albedo.r - 0.016) / 0.018, 0.0, 1.0);
-        let body = mix(vec3<f32>(0.0090, 0.0031, 0.0011), vec3<f32>(0.0155, 0.0052, 0.0018), tone);
-        let wrap = ndl * 0.28 + 0.72;
-        lit = body * (0.85 + wrap * shadow * 0.22);
-        // The flat top has almost one normal from this camera, so a Phong lobe
-        // paints the whole crown the color of a dry stone. Gloss is short streaks.
-        let streak = noise(in.world.xz * 6.5 + vec2<f32>(in.world.y * 4.0, 0.4));
-        let wetspot = smoothstep(0.80, 0.94, streak);
-        let facing = pow(ndotv, 16.0);
-        let fres = pow(1.0 - ndotv, 3.0);
-        let gloss = vec3<f32>(0.22, 0.08, 0.026);
-        let shine = 0.45 + shadow * 0.55;
-        lit += gloss * facing * 0.65 * shine;
-        lit += gloss * wetspot * clamp(n.y, 0.0, 1.0) * shine;
-        lit += gloss * fres * 0.08;
-        let belly = smoothstep(0.2, -0.45, n.y);
-        lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+        lit = clod_lighting(in.world, nrm);
+    } else if (in.panel > 46.5 && in.panel < 47.5) {
+        lit = sheet_lighting(in.world, nrm);
+    } else if (model.extra.x < 0.5 && in.panel < 39.5) {
+        lit += vehicle_sheen(in.world, nrm, rough);
     }
     return present(lit);
 }

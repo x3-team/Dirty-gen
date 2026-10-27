@@ -3,7 +3,9 @@
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
 mod mesh;
+mod mud_look;
 mod render;
+mod vehicle_mesh;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
@@ -13,9 +15,9 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
+use silt::world::{demo_camera, CameraPose, Input, World};
 #[cfg(not(target_arch = "wasm32"))]
 use silt::world::{demo_drive, demo_drive_bike};
-use silt::world::{demo_camera, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
