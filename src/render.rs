@@ -85,7 +85,6 @@ pub struct Renderer {
     susp_i: wgpu::Buffer,
     bike_susp_v: wgpu::Buffer,
     bike_susp_i: wgpu::Buffer,
-    #[allow(dead_code)]
     particles: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
     chunk_i: wgpu::Buffer,
@@ -95,6 +94,7 @@ pub struct Renderer {
     pipe_mesh: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
+    pipe_fuel: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -585,6 +585,26 @@ impl Renderer {
             true,
             None,
         );
+        let fuel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fuel-show"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fuel_show.wgsl").into()),
+        });
+        let pipe_fuel = pipeline(
+            &device,
+            &fuel_shader,
+            &solo_layout,
+            "vs_fuel",
+            Some("fs_fuel"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
         let pipe_shadow_terrain = pipeline(
             &device,
             &shader,
@@ -739,6 +759,7 @@ impl Renderer {
             pipe_water,
             pipe_mesh,
             pipe_particle,
+            pipe_fuel,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
@@ -894,6 +915,18 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
+        let mut fuel_verts = silt::fuel_show::vertices(&world.fuel, cam.eye, &world.soil);
+        if fuel_verts.len() > 6000 {
+            fuel_verts.truncate(6000);
+        }
+        let fuel_count = fuel_verts.len() as u32;
+        if fuel_count > 0 {
+            self.queue.write_buffer(
+                &self.particles,
+                0,
+                bytemuck::cast_slice(&fuel_verts),
+            );
+        }
 
         let mut encoder = self
             .device
@@ -979,6 +1012,12 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
+            if fuel_count > 0 {
+                pass.set_pipeline(&self.pipe_fuel);
+                pass.set_bind_group(0, &self.frame_bg, &[]);
+                pass.set_vertex_buffer(0, self.particles.slice(..));
+                pass.draw(0..fuel_count, 0..1);
+            }
         }
 
         if let Some((view, srgb)) = present {
