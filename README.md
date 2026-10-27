@@ -39,12 +39,12 @@ cargo test
 | S / Down | Brake, then reverse once the buggy is slow |
 | A / Left, D / Right | Steer |
 | V | Switch which vehicle the pedals drive. The other one keeps riding the lap |
-| C | Toggle the chase camera. The default is a fixed isometric view of the loop. Chase follows whichever vehicle V selected |
+| C | Cycle the camera: fixed isometric, chase, then the cockpit seats. Chase and the isometric view stay in the cycle |
 | Q / E | Orbit the chase camera |
 | R / F | Raise / lower the chase camera |
 | Esc | Quit |
 
-The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V.
+The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V. The cockpit is the buggy's own seats: the wheel, the wet dash and the muddy hood, from the driver, the passenger, and the outside angles. C walks into that view without dropping the other two.
 
 Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
 
@@ -66,7 +66,7 @@ trunk serve --release
 | S / ↓ | тормоз, затем задний ход |
 | A / ←, D / → | руль |
 | V | кого ведёте: багги или кроссовый мотоцикл. Вторая машина продолжает круг |
-| C | камера погони. По умолчанию изометрия. Погоня следует за выбранной машиной |
+| C | цикл камеры: изометрия, погоня, затем кабина. Изометрия и погоня остаются в цикле |
 | Q / E | орбита камеры погони |
 | R / F | выше / ниже |
 | Esc | выход |
