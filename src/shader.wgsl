@@ -690,40 +690,75 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
-    // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
+    // Wet clumps. The shared shade() mixes in the blue sky, which turns mud gray.
     if (in.panel > 45.5 && in.panel < 46.5) {
-        var n = normalize(nrm);
-        // Soft skin. A strong bump turns the highlight into gravel.
-        let e = 0.06;
-        let h0 = noise(in.world.xz * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        let hx = noise((in.world.xz + vec2<f32>(e, 0.0)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        let hz = noise((in.world.xz + vec2<f32>(0.0, e)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        n = normalize(n + vec3<f32>(h0 - hx, 0.04, h0 - hz) * 0.28);
-        let sun = normalize(frame.sun_dir.xyz);
-        let view = normalize(frame.cam_pos.xyz - in.world);
-        let ndl = clamp(dot(n, sun), 0.0, 1.0);
-        let ndotv = clamp(dot(n, view), 0.0, 1.0);
-        let shadow = shadow_factor(in.world + n * 0.02, n);
-        // Darker than the berm. A crown in the soil's own brown reads as a dry stone.
-        let tone = clamp((albedo.r - 0.016) / 0.018, 0.0, 1.0);
-        let body = mix(vec3<f32>(0.0090, 0.0031, 0.0011), vec3<f32>(0.0155, 0.0052, 0.0018), tone);
-        let wrap = ndl * 0.28 + 0.72;
-        lit = body * (0.85 + wrap * shadow * 0.22);
-        // The flat top has almost one normal from this camera, so a Phong lobe
-        // paints the whole crown the color of a dry stone. Gloss is short streaks.
-        let streak = noise(in.world.xz * 6.5 + vec2<f32>(in.world.y * 4.0, 0.4));
-        let wetspot = smoothstep(0.80, 0.94, streak);
-        let facing = pow(ndotv, 16.0);
-        let fres = pow(1.0 - ndotv, 3.0);
-        let gloss = vec3<f32>(0.22, 0.08, 0.026);
-        let shine = 0.45 + shadow * 0.55;
-        lit += gloss * facing * 0.65 * shine;
-        lit += gloss * wetspot * clamp(n.y, 0.0, 1.0) * shine;
-        lit += gloss * fres * 0.08;
-        let belly = smoothstep(0.2, -0.45, n.y);
-        lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+        lit = shade_wet_clod(in.world, nrm, in.uv);
     }
     return present(lit);
+}
+
+// Thickness is the chord through the clod: long through the middle, short at
+// the rim. Thin mud transmits caramel. Thick mud stays a dark wet core.
+fn shade_wet_clod(world: vec3<f32>, n_in: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    var n = normalize(n_in);
+    let e = 0.03;
+    let freq = 6.2;
+    let phase = uv.y * 8.0;
+    let h0 = noise(world.xz * freq + vec2<f32>(world.y * 3.4, phase));
+    let hx = noise((world.xz + vec2<f32>(e, 0.0)) * freq + vec2<f32>(world.y * 3.4, phase));
+    let hz = noise((world.xz + vec2<f32>(0.0, e)) * freq + vec2<f32>(world.y * 3.4, phase));
+    // Break the highlight into a wet film. A larger push turns it into gravel.
+    n = normalize(n + vec3<f32>(h0 - hx, 0.012, h0 - hz) * 0.48);
+
+    let sun = normalize(frame.sun_dir.xyz);
+    let view = normalize(frame.cam_pos.xyz - world);
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    let ndotv = clamp(dot(n, view), 0.04, 1.0);
+    // Extra bias. These masses are smooth, and the shadow map otherwise freckles them.
+    let shadow = shadow_factor(world + n * 0.08, n);
+    // uv.x is metres of mud. The rim of a sphere is the short chord.
+    let radius = clamp(uv.x, 0.004, 0.55);
+    let path = radius * ndotv * 1.45;
+    let absorb = exp(-path * vec3<f32>(4.2, 10.5, 18.0));
+    let caramel = vec3<f32>(0.40, 0.11, 0.022);
+    let chocolate = vec3<f32>(0.062, 0.022, 0.008);
+    let deep = vec3<f32>(0.024, 0.009, 0.003);
+    let grit = noise(world.xz * 4.4 + vec2<f32>(world.y * 2.8, phase));
+    var body = mix(deep, chocolate, 0.35 + 0.65 * grit);
+    // Thin rim transmits caramel. The core stays dark wet mud.
+    let rim = pow(1.0 - ndotv, 1.7);
+    body = mix(body, caramel * 0.7, rim * absorb.r * 0.65);
+    let wrap = ndl * 0.62 + 0.36;
+    var lit = body * (0.48 + wrap * shadow);
+    lit += caramel * rim * absorb * shadow * 0.28;
+
+    let halfv = normalize(sun + view);
+    let ndh = clamp(dot(n, halfv), 0.0, 1.0);
+    let vh = clamp(dot(view, halfv), 0.0, 1.0);
+    let sheen = ggx_spec(ndh, ndl, ndotv, vh, 0.34);
+    let spark = ggx_spec(ndh, ndl, ndotv, vh, 0.07);
+    let glint = smoothstep(0.55, 0.86, noise(world.xz * 6.5 + vec2<f32>(world.y * 4.0, phase)));
+    // Dark body, bright cap. A wide lobe on a bright albedo is what looked like plastic.
+    lit += frame.sun_color.rgb * shadow * (sheen * 0.42 + spark * glint * 0.55);
+    lit += vec3<f32>(0.7, 0.4, 0.16) * pow(1.0 - ndotv, 3.2) * 0.22 * shadow;
+    let belly = smoothstep(0.15, -0.55, n.y);
+    lit = mix(lit, lit * vec3<f32>(0.28, 0.16, 0.09), belly * 0.85);
+    let fold = noise(world.xz * 1.6 + vec2<f32>(world.y * 0.8, phase));
+    let crease = smoothstep(0.22, 0.5, fold);
+    lit *= mix(0.42, 1.0, crease);
+    return lit;
+}
+
+fn ggx_spec(ndh: f32, ndl: f32, ndv: f32, vh: f32, rough: f32) -> f32 {
+    let a = max(rough * rough, 0.004);
+    let a2 = a * a;
+    let d = ndh * ndh * (a2 - 1.0) + 1.0;
+    let dist = a2 / (3.14159265 * d * d);
+    let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+    let g = (ndv / (ndv * (1.0 - k) + k)) * (ndl / (max(ndl, 0.0) * (1.0 - k) + k));
+    let f0 = 0.045;
+    let fres = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+    return dist * g * fres * ndl;
 }
 
 struct PartIn {
@@ -736,6 +771,7 @@ struct PartOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) world: vec3<f32>,
 }
 
 @vertex
@@ -744,19 +780,62 @@ fn vs_particle(in: PartIn) -> PartOut {
     o.clip = frame.view_proj * vec4<f32>(in.pos, 1.0);
     o.color = in.color;
     o.uv = in.uv;
+    o.world = in.pos;
     return o;
 }
 
 @fragment
 fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
-    let d = length(in.uv - vec2<f32>(0.5));
-    // Broken clod edge. A round falloff stacked into an orange coin.
-    let wobble = 0.10 * sin(in.uv.x * 11.0 + in.uv.y * 7.0)
-        + 0.06 * sin(in.uv.x * 23.0 - in.uv.y * 17.0);
-    if (d > 0.40 + wobble) {
+    // uv is the quad. A sphere in that square is a bead; a sheet keeps the
+    // same lighting and breaks the edge so it is not a card.
+    let q = in.uv * 2.0 - vec2<f32>(1.0);
+    let r2 = dot(q, q);
+    let z = sqrt(max(1.0 - r2, 0.0));
+    let to_cam = normalize(frame.cam_pos.xyz - in.world);
+    let n = spray_normal(in.world, in.uv, q, z, to_cam);
+    let wobble = 0.07 * sin(q.x * 8.0 + q.y * 5.0 + in.color.b * 14.0);
+    var edge = smoothstep(1.02, 0.4, r2 + wobble);
+    if (in.color.g > 0.5) {
+        let tear = noise(in.uv * 4.2 + vec2<f32>(in.color.b * 9.0, 1.4));
+        let grit = noise(in.uv * 9.0 + vec2<f32>(2.0, in.color.b * 5.0));
+        edge *= smoothstep(0.32, 0.7, tear * 0.7 + grit * 0.3);
+    }
+    if (edge < 0.02 || r2 > 1.15) {
         discard;
     }
-    let fall = smoothstep(0.40, 0.12, d);
-    // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
-    return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
+    let sun = normalize(frame.sun_dir.xyz);
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    let halfv = normalize(sun + to_cam);
+    let spec = pow(clamp(dot(n, halfv), 0.0, 1.0), 56.0);
+    let path = clamp(in.color.r, 0.006, 0.25) * z;
+    let caramel = vec3<f32>(0.32, 0.09, 0.018);
+    let core = vec3<f32>(0.045, 0.016, 0.005);
+    let body = mix(caramel, core, smoothstep(0.0, 0.08, path));
+    var col = body * (0.32 + ndl * 0.85);
+    // A short warm rim. A strong one reads as a soap bubble.
+    col += caramel * (1.0 - z) * 0.22;
+    col += frame.sun_color.rgb * spec * select(0.95, 0.35, in.color.g > 0.5);
+    let alpha = edge * in.color.a * mix(0.72, 1.0, z);
+    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
+    return vec4<f32>(pow(mapped, vec3<f32>(1.0 / 2.2)), alpha);
+}
+
+fn spray_normal(world: vec3<f32>, uv: vec2<f32>, q: vec2<f32>, z: f32, to_cam: vec3<f32>) -> vec3<f32> {
+    let dw_dx = dpdx(world);
+    let dw_dy = dpdy(world);
+    let du_dx = dpdx(uv);
+    let du_dy = dpdy(uv);
+    let det = du_dx.x * du_dy.y - du_dy.x * du_dx.y;
+    if (abs(det) < 1e-5) {
+        return to_cam;
+    }
+    let inv_det = 1.0 / det;
+    let tang_u = (dw_dx * du_dy.y - dw_dy * du_dx.y) * inv_det;
+    let tang_v = (dw_dy * du_dx.x - dw_dx * du_dy.x) * inv_det;
+    let lu = length(tang_u);
+    let lv = length(tang_v);
+    if (lu < 1e-4 || lv < 1e-4) {
+        return to_cam;
+    }
+    return normalize(tang_u / lu * q.x + tang_v / lv * q.y + to_cam * z);
 }

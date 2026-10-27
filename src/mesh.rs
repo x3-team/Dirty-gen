@@ -670,7 +670,14 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
         4,
     );
     let pivot = Vec3::new(0.0, 0.02, -0.12);
-    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot,
+        rear + Vec3::new(0.0, 0.02, 0.0),
+        0.03,
+        arm,
+        5,
+    );
     add_tube(
         &mut m,
         pivot + Vec3::new(0.06, 0.0, 0.0),
@@ -882,16 +889,19 @@ fn chunk_hash(seed: u32, n: u32) -> f32 {
     (x & 0xFFFF) as f32 / 65535.0
 }
 
-fn push_smooth(mesh: &mut CpuMesh, p: Vec3, n: Vec3, panel: f32) {
+fn push_clod(mesh: &mut CpuMesh, p: Vec3, n: Vec3, thickness: f32, phase: f32) {
+    let n = n.normalize_or_zero();
     mesh.vertices.push(MeshVertex {
         pos: p.to_array(),
-        nrm: n.normalize_or_zero().to_array(),
-        uv: uv_of(p),
-        panel,
+        nrm: n.to_array(),
+        // uv.x is optical thickness in metres. The shader turns a thick core
+        // dark and a thin edge into caramel. uv.y breaks up the wet highlight.
+        uv: [thickness.max(0.004), phase],
+        panel: PANEL_CLOD,
     });
 }
 
-fn add_tri_smooth(
+fn add_tri_clod(
     mesh: &mut CpuMesh,
     a: Vec3,
     na: Vec3,
@@ -899,8 +909,9 @@ fn add_tri_smooth(
     nb: Vec3,
     c: Vec3,
     nc: Vec3,
-    panel: f32,
     center: Vec3,
+    thickness: f32,
+    phase: f32,
 ) {
     let face = (b - a).cross(c - a);
     if face.length_squared() < 1.0e-10 {
@@ -908,62 +919,132 @@ fn add_tri_smooth(
     }
     let base = mesh.vertices.len() as u32;
     if face.dot(a - center) < 0.0 {
-        push_smooth(mesh, a, na, panel);
-        push_smooth(mesh, c, nc, panel);
-        push_smooth(mesh, b, nb, panel);
+        push_clod(mesh, a, na, thickness, phase);
+        push_clod(mesh, c, nc, thickness, phase);
+        push_clod(mesh, b, nb, thickness, phase);
     } else {
-        push_smooth(mesh, a, na, panel);
-        push_smooth(mesh, b, nb, panel);
-        push_smooth(mesh, c, nc, panel);
+        push_clod(mesh, a, na, thickness, phase);
+        push_clod(mesh, b, nb, thickness, phase);
+        push_clod(mesh, c, nc, thickness, phase);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
-/// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
-/// `slump` flattens a piece that has already landed.
-fn add_lump(
-    mesh: &mut CpuMesh,
+/// One wet mass. Lobes come from a smooth radial field, so the silhouette is a
+/// clod. `stretch` flings it along the flight without moving the simulation.
+struct Lump {
     center: Vec3,
     rot: Quat,
     radius: f32,
     seed: u32,
-    stacks: usize,
-    slices: usize,
-    slump: bool,
-) {
-    let axis = Vec3::new(
-        0.88 + chunk_hash(seed, 1) * 0.22,
-        0.80 + chunk_hash(seed, 2) * 0.24,
-        0.86 + chunk_hash(seed, 3) * 0.22,
-    );
-    // Landed mud spreads and sinks. A tall axis reads as a stone sitting on the soil.
-    let squash = if slump {
-        Vec3::new(1.48, 0.36, 1.48)
-    } else {
-        Vec3::ONE
-    };
-    let center = if slump {
-        center - Vec3::Y * radius * 0.16
-    } else {
-        center
-    };
-    let mut pts = Vec::with_capacity(2 + stacks * slices);
-    let mut nrm = Vec::with_capacity(pts.capacity());
-    let place = |dir: Vec3, rad: f32| {
+    squash: Vec3,
+    stretch_axis: Vec3,
+    stretch: f32,
+    thickness: f32,
+    phase: f32,
+}
+
+fn hash_dir(seed: u32, n: u32) -> Vec3 {
+    let z = chunk_hash(seed, n) * 2.0 - 1.0;
+    let a = chunk_hash(seed, n + 1) * std::f32::consts::TAU;
+    let r = (1.0 - z * z).max(0.0).sqrt();
+    Vec3::new(r * a.cos(), z, r * a.sin())
+}
+
+impl Lump {
+    fn from_particle(p: &silt::particles::Particle, radius: f32, thickness: f32) -> Self {
+        let mut squash = Vec3::new(
+            0.82 + chunk_hash(p.seed, 1) * 0.36,
+            0.78 + chunk_hash(p.seed, 2) * 0.40,
+            0.84 + chunk_hash(p.seed, 3) * 0.32,
+        );
+        let mut center = p.pos;
+        if p.grounded {
+            // Spread into the soil. A tall axis reads as a stone on the mud.
+            squash.x *= 1.42;
+            squash.y *= 0.46;
+            squash.z *= 1.42;
+            center -= Vec3::Y * radius * 0.14;
+        }
+        let (stretch_axis, stretch) = if p.grounded {
+            (Vec3::Y, 1.0)
+        } else {
+            let speed = p.vel.length();
+            if speed < 0.35 {
+                (Vec3::Y, 1.0)
+            } else {
+                ((p.vel / speed), (1.0 + speed * 0.06).clamp(1.04, 1.32))
+            }
+        };
+        Self {
+            center,
+            rot: p.rot,
+            radius,
+            seed: p.seed,
+            squash,
+            stretch_axis,
+            stretch,
+            thickness,
+            phase: chunk_hash(p.seed, 6),
+        }
+    }
+
+    fn radius_at(&self, dir: Vec3) -> f32 {
+        let dir = dir.normalize_or_zero();
+        let mut r = 0.72;
+        for k in 0..5u32 {
+            let axis = hash_dir(self.seed, 11 + k * 4);
+            let amp = 0.22 + chunk_hash(self.seed, 60 + k) * 0.62;
+            let d = dir.dot(axis).max(0.0);
+            // Cubed so the bulge stays on one side instead of rounding into a ball.
+            r += amp * d * d * d;
+        }
+        let pinch = hash_dir(self.seed, 4);
+        let cut = dir.dot(pinch);
+        r *= 1.0 - 0.22 * cut * cut;
+        self.radius * r.max(0.45)
+    }
+
+    fn place(&self, dir: Vec3) -> Vec3 {
+        let dir = dir.normalize_or_zero();
+        let rad = self.radius_at(dir);
         let shaped = Vec3::new(
-            dir.x * rad * axis.x * squash.x,
-            dir.y * rad * axis.y * squash.y,
-            dir.z * rad * axis.z * squash.z,
+            dir.x * rad * self.squash.x,
+            dir.y * rad * self.squash.y,
+            dir.z * rad * self.squash.z,
         );
-        let n = Vec3::new(
-            dir.x / squash.x.max(0.05),
-            dir.y / squash.y.max(0.05),
-            dir.z / squash.z.max(0.05),
-        );
-        (center + rot * shaped, (rot * n).normalize_or_zero())
-    };
-    let (p, n) = place(Vec3::Y, radius * (0.92 + chunk_hash(seed, 4) * 0.12));
+        let spun = self.rot * shaped;
+        let along = spun.dot(self.stretch_axis);
+        self.center + spun + self.stretch_axis * along * (self.stretch - 1.0)
+    }
+
+    fn sample(&self, dir: Vec3) -> (Vec3, Vec3) {
+        let dir = dir.normalize_or_zero();
+        let p = self.place(dir);
+        let helper = if dir.y.abs() > 0.85 { Vec3::X } else { Vec3::Y };
+        let t = dir.cross(helper).normalize_or_zero();
+        let b = dir.cross(t).normalize_or_zero();
+        let e = 0.14;
+        let px = self.place(dir + t * e);
+        let py = self.place(dir + b * e);
+        let mut n = (px - p).cross(py - p);
+        if n.dot(p - self.center) < 0.0 {
+            n = -n;
+        }
+        if n.length_squared() < 1.0e-8 {
+            n = p - self.center;
+        }
+        (p, n.normalize_or_zero())
+    }
+}
+
+fn emit_lump(mesh: &mut CpuMesh, lump: &Lump, stacks: usize, slices: usize) {
+    if stacks < 3 || slices < 3 {
+        return;
+    }
+    let mut pts = Vec::with_capacity(2 + (stacks - 1) * slices);
+    let mut nrm = Vec::with_capacity(pts.capacity());
+    let (p, n) = lump.sample(Vec3::Y);
     pts.push(p);
     nrm.push(n);
     for s in 1..stacks {
@@ -971,31 +1052,31 @@ fn add_lump(
         for i in 0..slices {
             let th = i as f32 / slices as f32 * std::f32::consts::TAU;
             let dir = Vec3::new(th.cos() * phi.sin(), phi.cos(), th.sin() * phi.sin());
-            // Mild swell. A wide jitter makes spikes, and spikes read as broken rock.
-            let j = 0.90 + chunk_hash(seed, (s * 16 + i) as u32) * 0.18;
-            let (p, n) = place(dir, radius * j);
+            let (p, n) = lump.sample(dir);
             pts.push(p);
             nrm.push(n);
         }
     }
-    let (p, n) = place(-Vec3::Y, radius * (0.88 + chunk_hash(seed, 5) * 0.14));
+    let (p, n) = lump.sample(-Vec3::Y);
     pts.push(p);
     nrm.push(n);
     let ring = |s: usize, i: usize| 1 + (s - 1) * slices + (i % slices);
-    for i in 0..slices {
-        let a = ring(1, i);
-        let b = ring(1, i + 1);
-        add_tri_smooth(
+    let tri = |mesh: &mut CpuMesh, a: usize, b: usize, c: usize| {
+        add_tri_clod(
             mesh,
-            pts[0],
-            nrm[0],
             pts[a],
             nrm[a],
             pts[b],
             nrm[b],
-            PANEL_CLOD,
-            center,
+            pts[c],
+            nrm[c],
+            lump.center,
+            lump.thickness,
+            lump.phase,
         );
+    };
+    for i in 0..slices {
+        tri(mesh, 0, ring(1, i), ring(1, i + 1));
     }
     for s in 1..stacks.saturating_sub(1) {
         for i in 0..slices {
@@ -1003,108 +1084,493 @@ fn add_lump(
             let b = ring(s, i + 1);
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
-            add_tri_smooth(
-                mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
-            );
-            add_tri_smooth(
-                mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
-            );
+            tri(mesh, a, c, b);
+            tri(mesh, b, c, d);
         }
     }
     let bot = pts.len() - 1;
     let last = stacks - 1;
     for i in 0..slices {
-        let a = ring(last, i + 1);
-        let b = ring(last, i);
-        add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
-        );
+        tri(mesh, bot, ring(last, i + 1), ring(last, i));
     }
 }
 
-fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
-    add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
-    );
+fn emit_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
+    let lump = Lump::from_particle(p, p.size, p.size * if p.grounded { 0.2 } else { 0.5 });
+    emit_lump(mesh, &lump, stacks, slices);
 }
 
-/// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+/// Solid part of the splash. A big impact is a body with lobes, so the mass
+/// has thickness. Droplets that have landed stay as small pats. Droplets still
+/// flying are drawn as soft spray.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
-    // Draw the big clumps first so a full splash cannot crowd them out.
+    const MAX_INDICES: usize = 46000;
     for kind in [3u8, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
-            if mesh.vertices.len() + 700 > MAX_VERTS {
+            // Airborne droplets are the soft spray, not another pebble.
+            if matches!(p.kind, 0 | 2 | 4) && !p.grounded {
+                continue;
+            }
+            if mesh.vertices.len() + 500 > MAX_VERTS || mesh.indices.len() + 1800 > MAX_INDICES {
                 return mesh;
             }
             if p.kind == 3 {
-                add_piece(&mut mesh, p, 8, 16);
-                // Two side lobes so the clump is a soft mass, not one pebble.
-                for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {
-                    let dir = Vec3::new(
-                        chunk_hash(p.seed, slot) * 2.0 - 1.0,
-                        chunk_hash(p.seed, slot + 1) * 0.28,
-                        chunk_hash(p.seed, slot + 2) * 2.0 - 1.0,
-                    )
-                    .normalize_or_zero();
+                emit_piece(&mut mesh, p, 8, 14);
+                for (slot, scale, dist) in
+                    [(8u32, 0.64, 0.62), (13u32, 0.48, 0.5), (21u32, 0.4, 0.42)]
+                {
+                    let dir = hash_dir(p.seed, slot);
                     let lobe = silt::particles::Particle {
                         pos: p.pos + p.rot * dir * p.size * dist,
                         size: p.size * scale,
                         seed: p.seed ^ 0xA5A5_5A5Au32.wrapping_mul(slot | 1),
                         ..*p
                     };
-                    add_piece(&mut mesh, &lobe, 6, 12);
+                    emit_piece(&mut mesh, &lobe, 5, 10);
                 }
             } else if p.kind == 1 {
                 let mut q = *p;
-                q.size = p.size.max(0.08);
-                add_piece(&mut mesh, &q, 4, 6);
+                q.size = p.size.max(0.09);
+                emit_piece(&mut mesh, &q, 5, 9);
+                if !p.grounded {
+                    let dir = hash_dir(p.seed, 17);
+                    let lobe = silt::particles::Particle {
+                        pos: q.pos + q.rot * dir * q.size * 0.32,
+                        size: q.size * 0.62,
+                        seed: q.seed ^ 0x3C3C_3C3C,
+                        ..q
+                    };
+                    emit_piece(&mut mesh, &lobe, 4, 8);
+                }
             } else {
                 let mut q = *p;
                 q.size = if p.kind == 2 {
-                    p.size.max(0.045)
+                    p.size.max(0.04)
                 } else {
-                    p.size.max(0.07)
+                    p.size.max(0.06)
                 };
-                add_piece(&mut mesh, &q, 4, 7);
+                emit_piece(&mut mesh, &q, 4, 8);
             }
         }
     }
     mesh
+}
+
+fn cam_axes(eye: Vec3, center: Vec3) -> (Vec3, Vec3, Vec3) {
+    let to_cam = (eye - center).normalize_or_zero();
+    let mut right = Vec3::Y.cross(to_cam);
+    if right.length_squared() < 1.0e-6 {
+        right = Vec3::X.cross(to_cam);
+    }
+    right = right.normalize_or_zero();
+    let up = to_cam.cross(right).normalize_or_zero();
+    (right, up, to_cam)
+}
+
+fn push_sprite(
+    out: &mut Vec<ParticleVertex>,
+    center: Vec3,
+    axis_u: Vec3,
+    axis_v: Vec3,
+    radius: f32,
+    alpha: f32,
+    sheet: bool,
+    seed: f32,
+) {
+    if out.len() + 6 > 6144 || radius < 0.004 || alpha <= 0.02 {
+        return;
+    }
+    let color = [
+        radius,
+        if sheet { 1.0 } else { 0.0 },
+        seed.clamp(0.0, 1.0),
+        alpha.clamp(0.0, 0.92),
+    ];
+    let corner = |u: f32, v: f32, su: f32, sv: f32| ParticleVertex {
+        pos: (center + axis_u * u + axis_v * v).to_array(),
+        color,
+        uv: [su, sv],
+    };
+    let hx = radius;
+    let hy = radius;
+    // Two triangles, camera-facing. The shader feathers the ellipse.
+    let verts = [
+        corner(-hx, -hy, 0.0, 0.0),
+        corner(hx, -hy, 1.0, 0.0),
+        corner(hx, hy, 1.0, 1.0),
+        corner(-hx, -hy, 0.0, 0.0),
+        corner(hx, hy, 1.0, 1.0),
+        corner(-hx, hy, 0.0, 1.0),
+    ];
+    out.extend_from_slice(&verts);
+}
+
+fn push_bead(
+    out: &mut Vec<ParticleVertex>,
+    center: Vec3,
+    eye: Vec3,
+    vel: Vec3,
+    radius: f32,
+    alpha: f32,
+    seed: f32,
+) {
+    let (right, up, to_cam) = cam_axes(eye, center);
+    let planar = vel - to_cam * vel.dot(to_cam);
+    let speed = planar.length();
+    let (axis_u, axis_v, rx, ry) = if speed > 0.25 {
+        let along = planar / speed;
+        let side = to_cam.cross(along).normalize_or_zero();
+        let stretch = (speed / 2.6).clamp(1.0, 2.3);
+        (
+            along,
+            side,
+            radius * stretch,
+            radius * (0.82 / stretch.sqrt()),
+        )
+    } else {
+        (right, up, radius, radius)
+    };
+    // Rebuild through push_sprite's uniform radius by scaling the axes.
+    let axis_u = axis_u * (rx / radius.max(0.001));
+    let axis_v = axis_v * (ry / radius.max(0.001));
+    push_sprite(
+        out,
+        center + to_cam * 0.01,
+        axis_u,
+        axis_v,
+        radius,
+        alpha,
+        false,
+        seed,
+    );
+}
+
+fn push_sheet_sprite(
+    out: &mut Vec<ParticleVertex>,
+    center: Vec3,
+    eye: Vec3,
+    vel: Vec3,
+    radius: f32,
+    alpha: f32,
+    seed: f32,
+) {
+    let (_right, _up, to_cam) = cam_axes(eye, center);
+    let planar = vel - to_cam * vel.dot(to_cam);
+    let along = if planar.length() > 0.2 {
+        planar.normalize()
+    } else {
+        cam_axes(eye, center).0
+    };
+    let side = to_cam.cross(along).normalize_or_zero();
+    push_sprite(
+        out,
+        center + to_cam * 0.02,
+        along * 1.7,
+        side * 0.72,
+        radius,
+        alpha,
+        true,
+        seed,
+    );
+}
+
+/// Soft part of the splash. These are camera-facing beads and thin sheets.
+/// The solid clumps stay in `mud_chunks`. Nothing here changes the flight.
+pub fn mud_spray(items: &[silt::particles::Particle], eye: Vec3) -> Vec<ParticleVertex> {
+    let mut out = Vec::new();
+    for p in items {
+        if !p.alive || p.life <= 0.0 || p.grounded {
+            continue;
+        }
+        if out.len() + 6 > 6000 {
+            break;
+        }
+        let life = (p.life / p.max_life.max(0.05)).clamp(0.15, 1.0);
+        let seed = chunk_hash(p.seed, 3);
+        match p.kind {
+            0 => push_bead(
+                &mut out,
+                p.pos,
+                eye,
+                p.vel,
+                p.size.max(0.05) * 1.35,
+                0.5 * life,
+                seed,
+            ),
+            2 => push_bead(
+                &mut out,
+                p.pos,
+                eye,
+                p.vel,
+                p.size.max(0.03) * 1.2,
+                0.62 * life,
+                seed,
+            ),
+            4 => push_bead(
+                &mut out,
+                p.pos,
+                eye,
+                p.vel,
+                p.size.max(0.05) * 0.85,
+                0.9 * life,
+                seed,
+            ),
+            3 => {
+                for i in 0..14u32 {
+                    let mut dir = hash_dir(p.seed, 80 + i * 3);
+                    dir.y = dir.y.abs() * 0.55 + 0.2;
+                    dir = dir.normalize_or_zero();
+                    if p.vel.length() > 0.3 {
+                        dir = (dir + p.vel.normalize_or_zero() * 0.85).normalize_or_zero();
+                    }
+                    // Outside the solid mass, so the beads read as spray and not bubbles on the skin.
+                    let dist = p.size * (1.25 + chunk_hash(p.seed, 90 + i) * 1.6);
+                    let radius = p.size * (0.045 + chunk_hash(p.seed, 100 + i) * 0.07);
+                    let mist = i % 3 == 0;
+                    push_bead(
+                        &mut out,
+                        p.pos + dir * dist,
+                        eye,
+                        p.vel,
+                        radius.max(0.018),
+                        if mist { 0.28 } else { 0.72 } * life,
+                        chunk_hash(p.seed, 110 + i),
+                    );
+                }
+                let side = {
+                    let s = p.vel.cross(Vec3::Y);
+                    if s.length_squared() < 1.0e-4 {
+                        Vec3::X
+                    } else {
+                        s.normalize()
+                    }
+                };
+                push_sheet_sprite(
+                    &mut out,
+                    p.pos + side * p.size * 0.9 + p.vel.normalize_or_zero() * p.size * 0.35,
+                    eye,
+                    p.vel,
+                    p.size * 0.7,
+                    0.26 * life,
+                    seed,
+                );
+            }
+            1 => {
+                for i in 0..4u32 {
+                    let dir = hash_dir(p.seed, 40 + i * 2);
+                    push_bead(
+                        &mut out,
+                        p.pos + dir * p.size * 0.8,
+                        eye,
+                        p.vel,
+                        p.size * 0.28,
+                        0.46 * life,
+                        chunk_hash(p.seed, 50 + i),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+    use silt::particles::{Particle, Particles};
+
+    fn piece(kind: u8, grounded: bool) -> Particle {
+        Particle {
+            pos: Vec3::new(0.0, 1.2, 0.0),
+            vel: Vec3::new(0.6, 3.2, 0.15),
+            life: 1.4,
+            max_life: 2.5,
+            size: 0.42,
+            kind,
+            alive: true,
+            seed: 0x51_17,
+            spin: Vec3::new(0.2, 0.4, 0.1),
+            rot: Quat::from_rotation_y(0.4),
+            grounded,
+            deposited: false,
+        }
+    }
+
+    fn bounds(mesh: &CpuMesh) -> (Vec3, Vec3) {
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        for v in &mesh.vertices {
+            let p = Vec3::from_array(v.pos);
+            min = min.min(p);
+            max = max.max(p);
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn flying_chunk_has_volume_and_thickness() {
+        let mesh = mud_chunks(&[piece(3, false)]);
+        assert!(
+            mesh.vertices.len() > 120,
+            "lobes and a sheet should thicken the clod, verts {}",
+            mesh.vertices.len()
+        );
+        assert_eq!(mesh.indices.len() % 3, 0);
+        let (min, max) = bounds(&mesh);
+        let ext = max - min;
+        assert!(
+            ext.x > 0.35 && ext.y > 0.28 && ext.z > 0.28,
+            "clod is a volume, got {ext}"
+        );
+        assert!(
+            ext.y > 0.2,
+            "flying clod should keep a wet thickness, got {}",
+            ext.y
+        );
+        for v in &mesh.vertices {
+            assert!((v.panel - PANEL_CLOD).abs() < 0.01);
+            assert!(v.uv[0] > 0.01 && v.uv[0] < 0.8, "thickness {}", v.uv[0]);
+            let n = Vec3::from_array(v.nrm);
+            assert!((n.length() - 1.0).abs() < 0.08, "normal len {}", n.length());
+        }
+    }
+
+    #[test]
+    fn landed_chunk_slumps_but_stays_thick() {
+        let mesh = mud_chunks(&[piece(3, true)]);
+        let (min, max) = bounds(&mesh);
+        let ext = max - min;
+        assert!(
+            ext.y < ext.x && ext.y < ext.z,
+            "landed mud spreads, got {ext}"
+        );
+        assert!(
+            ext.y > 0.08,
+            "landed mud keeps a wet thickness, got {}",
+            ext.y
+        );
+    }
+
+    #[test]
+    fn airborne_droplets_are_soft_sprites() {
+        let p = piece(4, false);
+        let mesh = mud_chunks(&[p]);
+        assert!(
+            mesh.vertices.is_empty(),
+            "droplets in the air are spray, not solid pebbles"
+        );
+        let spray = mud_spray(&[p], Vec3::new(3.0, 2.0, 4.0));
+        assert!(spray.len() >= 6);
+        assert_eq!(spray.len() % 6, 0);
+        let mut alpha = 0.0_f32;
+        for v in &spray {
+            assert!((0.0..=1.0).contains(&v.uv[0]));
+            assert!((0.0..=1.0).contains(&v.uv[1]));
+            alpha = alpha.max(v.color[3]);
+        }
+        assert!(alpha > 0.4 && alpha < 1.0, "soft alpha {alpha}");
+    }
+
+    #[test]
+    fn impact_burst_builds_chunks_and_spray() {
+        let mut sys = Particles::new();
+        let n = sys.impact_burst(Vec3::new(0.0, 0.3, 0.0));
+        assert!(n >= 20);
+        let mesh = mud_chunks(&sys.items);
+        let spray = mud_spray(&sys.items, Vec3::new(2.0, 1.5, 2.0));
+        assert!(mesh.vertices.len() > 400, "chunks {}", mesh.vertices.len());
+        assert!(spray.len() > 60, "spray {}", spray.len());
+        assert!(spray.len() <= 6144);
+        assert!(mesh.vertices.len() <= 14000);
+        assert!(mesh.indices.len() <= 46000);
+    }
+
+    /// Offscreen stills of the wet splash. Needs lavapipe (`-- --ignored`).
+    #[test]
+    #[ignore]
+    fn capture_mud_pbr_stills() {
+        use crate::render::{
+            gpu_formats, open_adapter, prepare_software_vulkan, write_png, Renderer,
+        };
+        use silt::world::{CameraPose, World};
+        use std::path::PathBuf;
+
+        let software = std::env::var_os("SILT_SOFTWARE").is_some();
+        if software {
+            prepare_software_vulkan();
+        }
+        let (_instance, adapter, device, queue) = open_adapter(software, None);
+        let formats = gpu_formats(&adapter);
+        let width = 1280u32;
+        let height = 720u32;
+        let mut renderer = Renderer::new(
+            device,
+            queue,
+            adapter.get_info().name,
+            width,
+            height,
+            formats,
+        );
+        let mut world = World::flat(0.92);
+        world.vehicle.pos = Vec3::new(30.0, 8.0, 30.0);
+        world.bike.pos = Vec3::new(-30.0, 8.0, 30.0);
+        let h = world.soil.sample(0.0, 0.0).height;
+        world.particles.impact_burst(Vec3::new(0.0, h + 0.12, 0.0));
+        let fwd = Vec3::new(0.2, 0.0, 1.0).normalize();
+        for _ in 0..6 {
+            world
+                .particles
+                .clod(Vec3::new(0.05, h + 0.18, 0.0), fwd, Vec3::X, 2.2);
+        }
+        let media = PathBuf::from("/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media");
+        let shoot = |world: &World, renderer: &mut Renderer, name: &str, back: f32, lift: f32| {
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(f32::MIN);
+            let mut focus = Vec3::ZERO;
+            let mut n = 0.0_f32;
+            for p in &world.particles.items {
+                if !(p.alive && matches!(p.kind, 1 | 3 | 4)) {
+                    continue;
+                }
+                let rad = p.size.max(0.2);
+                min = min.min(p.pos - Vec3::splat(rad));
+                max = max.max(p.pos + Vec3::splat(rad));
+                if p.kind == 3 {
+                    focus += p.pos;
+                    n += 1.0;
+                }
+            }
+            if n < 1.0 {
+                focus = (min + max) * 0.5;
+            } else {
+                focus /= n;
+            }
+            let ext = (max - min).max_element().max(1.3);
+            let eye = focus + Vec3::new(ext * back, ext * lift, ext * back * 1.08);
+            let pose = CameraPose {
+                eye,
+                target: focus + Vec3::new(0.0, -ext * 0.08, 0.0),
+                ortho_width: None,
+            };
+            eprintln!("capture {name} focus {focus:?} ext {ext:.2} eye {eye:?}");
+            let rgba = renderer.draw(world, pose, None, true).expect("readback");
+            let dest = media.join(name);
+            write_png(&dest, width, height, &rgba).expect("png");
+            eprintln!("wrote {}", dest.display());
+        };
+        for _ in 0..10 {
+            world.particles.update(&mut world.soil, 1.0 / 60.0);
+        }
+        shoot(&world, &mut renderer, "mud-pbr-splash.png", 1.65, 0.34);
+        for _ in 0..20 {
+            world.particles.update(&mut world.soil, 1.0 / 60.0);
+        }
+        shoot(&world, &mut renderer, "mud-pbr-chunks.png", 1.02, 0.3);
+    }
 }
