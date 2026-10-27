@@ -14,6 +14,7 @@ use web_time::Instant;
 
 use glam::Vec3;
 use silt::lap::LapClock;
+use silt::replay::LapReplay;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -89,6 +90,7 @@ struct App {
     orbit_pitch: f32,
     chase_cam: bool,
     drive_bike: bool,
+    replay: LapReplay,
     /// Set once the player presses a drive key. Until then both vehicles run
     /// the scripted lap. After that, the selected one takes the keys and the
     /// other keeps the lap.
@@ -134,6 +136,13 @@ impl ApplicationHandler for App {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
                         PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
+                        // R replays the one recorded lap. It is a press, not a hold.
+                        PhysicalKey::Code(KeyCode::KeyR) => {
+                            if self.replay.start() {
+                                self.world = World::demo();
+                                self.acc = 0.0;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -165,7 +174,7 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyQ) => self.keys.orbit_left = down,
                     PhysicalKey::Code(KeyCode::KeyE) => self.keys.orbit_right = down,
-                    PhysicalKey::Code(KeyCode::KeyR) => self.keys.orbit_up = down,
+                    PhysicalKey::Code(KeyCode::KeyT) => self.keys.orbit_up = down,
                     PhysicalKey::Code(KeyCode::KeyF) => self.keys.orbit_down = down,
                     _ => {}
                 }
@@ -259,6 +268,14 @@ impl App {
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
+            if self.replay.is_playing() {
+                if let Some((buggy_input, bike_input)) = self.replay.take_inputs() {
+                    self.world.step_bike(step, &bike_input);
+                    self.world.step(step, &buggy_input);
+                    self.acc -= step;
+                    continue;
+                }
+            }
             // The page opens on the lap: buggy and bike both chase the loop.
             // A drive key takes the selected vehicle. The other one stays on
             // the script, so the track never drops to a single machine.
@@ -282,6 +299,8 @@ impl App {
                 (0, self.world.vehicle.pos)
             };
             self.lap.advance(step, who, pos);
+            self.replay
+                .note(buggy_input, bike_input, self.world.vehicle.pos);
             self.acc -= step;
         }
         #[cfg(target_arch = "wasm32")]
@@ -297,7 +316,9 @@ impl App {
         } else {
             (self.world.vehicle.pos, self.world.vehicle.yaw)
         };
-        let pose = if self.chase_cam {
+        let pose = if self.replay.is_playing() {
+            self.replay.camera(&self.world.vehicle)
+        } else if self.chase_cam {
             chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
         } else {
             demo_camera(
@@ -417,6 +438,7 @@ fn run_window() {
         orbit_pitch: 0.0,
         chase_cam: false,
         drive_bike: false,
+        replay: LapReplay::new(),
         player_drove: false,
         lap: LapClock::new(),
         acc: 0.0,
