@@ -167,6 +167,7 @@ fn add_tube(mesh: &mut CpuMesh, a: Vec3, b: Vec3, radius: f32, panel: f32, segs:
 }
 
 /// Grooved tire. Local axle is +X, radius matches the solver.
+#[allow(dead_code)]
 pub fn wheel_mesh() -> CpuMesh {
     let mut mesh = CpuMesh::new();
     let segs = 18;
@@ -296,6 +297,7 @@ fn add_fender_lip(mesh: &mut CpuMesh, sign: f32, z: f32, panel: f32) {
 
 /// Open-wheel buggy in vehicle local space. Y up, Z forward, origin at the CG.
 /// The chassis stays inside the tires so the wheels read as separate from above.
+#[allow(dead_code)]
 pub fn buggy_body() -> CpuMesh {
     let mut m = CpuMesh::new();
     let cage = 0.0;
@@ -485,6 +487,7 @@ pub fn buggy_body() -> CpuMesh {
 
 /// One A-arm and one coil per wheel, in the body frame. Ends track `wheel_center_local`,
 /// so the spring shortens when the tire compresses and hangs long at droop.
+#[allow(dead_code)]
 pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
     let mut m = CpuMesh::new();
     let hp = hardpoints();
@@ -513,6 +516,7 @@ pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
 /// Dirt bike in the same local space as the solver: Y up, Z forward, origin at the CG.
 /// Forks and the swingarm live in `bike_suspension` so they follow the wheels.
 /// The tubes are fat on purpose: a 3 cm spine disappears at the isometric distance.
+#[allow(dead_code)]
 pub fn bike_body() -> CpuMesh {
     let mut m = CpuMesh::new();
     let frame = 10.0;
@@ -645,6 +649,7 @@ pub fn bike_body() -> CpuMesh {
 
 /// Fork, swingarm and shock. Ends track the bike's wheel centers, so the
 /// spring shortens under load and hangs at droop in the air.
+#[allow(dead_code)]
 pub fn bike_suspension(bike: &Bike) -> CpuMesh {
     let mut m = CpuMesh::new();
     let front = bike.wheel_center_local(0);
@@ -670,7 +675,14 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
         4,
     );
     let pivot = Vec3::new(0.0, 0.02, -0.12);
-    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot,
+        rear + Vec3::new(0.0, 0.02, 0.0),
+        0.03,
+        arm,
+        5,
+    );
     add_tube(
         &mut m,
         pivot + Vec3::new(0.06, 0.0, 0.0),
@@ -916,8 +928,7 @@ fn add_tri_smooth(
         push_smooth(mesh, b, nb, panel);
         push_smooth(mesh, c, nc, panel);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
 /// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
@@ -986,15 +997,7 @@ fn add_lump(
         let a = ring(1, i);
         let b = ring(1, i + 1);
         add_tri_smooth(
-            mesh,
-            pts[0],
-            nrm[0],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
     for s in 1..stacks.saturating_sub(1) {
@@ -1004,26 +1007,10 @@ fn add_lump(
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
             add_tri_smooth(
-                mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
+                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center,
             );
             add_tri_smooth(
-                mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
+                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center,
             );
         }
     }
@@ -1033,29 +1020,14 @@ fn add_lump(
         let a = ring(last, i + 1);
         let b = ring(last, i);
         add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
     add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded,
     );
 }
 
@@ -1065,7 +1037,7 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    for kind in [3u8, 1, 4, 0, 2] {
+    for kind in [3u8, 5, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
@@ -1073,7 +1045,9 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
             if mesh.vertices.len() + 700 > MAX_VERTS {
                 return mesh;
             }
-            if p.kind == 3 {
+            if p.kind == 5 {
+                crate::mud_look::add_spray_sheet(&mut mesh, p);
+            } else if p.kind == 3 {
                 add_piece(&mut mesh, p, 8, 16);
                 // Two side lobes so the clump is a soft mass, not one pebble.
                 for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {

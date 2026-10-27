@@ -4,7 +4,9 @@
 
 mod mesh;
 mod minimap;
+mod mud_look;
 mod render;
+mod vehicle_mesh;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};

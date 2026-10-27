@@ -26,7 +26,11 @@ pub fn overcast() -> SkyLight {
 }
 
 pub fn shader_source() -> String {
-    let mut src = include_str!("shader.wgsl").to_string();
+    apply(include_str!("shader.wgsl").to_string())
+}
+
+/// Splice the overcast grade onto a shader that may already include the mud-look hooks.
+pub fn apply(mut src: String) -> String {
     src = strip_fn(&src, "present");
     src = strip_fn(&src, "sky_color");
     src = strip_fn(&src, "shade");
@@ -50,22 +54,28 @@ pub fn shader_source() -> String {
         "return present(ground_fog(lit, in.world));",
         2,
     );
-    src = patch(
-        &src,
-        "    // Quiet reflection. sky_color carries the sun disc and white clouds.\n    \
+    // The mud-look puddle mirror already samples sky_color. Once that function
+    // is the overcast sky, the sheet follows it. The older quiet-reflection
+    // block is only still here on a shader that has not grown that mirror.
+    const QUIET_WATER: &str = "    // Quiet reflection. sky_color carries the sun disc and white clouds.\n    \
          let quiet = vec3<f32>(0.10, 0.042, 0.015);\n    \
          let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);\n    \
          var col = mix(absorption, quiet, reflect_amt);\n    \
          let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);\n    \
-         col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);\n",
-        "    // The sheet mirrors the overcast sky. That is the glossy mud.\n    \
+         col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);\n";
+    if src.contains(QUIET_WATER) {
+        src = patch(
+            &src,
+            QUIET_WATER,
+            "    // The sheet mirrors the overcast sky. That is the glossy mud.\n    \
          let refl = reflect(-view, nrm);\n    \
          let sky_refl = sky_color(refl);\n    \
          let reflect_amt = mix(0.36, 0.74, fres);\n    \
          var col = mix(absorption, sky_refl, reflect_amt);\n    \
          let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 8.0);\n    \
          col += sky_refl * spec * 0.22;\n",
-    );
+        );
+    }
     src = patch(
         &src,
         "    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);\n    \
