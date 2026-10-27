@@ -3,6 +3,7 @@
 use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
+use crate::dust::Dust;
 use crate::particles::Particles;
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
@@ -57,6 +58,7 @@ pub struct World {
     pub vehicle: Vehicle,
     pub bike: Bike,
     pub particles: Particles,
+    pub dust: Dust,
     pub time: f32,
     pub telemetry: Telemetry,
     drip_acc: f32,
@@ -127,6 +129,7 @@ impl World {
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
+            dust: Dust::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -144,6 +147,7 @@ impl World {
         }
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.dust.clear();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -161,6 +165,7 @@ impl World {
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
+            dust: Dust::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -180,6 +185,7 @@ impl World {
         }
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.dust.clear();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -316,6 +322,15 @@ impl World {
                     speed.max(1.0),
                 );
             }
+            self.dust.note_wheel(
+                c.index,
+                c.contact_point,
+                c.forward,
+                c.right,
+                speed,
+                c.sample.wetness,
+                c.sample.water,
+            );
         }
 
         self.drip_acc += dt;
@@ -332,6 +347,7 @@ impl World {
         }
 
         self.particles.update(&mut self.soil, dt);
+        self.dust.update(dt);
         self.soil.step_water(dt);
 
         let softness = self.vehicle.mean_softness(&contacts);

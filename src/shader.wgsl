@@ -760,3 +760,29 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
     return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
 }
+
+// Soft silt. Density is a fat gaussian with a lumpy edge, so overlapping
+// puffs melt into one billow. A shaded sphere on the same card read as a bubble.
+@fragment
+fn fs_dust(in: PartOut) -> @location(0) vec4<f32> {
+    let q = in.uv - vec2<f32>(0.5);
+    let phase = fract(sin(dot(in.color.rgb, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+    let p = q * 2.4 + vec2<f32>(phase * 6.4, phase * 2.2);
+    let n = noise(p);
+    let n2 = noise(p * 1.8 + vec2<f32>(3.1, 8.4));
+    let lobe = (n - 0.48) * 0.16 + (n2 - 0.5) * 0.07;
+    let dist = length(q) - lobe;
+    let grain = 0.82 + 0.18 * n2;
+    let dens = exp(-dist * dist * 4.4) * grain;
+    let alpha = clamp(in.color.a * dens, 0.0, 0.78);
+    if (alpha < 0.025) {
+        discard;
+    }
+    // A little more light on the crown, still the same tan. White rims were the ribbon.
+    let crown = clamp(0.45 - q.y, 0.0, 1.0);
+    var rgb = in.color.rgb * mix(0.90, 1.04, crown);
+    let knot = smoothstep(0.62, 0.92, n);
+    rgb = mix(rgb, rgb * vec3<f32>(0.86, 0.76, 0.62), knot * 0.22);
+    rgb = min(rgb, vec3<f32>(0.86, 0.68, 0.44));
+    return vec4<f32>(rgb, alpha);
+}
