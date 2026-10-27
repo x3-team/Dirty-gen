@@ -6,6 +6,7 @@
 
 pub mod bike;
 pub mod particles;
+pub mod replay;
 pub mod soil;
 pub mod vehicle;
 pub mod world;
