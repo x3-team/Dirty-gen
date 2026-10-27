@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod buggy_gltf;
 mod mesh;
 mod render;
 
@@ -37,11 +38,13 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
-            let rest: Vec<String> = args.collect();
-            capture(&rest);
-        } else {
-            run_window();
+        match args.next().as_deref() {
+            Some("capture") => {
+                let rest: Vec<String> = args.collect();
+                capture(&rest);
+            }
+            Some("portraits") => portraits(),
+            _ => run_window(),
         }
     }
 }
@@ -434,6 +437,46 @@ struct CaptureArgs {
     still_start: PathBuf,
     still_puddle: PathBuf,
     still_ruts: PathBuf,
+}
+
+/// Close side and three-quarter frames of the glTF buggy on flat mud.
+#[cfg(not(target_arch = "wasm32"))]
+fn portraits() {
+    prepare_software_vulkan();
+    let (_instance, adapter, device, queue) = open_adapter(true, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        1280,
+        720,
+        formats,
+    );
+    let mut world = World::flat(0.92);
+    // The bike parks near the origin. Pull it out of the portrait.
+    world.bike.pos = Vec3::new(80.0, 0.0, 80.0);
+    let target = world.vehicle.pos + Vec3::new(0.0, 0.06, 0.04);
+    // Close enough that a coil wire and a tread void are more than a pixel.
+    // Sun sits on +X/+Z, so both eyes look at the lit side.
+    let shots = [
+        (target + Vec3::new(3.20, 0.48, 0.72), "buggy-pbr-side.png"),
+        (target + Vec3::new(2.25, 0.62, 2.55), "buggy-pbr-threeq.png"),
+    ];
+    for (eye, name) in shots {
+        let pose = lift_camera(
+            &world,
+            CameraPose {
+                eye,
+                target,
+                ortho_width: None,
+            },
+        );
+        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        let path = PathBuf::from(MEDIA).join(name);
+        write_png(&path, 1280, 720, &rgba).expect("portrait");
+        println!("wrote {}", path.display());
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

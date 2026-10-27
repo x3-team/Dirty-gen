@@ -10,9 +10,10 @@ use silt::bike::{Bike, BIKE_RADIUS};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
+use crate::buggy_gltf::{self, pose_suspension, PbrVertex};
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bike_body, bike_suspension, environment_mesh, mud_chunks, terrain_mesh, wheel_mesh, CpuMesh,
+    MeshVertex, ParticleVertex, TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
@@ -78,6 +79,9 @@ pub struct Renderer {
     padded_row: u32,
     terrain: GpuMesh,
     body: GpuMesh,
+    buggy_wheel: GpuMesh,
+    buggy: buggy_gltf::BuggyAsset,
+    buggy_susp_indices: u32,
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
@@ -93,6 +97,13 @@ pub struct Renderer {
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
+    pipe_pbr: wgpu::RenderPipeline,
+    pipe_shadow_pbr: wgpu::RenderPipeline,
+    pbr_bg: wgpu::BindGroup,
+    #[allow(dead_code)]
+    normal_tex: wgpu::Texture,
+    #[allow(dead_code)]
+    normal_view: wgpu::TextureView,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
@@ -484,6 +495,32 @@ impl Renderer {
             bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl],
             push_constant_ranges: &[],
         });
+        let pbr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("buggy-pbr"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pbr_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pbr-layout"),
+            bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &pbr_bgl],
+            push_constant_ranges: &[],
+        });
         let solo_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("solo-layout"),
             bind_group_layouts: &[&frame_bgl],
@@ -609,6 +646,34 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_pbr = pipeline(
+            &device,
+            &shader,
+            &pbr_layout,
+            "vs_pbr",
+            Some("fs_pbr"),
+            pbr_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_shadow_pbr = pipeline(
+            &device,
+            &shader,
+            &shadow_layout,
+            "vs_shadow_pbr",
+            Some("fs_shadow"),
+            pbr_buffers(),
+            color_format,
+            Some(shadow_depth_state(formats.depth)),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_blit = pipeline(
             &device,
             &blit_shader,
@@ -649,23 +714,51 @@ impl Renderer {
 
         let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
         let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
-        let body_cpu = buggy_body();
-        let body = upload_cpu(&device, &body_cpu, "body");
-        let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
-        let bike_body = upload_cpu(&device, &bike_body(), "bike");
-        let env = upload_cpu(&device, &environment_mesh(), "env");
+        let buggy = buggy_gltf::load_buggy();
+        let body = upload_pbr(&device, &buggy.chassis.vertices, &buggy.chassis.indices, "buggy");
+        let buggy_wheel = upload_pbr(&device, &buggy.wheel.vertices, &buggy.wheel.indices, "buggy-wheel");
+        let (normal_tex, normal_view) = upload_normal(&device, &queue, &buggy.normal_png);
+        let normal_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("buggy-normal"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let pbr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("buggy-pbr-bg"),
+            layout: &pbr_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&normal_samp),
+                },
+            ],
+        });
+        let posed = pose_suspension(&silt::vehicle::Vehicle::new(), &buggy);
+        let buggy_susp_indices = posed.indices.len() as u32;
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
-            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
+            size: (posed.vertices.len() * std::mem::size_of::<PbrVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-i"),
-            size: (32768 * 4) as u64,
+            size: (posed.indices.len() * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        queue.write_buffer(&susp_i, 0, bytemuck::cast_slice(&posed.indices));
+        let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
+        let bike_body = upload_cpu(&device, &bike_body(), "bike");
+        let env = upload_cpu(&device, &environment_mesh(), "env");
         let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-v"),
             size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -724,6 +817,9 @@ impl Renderer {
             padded_row,
             terrain,
             body,
+            buggy_wheel,
+            buggy,
+            buggy_susp_indices,
             wheel,
             bike_body,
             env,
@@ -738,6 +834,11 @@ impl Renderer {
             pipe_terrain,
             pipe_water,
             pipe_mesh,
+            pipe_pbr,
+            pipe_shadow_pbr,
+            pbr_bg,
+            normal_tex,
+            normal_view,
             pipe_particle,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
@@ -829,12 +930,16 @@ impl Renderer {
         readback: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
-        let susp = suspension_mesh(&world.vehicle);
-        let susp_index_count = susp.indices.len() as u32;
+        let susp = pose_suspension(&world.vehicle, &self.buggy);
+        if susp.indices.len() as u32 != self.buggy_susp_indices {
+            panic!(
+                "posed suspension index count changed ({} -> {})",
+                self.buggy_susp_indices,
+                susp.indices.len()
+            );
+        }
         self.queue
             .write_buffer(&self.susp_v, 0, bytemuck::cast_slice(&susp.vertices));
-        self.queue
-            .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
         self.queue
@@ -932,9 +1037,10 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
-            self.draw_bike(&mut pass, bike_susp_count);
+            pass.set_pipeline(&self.pipe_shadow_pbr);
+            self.draw_buggy(&mut pass);
             pass.set_pipeline(&self.pipe_shadow_mesh);
+            self.draw_bike(&mut pass, bike_susp_count);
             self.draw_chunks(&mut pass, chunk_count);
         }
 
@@ -971,7 +1077,10 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
+            pass.set_pipeline(&self.pipe_pbr);
+            pass.set_bind_group(3, &self.pbr_bg, &[]);
+            self.draw_buggy(&mut pass);
+            pass.set_pipeline(&self.pipe_mesh);
             self.draw_bike(&mut pass, bike_susp_count);
 
             pass.set_pipeline(&self.pipe_water);
@@ -1161,17 +1270,18 @@ impl Renderer {
         }
     }
 
-    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
+    fn draw_buggy(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(2, &self.model_bg, &[0]);
         draw_indexed(pass, &self.body);
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
-            draw_indexed(pass, &self.wheel);
+            draw_indexed(pass, &self.buggy_wheel);
         }
+        // Slot 6 is the body matrix. Posed arms and coils are already in body space.
         pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 6]);
         pass.set_vertex_buffer(0, self.susp_v.slice(..));
         pass.set_index_buffer(self.susp_i.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..susp_indices, 0, 0..1);
+        pass.draw_indexed(0..self.buggy_susp_indices, 0, 0..1);
     }
 
     fn write_bike_models(&self, bike: &Bike) {
@@ -1415,6 +1525,116 @@ fn terrain_buffers() -> &'static [wgpu::VertexBufferLayout<'static>] {
             },
         ],
     }]
+}
+
+fn pbr_buffers() -> &'static [wgpu::VertexBufferLayout<'static>] {
+    &[wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<PbrVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 16,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 28,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 32,
+                shader_location: 4,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 48,
+                shader_location: 5,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 64,
+                shader_location: 6,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 72,
+                shader_location: 7,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 76,
+                shader_location: 8,
+            },
+        ],
+    }]
+}
+
+fn upload_pbr(
+    device: &wgpu::Device,
+    vertices: &[PbrVertex],
+    indices: &[u32],
+    label: &str,
+) -> GpuMesh {
+    upload_mesh(device, vertices, indices, label)
+}
+
+fn upload_normal(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    png_bytes: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().expect("buggy normal map");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("buggy normal frame");
+    buf.truncate(info.buffer_size());
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("buggy-normal"),
+        size: wgpu::Extent3d {
+            width: info.width,
+            height: info.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &buf,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(info.width * 4),
+            rows_per_image: Some(info.height),
+        },
+        wgpu::Extent3d {
+            width: info.width,
+            height: info.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 fn mesh_buffers() -> &'static [wgpu::VertexBufferLayout<'static>] {

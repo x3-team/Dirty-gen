@@ -726,6 +726,136 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     return present(lit);
 }
 
+// Buggy glTF only. Base color and roughness live in the vertex color, the
+// normal map breaks up the tube highlight, and the mud mask darkens whatever
+// sits low on the chassis or on the tread. Wet metal still uses this frame's sun.
+@group(3) @binding(0) var buggy_normal: texture_2d<f32>;
+@group(3) @binding(1) var buggy_samp: sampler;
+
+struct PbrIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) emit: f32,
+    @location(2) nrm: vec3<f32>,
+    @location(3) panel: f32,
+    @location(4) tangent: vec4<f32>,
+    @location(5) color: vec4<f32>,
+    @location(6) uv: vec2<f32>,
+    @location(7) metal: f32,
+    @location(8) mud: f32,
+}
+
+struct PbrOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) nrm: vec3<f32>,
+    @location(2) tangent: vec4<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) color: vec4<f32>,
+    @location(5) mat: vec4<f32>,
+}
+
+@vertex
+fn vs_pbr(in: PbrIn) -> PbrOut {
+    let world = model.world * vec4<f32>(in.pos, 1.0);
+    var o: PbrOut;
+    o.clip = frame.view_proj * world;
+    o.world = world.xyz;
+    o.nrm = normalize((model.world * vec4<f32>(in.nrm, 0.0)).xyz);
+    let t = (model.world * vec4<f32>(in.tangent.xyz, 0.0)).xyz;
+    o.tangent = vec4<f32>(t, in.tangent.w);
+    o.uv = in.uv;
+    o.color = in.color;
+    o.mat = vec4<f32>(in.metal, in.mud, in.panel, in.emit);
+    return o;
+}
+
+struct PbrPos {
+    @location(0) pos: vec3<f32>,
+}
+
+@vertex
+fn vs_shadow_pbr(in: PbrPos) -> ShadowOut {
+    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let clip = frame.light_vp * world;
+    var o: ShadowOut;
+    o.clip = clip;
+    o.depth = clip.z / max(clip.w, 1e-5);
+    return o;
+}
+
+fn ggx_d(ndh: f32, rough: f32) -> f32 {
+    let a = max(rough * rough, 0.045);
+    let a2 = a * a;
+    let d = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * d * d + 1e-4);
+}
+
+fn shade_pbr(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough_in: f32, metal: f32, mud: f32, emit: vec3<f32>) -> vec3<f32> {
+    let n = normalize(n_in);
+    let sun = normalize(frame.sun_dir.xyz);
+    let view = normalize(frame.cam_pos.xyz - world);
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    let ndv = max(dot(n, view), 0.04);
+    let halfv = normalize(sun + view);
+    let ndh = clamp(dot(n, halfv), 0.0, 1.0);
+    let vdh = clamp(dot(view, halfv), 0.0, 1.0);
+    let shadow = shadow_factor(world + n * 0.02, n);
+    let hemi = mix(frame.amb.rgb, frame.sky_zenith.rgb * 0.55, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    let rough = clamp(rough_in, 0.045, 1.0);
+    let f0 = mix(vec3<f32>(0.04), albedo, metal);
+    let fres = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - vdh, 5.0);
+    let d = ggx_d(ndh, rough);
+    // Keep the lobe bright on chrome and paint without flooding a whole facet.
+    let spec = fres * d / (4.0 * ndv + 0.55);
+    let coat = (1.0 - metal) * (1.0 - clamp(mud, 0.0, 1.0));
+    let coat_lobe = ggx_d(ndh, 0.12) * coat / (4.0 * ndv + 0.7);
+    var col = albedo * (1.0 - metal * 0.88) * (hemi * 0.62 + frame.sun_color.rgb * ndl * shadow * 1.05);
+    col += frame.sun_color.rgb * spec * ndl * shadow * mix(0.70, 1.65, metal);
+    col += frame.sun_color.rgb * coat_lobe * ndl * shadow * 0.62;
+    col += emit;
+    let dist = length(world - frame.cam_pos.xyz);
+    let fog = smoothstep(58.0, 150.0, dist);
+    let fog_col = frame.sky_horizon.rgb * 0.28 + frame.sky_zenith.rgb * 0.12;
+    col = mix(col, fog_col, fog * 0.65);
+    return col;
+}
+
+@fragment
+fn fs_pbr(in: PbrOut) -> @location(0) vec4<f32> {
+    var albedo = in.color.rgb;
+    var rough = in.color.a;
+    var metal = clamp(in.mat.x, 0.0, 1.0);
+    var mud = clamp(in.mat.y, 0.0, 1.0);
+    let panel = i32(in.mat.z + 0.5);
+    var wet = 0.0;
+    if (model.extra.x > 0.5) {
+        // Tread already carries a baked mask. Spinning through a rut adds more.
+        let dyn = smoothstep(0.03, 0.40, model.extra.y);
+        mud = clamp(max(mud, dyn), 0.0, 1.0);
+    } else if (panel >= 0 && panel < 12) {
+        let m = mud_of(panel);
+        mud = clamp(max(mud, m.x), 0.0, 1.0);
+        wet = clamp(m.w, 0.0, 1.0);
+    }
+    let clump = noise(in.world.xz * 5.5 + vec2<f32>(in.world.y * 3.2, in.uv.x * 2.0));
+    let mask = clamp(mud * mix(0.82, 1.0, clump), 0.0, 1.0);
+    let mud_col = mix(vec3<f32>(0.105, 0.048, 0.020), vec3<f32>(0.045, 0.020, 0.010), clump);
+    albedo = mix(albedo, mud_col, mask);
+    // Caked mud roughens. A wet film on top of it pulls a little gloss back.
+    rough = mix(rough, mix(0.88, 0.30, wet), mask);
+    metal = mix(metal, 0.0, mask);
+
+    var n = normalize(in.nrm);
+    if (length(in.tangent.xyz) > 0.2) {
+        let t = normalize(in.tangent.xyz);
+        let b = normalize(cross(n, t)) * in.tangent.w;
+        let ts = textureSample(buggy_normal, buggy_samp, in.uv).xyz * 2.0 - 1.0;
+        n = normalize(n + t * ts.x * 0.55 + b * ts.y * 0.55);
+    }
+    let emit = vec3<f32>(in.mat.w) * albedo;
+    return present(shade_pbr(in.world, n, albedo, rough, metal, mask, emit));
+}
+
 struct PartIn {
     @location(0) pos: vec3<f32>,
     @location(1) color: vec4<f32>,
