@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Silt</title>
     <link data-trunk rel="rust" data-bin="silt" data-wasm-opt="0" />
+    <link data-trunk rel="css" href="ui/start-menu.css" />
+    <link data-trunk rel="copy-file" href="ui/start-menu.js" />
     <style>
       html,
       body {
@@ -39,9 +41,11 @@
   <body>
     <canvas id="silt" tabindex="0"></canvas>
     <div id="hud">
-      Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C камера.
+      Старт отдаёт руль выбранной машине, вторая едет круг. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C камера.
       <span id="backend">загрузка…</span>
     </div>
+    <div id="silt-menu-state" data-phase="menu" data-vehicle="buggy" data-action="" hidden></div>
+    <script type="module" src="start-menu.js"></script>
     <script>
       const canvas = document.getElementById("silt");
       const focus = () => canvas.focus();
@@ -50,6 +54,9 @@
       window.addEventListener(
         "keydown",
         (event) => {
+          if (event.target instanceof Element && event.target.closest("button")) {
+            return;
+          }
           if (
             event.key === "ArrowUp" ||
             event.key === "ArrowDown" ||

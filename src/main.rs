@@ -4,6 +4,7 @@
 
 mod mesh;
 mod render;
+mod start_menu;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
@@ -57,6 +58,21 @@ struct Keys {
     orbit_down: bool,
 }
 
+impl Default for Keys {
+    fn default() -> Self {
+        Self {
+            throttle: false,
+            reverse: false,
+            left: false,
+            right: false,
+            orbit_left: false,
+            orbit_right: false,
+            orbit_up: false,
+            orbit_down: false,
+        }
+    }
+}
+
 impl Keys {
     fn input(&self, speed: f32) -> Input {
         let mut throttle = if self.throttle { 1.0 } else { 0.0 };
@@ -92,6 +108,8 @@ struct App {
     /// the scripted lap. After that, the selected one takes the keys and the
     /// other keeps the lap.
     player_drove: bool,
+    /// Start screen is up. Both vehicles stay on the lap until Start.
+    menu_holding: bool,
     acc: f32,
     last: Instant,
     srgb: bool,
@@ -131,7 +149,11 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
-                        PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            if !self.menu_holding {
+                                self.drive_bike = !self.drive_bike;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -139,25 +161,25 @@ impl ApplicationHandler for App {
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
                         self.keys.throttle = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
                         self.keys.reverse = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
                         self.keys.left = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
                         self.keys.right = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
@@ -232,6 +254,7 @@ impl App {
     }
 
     fn frame(&mut self) {
+        self.apply_start_menu();
         #[cfg(target_arch = "wasm32")]
         if self.renderer.is_none() {
             if !self.take_web_gpu() {
@@ -257,15 +280,15 @@ impl App {
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
-            // The page opens on the lap: buggy and bike both chase the loop.
-            // A drive key takes the selected vehicle. The other one stays on
-            // the script, so the track never drops to a single machine.
-            let bike_input = if self.player_drove && self.drive_bike {
+            // Until Start, and again after Restart, both vehicles stay on the
+            // lap. Start hands the chosen one the keys. The other keeps the script.
+            let driving = self.player_drove && !self.menu_holding;
+            let bike_input = if driving && self.drive_bike {
                 self.keys.input(self.world.bike.speed())
             } else {
                 demo_drive_bike(&self.world)
             };
-            let buggy_input = if self.player_drove && !self.drive_bike {
+            let buggy_input = if driving && !self.drive_bike {
                 self.keys.input(self.world.vehicle.speed())
             } else {
                 demo_drive(&self.world)
@@ -356,6 +379,40 @@ impl App {
         self.renderer = Some(ready.renderer);
         true
     }
+
+    fn apply_start_menu(&mut self) {
+        let Some(hook) = start_menu::poll() else {
+            return;
+        };
+        match hook.action {
+            start_menu::MenuAction::Start => {
+                self.reset_run();
+                self.drive_bike = hook.ride == start_menu::Ride::Bike;
+                self.player_drove = true;
+                self.menu_holding = false;
+            }
+            start_menu::MenuAction::Restart => {
+                self.reset_run();
+                self.drive_bike = hook.ride == start_menu::Ride::Bike;
+                self.menu_holding = true;
+            }
+            start_menu::MenuAction::None => {
+                self.menu_holding = hook.holding;
+                if hook.holding {
+                    self.drive_bike = hook.ride == start_menu::Ride::Bike;
+                }
+            }
+        }
+    }
+
+    fn reset_run(&mut self) {
+        self.world = World::demo();
+        self.keys = Keys::default();
+        self.player_drove = false;
+        self.acc = 0.0;
+        self.orbit_yaw = 0.0;
+        self.orbit_pitch = 0.0;
+    }
 }
 
 fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
@@ -391,21 +448,13 @@ fn run_window() {
         config: None,
         renderer: None,
         world: World::demo(),
-        keys: Keys {
-            throttle: false,
-            reverse: false,
-            left: false,
-            right: false,
-            orbit_left: false,
-            orbit_right: false,
-            orbit_up: false,
-            orbit_down: false,
-        },
+        keys: Keys::default(),
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
         chase_cam: false,
         drive_bike: false,
         player_drove: false,
+        menu_holding: false,
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
