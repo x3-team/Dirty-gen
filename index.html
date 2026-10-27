@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Silt</title>
+    <link data-trunk rel="rust" data-bin="silt" data-wasm-opt="0" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #1a120c;
+        color: #efe2d2;
+        font: 15px/1.45 "Segoe UI", sans-serif;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      #silt {
+        flex: 1;
+        width: 100%;
+        min-height: 0;
+        display: block;
+        outline: none;
+        touch-action: none;
+        background: #24180f;
+      }
+      #hud {
+        padding: 8px 14px 10px;
+        background: #140e09;
+      }
+      #backend {
+        opacity: 0.75;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="silt" tabindex="0"></canvas>
+    <div id="hud">
+      Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C камера.
+      <span id="backend">загрузка…</span>
+    </div>
+    <script>
+      const canvas = document.getElementById("silt");
+      const focus = () => canvas.focus();
+      window.addEventListener("load", focus);
+      canvas.addEventListener("pointerdown", focus);
+      window.addEventListener(
+        "keydown",
+        (event) => {
+          if (
+            event.key === "ArrowUp" ||
+            event.key === "ArrowDown" ||
+            event.key === "ArrowLeft" ||
+            event.key === "ArrowRight" ||
+            event.key === " "
+          ) {
+            event.preventDefault();
+          }
+        },
+        { passive: false }
+      );
+    </script>
+  </body>
+</html>
