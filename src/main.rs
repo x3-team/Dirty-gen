@@ -5,6 +5,7 @@
 mod cockpit_mesh;
 mod debris_mesh;
 mod dust_draw;
+mod lens_pass;
 mod mesh;
 mod minimap;
 mod mud_look;
@@ -96,6 +97,8 @@ struct App {
     orbit_yaw: f32,
     orbit_pitch: f32,
     cam: DriveCam,
+    /// Lens mud on chase and cockpit. L toggles it. C stays the camera cycle.
+    show_lens: bool,
     drive_bike: bool,
     replay: LapReplay,
     /// Set once the player presses a drive key. Until then both vehicles run
@@ -142,6 +145,8 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) => self.cam = self.cam.cycle(),
+                        // Lens mud used to share C with the chase toggle. C is the cockpit cycle.
+                        PhysicalKey::Code(KeyCode::KeyL) => self.show_lens = !self.show_lens,
                         PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
                         // R replays the one recorded lap. It is a press, not a hold.
                         PhysicalKey::Code(KeyCode::KeyR) => {
@@ -355,6 +360,7 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
+        renderer.show_lens = self.show_lens;
         renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
         frame.present();
     }
@@ -453,6 +459,7 @@ fn run_window() {
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
         cam: DriveCam::Iso,
+        show_lens: true,
         drive_bike: false,
         replay: LapReplay::new(),
         player_drove: false,

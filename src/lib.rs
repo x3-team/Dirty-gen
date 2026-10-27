@@ -9,6 +9,7 @@ pub mod cockpit;
 pub mod debris;
 pub mod dust;
 pub mod lap;
+pub mod lens;
 pub mod particles;
 pub mod replay;
 pub mod soil;
