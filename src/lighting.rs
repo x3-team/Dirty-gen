@@ -1,8 +1,9 @@
-//! Overcast sky and ground fog for the wet oval.
+//! Photographic overcast for the wet oval.
 //!
-//! The Kling stills (flat gray sky, fog on the ground, glossy mud) drive the
-//! rig. This module owns those colors and splices `sky_light.wgsl` over the
-//! sunny grade. The renderer only asks for the shader and the rig.
+//! The Kling stills are a soft gray sky, mist sitting on the ground, and
+//! bright streaks where water fills a rut or a puddle. The soil stays dark.
+//! This module owns those colors and splices `sky_light.wgsl` over the sunny
+//! grade. The glTF buggy uses the same `shade`, sky, and ground fog.
 
 use glam::Vec3;
 
@@ -16,12 +17,14 @@ pub struct SkyLight {
 
 pub fn overcast() -> SkyLight {
     SkyLight {
-        // High and soft. A low sun rakes long shadows through the fog.
-        sun: Vec3::new(0.30, 0.90, 0.28).normalize(),
-        sun_color: [0.16, 0.17, 0.19, 1.0],
-        sky_zenith: [0.52, 0.56, 0.60, 1.0],
-        sky_horizon: [0.84, 0.86, 0.87, 1.0],
-        ambient: [0.20, 0.21, 0.23, 1.0],
+        // High and diffuse. Streaks are the sky in the water, not a hard sun.
+        sun: Vec3::new(0.22, 0.95, 0.18).normalize(),
+        sun_color: [0.26, 0.28, 0.31, 1.0],
+        // Soft overcast: a light zenith, and a brighter horizon the mist takes.
+        sky_zenith: [0.58, 0.62, 0.68, 1.0],
+        sky_horizon: [0.88, 0.90, 0.93, 1.0],
+        // Under the sky, so the soil can stay darker than the air.
+        ambient: [0.12, 0.13, 0.15, 1.0],
     }
 }
 
@@ -38,15 +41,42 @@ pub fn apply(mut src: String) -> String {
     src.push_str(include_str!("sky_light.wgsl"));
     src = patch(
         &src,
-        "    lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;\n",
-        "    let wet_refl = sky_color(reflect(-view, n));\n    \
-         lit = mix(lit, wet_refl, clamp(wet_spec, 0.0, 0.20));\n",
-    );
-    src = patch(
-        &src,
-        "    let wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);\n",
-        "    let damp = smoothstep(0.72, 1.0, wet);\n    \
-         let wet_spec = (facing * 0.40 + wide * 0.18) * max(shore * 0.40, damp * 0.30);\n",
+        r#"    // The lane stays matte. Shine is the soil ringing a puddle. The same lobe
+    // on the tire cut turned the groove into a tan stripe, so the floor stays dark.
+    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
+    // Standing water is drawn as its own sheet. A mirror bed under that film
+    // is the gray metal disc.
+    let drowned = smoothstep(0.012, 0.05, water);
+    let rough_out = mix(mix(0.94, 0.2, shore * (1.0 - drowned)), 0.90, drowned);
+    var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+    // The sun sits low, so a tight Phong highlight misses this camera.
+    // A wide lobe on the shore is the wet sheen.
+    let view = normalize(frame.cam_pos.xyz - in.world);
+    let ndotv = clamp(dot(n, view), 0.0, 1.0);
+    let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
+    let facing = pow(1.0 - ndotv, 2.0);
+    let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
+    let wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
+    lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
+"#,
+        r#"    // The lane stays matte. Shine is water in the tyre cut and on a puddle lip.
+    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
+    // Standing water is its own sheet. A second mirror under that film is a gray disc.
+    let drowned = smoothstep(0.012, 0.05, water);
+    let rough_out = mix(0.96, 0.90, drowned);
+    var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+    // Water in the tyre cut mirrors the bright sky as one ribbon.
+    // A per-cell lobe turned that ribbon into speckles.
+    let in_rut = smoothstep(0.012, 0.030, cut) * smoothstep(0.35, 0.80, wet) * (1.0 - drowned);
+    let axis = streak_axis(xz);
+    let along = vec2<f32>(-axis.y, axis.x);
+    // Bright along the cut, with grain so the highlight is not a flat white decal.
+    let grain = noise(vec2<f32>(dot(xz, along) * 1.3, dot(xz, axis) * 0.35));
+    let spark = smoothstep(0.80, 0.96, noise(xz * 4.5));
+    let shine = frame.sky_horizon.rgb * (0.58 + 0.28 * grain + spark * 0.35);
+    let shore_glint = shore * (1.0 - drowned);
+    lit = mix(lit, shine, clamp(in_rut * 0.86 + shore_glint * 0.25, 0.0, 1.0));
+"#,
     );
     src = patch_all(
         &src,
@@ -54,28 +84,23 @@ pub fn apply(mut src: String) -> String {
         "return present(ground_fog(lit, in.world));",
         2,
     );
-    // The mud-look puddle mirror already samples sky_color. Once that function
-    // is the overcast sky, the sheet follows it. The older quiet-reflection
-    // block is only still here on a shader that has not grown that mirror.
-    const QUIET_WATER: &str = "    // Quiet reflection. sky_color carries the sun disc and white clouds.\n    \
-         let quiet = vec3<f32>(0.10, 0.042, 0.015);\n    \
-         let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);\n    \
-         var col = mix(absorption, quiet, reflect_amt);\n    \
+    // The puddle sheet. Specular is the shared sky, in a few broad ribbons.
+    src = patch(
+        &src,
+        "    var col = puddle_color(in.world, nrm, depth_t, absorption);\n    \
          let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);\n    \
-         col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);\n";
-    if src.contains(QUIET_WATER) {
-        src = patch(
-            &src,
-            QUIET_WATER,
-            "    // The sheet mirrors the overcast sky. That is the glossy mud.\n    \
-         let refl = reflect(-view, nrm);\n    \
-         let sky_refl = sky_color(refl);\n    \
-         let reflect_amt = mix(0.36, 0.74, fres);\n    \
-         var col = mix(absorption, sky_refl, reflect_amt);\n    \
-         let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 8.0);\n    \
-         col += sky_refl * spec * 0.22;\n",
-        );
-    }
+         col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);\n",
+        "    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);\n    \
+         let fres = pow(1.0 - ndotv, 2.0);\n    \
+         let skin = 1.0 - depth_t * 0.62;\n    \
+         let body = reflected_sky(reflect(-view, nrm));\n    \
+         let reflect_amt = mix(0.42, 0.72, fres) * mix(0.40, 0.85, skin);\n    \
+         var col = mix(absorption, body, reflect_amt);\n    \
+         let ribbon = water_ribbon(in.world.xz);\n    \
+         let wrap = clamp(dot(nrm, sun) * 0.15 + 0.85, 0.0, 1.0);\n    \
+         col = col * wrap;\n    \
+         col = mix(col, silver(), ribbon * skin * 0.72);\n",
+    );
     src = patch(
         &src,
         "    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);\n    \
@@ -140,16 +165,50 @@ fn strip_fn(src: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn luma(c: &[f32; 4]) -> f32 {
+        c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722
+    }
+
     #[test]
-    fn splices_overcast_functions_once() {
+    fn splices_photographic_light_once() {
         let src = super::shader_source();
         assert_eq!(src.matches("fn sky_color(").count(), 1);
         assert_eq!(src.matches("fn shade(").count(), 1);
         assert_eq!(src.matches("fn present(").count(), 1);
         assert_eq!(src.matches("fn ground_fog(").count(), 1);
+        assert_eq!(src.matches("fn water_ribbon(").count(), 1);
+        assert_eq!(src.matches("fn streak_axis(").count(), 1);
         assert!(src.contains("ground_fog(lit, in.world)"));
+        assert!(src.contains("exp(-above * 2.2)"));
+        assert!(src.contains("smoothstep(18.0, 40.0, dist)"));
+        assert!(src.contains("let in_rut = smoothstep(0.012, 0.030, cut)"));
+        assert!(src.contains("mix(c, vec3<f32>(luma), 0.22)"));
         assert!(!src.contains("pow(d, 900.0)"));
         assert!(!src.contains("0.22, 0.095, 0.032"));
         assert!(!src.contains("vec3<f32>(0.10, 0.042, 0.015)"));
+        assert!(!src.contains("smoothstep(0.72, 1.0, wet)"));
+        assert!(!src.contains("flat * 0.94 + vec3<f32>(0.008)"));
+    }
+
+    #[test]
+    fn sky_is_a_soft_gradient_and_the_ground_stays_darker() {
+        let sky = super::overcast();
+        let zen = luma(&sky.sky_zenith);
+        let hor = luma(&sky.sky_horizon);
+        let amb = luma(&sky.ambient);
+        assert!(
+            hor > zen + 0.18,
+            "horizon {hor:.3} should open above zenith {zen:.3}"
+        );
+        assert!(
+            (0.45..0.78).contains(&zen),
+            "zenith {zen:.3} should stay a soft light gray"
+        );
+        assert!(hor < 0.97, "horizon {hor:.3} should not blow out");
+        assert!(sky.sun.y > 0.85, "sun should stay high and soft");
+        assert!(
+            amb + 0.15 < zen,
+            "ambient {amb:.3} should sit under the sky {zen:.3}"
+        );
     }
 }

@@ -859,3 +859,105 @@ fn fs_dust(in: PartOut) -> @location(0) vec4<f32> {
     let a = in.color.a * edge;
     return vec4<f32>(rgb, a);
 }
+
+// glTF buggy. One normal map. Lighting is the shared shade() / ground fog,
+// not a second sun.
+@group(3) @binding(0) var buggy_normal: texture_2d<f32>;
+@group(3) @binding(1) var buggy_samp: sampler;
+
+struct PbrIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) emit: f32,
+    @location(2) nrm: vec3<f32>,
+    @location(3) panel: f32,
+    @location(4) tangent: vec4<f32>,
+    @location(5) color: vec4<f32>,
+    @location(6) uv: vec2<f32>,
+    @location(7) metal: f32,
+    @location(8) mud: f32,
+}
+
+struct PbrOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) nrm: vec3<f32>,
+    @location(2) tangent: vec4<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) color: vec4<f32>,
+    @location(5) mat: vec4<f32>,
+}
+
+@vertex
+fn vs_pbr(in: PbrIn) -> PbrOut {
+    let world = model.world * vec4<f32>(in.pos, 1.0);
+    var o: PbrOut;
+    o.clip = frame.view_proj * world;
+    o.world = world.xyz;
+    o.nrm = normalize((model.world * vec4<f32>(in.nrm, 0.0)).xyz);
+    let t = (model.world * vec4<f32>(in.tangent.xyz, 0.0)).xyz;
+    o.tangent = vec4<f32>(t, in.tangent.w);
+    o.uv = in.uv;
+    o.color = in.color;
+    o.mat = vec4<f32>(in.metal, in.mud, in.panel, in.emit);
+    return o;
+}
+
+struct PbrPos {
+    @location(0) pos: vec3<f32>,
+}
+
+@vertex
+fn vs_shadow_pbr(in: PbrPos) -> ShadowOut {
+    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let clip = frame.light_vp * world;
+    var o: ShadowOut;
+    o.clip = clip;
+    o.depth = clip.z / max(clip.w, 1e-5);
+    return o;
+}
+
+@fragment
+fn fs_pbr(in: PbrOut) -> @location(0) vec4<f32> {
+    var albedo = in.color.rgb;
+    var rough = in.color.a;
+    var metal = clamp(in.mat.x, 0.0, 1.0);
+    var mud = clamp(in.mat.y, 0.0, 1.0);
+    let panel = i32(in.mat.z + 0.5);
+    var wet = 0.0;
+    if (model.extra.x > 0.5) {
+        let dyn = smoothstep(0.03, 0.40, model.extra.y);
+        mud = clamp(max(mud, dyn), 0.0, 1.0);
+    } else if (panel >= 0 && panel < 12) {
+        let m = mud_of(panel);
+        mud = clamp(max(mud, m.x), 0.0, 1.0);
+        wet = clamp(m.w, 0.0, 1.0);
+    }
+    let clump = noise(in.world.xz * 5.5 + vec2<f32>(in.world.y * 3.2, in.uv.x * 2.0));
+    let mask = clamp(mud * mix(0.82, 1.0, clump), 0.0, 1.0);
+    let mud_col = mix(vec3<f32>(0.105, 0.048, 0.020), vec3<f32>(0.045, 0.020, 0.010), clump);
+    albedo = mix(albedo, mud_col, mask);
+    rough = mix(rough, mix(0.88, 0.30, wet), mask);
+    metal = mix(metal, 0.0, mask);
+
+    var n = normalize(in.nrm);
+    if (length(in.tangent.xyz) > 0.2) {
+        let t = normalize(in.tangent.xyz);
+        let b = normalize(cross(n, t)) * in.tangent.w;
+        let ts = textureSample(buggy_normal, buggy_samp, in.uv).xyz * 2.0 - 1.0;
+        n = normalize(n + t * ts.x * 0.55 + b * ts.y * 0.55);
+    }
+    let clean = (1.0 - mask) * (1.0 - metal);
+    // Shared shade is dark and cool so the soil stays down. Clean paint is
+    // lifted here so the orange tubes stay orange. Mud is left alone.
+    albedo = mix(albedo, albedo * vec3<f32>(2.05, 1.55, 1.15), clean);
+    let emit = vec3<f32>(in.mat.w) * albedo * 0.15;
+    let rough_out = clamp(mix(rough, 0.42, metal * 0.25), 0.05, 1.0);
+    let diff = mix(albedo, albedo * 0.35, metal);
+    var col = shade(in.world, n, diff, rough_out, emit);
+    let view = normalize(frame.cam_pos.xyz - in.world);
+    let fres = pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 3.0);
+    let sky_refl = reflected_sky(reflect(-view, n));
+    let spec_amt = metal * (0.18 + fres * 0.35) * (1.0 - mask);
+    col = mix(col, sky_refl, clamp(spec_amt, 0.0, 0.55));
+    return present(ground_fog(col, in.world));
+}

@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod buggy_gltf;
 mod cockpit_mesh;
 mod debris_mesh;
 mod dents;
@@ -50,11 +51,13 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
-            let rest: Vec<String> = args.collect();
-            capture(&rest);
-        } else {
-            run_window();
+        match args.next().as_deref() {
+            Some("capture") => {
+                let rest: Vec<String> = args.collect();
+                capture(&rest);
+            }
+            Some("light-stills") => light_stills(),
+            _ => run_window(),
         }
     }
 }
@@ -640,6 +643,62 @@ struct CaptureArgs {
     still_puddle: PathBuf,
     still_ruts: PathBuf,
     exhaust_stills: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn light_stills() {
+    prepare_software_vulkan();
+    let (_instance, adapter, device, queue) = open_adapter(true, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        1280,
+        720,
+        formats,
+    );
+    renderer.show_lens = false;
+    let mut world = World::demo();
+    let dt = 1.0 / 60.0;
+    for _ in 0..(3.4 * 60.0) as u32 {
+        let bike_in = demo_drive_bike(&world);
+        let buggy_in = demo_drive(&world);
+        world.step_bike(dt, &bike_in);
+        world.step(dt, &buggy_in);
+    }
+    let parked = world.bike.pos;
+    world.bike.pos = Vec3::new(80.0, 0.0, 80.0);
+    let pos = world.vehicle.pos;
+    let yaw = world.vehicle.yaw;
+    let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let right = Vec3::new(forward.z, 0.0, -forward.x);
+    let sun = Vec3::new(0.22, 0.95, 0.18).normalize();
+    let sun_side = if right.dot(sun) >= 0.0 { right } else { -right };
+    let target = pos + Vec3::Y * 0.55 + forward * 0.15;
+    let eye = target + sun_side * 3.4 + Vec3::Y * 0.85 - forward * 0.35;
+    let side = lift_camera(
+        &world,
+        CameraPose {
+            eye,
+            target,
+            ortho_width: None,
+            fov_deg: Some(38.0),
+            near: Some(0.08),
+            cockpit: false,
+        },
+    );
+    let rgba = renderer.draw(&world, side, None, true).expect("side readback");
+    let side_path = PathBuf::from(format!("{MEDIA}/demo-buggy-light-side.png"));
+    write_png(&side_path, 1280, 720, &rgba).expect("side png");
+    println!("wrote {}", side_path.display());
+
+    world.bike.pos = parked;
+    let oval = demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw);
+    let rgba = renderer.draw(&world, oval, None, true).expect("oval readback");
+    let oval_path = PathBuf::from(format!("{MEDIA}/demo-buggy-light-oval.png"));
+    write_png(&oval_path, 1280, 720, &rgba).expect("oval png");
+    println!("wrote {}", oval_path.display());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
