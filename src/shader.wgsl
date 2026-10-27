@@ -606,9 +606,23 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 0.07);
         return vec4<f32>(vec3<f32>(0.092, 0.048, 0.024) * (0.78 + g * 0.4), 0.97);
     } else if (panel < 42.5) {
-        return vec4<f32>(vec3<f32>(0.07, 0.046, 0.028), 0.94);
+        // Wet cobble. Pale grey where it has dried, dark slate in the silt.
+        let g = noise(world.xz * 1.8 + vec2<f32>(world.y * 2.0, 0.7));
+        let wet = noise(world.xz * 5.0 + vec2<f32>(3.0, world.y));
+        let cobble = mix(vec3<f32>(0.28, 0.24, 0.18), vec3<f32>(0.42, 0.36, 0.28), g);
+        let slate = vec3<f32>(0.15, 0.12, 0.10);
+        let mud = vec3<f32>(0.07, 0.034, 0.016);
+        let stone = mix(cobble, slate, smoothstep(0.32, 0.78, wet));
+        return vec4<f32>(mix(stone, mud, 0.1 + wet * 0.28), mix(0.1, 0.3, wet));
     } else if (panel < 43.5) {
-        return vec4<f32>(vec3<f32>(0.032, 0.048, 0.020), 0.92);
+        // Reed bed. uv.y is base→tip, uv.x picks green blades against straw.
+        let tip = clamp(uv.y, 0.0, 1.0);
+        let green = mix(vec3<f32>(0.05, 0.18, 0.03), vec3<f32>(0.18, 0.34, 0.055), tip);
+        let straw = mix(vec3<f32>(0.24, 0.15, 0.04), vec3<f32>(0.55, 0.36, 0.09), tip);
+        let stalk = mix(green, straw, smoothstep(0.12, 0.42, uv.x));
+        let plume = mix(stalk, vec3<f32>(0.68, 0.46, 0.13), smoothstep(0.62, 0.94, tip));
+        let g = noise(world.xz * 4.0 + vec2<f32>(world.y * 6.0, uv.x * 3.0));
+        return vec4<f32>(plume * (0.78 + g * 0.36), 0.68);
     } else if (panel < 44.5) {
         let g = noise(world.xz * 0.9 + vec2<f32>(world.y, 0.2));
         let h = clamp((world.y - 1.0) / 3.2, 0.0, 1.0);
@@ -622,6 +636,11 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        // Puddle shore. Warm wet silt, lighter than the track and still glossy.
+        let g = noise(world.xz * 1.4 + vec2<f32>(0.4, world.y));
+        let col = mix(vec3<f32>(0.12, 0.065, 0.028), vec3<f32>(0.22, 0.13, 0.055), g);
+        return vec4<f32>(col, mix(0.12, 0.28, g));
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -690,6 +709,17 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
+    // Sky fill turns a wet cobble blue. Keep the bank in the silt colors of the stills.
+    if (in.panel > 41.5 && in.panel < 43.5) {
+        lit = vec3<f32>(lit.r * 1.04, lit.g * 0.94, lit.b * 0.58);
+    } else if (in.panel > 46.5 && in.panel < 47.5) {
+        lit = vec3<f32>(lit.r * 1.06, lit.g * 0.92, lit.b * 0.52);
+        let n = normalize(nrm);
+        let sun = normalize(frame.sun_dir.xyz);
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let glint = pow(clamp(dot(n, normalize(sun + view)), 0.0, 1.0), 32.0);
+        lit += vec3<f32>(0.14, 0.07, 0.025) * glint;
+    }
     // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
     if (in.panel > 45.5 && in.panel < 46.5) {
         var n = normalize(nrm);
