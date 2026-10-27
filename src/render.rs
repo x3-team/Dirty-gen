@@ -17,6 +17,7 @@ use silt::world::{CameraPose, World};
 use crate::cockpit_mesh;
 use crate::debris_mesh::debris_mesh;
 use crate::dust_draw::dust_billboards;
+use crate::exhaust_pass::ExhaustPass;
 use crate::mesh::{
     bank_mesh, environment_mesh, mud_chunks, terrain_mesh, CpuMesh, MeshVertex, ParticleVertex,
     TerrainVertex,
@@ -131,6 +132,7 @@ pub struct Renderer {
     height_bytes: Vec<u8>,
     height_packed: bool,
     depth_format: wgpu::TextureFormat,
+    exhaust_fx: ExhaustPass,
 }
 
 pub struct GpuFormats {
@@ -674,6 +676,7 @@ impl Renderer {
             None,
         );
         let lens = crate::lens_pass::LensPass::new(&device, color_format, formats.depth);
+        let exhaust_fx = ExhaustPass::new(&device, width, height, formats.depth);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -847,6 +850,7 @@ impl Renderer {
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
             height_packed: formats.height_packed,
             depth_format: formats.depth,
+            exhaust_fx,
         }
     }
 
@@ -893,6 +897,7 @@ impl Renderer {
         self.depth_view = depth_view;
         self.readback = readback;
         self.padded_row = padded_row;
+        self.exhaust_fx.resize(&self.device, width, height);
         let nearest = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -1119,6 +1124,43 @@ impl Renderer {
                 pass.draw(0..dust_count, 0..1);
             }
             self.draw_debris(&mut pass, debris_count);
+        }
+
+        self.exhaust_fx.draw(
+            &mut encoder,
+            &self.queue,
+            &self.color,
+            &self.color_view,
+            &self.depth_view,
+            &world.exhaust,
+            view_proj,
+            cam.eye,
+            cam.target,
+            self.width,
+            self.height,
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lens"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
             let aspect = self.width as f32 / self.height.max(1) as f32;
             self.lens
                 .composite(&mut pass, &self.queue, world, &cam, aspect, self.show_lens);

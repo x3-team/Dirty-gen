@@ -6,6 +6,7 @@ use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::body_damage::BodyDamage;
 use crate::debris::Debris;
 use crate::dust::Dust;
+use crate::exhaust::{Exhaust, Tailpipe};
 use crate::particles::Particles;
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
@@ -68,6 +69,7 @@ pub struct World {
     pub particles: Particles,
     pub dust: Dust,
     pub debris: Debris,
+    pub exhaust: Exhaust,
     pub time: f32,
     pub telemetry: Telemetry,
     pub damage: BodyDamage,
@@ -141,6 +143,7 @@ impl World {
             particles: Particles::new(),
             dust: Dust::new(),
             debris: Debris::new(),
+            exhaust: Exhaust::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -161,6 +164,7 @@ impl World {
         world.particles.clear();
         world.dust.clear();
         world.debris.clear();
+        world.exhaust.clear();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -181,6 +185,7 @@ impl World {
             particles: Particles::new(),
             dust: Dust::new(),
             debris: Debris::new(),
+            exhaust: Exhaust::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -203,6 +208,7 @@ impl World {
         world.particles.clear();
         world.dust.clear();
         world.debris.clear();
+        world.exhaust.clear();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -224,12 +230,16 @@ impl World {
         for _ in 0..substeps {
             self.substep(h, input);
         }
+        self.exhaust
+            .hook_tailpipe(Tailpipe::buggy(&self.vehicle), input.throttle, dt);
+        self.exhaust.sim(dt);
         self.time += dt;
     }
 
     /// Integrate the bike only. Does not advance `time`, water, or particles.
     /// Call it before [`step`](Self::step) so the buggy path tests stay put
-    /// and the shared particle step still runs once.
+    /// and the shared particle step still runs once. Tailpipe smoke for the
+    /// bike is emitted here and carried by that same `step`.
     pub fn step_bike(&mut self, dt: f32, input: &Input) {
         let substeps = 2;
         let h = dt / substeps as f32;
@@ -266,6 +276,8 @@ impl World {
                 .note_flight(&mut self.soil, &mut self.particles, planted, h);
             self.bike.integrate(&contacts, h);
         }
+        self.exhaust
+            .hook_tailpipe(Tailpipe::bike(&self.bike), input.throttle, dt);
     }
 
     fn substep(&mut self, dt: f32, input: &Input) {

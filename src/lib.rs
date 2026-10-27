@@ -9,6 +9,7 @@ pub mod body_damage;
 pub mod cockpit;
 pub mod debris;
 pub mod dust;
+pub mod exhaust;
 pub mod lap;
 pub mod lens;
 pub mod particles;
