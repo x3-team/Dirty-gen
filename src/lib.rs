@@ -7,6 +7,7 @@
 pub mod bike;
 pub mod body_damage;
 pub mod cockpit;
+pub mod contact;
 pub mod debris;
 pub mod dust;
 pub mod exhaust;

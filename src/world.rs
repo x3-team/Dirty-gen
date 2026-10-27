@@ -218,6 +218,13 @@ impl World {
         world
     }
 
+    fn resolve_chassis_contacts(&mut self) {
+        let mut bodies = [self.vehicle.contact_body(), self.bike.contact_body()];
+        crate::contact::solve(&mut bodies);
+        self.vehicle.apply_contact_body(&bodies[0]);
+        self.bike.apply_contact_body(&bodies[1]);
+    }
+
     fn place_on_soil(&mut self) {
         let sample = self.soil.sample(self.vehicle.pos.x, self.vehicle.pos.z);
         // CG about half a metre above undisturbed ground before the springs settle.
@@ -275,6 +282,7 @@ impl World {
             self.bike
                 .note_flight(&mut self.soil, &mut self.particles, planted, h);
             self.bike.integrate(&contacts, h);
+            self.resolve_chassis_contacts();
         }
         self.exhaust
             .hook_tailpipe(Tailpipe::bike(&self.bike), input.throttle, dt);
@@ -328,6 +336,7 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
+        self.resolve_chassis_contacts();
         self.debris.step(&self.vehicle, &contacts, &self.soil, dt);
 
         let speed = self.vehicle.speed();
@@ -571,7 +580,8 @@ pub fn demo_drive(world: &World) -> Input {
     )
 }
 
-/// Same loop as the buggy, one tyre-width inside it, so the two stay side by side.
+/// Same loop as the buggy, one lane outside it. The inside line meets the
+/// buggy where it bogs after the lip.
 pub fn demo_drive_bike(world: &World) -> Input {
     chase_line(
         world.time,
@@ -579,7 +589,7 @@ pub fn demo_drive_bike(world: &World) -> Input {
         world.bike.yaw,
         world.bike.speed(),
         &world.soil,
-        -0.55,
+        1.15,
     )
 }
 
@@ -603,7 +613,17 @@ fn chase_line(
     // The scripted lap was riding the outside berm and missing the lip.
     // Aim at the lip until the car is on it. The player gets the same crest.
     let aim_lip = pos.x < -1.0 && (-6.3..2.4).contains(&pos.z);
-    let desired = if pos.x < -2.2 && (-4.2..2.4).contains(&pos.z) {
+    // The bike rides the outside lane. It still has to cross this lip, which
+    // the buggy then blocks by bogging in the puddle. Merge onto the kicker,
+    // nose outward while the tyres are planted, and the jump lands clear.
+    let bike_lane = lane_bias.abs() > 0.2;
+    let merging = bike_lane && pos.z < 0.15 && pos.x > -6.15 && pos.x < -1.0;
+    let nose_out = bike_lane && pos.x < -5.70 && (-0.25..1.70).contains(&pos.z);
+    let desired = if nose_out {
+        -0.55
+    } else if merging {
+        ((-6.45 - pos.x) * 0.42).clamp(-0.85, 0.15)
+    } else if pos.x < -2.2 && (-4.2..2.4).contains(&pos.z) {
         // Due north on the straight. A point ahead and to the west kept the
         // nose pointed off the puddle, so the landing missed the water.
         ((-6.35 - pos.x) * 0.28).clamp(-0.42, 0.42)
@@ -614,7 +634,7 @@ fn chase_line(
     };
     let mut err = wrap_pi(desired - yaw);
     // Positive offset is outside the loop (left of the clockwise heading).
-    if !aim_lip {
+    if !aim_lip && !nose_out && !merging {
         err += ((off - lane_bias) * 0.22).clamp(-0.55, 0.55);
     }
     let steer = (err / if aim_lip { 0.36 } else { 0.30 }).clamp(-1.0, 1.0);

@@ -114,6 +114,8 @@ pub struct Vehicle {
     pub panels: [PanelMud; PANEL_COUNT],
     /// Seconds of free flight after the crest. A clipping tire must not erase the launch.
     pub jump_hold: f32,
+    /// Seconds after a chassis hit during which the upright assist stays soft.
+    pub collision_loose: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +153,7 @@ impl Vehicle {
             wheels: [Wheel::default(); 4],
             panels: [PanelMud::default(); PANEL_COUNT],
             jump_hold: 0.0,
+            collision_loose: 0.0,
         }
     }
 
@@ -186,6 +189,51 @@ impl Vehicle {
         let hp = hardpoints()[index];
         let c = self.wheels[index].compression;
         Vec3::new(hp.x, hp.y - REST_LEN + c, hp.z)
+    }
+
+    /// Chassis box plus a box for each tire. The contact solver does not own the mud model.
+    pub fn contact_body(&self) -> crate::contact::Body {
+        let mut body = crate::contact::Body::kinematic(
+            self.pos,
+            self.vel,
+            self.yaw,
+            self.pitch,
+            self.roll,
+            self.pitch_rate,
+            self.yaw_rate,
+            self.roll_rate,
+            MASS,
+            Vec3::new(1.0 / I_PITCH, 1.0 / I_YAW, 1.0 / I_ROLL),
+            self.collision_loose,
+        );
+        body.push_shape(crate::contact::Shape::cube(
+            Vec3::new(0.0, 0.22, -0.02),
+            Vec3::new(0.40, 0.62, 1.46),
+            0.0,
+        ));
+        for (i, wheel) in self.wheels.iter().enumerate() {
+            body.push_shape(crate::contact::Shape::cube(
+                self.wheel_center_local(i),
+                Vec3::new(WHEEL_WIDTH * 0.5, WHEEL_RADIUS, WHEEL_RADIUS),
+                wheel.steer,
+            ));
+        }
+        body
+    }
+
+    pub fn apply_contact_body(&mut self, body: &crate::contact::Body) {
+        if !body.pos.is_finite() || !body.vel.is_finite() {
+            return;
+        }
+        self.pos = body.pos;
+        self.vel = body.vel;
+        self.yaw = body.yaw;
+        self.pitch = body.pitch;
+        self.roll = body.roll;
+        self.pitch_rate = body.pitch_rate;
+        self.yaw_rate = body.yaw_rate;
+        self.roll_rate = body.roll_rate;
+        self.collision_loose = body.loosen.max(0.0);
     }
 
     pub fn update_steer(&mut self, steer: f32, dt: f32) {
@@ -373,6 +421,10 @@ impl Vehicle {
     }
 
     pub fn integrate(&mut self, contacts: &[Contact; 4], soil: &SoilField, dt: f32) {
+        let loose = self.collision_loose > 0.0;
+        if self.collision_loose > 0.0 {
+            self.collision_loose = (self.collision_loose - dt).max(0.0);
+        }
         let ori = self.orientation();
         let mut force = Vec3::new(0.0, -MASS * 9.81, 0.0);
         let mut torque_local = Vec3::ZERO;
@@ -417,6 +469,7 @@ impl Vehicle {
             !held && on_launch_crest(self.pos.x, self.pos.z) && slope > 0.16 && planted >= 2;
         let airborne = held || planted == 0;
         let tumbling = self.pitch.abs() > 0.72 || self.roll.abs() > 0.78;
+        let tipped = tumbling || loose;
         let ang_world = ori * Vec3::new(self.pitch_rate, self.yaw_rate, self.roll_rate);
         if !climbing && !airborne {
             for (i, hp) in hardpoints().into_iter().enumerate() {
@@ -443,12 +496,14 @@ impl Vehicle {
             torque_local.x += (target - self.pitch) * 2_800.0;
             torque_local.x -= 70.0 * self.pitch_rate;
             torque_local.z -= 360.0 * self.roll_rate;
-        } else if tumbling {
+        } else if tipped {
             force.y += -800.0 * self.vel.y;
-            torque_local.x -= wrap_angle(self.pitch) * 3_400.0;
-            torque_local.z -= wrap_angle(self.roll) * 3_400.0;
-            torque_local.x -= 260.0 * self.pitch_rate;
-            torque_local.z -= 260.0 * self.roll_rate;
+            let hold = if loose { 0.18 } else { 1.0 };
+            let damp = if loose { 80.0 } else { 260.0 };
+            torque_local.x -= wrap_angle(self.pitch) * 3_400.0 * hold;
+            torque_local.z -= wrap_angle(self.roll) * 3_400.0 * hold;
+            torque_local.x -= damp * self.pitch_rate;
+            torque_local.z -= damp * self.roll_rate;
         } else {
             force.y += -4_500.0 * self.vel.y;
             if self.roll.abs() > 0.42 {
@@ -460,7 +515,8 @@ impl Vehicle {
             torque_local.x -= 900.0 * self.pitch_rate;
             torque_local.z -= 750.0 * self.roll_rate;
         }
-        torque_local.y -= 180.0 * self.yaw_rate;
+        let yaw_damp = if loose { 40.0 } else { 180.0 };
+        torque_local.y -= yaw_damp * self.yaw_rate;
 
         self.vel += (force / MASS) * dt;
         if airborne || climbing {
@@ -479,16 +535,21 @@ impl Vehicle {
         }
         self.pos += self.vel * dt;
 
-        self.yaw_rate = (self.yaw_rate + torque_local.y / I_YAW * dt).clamp(-1.6, 1.6);
+        let yaw_lim = if loose { 5.5 } else { 1.6 };
+        self.yaw_rate = (self.yaw_rate + torque_local.y / I_YAW * dt).clamp(-yaw_lim, yaw_lim);
         self.yaw += self.yaw_rate * dt;
         if airborne {
             self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-8.0, 8.0);
             self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-6.0, 6.0);
             self.pitch = wrap_angle(self.pitch + self.pitch_rate * dt);
             self.roll = wrap_angle(self.roll + self.roll_rate * dt);
-        } else if climbing || tumbling {
-            self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-6.0, 6.0);
-            self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-4.0, 4.0);
+        } else if climbing || tipped {
+            let pitch_lim = if loose { 8.0 } else { 6.0 };
+            let roll_lim = if loose { 6.0 } else { 4.0 };
+            self.pitch_rate =
+                (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-pitch_lim, pitch_lim);
+            self.roll_rate =
+                (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-roll_lim, roll_lim);
             self.pitch = wrap_angle(self.pitch + self.pitch_rate * dt);
             self.roll = wrap_angle(self.roll + self.roll_rate * dt);
         } else {
