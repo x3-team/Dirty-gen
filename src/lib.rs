@@ -7,6 +7,7 @@
 pub mod bike;
 pub mod particles;
 pub mod soil;
+pub mod ui;
 pub mod vehicle;
 pub mod world;
 
