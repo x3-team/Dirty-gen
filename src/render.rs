@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
-use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::bike::{Bike, BIKE_RADIUS};
+use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
@@ -81,6 +81,7 @@ pub struct Renderer {
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
+    dressing: Option<GpuMesh>,
     susp_v: wgpu::Buffer,
     susp_i: wgpu::Buffer,
     bike_susp_v: wgpu::Buffer,
@@ -97,6 +98,8 @@ pub struct Renderer {
     pipe_particle: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
+    pipe_dressing: wgpu::RenderPipeline,
+    pipe_shadow_dressing: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
@@ -609,6 +612,34 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_dressing = pipeline(
+            &device,
+            &shader,
+            mesh_layout_ref,
+            "vs_dressing",
+            Some("fs_mesh"),
+            mesh_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_shadow_dressing = pipeline(
+            &device,
+            &shader,
+            &shadow_layout,
+            "vs_shadow_dressing",
+            Some("fs_shadow"),
+            mesh_buffers(),
+            color_format,
+            Some(shadow_depth_state(formats.depth)),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_blit = pipeline(
             &device,
             &blit_shader,
@@ -727,6 +758,7 @@ impl Renderer {
             wheel,
             bike_body,
             env,
+            dressing: None,
             susp_v,
             susp_i,
             bike_susp_v,
@@ -741,6 +773,8 @@ impl Renderer {
             pipe_particle,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
+            pipe_dressing,
+            pipe_shadow_dressing,
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
@@ -829,6 +863,7 @@ impl Renderer {
         readback: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
+        self.ensure_dressing(&world.soil);
         let susp = suspension_mesh(&world.vehicle);
         let susp_index_count = susp.indices.len() as u32;
         self.queue
@@ -837,10 +872,16 @@ impl Renderer {
             .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.bike_susp_v, 0, bytemuck::cast_slice(&bike_susp.vertices));
-        self.queue
-            .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
+        self.queue.write_buffer(
+            &self.bike_susp_v,
+            0,
+            bytemuck::cast_slice(&bike_susp.vertices),
+        );
+        self.queue.write_buffer(
+            &self.bike_susp_i,
+            0,
+            bytemuck::cast_slice(&bike_susp.indices),
+        );
 
         let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
         let aspect = self.width as f32 / self.height as f32;
@@ -929,8 +970,12 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[0]);
             pass.set_pipeline(&self.pipe_shadow_terrain);
             draw_indexed(&mut pass, &self.terrain);
-            pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            if let Some(dressing) = &self.dressing {
+                pass.set_pipeline(&self.pipe_shadow_dressing);
+                draw_indexed(&mut pass, dressing);
+            }
+            pass.set_pipeline(&self.pipe_shadow_mesh);
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
             self.draw_bike(&mut pass, bike_susp_count);
@@ -976,6 +1021,14 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
+
+            // After the sheet, so a crown shows through the film. Terrain depth
+            // already covers the half that sits in the mud.
+            if let Some(dressing) = &self.dressing {
+                pass.set_pipeline(&self.pipe_dressing);
+                pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+                draw_indexed(&mut pass, dressing);
+            }
 
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
@@ -1211,6 +1264,29 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
         pass.set_index_buffer(self.bike_susp_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..susp_indices, 0, 0..1);
+    }
+
+    fn ensure_dressing(&mut self, soil: &SoilField) {
+        if self.dressing.is_some() {
+            return;
+        }
+        let src = silt::dressing::dressing_mesh(soil);
+        let vertices: Vec<MeshVertex> = src
+            .vertices
+            .iter()
+            .map(|v| MeshVertex {
+                pos: v.pos,
+                nrm: v.nrm,
+                uv: v.uv,
+                panel: v.panel,
+            })
+            .collect();
+        self.dressing = Some(upload_mesh(
+            &self.device,
+            &vertices,
+            &src.indices,
+            "dressing",
+        ));
     }
 
     fn draw_chunks(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {

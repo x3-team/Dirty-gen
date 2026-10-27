@@ -533,6 +533,38 @@ fn vs_mesh(in: MeshIn) -> MeshOut {
     return o;
 }
 
+// y = 0 in the dressing mesh is the heightfield. Seat on the bed under the
+// vertex, then push 18 mm in so the mud line cuts the body.
+fn dress_seated(pos: vec3<f32>) -> vec3<f32> {
+    let placed = model.world * vec4<f32>(pos, 1.0);
+    let h = height_bilinear(placed.xz);
+    return vec3<f32>(placed.x, placed.y + h - 0.018, placed.z);
+}
+
+fn dress_nrm(n: vec3<f32>, center_xz: vec2<f32>) -> vec3<f32> {
+    let c = (model.world * vec4<f32>(center_xz.x, 0.0, center_xz.y, 1.0)).xz;
+    let e = max(frame.params.z * 0.55, 0.1);
+    let h = height_bilinear(c);
+    let hx = height_bilinear(c + vec2<f32>(e, 0.0));
+    let hz = height_bilinear(c + vec2<f32>(0.0, e));
+    let sx = clamp((hx - h) / e, -0.9, 0.9);
+    let sz = clamp((hz - h) / e, -0.9, 0.9);
+    let wn = normalize((model.world * vec4<f32>(n, 0.0)).xyz);
+    return normalize(wn + vec3<f32>(-sx, 0.0, -sz));
+}
+
+@vertex
+fn vs_dressing(in: MeshIn) -> MeshOut {
+    let world = dress_seated(in.pos);
+    var o: MeshOut;
+    o.clip = frame.view_proj * vec4<f32>(world, 1.0);
+    o.world = world;
+    o.nrm = dress_nrm(in.nrm, in.uv);
+    o.uv = in.uv;
+    o.panel = in.panel;
+    return o;
+}
+
 struct ShadowOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) depth: f32,
@@ -553,6 +585,16 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
 fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
     let world = model.world * vec4<f32>(in.pos, 1.0);
     let clip = frame.light_vp * world;
+    var o: ShadowOut;
+    o.clip = clip;
+    o.depth = clip.z / max(clip.w, 1e-5);
+    return o;
+}
+
+@vertex
+fn vs_shadow_dressing(in: MeshIn) -> ShadowOut {
+    let world = dress_seated(in.pos);
+    let clip = frame.light_vp * vec4<f32>(world, 1.0);
     var o: ShadowOut;
     o.clip = clip;
     o.depth = clip.z / max(clip.w, 1e-5);
@@ -622,12 +664,31 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        // Pebble. Cooler than the soil so a facet reads as stone.
+        let g = noise(world.xz * 1.6) * 0.65 + noise(world.xz * 7.0 + vec2<f32>(world.y * 5.0, 0.2)) * 0.35;
+        let tone = mix(vec3<f32>(0.16, 0.145, 0.12), vec3<f32>(0.26, 0.23, 0.19), g);
+        return vec4<f32>(tone, 0.58);
+    } else if (panel < 48.5) {
+        // Dried clod. Tan crust, matte. Not the wet splash on panel 46.
+        let g = noise(world.xz * 1.4) * 0.6 + noise(world.xz * 5.5 + vec2<f32>(world.y * 3.0, 1.0)) * 0.4;
+        let tone = mix(vec3<f32>(0.15, 0.072, 0.028), vec3<f32>(0.24, 0.125, 0.046), g);
+        return vec4<f32>(tone, 0.92);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
 
 @fragment
 fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
+    // Pebbles and dried clods. The water sheet is drawn first; this hides the
+    // belly that sits under the film and leaves the crown.
+    if (in.panel > 46.5 && in.panel < 48.5) {
+        let bed = height_bilinear(in.world.xz);
+        let depth = mat_bilinear(in.world.xz).g * 0.34;
+        if (depth > 0.018 && in.world.y < bed + depth * 0.72) {
+            discard;
+        }
+    }
     let panel = i32(in.panel + 0.5);
     var paint = panel_paint(in.panel, in.uv, in.world);
     var albedo = paint.rgb;
@@ -687,6 +748,12 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         albedo = vec3<f32>(1.0, 0.95, 0.7);
     } else if (in.panel > 16.5 && in.panel < 17.5) {
         emit = vec3<f32>(0.9, 0.02, 0.01);
+    }
+
+    if (in.panel > 46.5 && in.panel < 48.5) {
+        // The part pressed into the mud goes dark, so the crown is the stone.
+        let cavity = smoothstep(0.4, -0.25, normalize(nrm).y);
+        albedo = mix(albedo, albedo * vec3<f32>(0.42, 0.32, 0.24), cavity);
     }
 
     var lit = shade(in.world, nrm, albedo, rough, emit);

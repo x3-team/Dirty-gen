@@ -37,11 +37,13 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
-            let rest: Vec<String> = args.collect();
-            capture(&rest);
-        } else {
-            run_window();
+        match args.next().as_deref() {
+            Some("capture") => {
+                let rest: Vec<String> = args.collect();
+                capture(&rest);
+            }
+            Some("stones") => capture_stones(),
+            _ => run_window(),
         }
     }
 }
@@ -434,6 +436,90 @@ struct CaptureArgs {
     still_start: PathBuf,
     still_puddle: PathBuf,
     still_ruts: PathBuf,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_stones() {
+    prepare_software_vulkan();
+    let (_instance, adapter, device, queue) = open_adapter(true, None);
+    let formats = render::gpu_formats(&adapter);
+    let width = 1280u32;
+    let height = 720u32;
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let world = World::demo();
+    let shore = silt::dressing::west_puddle_shore(&world.soil);
+    let berm = silt::dressing::west_berm(&world.soil);
+    let shots = [
+        (
+            "shore",
+            shore_pose(&world, shore),
+            PathBuf::from(format!("{MEDIA}/mud-stones-shore.png")),
+        ),
+        (
+            "berm",
+            berm_pose(&world, berm),
+            PathBuf::from(format!("{MEDIA}/mud-stones-berm.png")),
+        ),
+    ];
+    println!(
+        "stones {}  shore ({:.2},{:.2}) berm ({:.2},{:.2})",
+        silt::dressing::scatter(&world.soil).len(),
+        shore.0,
+        shore.1,
+        berm.0,
+        berm.1
+    );
+    for (name, pose, path) in shots {
+        let pose = lift_camera(&world, pose);
+        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        write_png(&path, width, height, &rgba).expect("still");
+        println!(
+            "still {name} {}  eye ({:.2},{:.2},{:.2}) target ({:.2},{:.2},{:.2})",
+            path.display(),
+            pose.eye.x,
+            pose.eye.y,
+            pose.eye.z,
+            pose.target.x,
+            pose.target.y,
+            pose.target.z
+        );
+    }
+}
+
+/// Down onto the west puddle bank. The outer face points away from the sun,
+/// so a camera sat in it only sees a black slope.
+#[cfg(not(target_arch = "wasm32"))]
+fn shore_pose(world: &World, anchor: (f32, f32)) -> CameraPose {
+    let h = world.soil.sample(anchor.0, anchor.1).height;
+    let target = Vec3::new(anchor.0, h + 0.02, anchor.1);
+    let out = Vec3::new(anchor.0 + 6.15, 0.0, anchor.1 - 5.05).normalize_or_zero();
+    let side = Vec3::new(-out.z, 0.0, out.x);
+    let eye = target + out * 0.55 + side * 2.65 + Vec3::Y * 2.45;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+/// From the lane, looking down onto the lit face of the west berm.
+#[cfg(not(target_arch = "wasm32"))]
+fn berm_pose(world: &World, anchor: (f32, f32)) -> CameraPose {
+    let h = world.soil.sample(anchor.0, anchor.1).height;
+    let target = Vec3::new(anchor.0, h + 0.04, anchor.1);
+    let eye = target + Vec3::new(2.15, 2.05, -2.05);
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
