@@ -274,17 +274,18 @@ impl App {
             self.world.step(step, &buggy_input);
             self.acc -= step;
         }
-        let driven_speed = if self.drive_bike {
-            self.world.bike.speed()
+        let heard = if self.drive_bike {
+            if self.player_drove {
+                self.keys.input(self.world.bike.speed())
+            } else {
+                demo_drive_bike(&self.world)
+            }
+        } else if self.player_drove {
+            self.keys.input(self.world.vehicle.speed())
         } else {
-            self.world.vehicle.speed()
+            demo_drive(&self.world)
         };
-        silt::audio::tick(
-            &self.world,
-            dt,
-            self.drive_bike,
-            self.keys.input(driven_speed).throttle,
-        );
+        silt::audio::tick(&self.world, dt, self.drive_bike, heard.throttle);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
