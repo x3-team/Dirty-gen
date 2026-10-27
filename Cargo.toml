@@ -23,6 +23,22 @@ winit = "0.30"
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["console", "Document", "Element", "HtmlCanvasElement", "Location", "Window"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Location",
+    "Window",
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioBuffer",
+    "AudioNode",
+    "AudioProcessingEvent",
+    "BaseAudioContext",
+    "ScriptProcessorNode",
+    "EventTarget",
+] }
 web-time = "1"
 wgpu = { version = "23", features = ["webgl"] }
