@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod exhaust_pass;
 mod mesh;
 mod render;
 
@@ -434,6 +435,7 @@ struct CaptureArgs {
     still_start: PathBuf,
     still_puddle: PathBuf,
     still_ruts: PathBuf,
+    exhaust_stills: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -452,6 +454,10 @@ fn capture(args: &[String]) {
         parsed.height,
         formats,
     );
+    if parsed.exhaust_stills {
+        write_exhaust_stills(&mut renderer, parsed.width, parsed.height);
+        return;
+    }
     let mut world = World::demo();
     let frames = (parsed.seconds * parsed.fps as f32).round() as u32;
     let steps = (60.0 / parsed.fps as f32).round().max(1.0) as u32;
@@ -588,6 +594,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
     let mut still_ruts = PathBuf::from(format!("{MEDIA}/mud-demo-ruts.png"));
+    let mut exhaust_stills = false;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -608,6 +615,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--still-start" => still_start = PathBuf::from(val(&mut i)),
             "--still-puddle" => still_puddle = PathBuf::from(val(&mut i)),
             "--still-ruts" => still_ruts = PathBuf::from(val(&mut i)),
+            "--exhaust-stills" => exhaust_stills = true,
             other => panic!("unknown capture flag {other}"),
         }
         i += 1;
@@ -624,7 +632,72 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         still_start,
         still_puddle,
         still_ruts,
+        exhaust_stills,
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exhaust_cam(outlet: Vec3, forward: Vec3, rear: bool) -> CameraPose {
+    let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+    let right = Vec3::new(forward.z, 0.0, -forward.x);
+    let focus = outlet + Vec3::Y * 0.12;
+    let eye = if rear {
+        outlet - forward * 2.15 + Vec3::Y * 0.62 + right * 0.28
+    } else {
+        outlet + right * 1.85 + Vec3::Y * 0.38 - forward * 0.15
+    };
+    CameraPose {
+        eye,
+        target: focus,
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_exhaust_stills(renderer: &mut Renderer, width: u32, height: u32) {
+    let mut world = World::demo();
+    let dt = 1.0 / 60.0;
+    for _ in 0..120 {
+        let bike = demo_drive_bike(&world);
+        world.step_bike(dt, &bike);
+        let input = demo_drive(&world);
+        world.step(dt, &input);
+    }
+    let shots = [
+        ("buggy-side", false, false),
+        ("buggy-rear", false, true),
+        ("bike-side", true, false),
+        ("bike-rear", true, true),
+    ];
+    for (name, bike, rear) in shots {
+        let (outlet, forward) = if bike {
+            let pipe = silt::exhaust::Tailpipe::bike(&world.bike);
+            (pipe.outlets()[0], world.bike.forward())
+        } else {
+            let pipe = silt::exhaust::Tailpipe::buggy(&world.vehicle);
+            let mid = (pipe.outlets()[0] + pipe.outlets()[1]) * 0.5;
+            (mid, world.vehicle.forward())
+        };
+        let pose = lift_camera(&world, exhaust_cam(outlet, forward, rear));
+        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        let path = PathBuf::from(format!("/tmp/exhaust-{name}.png"));
+        write_png(&path, width, height, &rgba).expect("exhaust still");
+        println!(
+            "exhaust still {} smoke {} plumes buggy {:.2} bike {:.2}",
+            path.display(),
+            world.exhaust.alive_count(),
+            world.exhaust.plumes()[0].strength,
+            world.exhaust.plumes()[2].strength,
+        );
+    }
+    let pose = lift_camera(
+        &world,
+        demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
+    );
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    let path = PathBuf::from("/tmp/exhaust-overview.png");
+    write_png(&path, width, height, &rgba).expect("overview");
+    println!("exhaust still {}", path.display());
 }
 
 #[cfg(target_arch = "wasm32")]

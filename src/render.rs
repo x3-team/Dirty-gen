@@ -10,6 +10,7 @@ use silt::bike::{Bike, BIKE_RADIUS};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
+use crate::exhaust_pass::ExhaustPass;
 use crate::mesh::{
     bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
     terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
@@ -107,6 +108,7 @@ pub struct Renderer {
     height_bytes: Vec<u8>,
     height_packed: bool,
     depth_format: wgpu::TextureFormat,
+    exhaust_fx: ExhaustPass,
 }
 
 pub struct GpuFormats {
@@ -633,6 +635,7 @@ impl Renderer {
             false,
             None,
         );
+        let exhaust_fx = ExhaustPass::new(&device, width, height, formats.depth);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -751,6 +754,7 @@ impl Renderer {
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
             height_packed: formats.height_packed,
             depth_format: formats.depth,
+            exhaust_fx,
         }
     }
 
@@ -797,6 +801,7 @@ impl Renderer {
         self.depth_view = depth_view;
         self.readback = readback;
         self.padded_row = padded_row;
+        self.exhaust_fx.resize(&self.device, width, height);
         let nearest = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -980,6 +985,20 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
+
+        self.exhaust_fx.draw(
+            &mut encoder,
+            &self.queue,
+            &self.color,
+            &self.color_view,
+            &self.depth_view,
+            &world.exhaust,
+            view_proj,
+            cam.eye,
+            cam.target,
+            self.width,
+            self.height,
+        );
 
         if let Some((view, srgb)) = present {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
