@@ -92,6 +92,7 @@ pub struct Renderer {
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
+    height_scratch: Vec<f32>,
 }
 
 pub fn prepare_software_vulkan() {
@@ -293,7 +294,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
+            format: wgpu::TextureFormat::Rg32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -600,6 +601,7 @@ impl Renderer {
             blit_shader,
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
+            height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
         }
     }
 
@@ -886,9 +888,11 @@ impl Renderer {
             height: res,
             depth_or_array_layers: 1,
         };
-        // The picture of the rut. The solver height stays on the CPU so the
-        // tests still measure the real plastic sinkage.
-        let (shown, shown_darken) = display_track(soil);
+        for (i, px) in self.height_scratch.chunks_exact_mut(2).enumerate() {
+            px[0] = soil.height[i];
+            // Current height minus the surface the stamp started from.
+            px[1] = soil.height[i] - soil.initial_height[i];
+        }
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.height_tex,
@@ -896,10 +900,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&shown),
+            bytemuck::cast_slice(&self.height_scratch),
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(res * 4),
+                bytes_per_row: Some(res * 8),
                 rows_per_image: Some(res),
             },
             extent,
@@ -907,7 +911,7 @@ impl Renderer {
         for (i, px) in self.mat_scratch.chunks_exact_mut(4).enumerate() {
             px[0] = (soil.wetness[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[1] = ((soil.water[i] / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
-            px[2] = (shown_darken[i].clamp(0.0, 1.0) * 255.0) as u8;
+            px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = (soil.roughness[i].clamp(0.0, 1.0) * 255.0) as u8;
         }
         self.queue.write_texture(
@@ -968,85 +972,6 @@ impl Renderer {
         pass.set_index_buffer(self.susp_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..susp_indices, 0, 0..1);
     }
-}
-
-/// Picture of the two tire grooves. `soil.height` stays the plastic sinkage
-/// the tests measure. `darken` is the line the tires drove. A wide close of
-/// that mask turned the curve into one scar, and a blur that mixed the berm
-/// back into the floor erased the straight. Each tread stays narrow: fill a
-/// one-cell gap, blur a short way, drop the floor, lift the shoulder.
-fn display_track(soil: &SoilField) -> (Vec<f32>, Vec<f32>) {
-    let res = soil.res;
-    let n = soil.height.len();
-    let mut seed = vec![0.0f32; n];
-    for i in 0..n {
-        if soil.darken[i] > 0.48 {
-            seed[i] = 1.0;
-        }
-    }
-    // Two short blurs. A hard dilate stair-stepped into a ladder. The treads
-    // are about seven cells apart, and this kernel dies before the midpoint.
-    let soft = blur5(&blur5(&seed, res), res);
-    let mut delta = vec![0.0f32; n];
-    let mut dark = soil.darken.clone();
-    for i in 0..n {
-        let s = soft[i];
-        // Continuous in s. A hard cut between floor and berm was a cliff,
-        // and that cliff stair-stepped into a ladder along the curve.
-        let floor = smoothstep(0.11, 0.30, s);
-        let shoulder = smoothstep(0.02, 0.09, s) * (1.0 - smoothstep(0.09, 0.20, s));
-        delta[i] = -0.045 * floor + 0.10 * shoulder;
-        dark[i] = dark[i].max(0.22 + 0.72 * floor);
-    }
-    let mut h = soil.height.clone();
-    for i in 0..n {
-        h[i] += delta[i];
-    }
-    (h, dark)
-}
-
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn blur5(src: &[f32], res: usize) -> Vec<f32> {
-    let k = [1.0f32, 4.0, 6.0, 4.0, 1.0];
-    let mut tmp = vec![0.0f32; src.len()];
-    let mut out = vec![0.0f32; src.len()];
-    for j in 0..res {
-        for i in 0..res {
-            let mut acc = 0.0f32;
-            let mut w = 0.0f32;
-            for di in -2i32..=2 {
-                let ii = i as i32 + di;
-                if ii < 0 || ii >= res as i32 {
-                    continue;
-                }
-                let kw = k[(di + 2) as usize];
-                acc += src[j * res + ii as usize] * kw;
-                w += kw;
-            }
-            tmp[j * res + i] = acc / w;
-        }
-    }
-    for j in 0..res {
-        for i in 0..res {
-            let mut acc = 0.0f32;
-            let mut w = 0.0f32;
-            for dj in -2i32..=2 {
-                let jj = j as i32 + dj;
-                if jj < 0 || jj >= res as i32 {
-                    continue;
-                }
-                let kw = k[(dj + 2) as usize];
-                acc += tmp[jj as usize * res + i] * kw;
-                w += kw;
-            }
-            out[j * res + i] = acc / w;
-        }
-    }
-    out
 }
 
 fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {

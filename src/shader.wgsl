@@ -102,9 +102,9 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     }
     let dims = vec2<f32>(textureDimensions(shadow_tex));
     let base = vec2<i32>(uv * dims);
-    let ndl = clamp(dot(n, normalize(frame.sun_dir.xyz)), 0.0, 1.0);
-    // Tight bias so the buggy leaves a contact shadow and a rut wall can occlude itself.
-    let bias = 0.00040 + (1.0 - ndl) * 0.00095;
+    // Flat ground can shadow a few centimetres of rut. A wall keeps a larger bias.
+    let slope = clamp(1.0 - n.y, 0.0, 1.0);
+    let bias = 0.00004 + slope * 0.0011;
     var blocked = 0.0;
     for (var y: i32 = -1; y <= 1; y = y + 1) {
         for (var x: i32 = -1; x <= 1; x = x + 1) {
@@ -173,6 +173,13 @@ fn height_at(ij: vec2<i32>) -> f32 {
     return textureLoad(height_tex, c, 0).r;
 }
 
+// Metres the stamp added. Negative is soil the tire removed.
+fn stamp_at(ij: vec2<i32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(height_tex));
+    let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(height_tex, c, 0).g;
+}
+
 fn mat_at(ij: vec2<i32>) -> vec4<f32> {
     let dims = vec2<i32>(textureDimensions(mat_tex));
     let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
@@ -196,6 +203,18 @@ fn height_bilinear(xz: vec2<f32>) -> f32 {
     let h01 = height_at(i0 + vec2<i32>(0, 1));
     let h11 = height_at(i0 + vec2<i32>(1, 1));
     return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+fn stamp_bilinear(xz: vec2<f32>) -> f32 {
+    let ij = world_to_ij(xz);
+    let i = floor(ij);
+    let f = fract(ij);
+    let i0 = vec2<i32>(i);
+    let s00 = stamp_at(i0);
+    let s10 = stamp_at(i0 + vec2<i32>(1, 0));
+    let s01 = stamp_at(i0 + vec2<i32>(0, 1));
+    let s11 = stamp_at(i0 + vec2<i32>(1, 1));
+    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
 // Same samples as height_bilinear, but the step sits in a short wall.
@@ -229,16 +248,33 @@ fn mat_bilinear(xz: vec2<f32>) -> vec4<f32> {
 // Continuous slope of the real displaced height. Not the triangle normal,
 // which is constant across a 20 cm cell and flattens a 14 cm groove.
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
-    let e = max(frame.params.z * 0.45, 0.08);
+    // Short step. A wider sample flattens a tyre-width cut into the lane slope.
+    let e = max(frame.params.z * 0.28, 0.05);
     let h_l = height_bilinear(xz - vec2<f32>(e, 0.0));
     let h_r = height_bilinear(xz + vec2<f32>(e, 0.0));
     let h_d = height_bilinear(xz - vec2<f32>(0.0, e));
     let h_u = height_bilinear(xz + vec2<f32>(0.0, e));
     var n = normalize(vec3<f32>(h_l - h_r, e * 2.0, h_d - h_u));
+    // The berm's real slope stays as it is. Only the stamp's slope is tipped,
+    // so a centimetre wall catches the low sun without serrating the berm.
+    let se = max(frame.params.z * 0.7, 0.1);
+    let s_l = stamp_bilinear(xz - vec2<f32>(se, 0.0));
+    let s_r = stamp_bilinear(xz + vec2<f32>(se, 0.0));
+    let s_d = stamp_bilinear(xz - vec2<f32>(0.0, se));
+    let s_u = stamp_bilinear(xz + vec2<f32>(0.0, se));
+    let raw = vec3<f32>(s_l - s_r, 0.0, s_d - s_u);
+    let mag = length(raw);
+    // A centimetre of wall stays a shallow tilt. Millimetre noise does not
+    // become a cord, and a few centimetres does not become a cliff.
+    if (mag > 1e-4) {
+        let gain = min(4.0, 0.08 / mag);
+        n = normalize(n + raw * gain);
+    }
     let grit = noise(xz * 2.4);
     let grit_x = noise(xz * 2.4 + vec2<f32>(0.45, 0.0));
     let grit_z = noise(xz * 2.4 + vec2<f32>(0.0, 0.45));
-    n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * 0.10);
+    // Keep the grit under the slope of a centimetre-deep stamp.
+    n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * 0.035);
     return n;
 }
 
@@ -308,24 +344,28 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
     let soaked = vec3<f32>(0.04, 0.022, 0.012);
     var albedo = mix(dry, soaked, smoothstep(0.12, 0.88, wet));
-    // Driven cells are the floor of the groove. Dark, not a faint tint.
-    let driven = smoothstep(0.4, 0.78, darken);
-    albedo = mix(albedo, vec3<f32>(0.018, 0.01, 0.006), driven * 0.82);
+    // Compacted soil is a little darker. This is not the groove.
+    albedo *= mix(1.0, 0.86, smoothstep(0.25, 0.8, darken));
 
-    let reach = max(frame.params.z * 1.7, 0.22);
-    let avg = (
-        height_bilinear(xz + vec2<f32>(reach, 0.0))
-        + height_bilinear(xz - vec2<f32>(reach, 0.0))
-        + height_bilinear(xz + vec2<f32>(0.0, reach))
-        + height_bilinear(xz - vec2<f32>(0.0, reach))
-    ) * 0.25;
-    // Floor of the groove goes dark. The walls keep their albedo so the low sun
-    // lights one face and leaves the other in shade.
-    let rut = smoothstep(0.008, 0.055, avg - h);
-    let berm = smoothstep(0.006, 0.035, h - avg);
-    let floor = rut * smoothstep(0.45, 0.9, n.y);
-    albedo *= mix(1.0, 0.07, floor);
-    albedo = mix(albedo, vec3<f32>(0.50, 0.28, 0.12) * (0.92 + grit * 0.16), berm * 0.92);
+    // The floor is the stamp: soil the tire removed, sitting below the shoulder
+    // one tyre-width away. The other tire is 1.5 m over, so it stays its own groove.
+    // A broad slope has no shoulder and is left alone.
+    let reach = max(frame.params.z * 1.7, 0.34);
+    let stamp = stamp_bilinear(xz);
+    let s_px = stamp_bilinear(xz + vec2<f32>(reach, 0.0));
+    let s_nx = stamp_bilinear(xz - vec2<f32>(reach, 0.0));
+    let s_pz = stamp_bilinear(xz + vec2<f32>(0.0, reach));
+    let s_nz = stamp_bilinear(xz - vec2<f32>(0.0, reach));
+    let shoulder = max(max(s_px, s_nx), max(s_pz, s_nz));
+    let low = min(min(s_px, s_nx), min(s_pz, s_nz));
+    let drop = max(shoulder - stamp, 0.0);
+    // A centimetre is only a hint. A few centimetres — what the tires cut in the
+    // water — reads as a floor. It stops there, so a deeper cell is not a blacker trench.
+    let groove = smoothstep(0.012, 0.028, drop);
+    albedo *= mix(1.0, 0.32, groove);
+    let pile = max(stamp - low, 0.0);
+    let lip = smoothstep(0.006, 0.018, pile) * (1.0 - groove);
+    albedo = mix(albedo, albedo * vec3<f32>(1.55, 1.32, 1.12), lip);
 
     // Wet rim on the soil. The sky reflection is the water sheet, not this grid.
     let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
@@ -334,7 +374,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // The dry parking cut is only mildly wet. Keep a sheen in the floor
     // so the bottom of the groove reads as damp soil, not a flat tint.
     let wet_amt = smoothstep(0.08, 0.40, wet);
-    let sheen = wet_amt * mix(0.45, 1.0, max(rut, smoothstep(0.015, 0.07, water)));
+    // The groove is a shadow in the soil, not a wetter mirror than the lane.
+    let sheen = wet_amt * mix(0.45, 1.0, smoothstep(0.015, 0.07, water));
     // Standing water is drawn as its own sheet. A mirror bed under that film
     // is the gray metal disc.
     let drowned = smoothstep(0.012, 0.05, water);
@@ -414,7 +455,12 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 48.0);
     col += vec3<f32>(0.04, 0.025, 0.012) * spec * shadow_factor(in.world, nrm) * 0.04;
     let shore = smoothstep(0.002, 0.07, in.depth);
-    let alpha = shore * mix(0.88, 0.98, depth_t);
+    // Only a cut of a couple of centimetres thins the film, and only on that cut.
+    // The rest of the pond stays a dark cover, shore and middle alike.
+    let dug = max(-stamp_bilinear(in.world.xz), 0.0);
+    let reveal = smoothstep(0.016, 0.034, dug);
+    let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
+    let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
