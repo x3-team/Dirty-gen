@@ -331,7 +331,7 @@ fn vs_shadow_terrain(in: TerrIn) -> @builtin(position) vec4<f32> {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     let h = height_bilinear(xz);
-    let n = terrain_normal(xz);
+    var n = terrain_normal(xz);
 
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
@@ -340,6 +340,12 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let darken = mat.b;
 
     let grit = noise(xz * 1.4) * 0.6 + noise(xz * 4.8) * 0.4;
+    // Grain on the dry face, smoothed off where the soil is wet.
+    let wet_face = smoothstep(0.18, 0.8, wet);
+    let g0 = noise(xz * 2.7);
+    let gx = noise((xz + vec2<f32>(0.14, 0.0)) * 2.7);
+    let gz = noise((xz + vec2<f32>(0.0, 0.14)) * 2.7);
+    n = normalize(n + vec3<f32>(g0 - gx, 0.0, g0 - gz) * mix(0.28, 0.04, wet_face));
     // Dark saturated soil. The noon tan read as flat beige.
     let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
     let soaked = vec3<f32>(0.04, 0.022, 0.012);
@@ -375,11 +381,11 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // so the bottom of the groove reads as damp soil, not a flat tint.
     let wet_amt = smoothstep(0.08, 0.40, wet);
     // The groove is a shadow in the soil, not a wetter mirror than the lane.
-    let sheen = wet_amt * mix(0.45, 1.0, smoothstep(0.015, 0.07, water));
+    let sheen = wet_amt * mix(0.62, 1.0, smoothstep(0.25, 0.9, wet));
     // Standing water is drawn as its own sheet. A mirror bed under that film
     // is the gray metal disc.
     let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(0.98, 0.34, sheen * (1.0 - drowned)), 0.96, drowned);
+    let rough_out = mix(mix(0.97, 0.30, sheen * (1.0 - drowned)), 0.94, drowned);
     return present(shade(in.world, n, albedo, rough_out, vec3<f32>(0.0)));
 }
 
@@ -439,19 +445,19 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     }
     let n = ripple_normal(in.world.xz, frame.misc.x);
     // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.25, 1.0, n.z * 0.25));
+    let nrm = normalize(vec3<f32>(n.x * 0.4, 1.0, n.z * 0.4));
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 4.0);
+    let fres = pow(1.0 - ndotv, 3.0);
     let depth_t = smoothstep(0.012, 0.14, in.depth);
     // Red-heavy mud. A gray mix here is what read as a metal disc from above.
-    let shore_col = vec3<f32>(0.055, 0.026, 0.012);
-    let deep_col = vec3<f32>(0.022, 0.010, 0.005);
+    let shore_col = vec3<f32>(0.07, 0.032, 0.014);
+    let deep_col = vec3<f32>(0.018, 0.008, 0.004);
     let absorption = mix(shore_col, deep_col, depth_t);
     // Flat dull sky. sky_color carries the sun disc and white clouds.
     let quiet = vec3<f32>(0.10, 0.11, 0.12);
-    var col = mix(absorption, quiet, 0.04 + fres * 0.03);
+    var col = mix(absorption, quiet, 0.04 + fres * 0.09);
     let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 48.0);
     col += vec3<f32>(0.04, 0.025, 0.012) * spec * shadow_factor(in.world, nrm) * 0.04;
     let shore = smoothstep(0.002, 0.07, in.depth);

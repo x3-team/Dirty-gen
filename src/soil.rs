@@ -206,6 +206,8 @@ impl SoilField {
                     for (cx, cz, rad, amp) in crests {
                         h += gauss(x, z, cx, cz, rad) * amp;
                     }
+                    // Ski jump on the west straight. The lip faces the west puddle.
+                    h += launch_kicker(x, z);
                     h = h.max(0.035);
                     // Infield pond. Flat floor, clear of the racing line, on the dig ray.
                     h -= bog_bowl(x, z, 0.0, 1.05, 4.2, 0.52);
@@ -250,16 +252,19 @@ impl SoilField {
                     water = (water_line - h).min(0.28);
                     wet = 1.0;
                 }
+                // Firm run-up so a rolling lap still has speed at the lip.
+                // The puddle beyond the lip stays soft.
+                if launch_runup(x, z) && water < 0.01 {
+                    wet = wet.min(0.22);
+                }
                 field.water[idx] = water;
                 field.wetness[idx] = wet.clamp(0.0, 1.0);
-                field.base_wetness[idx] = if water > 0.0 {
-                    0.95
-                } else {
-                    wet.min(0.75)
-                };
+                field.base_wetness[idx] = if water > 0.0 { 0.95 } else { wet.min(0.75) };
                 let on_lane = with_puddle && off.abs() < 1.35;
                 field.loose[idx] = if water > 0.02 {
                     0.02
+                } else if launch_runup(x, z) {
+                    0.0
                 } else if on_lane {
                     0.045
                 } else if wet > 0.75 {
@@ -461,7 +466,11 @@ impl SoilField {
         self.water[idx] -= take;
         // Push ahead of the tire and a little to both sides.
         let spots = [
-            (x + forward.x * self.cell * 1.4, z + forward.z * self.cell * 1.4, 0.45),
+            (
+                x + forward.x * self.cell * 1.4,
+                z + forward.z * self.cell * 1.4,
+                0.45,
+            ),
             (x + forward.z * self.cell, z - forward.x * self.cell, 0.275),
             (x - forward.z * self.cell, z + forward.x * self.cell, 0.275),
         ];
@@ -486,11 +495,31 @@ impl SoilField {
                 let a = j * res + i;
                 if i + 1 < res {
                     let b = a + 1;
-                    transfer(&self.height, &self.water, &mut next, a, b, dt, dx, area, cond);
+                    transfer(
+                        &self.height,
+                        &self.water,
+                        &mut next,
+                        a,
+                        b,
+                        dt,
+                        dx,
+                        area,
+                        cond,
+                    );
                 }
                 if j + 1 < res {
                     let b = a + res;
-                    transfer(&self.height, &self.water, &mut next, a, b, dt, dx, area, cond);
+                    transfer(
+                        &self.height,
+                        &self.water,
+                        &mut next,
+                        a,
+                        b,
+                        dt,
+                        dx,
+                        area,
+                        cond,
+                    );
                 }
             }
         }
@@ -506,6 +535,106 @@ impl SoilField {
             } else {
                 let base = self.base_wetness[idx];
                 self.wetness[idx] += (base - self.wetness[idx]) * (dt * 0.12).min(0.25);
+            }
+        }
+    }
+
+    /// Body-sized crater. The displaced soil is piled on the rim. Returns the
+    /// deepest cut this stamp wrote into the heightfield.
+    pub fn stamp_impact(&mut self, x: f32, z: f32, radius: f32, depth: f32) -> f32 {
+        let radius = radius.clamp(0.5, 2.2);
+        let depth = depth.clamp(0.04, 0.24);
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let reach = radius * 1.6;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let area = self.cell * self.cell;
+        let mut vol = 0.0_f32;
+        let mut dug_max = 0.0_f32;
+        let mut ring_n = 0.0_f32;
+        for j in j0.max(1)..j1.min(res - 1) {
+            for i in i0.max(1)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let d = ((cx - x).powi(2) + (cz - z).powi(2)).sqrt() / radius;
+                let idx = j as usize * self.res + i as usize;
+                if d < 1.0 {
+                    let w = (1.0 - d).powf(1.35);
+                    let drop = depth * w;
+                    self.height[idx] -= drop;
+                    self.loose[idx] = (self.loose[idx] + drop * 0.55).min(0.2);
+                    self.wetness[idx] = self.wetness[idx].max(0.9);
+                    self.darken[idx] = (self.darken[idx] + 0.35 * w).min(1.0);
+                    vol += drop * area;
+                    dug_max = dug_max.max(drop);
+                } else if d < 1.5 {
+                    ring_n += 1.0;
+                }
+            }
+        }
+        if ring_n > 0.0 && vol > 0.0 {
+            let dh = vol * 0.7 / (ring_n * area);
+            for j in j0.max(1)..j1.min(res - 1) {
+                for i in i0.max(1)..i1.min(res - 1) {
+                    let cx = (i as f32 + 0.5) * self.cell - half;
+                    let cz = (j as f32 + 0.5) * self.cell - half;
+                    let d = ((cx - x).powi(2) + (cz - z).powi(2)).sqrt() / radius;
+                    if (1.0..1.5).contains(&d) {
+                        let idx = j as usize * self.res + i as usize;
+                        let lip = 1.0 - (d - 1.0) / 0.5;
+                        self.height[idx] += dh * lip;
+                    }
+                }
+            }
+        }
+        dug_max
+    }
+
+    /// Push standing water out of the impact into a ring. The pipe step then
+    /// carries that ring. The center keeps most of its water, so the pond
+    /// does not open a hole.
+    pub fn shock_ring(&mut self, x: f32, z: f32) {
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let reach = 2.3_f32;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let mut taken = 0.0_f32;
+        let mut ring_n = 0.0_f32;
+        for j in j0.max(0)..j1.min(res - 1) {
+            for i in i0.max(0)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let d = ((cx - x).powi(2) + (cz - z).powi(2)).sqrt();
+                let idx = j as usize * self.res + i as usize;
+                if d < 0.7 {
+                    let take = (self.water[idx] * 0.28).min(0.05);
+                    self.water[idx] -= take;
+                    taken += take;
+                } else if (0.85..2.05).contains(&d) {
+                    ring_n += 1.0;
+                }
+            }
+        }
+        if taken <= 0.0 || ring_n <= 0.0 {
+            return;
+        }
+        let share = taken / ring_n;
+        for j in j0.max(0)..j1.min(res - 1) {
+            for i in i0.max(0)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let d = ((cx - x).powi(2) + (cz - z).powi(2)).sqrt();
+                if (0.85..2.05).contains(&d) {
+                    let idx = j as usize * self.res + i as usize;
+                    self.water[idx] = (self.water[idx] + share).min(0.34);
+                    self.wetness[idx] = (self.wetness[idx] + 0.25).min(1.0);
+                }
             }
         }
     }
@@ -611,6 +740,39 @@ pub fn track_offset(x: f32, z: f32) -> f32 {
     } else {
         x.abs() - TRACK_R
     }
+}
+
+/// West-straight ski jump. True while the chassis is on the face or the lip.
+pub fn on_launch_crest(x: f32, z: f32) -> bool {
+    (x + 6.6).abs() < 1.25 && (0.4..2.55).contains(&z)
+}
+
+fn launch_runup(x: f32, z: f32) -> bool {
+    (x + 6.6).abs() < 2.8 && (-5.6..2.35).contains(&z)
+}
+
+/// Climbable face, short flat lip, then a drop into the west puddle.
+fn launch_kicker(x: f32, z: f32) -> f32 {
+    let toe = 0.25_f32;
+    let lip = 2.05_f32;
+    let along = (z - toe) / (lip - toe);
+    if !(0.0..1.22).contains(&along) {
+        return 0.0;
+    }
+    let ax = 1.0 - ((x + 6.6).abs() / 1.45).clamp(0.0, 1.0);
+    let ax = ax * ax * (3.0 - 2.0 * ax);
+    let peak = 0.55_f32;
+    let face = if along < 0.78 {
+        let u = along / 0.78;
+        let u = u * u * (3.0 - 2.0 * u);
+        u * peak
+    } else if along < 1.0 {
+        peak
+    } else {
+        let u = ((along - 1.0) / 0.22).clamp(0.0, 1.0);
+        peak * (1.0 - u * u)
+    };
+    face * ax
 }
 
 fn smooth01(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -743,7 +905,10 @@ mod tests {
     fn sinkage_table_is_finite() {
         for s in [0.1_f32, 0.5, 0.9] {
             let z = sinkage_for_load(1_600.0, s, 0.38, 0.28);
-            assert!(z.is_finite() && z > 0.005 && z < 0.38, "softness {s} -> z {z}");
+            assert!(
+                z.is_finite() && z > 0.005 && z < 0.38,
+                "softness {s} -> z {z}"
+            );
         }
         let firm = sinkage_for_load(1_600.0, 0.15, 0.38, 0.28);
         let mid = sinkage_for_load(1_600.0, 0.5, 0.38, 0.28);
@@ -763,6 +928,9 @@ mod tests {
         }
         assert!(soil.water.iter().all(|w| *w >= 0.0 && w.is_finite()));
         let after: f32 = soil.water.iter().sum();
-        assert!(after > total * 0.85, "water drained too fast {total} -> {after}");
+        assert!(
+            after > total * 0.85,
+            "water drained too fast {total} -> {after}"
+        );
     }
 }

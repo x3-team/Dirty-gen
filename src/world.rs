@@ -3,8 +3,11 @@
 use glam::Vec3;
 
 use crate::particles::Particles;
-use crate::soil::{track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
-use crate::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS};
+use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
+use crate::vehicle::{
+    hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
+    PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Input {
@@ -34,6 +37,10 @@ pub struct Telemetry {
     pub bog_time: f32,
     pub distance: f32,
     pub left_soft: bool,
+    pub impact_depth: f32,
+    pub impact_sprays: u32,
+    pub impact_time: f32,
+    pub max_air_pitch: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +58,10 @@ pub struct World {
     pub time: f32,
     pub telemetry: Telemetry,
     drip_acc: f32,
+    crest_armed: bool,
+    air_time: f32,
+    impact_latched: bool,
+    did_launch: bool,
 }
 
 impl World {
@@ -65,6 +76,10 @@ impl World {
                 ..Telemetry::default()
             },
             drip_acc: 0.0,
+            crest_armed: false,
+            air_time: 0.0,
+            impact_latched: false,
+            did_launch: false,
         };
         world.place_on_soil();
         for _ in 0..120 {
@@ -93,6 +108,10 @@ impl World {
                 ..Telemetry::default()
             },
             drip_acc: 0.0,
+            crest_armed: false,
+            air_time: 0.0,
+            impact_latched: false,
+            did_launch: false,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -157,6 +176,8 @@ impl World {
             }
         }
 
+        let planted = contacts.iter().filter(|c| c.active).count();
+        self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
 
@@ -166,13 +187,8 @@ impl World {
                 continue;
             }
             if c.sample.water > 0.012 && speed > 0.35 {
-                self.particles.spray(
-                    c.contact_point,
-                    c.forward,
-                    c.right,
-                    speed,
-                    c.sample.water,
-                );
+                self.particles
+                    .spray(c.contact_point, c.forward, c.right, speed, c.sample.water);
                 self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(1);
             } else if c.sample.wetness > 0.62 && speed > 1.1 && c.sinkage > 0.02 {
                 if (self.particles.alive_count() as u32 + self.time.to_bits()) % 3 == 0 {
@@ -228,6 +244,97 @@ impl World {
         }
     }
 
+    fn note_flight(&mut self, planted: usize, dt: f32) {
+        let x = self.vehicle.pos.x;
+        let z = self.vehicle.pos.z;
+        let on_crest = on_launch_crest(x, z);
+        // The face is short. Arm on the firm approach, not only in the lip box,
+        // or a fast car is already rotating when the box starts and never arms.
+        let approaching = (x + 6.6).abs() < 2.4
+            && (-2.0..1.65).contains(&z)
+            && planted >= 2
+            && self.vehicle.speed() > 2.0;
+        if (on_crest && planted >= 1) || approaching {
+            self.crest_armed = true;
+        }
+        let ground = self.soil.sample(x, z).height;
+        let clearance = self.vehicle.pos.y - ground;
+        let flying = planted == 0 || self.vehicle.jump_hold > 0.0;
+        if flying && (clearance > 0.22 || self.vehicle.jump_hold > 0.0) {
+            self.air_time += dt;
+            self.telemetry.max_air_pitch =
+                self.telemetry.max_air_pitch.max(self.vehicle.pitch.abs());
+        }
+        // The lip, plus speed, is the whole trigger. No key.
+        // Rear tires are still on the face when the nose clears it, so this
+        // does not wait for every wheel to unload. jump_hold keeps the damper
+        // from gluing the car back onto the ramp.
+        let on_lip = on_crest && z > 1.55;
+        if !self.did_launch && self.crest_armed && on_lip && self.vehicle.speed() > 3.15 {
+            let spd = self.vehicle.speed();
+            // Enough to clear the lip and tumble, short enough to land in the puddle.
+            let vy = (spd * 0.85).clamp(4.2, 5.4);
+            if self.vehicle.vel.y < vy {
+                self.vehicle.vel.y = vy;
+            }
+            // Positive pitch is nose-down. This rate is nose-up, enough to tumble.
+            let rate = (4.8 + spd * 0.28).clamp(5.2, 6.6);
+            if self.vehicle.pitch_rate > -rate {
+                self.vehicle.pitch_rate = -rate;
+            }
+            self.vehicle.roll_rate += 0.85;
+            self.vehicle.jump_hold = 0.78;
+            self.crest_armed = false;
+            self.did_launch = true;
+        }
+        if self.did_launch
+            && self.air_time > 0.40
+            && !self.impact_latched
+            && self.vehicle.vel.y < -2.0
+            && clearance < 1.55
+        {
+            self.apply_impact();
+            self.impact_latched = true;
+        }
+        if self.vehicle.jump_hold <= 0.0
+            && planted >= 3
+            && self.vehicle.vel.y > -0.7
+            && clearance < 0.9
+        {
+            // Wheels ate the last of the fall. Still stamp the landing.
+            if self.did_launch && !self.impact_latched && self.air_time > 0.18 {
+                self.apply_impact();
+                self.impact_latched = true;
+            }
+            self.air_time = 0.0;
+            self.did_launch = false;
+            if !on_crest {
+                self.crest_armed = false;
+            }
+        }
+    }
+
+    fn apply_impact(&mut self) {
+        let x = self.vehicle.pos.x;
+        let z = self.vehicle.pos.z;
+        let vy = self.vehicle.vel.y.abs();
+        let depth = (vy * 0.024).clamp(0.10, 0.22);
+        let dug = self.soil.stamp_impact(x, z, 1.35, depth);
+        self.soil.shock_ring(x, z);
+        let h = self.soil.sample(x, z).height;
+        let spawned = self.particles.impact_burst(Vec3::new(x, h + 0.15, z));
+        stick_impact_mud(&mut self.vehicle, &self.soil);
+        self.telemetry.impact_depth = self.telemetry.impact_depth.max(dug);
+        self.telemetry.impact_sprays = self.telemetry.impact_sprays.saturating_add(spawned);
+        self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(spawned);
+        if self.telemetry.impact_time <= 0.0 {
+            self.telemetry.impact_time = self.time;
+        }
+        if self.vehicle.vel.y < 0.0 {
+            self.vehicle.vel.y *= 0.22;
+        }
+    }
+
     pub fn run_seconds(&mut self, seconds: f32, input_fn: impl Fn(f32) -> Input) {
         let dt = 1.0 / 60.0;
         let steps = (seconds / dt).round() as u32;
@@ -243,6 +350,33 @@ impl World {
         for _ in 0..steps {
             let input = input_fn(self);
             self.step(dt, &input);
+        }
+    }
+}
+
+fn stick_impact_mud(vehicle: &mut Vehicle, soil: &SoilField) {
+    let ori = vehicle.orientation();
+    let spots = [
+        (PANEL_BELLY, Vec3::new(0.0, -0.16, 0.05)),
+        (PANEL_NOSE, Vec3::new(0.0, 0.02, 1.35)),
+        (PANEL_REAR, Vec3::new(0.0, 0.08, -1.15)),
+        (PANEL_LEFT, Vec3::new(-0.38, 0.02, 0.2)),
+        (PANEL_RIGHT, Vec3::new(0.38, 0.02, 0.2)),
+        (PANEL_FENDER_FL, Vec3::new(-0.74, 0.15, 1.08)),
+        (PANEL_FENDER_FR, Vec3::new(0.74, 0.15, 1.08)),
+        (PANEL_FENDER_RL, Vec3::new(-0.74, 0.15, -1.18)),
+        (PANEL_FENDER_RR, Vec3::new(0.74, 0.15, -1.18)),
+    ];
+    for (panel, local) in spots {
+        let world = vehicle.pos + ori * local;
+        let sample = soil.sample(world.x, world.z);
+        if world.y < vehicle.pos.y + 0.05 || world.y < sample.height + 0.55 {
+            let add = 0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0);
+            let p = &mut vehicle.panels[panel];
+            p.mass = (p.mass + add).min(PANEL_MUD_CAP);
+            p.wet = (p.wet + 0.7).min(1.0);
+            p.streak = (p.streak + 0.45).min(1.0);
+            p.drip = (p.mass / PANEL_MUD_CAP).clamp(0.0, 1.0);
         }
     }
 }
@@ -277,15 +411,36 @@ pub fn demo_drive(world: &World) -> Input {
     // instead of riding the berm or cutting the infield pond.
     let look = if off.abs() > 0.65 { 1.8 } else { 3.0 };
     let ahead = point_on_track(s + look);
-    let desired = (ahead.x - pos.x).atan2(ahead.z - pos.z);
+    // The scripted lap was riding the outside berm and missing the lip.
+    // Aim at the lip until the car is on it. The player gets the same crest.
+    let aim_lip = pos.x < -1.0 && (-6.3..2.4).contains(&pos.z);
+    let desired = if pos.x < -2.2 && (-4.2..2.4).contains(&pos.z) {
+        // Due north on the straight. A point ahead and to the west kept the
+        // nose pointed off the puddle, so the landing missed the water.
+        ((-6.35 - pos.x) * 0.28).clamp(-0.42, 0.42)
+    } else if aim_lip {
+        (-6.35 - pos.x).atan2(-0.4 - pos.z)
+    } else {
+        (ahead.x - pos.x).atan2(ahead.z - pos.z)
+    };
     let mut err = wrap_pi(desired - yaw);
     // Positive offset is outside the loop (left of the clockwise heading).
-    err += (off * 0.22).clamp(-0.55, 0.55);
-    let steer = (err / 0.30).clamp(-1.0, 1.0);
+    if !aim_lip {
+        err += (off * 0.22).clamp(-0.55, 0.55);
+    }
+    let steer = (err / if aim_lip { 0.36 } else { 0.30 }).clamp(-1.0, 1.0);
     let under = world.soil.sample(pos.x, pos.z);
+    // Full throttle on the firm run-up. The lip, not a key, is what launches.
+    let on_runup = aim_lip || (pos.x < -4.0 && (-3.6..3.0).contains(&pos.z));
     // Ease off on the straight, and brake in standing water so the tires
     // slip, throw spray, and cut a rut before the buggy climbs back out.
-    let (throttle, brake) = if under.water > 0.05 && speed > 0.62 {
+    let (throttle, brake) = if on_runup && under.water < 0.04 {
+        if speed > 4.25 {
+            (0.08, 0.0)
+        } else {
+            (1.0, 0.0)
+        }
+    } else if under.water > 0.05 && speed > 0.62 {
         (0.0, 1.0)
     } else if speed > 3.05 {
         (0.1, 0.0)

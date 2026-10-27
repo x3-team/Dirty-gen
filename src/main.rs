@@ -92,9 +92,7 @@ impl ApplicationHandler for App {
                 .expect("window"),
         );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("surface");
+        let surface = instance.create_surface(window.clone()).expect("surface");
         let (_instance, adapter, device, queue) = open_adapter(false, Some(&surface));
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -223,7 +221,11 @@ impl App {
         let pose = if self.chase_cam {
             chase(&self.world, self.orbit_yaw, self.orbit_pitch)
         } else {
-            demo_camera(self.world.time, self.world.vehicle.pos, self.world.vehicle.yaw)
+            demo_camera(
+                self.world.time,
+                self.world.vehicle.pos,
+                self.world.vehicle.yaw,
+            )
         };
         let pose = lift_camera(&self.world, pose);
         let frame = match surface.get_current_texture() {
@@ -334,8 +336,8 @@ fn capture(args: &[String]) {
     let mut saved = [false; 3];
     let stills = [
         (0.35_f32, &parsed.still_start),
-        (6.60, &parsed.still_puddle),
-        (10.70, &parsed.still_ruts),
+        (4.68, &parsed.still_puddle),
+        (5.25, &parsed.still_ruts),
     ];
     println!(
         "capture {frames} frames at {}x{} ({} physics steps/frame)",
@@ -369,15 +371,19 @@ fn capture(args: &[String]) {
             world.step(1.0 / 60.0, &input);
         }
         if next != stills.len() {
-            panic!("stills-only ended at t={:.2} after {next} images", world.time);
+            panic!(
+                "stills-only ended at t={:.2} after {next} images",
+                world.time
+            );
         }
         return;
     }
     for frame in 0..frames {
-        let pose = lift_camera(&world, demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw));
-        let rgba = renderer
-            .draw(&world, pose, None, true)
-            .expect("readback");
+        let pose = lift_camera(
+            &world,
+            demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
+        );
+        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
         let path = dir.join(format!("frame_{frame:04}.png"));
         write_png(&path, parsed.width, parsed.height, &rgba).expect("png");
         for (i, (when, dest)) in stills.iter().enumerate() {
@@ -403,7 +409,10 @@ fn capture(args: &[String]) {
         }
     }
     if saved.iter().any(|s| !s) {
-        panic!("a still was not written; sim time ended at {:.2}", world.time);
+        panic!(
+            "a still was not written; sim time ended at {:.2}",
+            world.time
+        );
     }
     let video = &parsed.video;
     if let Some(parent) = video.parent() {

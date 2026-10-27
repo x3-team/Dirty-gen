@@ -150,7 +150,13 @@ pub fn open_adapter(
 }
 
 impl Renderer {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue, adapter_name: String, width: u32, height: u32) -> Self {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        adapter_name: String,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -162,7 +168,11 @@ impl Renderer {
 
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[uniform_entry(0, false, std::mem::size_of::<FrameData>() as u64)],
+            entries: &[uniform_entry(
+                0,
+                false,
+                std::mem::size_of::<FrameData>() as u64,
+            )],
         });
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-tex"),
@@ -346,11 +356,15 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&height_tex.create_view(&Default::default())),
+                    resource: wgpu::BindingResource::TextureView(
+                        &height_tex.create_view(&Default::default()),
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&mat_tex.create_view(&Default::default())),
+                    resource: wgpu::BindingResource::TextureView(
+                        &mat_tex.create_view(&Default::default()),
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -541,13 +555,13 @@ impl Renderer {
         let env = upload_cpu(&device, &environment_mesh(), "env");
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
-            size: (4096 * std::mem::size_of::<MeshVertex>()) as u64,
+            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-i"),
-            size: (8192 * 4) as u64,
+            size: (32768 * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -735,7 +749,9 @@ impl Renderer {
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1014,8 +1030,12 @@ fn build_particles(out: &mut Vec<ParticleVertex>, items: &[Particle], eye: Vec3,
         let (color, scale) = match p.kind {
             // Display-space mud. These values are the pixels. Paler than this
             // reads as a white cloud against the track.
-            0 => ([0.50, 0.22, 0.07, 1.0], 1.65),
-            1 => ([0.32, 0.14, 0.05, 0.98], 1.3),
+            0 => ([0.42, 0.18, 0.06, 1.0], 1.65),
+            1 => ([0.28, 0.12, 0.045, 0.98], 1.3),
+            // Impact clumps and droplets. Darker than the driving spray, and
+            // large enough to read from the isometric frame while they fall.
+            3 => ([0.16, 0.07, 0.025, 1.0], 3.6),
+            4 => ([0.22, 0.09, 0.03, 1.0], 2.6),
             _ => ([0.11, 0.055, 0.025, life * 0.85], 0.7),
         };
         let h = p.size * scale;

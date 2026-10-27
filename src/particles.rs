@@ -49,7 +49,10 @@ impl Particles {
     }
 
     pub fn alive_count(&self) -> usize {
-        self.items.iter().filter(|p| p.alive && p.life > 0.0).count()
+        self.items
+            .iter()
+            .filter(|p| p.alive && p.life > 0.0)
+            .count()
     }
 
     fn rnd(&mut self) -> f32 {
@@ -89,13 +92,13 @@ impl Particles {
         // One droplet, and not on top of one that is already in the air.
         // A spawn every step became a pale cloud from the isometric camera.
         let side = if self.rnd() > 0.5 { 1.0 } else { -1.0 };
-        let pos = origin
-            - forward * (0.1 + self.rnd() * 0.16)
+        let pos = origin - forward * (0.1 + self.rnd() * 0.16)
             + right * side * (0.3 + self.rnd() * 0.14)
             + Vec3::Y * (0.48 + self.rnd() * 0.18);
-        let crowded = self.items.iter().any(|p| {
-            p.alive && p.kind == 0 && (p.pos - pos).length() < 0.36
-        });
+        let crowded = self
+            .items
+            .iter()
+            .any(|p| p.alive && p.kind == 0 && (p.pos - pos).length() < 0.36);
         if crowded {
             return;
         }
@@ -111,6 +114,39 @@ impl Particles {
         let life = 0.55 + self.rnd() * 0.4;
         let size = 0.10 + self.rnd() * 0.08;
         self.spawn(origin + Vec3::Y * 0.08, vel, life, size, 1);
+    }
+
+    /// Clumps and droplets born at the impact, in world space. They fall
+    /// under the same gravity as the rest of the spray.
+    pub fn impact_burst(&mut self, origin: Vec3) -> u32 {
+        let mut n = 0u32;
+        for i in 0..48 {
+            let ang = self.rnd() * std::f32::consts::TAU;
+            let speed = 3.4 + self.rnd() * 5.2;
+            let up = 3.0 + self.rnd() * 4.6;
+            let vel = Vec3::new(ang.cos() * speed, up, ang.sin() * speed);
+            let clod = i < 30;
+            let life = if clod {
+                1.15 + self.rnd() * 0.8
+            } else {
+                0.85 + self.rnd() * 0.65
+            };
+            let size = if clod {
+                0.22 + self.rnd() * 0.2
+            } else {
+                0.10 + self.rnd() * 0.08
+            };
+            let kind = if clod { 3 } else { 4 };
+            let pos = origin
+                + Vec3::new(
+                    (self.rnd() - 0.5) * 0.35,
+                    self.rnd() * 0.1,
+                    (self.rnd() - 0.5) * 0.35,
+                );
+            self.spawn(pos, vel, life, size, kind);
+            n += 1;
+        }
+        n
     }
 
     pub fn drip(&mut self, origin: Vec3) {
@@ -136,6 +172,8 @@ impl Particles {
             let drag = match p.kind {
                 0 => 1.6,
                 1 => 0.8,
+                3 => 0.45,
+                4 => 0.7,
                 _ => 0.4,
             };
             p.vel.y -= 9.81 * dt;
@@ -145,11 +183,11 @@ impl Particles {
             if p.pos.y < h + 0.02 {
                 if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
                     match p.kind {
-                        0 => {
+                        0 | 4 => {
                             soil.wetness[idx] = (soil.wetness[idx] + 0.03).min(1.0);
                             soil.darken[idx] = (soil.darken[idx] + 0.02).min(1.0);
                         }
-                        1 | 2 => {
+                        1 | 2 | 3 => {
                             soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
                             soil.loose[idx] = (soil.loose[idx] + 0.004).min(0.16);
                         }

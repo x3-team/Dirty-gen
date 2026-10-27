@@ -245,50 +245,54 @@ fn add_disc(mesh: &mut CpuMesh, x: f32, radius: f32, sign: f32, segs: usize, pan
                 panel,
             });
         }
-        mesh.indices
-            .extend_from_slice(&[base, base + 1, base + 2]);
+        mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 }
 
-fn add_fender(mesh: &mut CpuMesh, x: f32, z: f32, panel: f32) {
-    // Nominal wheel center sits near y = -0.18 once the spring has settled.
-    let cy = -0.16;
-    let radius = 0.50;
-    let segs = 6;
-    let a_start = 0.18 * std::f32::consts::PI;
-    let a_span = 0.64 * std::f32::consts::PI;
-    let half_w = 0.20;
-    for i in 0..segs {
-        let a0 = a_start + a_span * (i as f32 / segs as f32);
-        let a1 = a_start + a_span * ((i + 1) as f32 / segs as f32);
-        let p = |a: f32, xo: f32| {
-            Vec3::new(
-                x + xo,
-                cy + a.sin() * radius,
-                z + a.cos() * radius,
-            )
-        };
-        add_quad(
-            mesh,
-            [p(a0, -half_w), p(a0, half_w), p(a1, half_w), p(a1, -half_w)],
-            panel,
-        );
-        // Lip on the outer edge so the fender reads from the side.
-        let lip = if x > 0.0 { 0.04 } else { -0.04 };
-        add_quad(
-            mesh,
-            [
-                p(a0, half_w * x.signum()),
-                p(a0, half_w * x.signum() + lip),
-                p(a1, half_w * x.signum() + lip),
-                p(a1, half_w * x.signum()),
-            ],
-            panel,
-        );
+/// Coil from `a` to `b`. Length is the distance, so a rising wheel shortens it.
+fn add_helix(
+    mesh: &mut CpuMesh,
+    a: Vec3,
+    b: Vec3,
+    coil_radius: f32,
+    tube_radius: f32,
+    coils: usize,
+    steps: usize,
+    panel: f32,
+) {
+    let axis = b - a;
+    let len = axis.length();
+    if len < 1.0e-3 || coils == 0 || steps == 0 {
+        return;
+    }
+    let dir = axis / len;
+    let helper = if dir.y.abs() < 0.85 { Vec3::Y } else { Vec3::X };
+    let u = dir.cross(helper).normalize();
+    let v = dir.cross(u).normalize();
+    let n = coils * steps;
+    let mut prev = a + u * coil_radius;
+    for i in 1..=n {
+        let t = i as f32 / n as f32;
+        let ang = t * coils as f32 * std::f32::consts::TAU;
+        let center = a + axis * t;
+        let p = center + (u * ang.cos() + v * ang.sin()) * coil_radius;
+        add_tube(mesh, prev, p, tube_radius, panel, 4);
+        prev = p;
     }
 }
 
-/// Sand-rail buggy in vehicle local space. Y up, Z forward, origin at the CG.
+/// Short inboard plate. The tire sits outside it.
+fn add_fender_lip(mesh: &mut CpuMesh, sign: f32, z: f32, panel: f32) {
+    add_box(
+        mesh,
+        Vec3::new(sign * 0.40, 0.12, z),
+        Vec3::new(0.045, 0.018, 0.16),
+        panel,
+    );
+}
+
+/// Open-wheel buggy in vehicle local space. Y up, Z forward, origin at the CG.
+/// The chassis stays inside the tires so the wheels read as separate from above.
 pub fn buggy_body() -> CpuMesh {
     let mut m = CpuMesh::new();
     let cage = 0.0;
@@ -300,253 +304,205 @@ pub fn buggy_body() -> CpuMesh {
     let engine = 10.0;
     let seat = 11.0;
 
-    // Frame rails.
+    // Orange frame rails. Narrow: tires live at x = ±0.74.
     add_box(
         &mut m,
-        Vec3::new(-0.30, -0.02, 0.05),
-        Vec3::new(0.055, 0.07, 1.38),
-        cage,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.30, -0.02, 0.05),
-        Vec3::new(0.055, 0.07, 1.38),
-        cage,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.0, -0.02, 1.28),
-        Vec3::new(0.32, 0.05, 0.06),
-        cage,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.0, -0.02, -1.22),
-        Vec3::new(0.32, 0.05, 0.06),
-        cage,
-    );
-
-    // Belly and floor. These pick up the heavy mud.
-    add_box(
-        &mut m,
-        Vec3::new(0.0, -0.14, 0.05),
-        Vec3::new(0.36, 0.022, 1.18),
-        belly,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.0, -0.05, -0.05),
-        Vec3::new(0.28, 0.02, 0.72),
-        belly,
-    );
-
-    // Orange side pods.
-    add_box(
-        &mut m,
-        Vec3::new(-0.50, 0.04, 0.20),
-        Vec3::new(0.09, 0.15, 0.92),
-        left,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.50, 0.04, 0.20),
-        Vec3::new(0.09, 0.15, 0.92),
-        right,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(-0.46, 0.16, 0.55),
-        Vec3::new(0.07, 0.05, 0.42),
-        left,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.46, 0.16, 0.55),
-        Vec3::new(0.07, 0.05, 0.42),
-        right,
-    );
-
-    // Nose, hood, bumper, plate, lamps.
-    add_box(
-        &mut m,
-        Vec3::new(0.0, 0.02, 1.48),
-        Vec3::new(0.34, 0.12, 0.22),
+        Vec3::new(-0.26, 0.02, -0.02),
+        Vec3::new(0.065, 0.07, 1.28),
         nose,
     );
     add_box(
         &mut m,
-        Vec3::new(0.0, 0.16, 1.28),
-        Vec3::new(0.28, 0.045, 0.28),
+        Vec3::new(0.26, 0.02, -0.02),
+        Vec3::new(0.065, 0.07, 1.28),
         nose,
     );
     add_box(
         &mut m,
-        Vec3::new(0.0, -0.08, 1.62),
-        Vec3::new(0.42, 0.035, 0.05),
+        Vec3::new(0.0, 0.02, 1.18),
+        Vec3::new(0.28, 0.055, 0.06),
         nose,
     );
     add_box(
         &mut m,
-        Vec3::new(0.0, 0.02, 1.70),
-        Vec3::new(0.10, 0.045, 0.012),
-        cage,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(-0.20, 0.05, 1.69),
-        Vec3::new(0.07, 0.045, 0.025),
-        PANEL_LIGHT,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.20, 0.05, 1.69),
-        Vec3::new(0.07, 0.045, 0.025),
-        PANEL_LIGHT,
-    );
-
-    // Rear bulkhead and lamps.
-    add_box(
-        &mut m,
-        Vec3::new(0.0, 0.10, -1.32),
-        Vec3::new(0.42, 0.18, 0.07),
+        Vec3::new(0.0, 0.04, -1.12),
+        Vec3::new(0.28, 0.055, 0.06),
         rear,
     );
     add_box(
         &mut m,
-        Vec3::new(-0.30, 0.14, -1.39),
-        Vec3::new(0.07, 0.04, 0.02),
-        PANEL_TAIL,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.30, 0.14, -1.39),
-        Vec3::new(0.07, 0.04, 0.02),
-        PANEL_TAIL,
-    );
-
-    // Seats.
-    add_box(
-        &mut m,
-        Vec3::new(-0.20, 0.12, -0.18),
-        Vec3::new(0.14, 0.06, 0.20),
-        seat,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.20, 0.12, -0.18),
-        Vec3::new(0.14, 0.06, 0.20),
-        seat,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(-0.20, 0.28, -0.34),
-        Vec3::new(0.13, 0.16, 0.045),
-        seat,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.20, 0.28, -0.34),
-        Vec3::new(0.13, 0.16, 0.045),
-        seat,
-    );
-
-    // Rear engine and a small intake.
-    add_box(
-        &mut m,
-        Vec3::new(0.0, 0.08, -0.82),
-        Vec3::new(0.26, 0.16, 0.28),
-        engine,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.0, 0.28, -0.78),
-        Vec3::new(0.10, 0.06, 0.10),
-        engine,
-    );
-    add_tube(
-        &mut m,
-        Vec3::new(0.22, 0.06, -0.95),
-        Vec3::new(0.48, 0.02, -1.25),
-        0.035,
-        engine,
-        6,
-    );
-    add_tube(
-        &mut m,
-        Vec3::new(-0.22, 0.06, -0.95),
-        Vec3::new(-0.48, 0.02, -1.25),
-        0.035,
-        engine,
-        6,
-    );
-
-    // Fenders sit above the four wheels.
-    let hp = hardpoints();
-    add_fender(&mut m, hp[0].x, hp[0].z, 6.0);
-    add_fender(&mut m, hp[1].x, hp[1].z, 7.0);
-    add_fender(&mut m, hp[2].x, hp[2].z, 8.0);
-    add_fender(&mut m, hp[3].x, hp[3].z, 9.0);
-
-    // Cage: rear hoop, front hoop, roof, side bars.
-    let rl = Vec3::new(-0.46, -0.02, -0.42);
-    let rr = Vec3::new(0.46, -0.02, -0.42);
-    let rtl = Vec3::new(-0.46, 1.08, -0.42);
-    let rtr = Vec3::new(0.46, 1.08, -0.42);
-    add_tube(&mut m, rl, rtl, 0.028, cage, 6);
-    add_tube(&mut m, rr, rtr, 0.028, cage, 6);
-    add_tube(&mut m, rtl, rtr, 0.028, cage, 6);
-    let fl = Vec3::new(-0.40, 0.02, 0.92);
-    let fr = Vec3::new(0.40, 0.02, 0.92);
-    let ftl = Vec3::new(-0.40, 0.78, 0.92);
-    let ftr = Vec3::new(0.40, 0.78, 0.92);
-    add_tube(&mut m, fl, ftl, 0.026, cage, 5);
-    add_tube(&mut m, fr, ftr, 0.026, cage, 5);
-    add_tube(&mut m, ftl, ftr, 0.026, cage, 5);
-    add_tube(&mut m, ftl, rtl, 0.024, cage, 5);
-    add_tube(&mut m, ftr, rtr, 0.024, cage, 5);
-    add_tube(
-        &mut m,
-        Vec3::new(-0.46, 0.42, -0.42),
-        Vec3::new(-0.46, 0.42, 0.70),
-        0.022,
-        cage,
-        5,
-    );
-    add_tube(
-        &mut m,
-        Vec3::new(0.46, 0.42, -0.42),
-        Vec3::new(0.46, 0.42, 0.70),
-        0.022,
-        cage,
-        5,
-    );
-    add_box(
-        &mut m,
-        Vec3::new(0.0, 1.10, -0.05),
-        Vec3::new(0.40, 0.015, 0.32),
+        Vec3::new(0.0, 0.04, 0.10),
+        Vec3::new(0.26, 0.04, 0.055),
         nose,
+    );
+
+    // Belly. Impact mud sticks here.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, -0.12, 0.02),
+        Vec3::new(0.30, 0.016, 1.00),
+        belly,
+    );
+
+    // Cockpit sides, inboard of the tires.
+    add_box(
+        &mut m,
+        Vec3::new(-0.34, 0.14, -0.02),
+        Vec3::new(0.03, 0.11, 0.42),
+        left,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.34, 0.14, -0.02),
+        Vec3::new(0.03, 0.11, 0.42),
+        right,
+    );
+
+    // Short nose and lamps. No hood box over the front tires.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.06, 1.40),
+        Vec3::new(0.20, 0.05, 0.14),
+        nose,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.00, 1.54),
+        Vec3::new(0.24, 0.025, 0.035),
+        nose,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(-0.12, 0.08, 1.53),
+        Vec3::new(0.045, 0.03, 0.018),
+        PANEL_LIGHT,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.12, 0.08, 1.53),
+        Vec3::new(0.045, 0.03, 0.018),
+        PANEL_LIGHT,
+    );
+
+    // Rear bulkhead.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.16, -1.26),
+        Vec3::new(0.26, 0.12, 0.045),
+        rear,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(-0.16, 0.16, -1.31),
+        Vec3::new(0.045, 0.028, 0.014),
+        PANEL_TAIL,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.16, 0.16, -1.31),
+        Vec3::new(0.045, 0.028, 0.014),
+        PANEL_TAIL,
+    );
+
+    // Two seats.
+    add_box(
+        &mut m,
+        Vec3::new(-0.15, 0.16, -0.08),
+        Vec3::new(0.11, 0.045, 0.16),
+        seat,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.15, 0.16, -0.08),
+        Vec3::new(0.11, 0.045, 0.16),
+        seat,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(-0.15, 0.32, -0.22),
+        Vec3::new(0.105, 0.15, 0.035),
+        seat,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.15, 0.32, -0.22),
+        Vec3::new(0.105, 0.15, 0.035),
+        seat,
+    );
+
+    // Engine between the rear rails.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.18, -0.72),
+        Vec3::new(0.16, 0.12, 0.18),
+        engine,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.32, -0.68),
+        Vec3::new(0.07, 0.04, 0.07),
+        engine,
+    );
+
+    // Fender lips stay on the frame. The tire is outside them.
+    add_fender_lip(&mut m, -1.0, 1.08, 6.0);
+    add_fender_lip(&mut m, 1.0, 1.08, 7.0);
+    add_fender_lip(&mut m, -1.0, -1.18, 8.0);
+    add_fender_lip(&mut m, 1.0, -1.18, 9.0);
+
+    // Roll cage. Radius is large enough to read at the isometric frame.
+    let r = 0.048;
+    let rl = Vec3::new(-0.32, 0.06, -0.46);
+    let rr = Vec3::new(0.32, 0.06, -0.46);
+    let rtl = Vec3::new(-0.32, 0.88, -0.40);
+    let rtr = Vec3::new(0.32, 0.88, -0.40);
+    add_tube(&mut m, rl, rtl, r, cage, 5);
+    add_tube(&mut m, rr, rtr, r, cage, 5);
+    add_tube(&mut m, rtl, rtr, r, cage, 5);
+    let fl = Vec3::new(-0.28, 0.08, 0.62);
+    let fr = Vec3::new(0.28, 0.08, 0.62);
+    let ftl = Vec3::new(-0.30, 0.74, 0.22);
+    let ftr = Vec3::new(0.30, 0.74, 0.22);
+    add_tube(&mut m, fl, ftl, 0.044, cage, 5);
+    add_tube(&mut m, fr, ftr, 0.044, cage, 5);
+    add_tube(&mut m, ftl, ftr, 0.044, cage, 5);
+    add_tube(&mut m, ftl, rtl, 0.04, cage, 5);
+    add_tube(&mut m, ftr, rtr, 0.04, cage, 5);
+    add_tube(&mut m, Vec3::new(-0.28, 0.10, -1.02), rl, 0.038, cage, 4);
+    add_tube(&mut m, Vec3::new(0.28, 0.10, -1.02), rr, 0.038, cage, 4);
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.86, -0.08),
+        Vec3::new(0.24, 0.012, 0.26),
+        cage,
     );
 
     m
 }
 
-/// Shocks and solid axles in vehicle local space. Rebuilt when the springs move.
+/// One A-arm and one coil per wheel, in the body frame. Ends track `wheel_center_local`,
+/// so the spring shortens when the tire compresses and hangs long at droop.
 pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
     let mut m = CpuMesh::new();
     let hp = hardpoints();
+    let arm = 1.0;
+    let spring = 10.0;
     for i in 0..4 {
         let wc = vehicle.wheel_center_local(i);
-        add_tube(&mut m, hp[i], wc, 0.02, 0.0, 6);
-        let spring_top = hp[i] + (wc - hp[i]) * 0.15;
-        let spring_bot = hp[i] + (wc - hp[i]) * 0.72;
-        add_tube(&mut m, spring_top, spring_bot, 0.045, 0.0, 7);
+        let sign = hp[i].x.signum();
+        let z = hp[i].z;
+        let lower_f = Vec3::new(sign * 0.28, -0.02, z + 0.18);
+        let lower_r = Vec3::new(sign * 0.28, -0.02, z - 0.18);
+        let knuckle = Vec3::new(wc.x - sign * 0.04, wc.y, wc.z);
+        add_tube(&mut m, lower_f, knuckle, 0.04, arm, 4);
+        add_tube(&mut m, lower_r, knuckle, 0.04, arm, 4);
+        let upright_top = knuckle + Vec3::Y * 0.16;
+        add_tube(&mut m, knuckle, upright_top, 0.032, spring, 4);
+        let tower = Vec3::new(sign * 0.28, 0.46, z);
+        let perch = knuckle + Vec3::Y * 0.04;
+        add_helix(&mut m, tower, perch, 0.09, 0.034, 3, 4, spring);
+        add_tube(&mut m, tower, perch, 0.02, spring, 4);
     }
-    let fl = vehicle.wheel_center_local(0);
-    let fr = vehicle.wheel_center_local(1);
-    let rl = vehicle.wheel_center_local(2);
-    let rr = vehicle.wheel_center_local(3);
-    add_tube(&mut m, fl, fr, 0.035, 0.0, 6);
-    add_tube(&mut m, rl, rr, 0.035, 0.0, 6);
     m
 }
 
@@ -698,14 +654,7 @@ pub fn environment_mesh() -> CpuMesh {
     ];
     for (k, p) in trees.iter().enumerate() {
         let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
-        add_tube(
-            &mut m,
-            *p,
-            *p + Vec3::Y * trunk_h,
-            0.09,
-            PANEL_TRUNK,
-            6,
-        );
+        add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
         // Stacked cones so the crown has volume instead of a flat card.
         let layers = [
             (trunk_h * 0.42, 1.25, 1.45),

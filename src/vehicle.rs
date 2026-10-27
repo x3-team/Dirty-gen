@@ -3,7 +3,9 @@
 
 use glam::{EulerRot, Quat, Vec3};
 
-use crate::soil::{bekker_load, contact_length, janosi_hanamoto, terramech, SoilField, SoilSample};
+use crate::soil::{
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField, SoilSample,
+};
 
 pub const WHEEL_RADIUS: f32 = 0.38;
 pub const WHEEL_WIDTH: f32 = 0.28;
@@ -110,6 +112,8 @@ pub struct Vehicle {
     pub roll_rate: f32,
     pub wheels: [Wheel; 4],
     pub panels: [PanelMud; PANEL_COUNT],
+    /// Seconds of free flight after the crest. A clipping tire must not erase the launch.
+    pub jump_hold: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +150,7 @@ impl Vehicle {
             roll_rate: 0.0,
             wheels: [Wheel::default(); 4],
             panels: [PanelMud::default(); PANEL_COUNT],
+            jump_hold: 0.0,
         }
     }
 
@@ -192,7 +197,13 @@ impl Vehicle {
         self.wheels[3].steer += (0.0 - self.wheels[3].steer) * blend;
     }
 
-    pub fn compute_contacts(&mut self, soil: &SoilField, throttle: f32, brake: f32, dt: f32) -> [Contact; 4] {
+    pub fn compute_contacts(
+        &mut self,
+        soil: &SoilField,
+        throttle: f32,
+        brake: f32,
+        dt: f32,
+    ) -> [Contact; 4] {
         let ori = self.orientation();
         let ang_world = ori * Vec3::new(self.pitch_rate, self.yaw_rate, self.roll_rate);
         let mut out = [Contact::default(); 4];
@@ -210,7 +221,8 @@ impl Vehicle {
             let z0 = sample.height - wc0.y + WHEEL_RADIUS;
 
             let (compression, sinkage, normal) = if z0 <= 0.004 {
-                (self.wheels[i].compression * (1.0 - (dt * 4.0).min(0.5)), 0.0, 0.0)
+                // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
+                ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
             } else {
                 solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
             };
@@ -364,6 +376,10 @@ impl Vehicle {
         let ori = self.orientation();
         let mut force = Vec3::new(0.0, -MASS * 9.81, 0.0);
         let mut torque_local = Vec3::ZERO;
+        let held = self.jump_hold > 0.0;
+        if self.jump_hold > 0.0 {
+            self.jump_hold = (self.jump_hold - dt).max(0.0);
+        }
 
         for c in contacts.iter() {
             let f_world = Vec3::new(
@@ -371,7 +387,8 @@ impl Vehicle {
                 c.normal,
                 c.forward.z * c.chassis_long + c.right.z * c.chassis_lat,
             );
-            if c.active {
+            // The crest already set the flight. Contact springs would glue the car back down.
+            if c.active && !held {
                 force += f_world;
                 let r = c.contact_point - self.pos;
                 torque_local += ori.inverse() * r.cross(f_world);
@@ -389,29 +406,68 @@ impl Vehicle {
         }
 
         // Suspension damping from hardpoint vertical speed.
+        let planted = contacts.iter().filter(|c| c.active).count();
+        let fwd = self.forward();
+        let here_h = soil.sample(self.pos.x, self.pos.z).height;
+        let ahead_h = soil
+            .sample(self.pos.x + fwd.x * 0.75, self.pos.z + fwd.z * 0.75)
+            .height;
+        let slope = (ahead_h - here_h) / 0.75;
+        let climbing =
+            !held && on_launch_crest(self.pos.x, self.pos.z) && slope > 0.16 && planted >= 2;
+        let airborne = held || planted == 0;
+        let tumbling = self.pitch.abs() > 0.72 || self.roll.abs() > 0.78;
         let ang_world = ori * Vec3::new(self.pitch_rate, self.yaw_rate, self.roll_rate);
-        for (i, hp) in hardpoints().into_iter().enumerate() {
-            if !contacts[i].active {
-                continue;
+        if !climbing && !airborne {
+            for (i, hp) in hardpoints().into_iter().enumerate() {
+                if !contacts[i].active {
+                    continue;
+                }
+                let r = (self.pos + ori * hp) - self.pos;
+                let v_y = (self.vel + ang_world.cross(r)).y;
+                force.y += -2_600.0 * v_y;
             }
-            let r = (self.pos + ori * hp) - self.pos;
-            let v_y = (self.vel + ang_world.cross(r)).y;
-            force.y += -2_600.0 * v_y;
         }
-        force.y += -4_500.0 * self.vel.y;
 
-        if self.roll.abs() > 0.42 {
-            torque_local.z -= self.roll.signum() * (self.roll.abs() - 0.42) * 9_000.0;
+        if airborne {
+            force.y += -70.0 * self.vel.y;
+            torque_local.x -= 28.0 * self.pitch_rate;
+            torque_local.z -= 28.0 * self.roll_rate;
+        } else if climbing {
+            let want = self.speed() * slope / (1.0 + slope * slope).sqrt();
+            let lift = (want - self.vel.y).max(0.0);
+            force.y += lift * MASS * 7.0;
+            force.y += -320.0 * self.vel.y;
+            // Positive pitch is nose-down. The face wants the nose up.
+            let target = -slope.atan();
+            torque_local.x += (target - self.pitch) * 2_800.0;
+            torque_local.x -= 70.0 * self.pitch_rate;
+            torque_local.z -= 360.0 * self.roll_rate;
+        } else if tumbling {
+            force.y += -800.0 * self.vel.y;
+            torque_local.x -= wrap_angle(self.pitch) * 3_400.0;
+            torque_local.z -= wrap_angle(self.roll) * 3_400.0;
+            torque_local.x -= 260.0 * self.pitch_rate;
+            torque_local.z -= 260.0 * self.roll_rate;
+        } else {
+            force.y += -4_500.0 * self.vel.y;
+            if self.roll.abs() > 0.42 {
+                torque_local.z -= self.roll.signum() * (self.roll.abs() - 0.42) * 9_000.0;
+            }
+            if self.pitch.abs() > 0.38 {
+                torque_local.x -= self.pitch.signum() * (self.pitch.abs() - 0.38) * 7_000.0;
+            }
+            torque_local.x -= 900.0 * self.pitch_rate;
+            torque_local.z -= 750.0 * self.roll_rate;
         }
-        if self.pitch.abs() > 0.38 {
-            torque_local.x -= self.pitch.signum() * (self.pitch.abs() - 0.38) * 7_000.0;
-        }
-        torque_local.x -= 900.0 * self.pitch_rate;
-        torque_local.z -= 750.0 * self.roll_rate;
         torque_local.y -= 180.0 * self.yaw_rate;
 
         self.vel += (force / MASS) * dt;
-        self.vel.y = self.vel.y.clamp(-7.0, 7.0);
+        if airborne || climbing {
+            self.vel.y = self.vel.y.clamp(-14.0, 9.0);
+        } else {
+            self.vel.y = self.vel.y.clamp(-7.0, 7.0);
+        }
         let hv = Vec3::new(self.vel.x, 0.0, self.vel.z);
         if hv.length() > 16.0 {
             let s = 16.0 / hv.length();
@@ -423,14 +479,28 @@ impl Vehicle {
         }
         self.pos += self.vel * dt;
 
-        self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-2.0, 2.0);
         self.yaw_rate = (self.yaw_rate + torque_local.y / I_YAW * dt).clamp(-1.6, 1.6);
-        self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-2.0, 2.0);
-        self.pitch = (self.pitch + self.pitch_rate * dt).clamp(-0.5, 0.5);
-        self.roll = (self.roll + self.roll_rate * dt).clamp(-0.55, 0.55);
         self.yaw += self.yaw_rate * dt;
+        if airborne {
+            self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-8.0, 8.0);
+            self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-6.0, 6.0);
+            self.pitch = wrap_angle(self.pitch + self.pitch_rate * dt);
+            self.roll = wrap_angle(self.roll + self.roll_rate * dt);
+        } else if climbing || tumbling {
+            self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-6.0, 6.0);
+            self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-4.0, 4.0);
+            self.pitch = wrap_angle(self.pitch + self.pitch_rate * dt);
+            self.roll = wrap_angle(self.roll + self.roll_rate * dt);
+        } else {
+            self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-2.0, 2.0);
+            self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-2.0, 2.0);
+            self.pitch = (self.pitch + self.pitch_rate * dt).clamp(-0.5, 0.5);
+            self.roll = (self.roll + self.roll_rate * dt).clamp(-0.55, 0.55);
+        }
 
-        self.collide_belly(soil, dt);
+        if !held {
+            self.collide_belly(soil, dt);
+        }
         if !self.pos.is_finite() {
             self.pos.y = 0.5;
             self.vel = Vec3::ZERO;
@@ -542,7 +612,8 @@ impl Vehicle {
             p.mass = (p.mass - drip).max(0.0);
             p.wet = (p.wet + add * 3.0).clamp(0.0, 1.0);
             p.wet += (0.15 - p.wet) * dt * 0.02;
-            p.streak = (p.streak * (1.0 - dt * 0.15) + add * 6.0 + speed * dt * 0.15).clamp(0.0, 1.0);
+            p.streak =
+                (p.streak * (1.0 - dt * 0.15) + add * 6.0 + speed * dt * 0.15).clamp(0.0, 1.0);
             p.drip = (p.mass / PANEL_MUD_CAP).clamp(0.0, 1.0);
         }
     }
@@ -579,6 +650,17 @@ impl Default for Contact {
             fling: 0.0,
         }
     }
+}
+
+fn wrap_angle(mut a: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    while a > pi {
+        a -= pi * 2.0;
+    }
+    while a < -pi {
+        a += pi * 2.0;
+    }
+    a
 }
 
 fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {

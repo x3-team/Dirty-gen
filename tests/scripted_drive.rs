@@ -132,3 +132,40 @@ fn holding_throttle_digs_in() {
     );
     assert!(dug.vehicle.body_mud_mass() > 0.1);
 }
+
+#[test]
+fn crest_impact_cuts_rut_and_sprays() {
+    let mut world = World::demo();
+    let rut0 = world.soil.max_rut_depth();
+    world.run_seconds_with(12.0, silt::demo_drive);
+    eprintln!(
+        "impact depth {:.3} sprays {} pitch {:.2} t {:.2} pos {:?} rut {:.3}->{:.3} mud {:.2}",
+        world.telemetry.impact_depth,
+        world.telemetry.impact_sprays,
+        world.telemetry.max_air_pitch,
+        world.telemetry.impact_time,
+        world.vehicle.pos,
+        rut0,
+        world.soil.max_rut_depth(),
+        world.vehicle.body_mud_mass()
+    );
+    assert!(
+        world.telemetry.impact_depth > 0.06,
+        "impact did not dig the heightfield, depth {}",
+        world.telemetry.impact_depth
+    );
+    assert!(
+        world.soil.max_rut_depth() > rut0 + 0.06,
+        "rut did not grow from the landing"
+    );
+    assert!(
+        world.telemetry.impact_sprays > 12,
+        "impact did not throw spray, {}",
+        world.telemetry.impact_sprays
+    );
+    assert!(
+        world.telemetry.max_air_pitch > 1.2,
+        "airborne pitch {:.2} is a hop, not a tumble",
+        world.telemetry.max_air_pitch
+    );
+}
