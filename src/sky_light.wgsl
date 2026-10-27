@@ -1,25 +1,25 @@
-// Overcast wet-oval light. Matched to the Kling stills: a flat gray sky,
-// fog sitting on the ground, and glossy mud that mirrors that sky.
+// Photographic overcast on the wet oval.
+// Soft sky, mist that sits on the ground, and sky-colored streaks in the
+// water that fills a rut or a puddle. The soil stays dark so the oval reads.
 // lighting.rs splices these functions over the sunny grade in shader.wgsl.
 
 fn overcast_grade(c: vec3<f32>) -> vec3<f32> {
     let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-    // Cool and flat, but the mud stays dark. A hard lift turned the lane white.
-    var flat = mix(c, vec3<f32>(luma), 0.34);
-    flat = flat * vec3<f32>(0.93, 0.97, 1.03);
-    let lifted = flat * 0.94 + vec3<f32>(0.008);
-    let mapped = vec3<f32>(1.0) - exp(-max(lifted, vec3<f32>(0.0)) * 1.05);
+    // Cool the frame without draining it to one gray. A hard mix flattened the lane.
+    var col = mix(c, vec3<f32>(luma), 0.22);
+    col = col * vec3<f32>(0.95, 0.98, 1.04);
+    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.12);
     return pow(mapped, vec3<f32>(1.0 / 2.2));
 }
 
 fn ground_fog(col: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
     let dist = length(world - frame.cam_pos.xyz);
     let above = max(world.y, 0.0);
-    // Thick against the soil, thinner on a berm, gone above the hills.
-    let height = exp(-above * 0.42);
-    // The near oval stays dark. Fog builds across the far bank into the horizon.
-    let dist_f = smoothstep(20.0, 40.0, dist);
-    let fog = clamp(height * (0.04 + dist_f * 0.86), 0.0, 0.86);
+    // Hugs the soil. A berm is already out of it, so the ring stays readable.
+    let height = exp(-above * 2.2);
+    // Near foreground (about 14 m) stays clear. The far side of the frame is mist.
+    let dist_f = smoothstep(18.0, 40.0, dist);
+    let fog = clamp(height * dist_f * 0.78, 0.0, 0.60);
     return mix(col, frame.sky_horizon.rgb, fog);
 }
 
@@ -30,11 +30,52 @@ fn present(c: vec3<f32>) -> vec4<f32> {
 fn sky_color(dir_in: vec3<f32>) -> vec3<f32> {
     let dir = normalize(dir_in);
     let h = clamp(dir.y, 0.0, 1.0);
-    // Flat overcast. No sun disc and no cumulus.
-    var col = mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, smoothstep(0.0, 0.38, h));
-    let band = smoothstep(0.0, 0.06, dir.y) * (1.0 - smoothstep(0.06, 0.22, dir.y));
-    col = col + frame.sky_horizon.rgb * band * 0.04;
+    // Soft overcast. No sun disc. The horizon opens into the mist.
+    let t = smoothstep(0.0, 0.62, h);
+    let curve = t * t * (3.0 - 2.0 * t);
+    var col = mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, curve);
+    let band = smoothstep(0.0, 0.03, dir.y) * (1.0 - smoothstep(0.05, 0.34, dir.y));
+    col = col + frame.sky_horizon.rgb * band * 0.06;
     return col;
+}
+
+// Below the horizon a mirror shows mud, not a second copy of the bright sky.
+fn reflected_sky(dir_in: vec3<f32>) -> vec3<f32> {
+    let dir = normalize(dir_in);
+    let sky = sky_color(dir);
+    let ground = smoothstep(0.04, -0.16, dir.y);
+    return mix(sky, sky * vec3<f32>(0.16, 0.14, 0.12), ground);
+}
+
+// Across a tyre cut. A flat pad falls back to the long axis of the oval.
+fn streak_axis(xz: vec2<f32>) -> vec2<f32> {
+    let e = max(frame.params.z * 1.35, 0.22);
+    let gx = stamp_bilinear(xz + vec2<f32>(e, 0.0)) - stamp_bilinear(xz - vec2<f32>(e, 0.0));
+    let gz = stamp_bilinear(xz + vec2<f32>(0.0, e)) - stamp_bilinear(xz - vec2<f32>(0.0, e));
+    let glen = length(vec2<f32>(gx, gz));
+    let across = select(
+        vec2<f32>(0.42, 0.91),
+        vec2<f32>(gx, gz) / max(glen, 1e-4),
+        glen > 0.012,
+    );
+    return normalize(across);
+}
+
+// A few broad ribbons across the water. A tight sine drew hairline contours.
+fn water_ribbon(xz: vec2<f32>) -> f32 {
+    let across = streak_axis(xz);
+    let along = vec2<f32>(-across.y, across.x);
+    let u = dot(xz, across);
+    let v = dot(xz, along);
+    let wander = noise(vec2<f32>(v * 0.18, 1.7));
+    let band = abs(fract(u * 0.38 + wander * 0.45) - 0.5);
+    let wide = 1.0 - smoothstep(0.05, 0.20, band);
+    let dash = smoothstep(0.22, 0.62, noise(vec2<f32>(v * 0.42, u * 0.05)));
+    return wide * (0.35 + 0.65 * dash);
+}
+
+fn silver() -> vec3<f32> {
+    return frame.sky_horizon.rgb * vec3<f32>(1.06, 1.03, 1.0);
 }
 
 fn shade(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough: f32, emit: vec3<f32>) -> vec3<f32> {
@@ -42,24 +83,23 @@ fn shade(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough: f32, emit:
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = clamp(dot(n, sun), 0.0, 1.0);
     // Soft wrap. An overcast day has no hard terminator.
-    let wrap = ndl * 0.34 + 0.66;
+    let wrap = ndl * 0.28 + 0.72;
     let shadow = shadow_factor(world + n * 0.012, n);
-    // A hint of contact, not a black cut.
-    let occ = mix(0.64, 1.0, shadow);
-    let hemi = mix(frame.amb.rgb, frame.sky_zenith.rgb, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    let occ = mix(0.58, 1.0, shadow);
+    // Zenith is bright for the sky and the water. The soil only takes part of it.
+    let hemi = mix(frame.amb.rgb, frame.sky_zenith.rgb * 0.72, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
     let view = normalize(frame.cam_pos.xyz - world);
     let gloss = smoothstep(0.15, 0.70, 1.0 - rough);
-    let refl = reflect(-view, n);
-    let sky_refl = sky_color(refl);
+    let sky_refl = reflected_sky(reflect(-view, n));
     let ndotv = clamp(dot(n, view), 0.0, 1.0);
     let fres = pow(1.0 - ndotv, 2.0);
     let halfv = normalize(sun + view);
-    let broad = pow(clamp(dot(n, halfv), 0.0, 1.0), 3.5);
-    var col = albedo * hemi * (0.58 + 0.42 * wrap) * occ;
-    col = col + frame.sun_color.rgb * albedo * wrap * occ * 0.28;
-    // Smooth wet surfaces mirror the gray sky. Dry soil stays matte.
-    col = mix(col, sky_refl, gloss * (0.20 + fres * 0.62) * occ);
-    col = col + sky_refl * broad * gloss * 0.22 * occ;
+    let broad = pow(clamp(dot(n, halfv), 0.0, 1.0), 4.0);
+    var col = albedo * hemi * (0.70 + 0.30 * wrap) * occ;
+    col = col + frame.sun_color.rgb * albedo * wrap * occ * 0.42;
+    // A hint of sky on smooth paint. The material color stays in the pixel.
+    col = mix(col, sky_refl, gloss * (0.08 + fres * 0.22) * occ);
+    col = col + sky_refl * broad * gloss * 0.12 * occ;
     col = col + emit;
     return col;
 }
