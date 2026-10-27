@@ -573,6 +573,112 @@ fn mud_normal(n: vec3<f32>, p: vec3<f32>, amount: f32) -> vec3<f32> {
     return normalize(n + vec3<f32>(h0 - hx, 0.0, h0 - hz) * amount * 1.6);
 }
 
+// Height of the creases on a dent sheet. uv is the panel's own 0..1.
+fn fold_h(uv: vec2<f32>) -> f32 {
+    // A few wide creases. Hairline ridges read as a white lattice.
+    var h = 0.0;
+    let w0 = abs(fract(uv.x * 2.5 + uv.y * 0.65) - 0.5);
+    h = h + exp(-w0 * w0 * 42.0) * 0.03;
+    let w1 = abs(fract(uv.y * 3.0 - uv.x * 0.45 + 0.42) - 0.5);
+    h = h + exp(-w1 * w1 * 36.0) * 0.026;
+    let w2 = abs(fract((uv.x + uv.y) * 1.7 + 0.18) - 0.5);
+    h = h + exp(-w2 * w2 * 30.0) * 0.02;
+    return h;
+}
+
+// x is bare metal, y is the primer ring around a chip.
+fn chip_mask(uv: vec2<f32>) -> vec2<f32> {
+    let scale = vec2<f32>(9.0, 7.0);
+    let p = uv * scale;
+    let cell = floor(p);
+    let f = fract(p);
+    var metal = 0.0;
+    var primer = 0.0;
+    let tear = smoothstep(0.4, 0.95, uv.y);
+    let chance = 0.9 - tear * 0.22;
+    for (var oy: i32 = -1; oy <= 1; oy = oy + 1) {
+        for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
+            let c = cell + vec2<f32>(f32(ox), f32(oy));
+            if (hash12(c) > chance) {
+                let cx = hash12(c + vec2<f32>(1.7, 8.2));
+                let cy = hash12(c + vec2<f32>(4.1, 2.6));
+                let rad = 0.10 + hash12(c + vec2<f32>(9.0, 0.4)) * 0.18;
+                let squash_y = 0.40 + hash12(c + vec2<f32>(2.2, 3.3)) * 0.9;
+                let q = (f - vec2<f32>(f32(ox), f32(oy)) - vec2<f32>(cx, cy)) / vec2<f32>(1.15, squash_y);
+                let d = length(q);
+                let flake = smoothstep(rad, rad * 0.42, d);
+                let ring = smoothstep(rad * 1.35, rad * 0.72, d) * (1.0 - flake);
+                metal = max(metal, flake);
+                primer = max(primer, ring);
+            }
+        }
+    }
+    return vec2<f32>(metal, primer);
+}
+
+fn crease_normal(n_in: vec3<f32>, uv: vec2<f32>, dp1: vec3<f32>, dp2: vec3<f32>, duv1: vec2<f32>, duv2: vec2<f32>) -> vec3<f32> {
+    var n = n_in;
+    if (length(n) < 1e-5) {
+        n = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    n = normalize(n);
+    let e = 0.004;
+    let h = fold_h(uv);
+    let dhx = (fold_h(uv + vec2<f32>(e, 0.0)) - h) / e;
+    let dhy = (fold_h(uv + vec2<f32>(0.0, e)) - h) / e;
+    let det = duv1.x * duv2.y - duv1.y * duv2.x;
+    if (abs(det) < 1e-5) {
+        return n;
+    }
+    let inv_det = sign(det) / abs(det);
+    var t = (dp1 * duv2.y - dp2 * duv1.y) * inv_det;
+    var b = (dp2 * duv1.x - dp1 * duv2.x) * inv_det;
+    if (length(t) < 1e-5 || length(b) < 1e-5) {
+        return n;
+    }
+    t = normalize(t);
+    t = t - n * dot(n, t);
+    if (length(t) < 1e-5) {
+        return n;
+    }
+    t = normalize(t);
+    b = cross(n, t);
+    let strength = 1.25;
+    return normalize(n - t * dhx * strength - b * dhy * strength);
+}
+
+fn shade_painted_metal(world: vec3<f32>, n_in: vec3<f32>, geo: vec3<f32>, albedo: vec3<f32>, rough: f32) -> vec3<f32> {
+    let n = normalize(n_in);
+    var g = geo;
+    if (length(g) < 1e-5) {
+        g = n;
+    }
+    g = normalize(g);
+    let sun = normalize(frame.sun_dir.xyz);
+    let view = normalize(frame.cam_pos.xyz - world);
+    // The torn fender faces away from the low sun. A hard ndl would paint it black.
+    let ndl = dot(n, sun);
+    let wrap = clamp(ndl * 0.5 + 0.62, 0.22, 1.0);
+    let up = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    let metalness = smoothstep(0.25, 0.7, albedo.b / max(albedo.r, 0.04));
+    var sky = mix(vec3<f32>(0.22, 0.12, 0.06), vec3<f32>(0.50, 0.40, 0.30), up);
+    sky = mix(sky, vec3<f32>(0.42, 0.45, 0.50), metalness * 0.65);
+    let shadow = shadow_factor(world + g * 0.04, g);
+    var lit = albedo * (sky * 0.85 + frame.sun_color.rgb * wrap * shadow * 1.05);
+    let halfv = normalize(sun + view);
+    let gloss = clamp(1.0 - rough, 0.0, 1.0);
+    let spec_pow = mix(22.0, 160.0, gloss);
+    let spec = min(pow(clamp(dot(n, halfv), 0.0, 1.0), spec_pow), 0.55);
+    lit = lit + frame.sun_color.rgb * spec * gloss * (0.3 + 0.35 * shadow) * 0.28;
+    let ndv = clamp(dot(n, view), 0.0, 1.0);
+    let fres = pow(1.0 - ndv, 4.0);
+    lit = lit + vec3<f32>(0.9, 0.82, 0.7) * fres * (0.05 + gloss * 0.1);
+    let dist = length(world - frame.cam_pos.xyz);
+    let fog = smoothstep(58.0, 150.0, dist);
+    let fog_col = frame.sky_horizon.rgb * 0.28 + frame.sky_zenith.rgb * 0.12;
+    return mix(lit, fog_col, fog * 0.65);
+}
+
 fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     // rgb albedo, a roughness. Panel ids match the vehicle solver.
     let grit = hash12(floor(world.xz * 8.0 + vec2<f32>(world.y, world.y * 0.3)));
@@ -623,37 +729,53 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
     } else if (panel < 47.5) {
-        // Torn lip and the scraped ridge of a dent. Bright metal, mud in the scratches.
-        let g = noise(world.xz * 40.0 + vec2<f32>(world.y * 18.0, 0.4));
-        let scratch = smoothstep(0.45, 0.88, g);
-        let stain = smoothstep(0.4, 0.78, noise(world.xy * 5.5 + vec2<f32>(world.z * 2.0, 1.0)));
-        var col = mix(vec3<f32>(0.42, 0.43, 0.45), vec3<f32>(0.78, 0.78, 0.75), scratch);
-        col = mix(col, vec3<f32>(0.16, 0.08, 0.035), stain * 0.65);
-        return vec4<f32>(col, mix(0.42, 0.14, scratch));
+        // Torn lip. Scratched sheet metal, mud caught in the pits.
+        let scratch = smoothstep(0.25, 0.8, noise(uv * vec2<f32>(14.0, 5.0) + world.xy * 2.0));
+        var col = mix(vec3<f32>(0.42, 0.44, 0.48), vec3<f32>(0.68, 0.70, 0.72), scratch);
+        let mud = smoothstep(0.45, 0.88, noise(uv * 7.0 + vec2<f32>(world.y, 0.4))) * smoothstep(0.55, 1.0, uv.y);
+        col = mix(col, vec3<f32>(0.22, 0.10, 0.04), mud * 0.7);
+        return vec4<f32>(col, mix(0.36, 0.14, scratch));
     } else if (panel < 48.5) {
-        // Creased orange sheet. Paint stays orange; mud is a stain, not a full coat.
-        let n = noise(world.xz * 7.0 + vec2<f32>(world.y * 3.0, 0.7));
-        let scratch = noise(world.xy * 28.0 + vec2<f32>(world.z * 9.0, 2.0));
-        var col = mix(vec3<f32>(0.86, 0.28, 0.045), vec3<f32>(0.58, 0.15, 0.02), smoothstep(0.35, 0.85, n));
-        let mud = smoothstep(0.72, 0.92, n);
-        col = mix(col, vec3<f32>(0.12, 0.055, 0.022), mud * 0.75);
-        col = mix(col, vec3<f32>(0.72, 0.68, 0.62), smoothstep(0.9, 0.98, scratch) * 0.65);
-        return vec4<f32>(col, mix(0.4, 0.15, mud));
+        // Orange paint. Chips open onto metal. Crease valleys hold a thin stain.
+        let chips = chip_mask(uv);
+        let ridge = smoothstep(0.004, 0.024, fold_h(uv));
+        var col = vec3<f32>(0.84, 0.30, 0.042);
+        // Wide dark valleys. The ridge stays paint, so a fold reads in flat light.
+        col = mix(vec3<f32>(0.30, 0.10, 0.026), col, 0.1 + 0.9 * ridge);
+        let lip = smoothstep(0.72, 1.0, uv.y) * noise(uv * 4.0 + vec2<f32>(1.7, world.z));
+        col = mix(col, vec3<f32>(0.26, 0.11, 0.038), lip * 0.75);
+        col = mix(col, vec3<f32>(0.38, 0.14, 0.04), chips.y);
+        col = mix(col, vec3<f32>(0.22, 0.23, 0.25), chips.x);
+        let jag = hash12(vec2<f32>(floor(uv.x * 14.0), 4.0));
+        let fringe = smoothstep(0.93, 1.0, uv.y + (jag - 0.5) * 0.06);
+        col = mix(col, vec3<f32>(0.50, 0.52, 0.56), fringe);
+        var rough = mix(0.58, 0.34, ridge);
+        rough = mix(rough, 0.62, max(chips.x, fringe * 0.4));
+        return vec4<f32>(col, rough);
     } else if (panel < 49.5) {
-        // Mud caked on a torn lip. Brown, not the black of a ground clod.
-        let g = noise(world.xz * 10.0 + vec2<f32>(world.y * 6.0, 0.3));
-        let col = mix(vec3<f32>(0.30, 0.14, 0.05), vec3<f32>(0.12, 0.05, 0.018), g);
-        return vec4<f32>(col, 0.25);
+        // Mud caked on the lip. Brown and a little wet, not a black clod.
+        let g = noise(uv * 6.0 + world.xz * 5.0);
+        let col = mix(vec3<f32>(0.34, 0.16, 0.055), vec3<f32>(0.16, 0.07, 0.025), g);
+        return vec4<f32>(col, mix(0.48, 0.28, g));
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
 
 @fragment
 fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
+    // Screen derivatives stay in uniform control flow. Only the dent sheets use them.
+    let dp1 = dpdx(in.world);
+    let dp2 = dpdy(in.world);
+    let duv1 = dpdx(in.uv);
+    let duv2 = dpdy(in.uv);
     let panel = i32(in.panel + 0.5);
     var paint = panel_paint(in.panel, in.uv, in.world);
     var albedo = paint.rgb;
     var rough = paint.a;
+    if (in.panel > 46.5 && in.panel < 49.5) {
+        let folded = crease_normal(in.nrm, in.uv, dp1, dp2, duv1, duv2);
+        return present(shade_painted_metal(in.world, folded, in.nrm, albedo, rough));
+    }
     var emit = vec3<f32>(0.0);
 
     var nrm = in.nrm;
