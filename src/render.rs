@@ -100,6 +100,7 @@ pub struct Renderer {
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
+    lens: crate::lens_pass::LensPass,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
@@ -633,6 +634,7 @@ impl Renderer {
             false,
             None,
         );
+        let lens = crate::lens_pass::LensPass::new(&device, color_format, formats.depth);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -744,6 +746,7 @@ impl Renderer {
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
+            lens,
             blit_shader,
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
@@ -979,6 +982,9 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
+            let aspect = self.width as f32 / self.height.max(1) as f32;
+            self.lens
+                .composite(&mut pass, &self.queue, world, &cam, aspect);
         }
 
         if let Some((view, srgb)) = present {
