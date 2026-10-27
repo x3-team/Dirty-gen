@@ -3,6 +3,7 @@
 use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
+use crate::debris::Debris;
 use crate::particles::Particles;
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
@@ -57,6 +58,7 @@ pub struct World {
     pub vehicle: Vehicle,
     pub bike: Bike,
     pub particles: Particles,
+    pub debris: Debris,
     pub time: f32,
     pub telemetry: Telemetry,
     drip_acc: f32,
@@ -127,6 +129,7 @@ impl World {
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
+            debris: Debris::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -144,6 +147,7 @@ impl World {
         }
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.debris.clear();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -161,6 +165,7 @@ impl World {
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
+            debris: Debris::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
@@ -180,6 +185,7 @@ impl World {
         }
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.debris.clear();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -292,6 +298,7 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
+        self.debris.step(&self.vehicle, &contacts, &self.soil, dt);
 
         let speed = self.vehicle.speed();
         for c in &contacts {

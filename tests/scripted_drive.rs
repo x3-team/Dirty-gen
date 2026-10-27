@@ -77,9 +77,25 @@ fn scripted_drive_cuts_ruts_and_picks_up_mud() {
         world.vehicle.pos,
         world.telemetry.max_sink
     );
+    eprintln!(
+        "debris stuck {} falling {} grass {} twig {} clod {}",
+        world.debris.stuck_count(),
+        world.debris.falling_count(),
+        world.debris.kind_count(silt::debris::KIND_GRASS),
+        world.debris.kind_count(silt::debris::KIND_TWIG),
+        world.debris.kind_count(silt::debris::KIND_CLOD)
+    );
     assert!(rut1 > rut0 + 0.04, "rut depth did not grow");
     assert!(mud1 > mud0 + 0.12, "body mud did not accumulate");
     assert!(wheels > 0.05, "tires stayed clean");
+    assert!(
+        world.debris.stuck_count() >= 6,
+        "grass and clods did not stick, {}",
+        world.debris.stuck_count()
+    );
+    assert!(world.debris.kind_count(silt::debris::KIND_GRASS) > 0);
+    assert!(world.debris.kind_count(silt::debris::KIND_TWIG) > 0);
+    assert!(world.debris.kind_count(silt::debris::KIND_CLOD) > 0);
     assert!(span1 > span0 + 3.0, "track did not lengthen");
     assert!(world.telemetry.splash_bursts > 5, "puddle did not splash");
     assert!(
