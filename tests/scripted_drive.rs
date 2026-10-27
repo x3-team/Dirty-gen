@@ -199,9 +199,7 @@ fn both_stay_on_the_loop() {
             samples += 1;
         }
     }
-    eprintln!(
-        "samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}"
-    );
+    eprintln!("samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}");
     assert!(samples > 10, "lap was not sampled");
     assert!(buggy_far < 3, "buggy left the loop");
     assert!(bike_far < 3, "bike left the loop");
@@ -261,7 +259,10 @@ fn rolling_tires_leave_a_pair_of_grooves() {
         prev2 = prev;
         prev = rut;
     }
-    eprintln!("groove peaks at z={z}: {peaks:?} pos {:?}", world.vehicle.pos);
+    eprintln!(
+        "groove peaks at z={z}: {peaks:?} pos {:?}",
+        world.vehicle.pos
+    );
     assert!(
         peaks.len() >= 2,
         "expected a pair of tire grooves behind the buggy, got {peaks:?}"
@@ -287,6 +288,37 @@ fn rolling_tires_leave_a_pair_of_grooves() {
             "groove {depth:.3} at x={x:.2} has no shoulder: floor {floor:.3} shoulder {shoulder:.3}"
         );
     }
+}
+
+#[test]
+fn leaving_mud_for_dry_dirt_throws_tan_dust() {
+    let mut world = World::demo();
+    let mut peak = 0usize;
+    let mut at = glam::Vec3::ZERO;
+    for _ in 0..(7.0 * 60.0) as u32 {
+        world.step(1.0 / 60.0, &silt::demo_drive(&world));
+        let n = world.dust.alive_count();
+        if n > peak {
+            peak = n;
+            at = world.vehicle.pos;
+        }
+    }
+    let wet = world.soil.sample(at.x, at.z).wetness;
+    eprintln!(
+        "dust peak {peak} at ({:.2},{:.2}) wet {wet:.2} t {:.2}",
+        at.x, at.z, world.time
+    );
+    assert!(
+        peak > 24,
+        "no tan dust when the buggy left the mud, peak {peak}"
+    );
+    let mut firm = World::flat(0.12);
+    firm.run_seconds(2.0, |_| Input {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+    });
+    assert_eq!(firm.dust.alive_count(), 0, "firm pad should not dust");
 }
 
 #[test]

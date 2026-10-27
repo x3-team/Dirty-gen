@@ -15,6 +15,7 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP};
 use silt::world::{CameraPose, World};
 
 use crate::cockpit_mesh;
+use crate::dust_draw::dust_billboards;
 use crate::mesh::{
     bank_mesh, environment_mesh, mud_chunks, terrain_mesh, CpuMesh, MeshVertex, ParticleVertex,
     TerrainVertex,
@@ -98,7 +99,6 @@ pub struct Renderer {
     susp_i: wgpu::Buffer,
     bike_susp_v: wgpu::Buffer,
     bike_susp_i: wgpu::Buffer,
-    #[allow(dead_code)]
     particles: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
     chunk_i: wgpu::Buffer,
@@ -108,6 +108,7 @@ pub struct Renderer {
     pipe_mesh: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
+    pipe_dust: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -599,6 +600,22 @@ impl Renderer {
             true,
             None,
         );
+        let pipe_dust = pipeline(
+            &device,
+            &shader,
+            &solo_layout,
+            "vs_particle",
+            Some("fs_dust"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
         let pipe_shadow_terrain = pipeline(
             &device,
             &shader,
@@ -762,6 +779,7 @@ impl Renderer {
             pipe_water,
             pipe_mesh,
             pipe_particle,
+            pipe_dust,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
@@ -921,6 +939,12 @@ impl Renderer {
 
         let chunks = mud_chunks(&world.particles.items);
         let chunk_count = chunks.indices.len() as u32;
+        let dust_verts = dust_billboards(&world.dust, cam.eye, cam.target);
+        let dust_count = dust_verts.len() as u32;
+        if dust_count > 0 {
+            self.queue
+                .write_buffer(&self.particles, 0, bytemuck::cast_slice(&dust_verts));
+        }
         if chunk_count > 0 {
             self.queue
                 .write_buffer(&self.chunk_v, 0, bytemuck::cast_slice(&chunks.vertices));
@@ -1020,6 +1044,11 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
+            if dust_count > 0 {
+                pass.set_pipeline(&self.pipe_dust);
+                pass.set_vertex_buffer(0, self.particles.slice(..));
+                pass.draw(0..dust_count, 0..1);
+            }
         }
 
         self.minimap.draw(

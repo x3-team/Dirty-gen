@@ -768,3 +768,21 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
     return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
 }
+
+// Tan dust. Pale at the rim, warmer in the body, soft enough to read as one cloud.
+@fragment
+fn fs_dust(in: PartOut) -> @location(0) vec4<f32> {
+    let q = in.uv - vec2<f32>(0.5);
+    let n = sin(q.x * 14.0 + q.y * 9.0) * 0.035 + sin(q.x * 27.0 - q.y * 19.0) * 0.02;
+    let d = length(q) + n;
+    let edge = smoothstep(0.50, 0.04, d);
+    if (edge < 0.05) {
+        discard;
+    }
+    let core = smoothstep(0.30, 0.02, d);
+    let rim = smoothstep(0.08, 0.42, d);
+    var rgb = mix(in.color.rgb, in.color.rgb * vec3<f32>(1.12, 1.08, 0.98), rim);
+    rgb = mix(rgb, rgb * vec3<f32>(0.82, 0.70, 0.52), core * 0.45);
+    let a = in.color.a * edge;
+    return vec4<f32>(rgb, a);
+}

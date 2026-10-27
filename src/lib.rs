@@ -6,6 +6,7 @@
 
 pub mod bike;
 pub mod cockpit;
+pub mod dust;
 pub mod lap;
 pub mod particles;
 pub mod replay;
