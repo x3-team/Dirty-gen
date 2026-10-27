@@ -345,7 +345,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let g0 = noise(xz * 2.7);
     let gx = noise((xz + vec2<f32>(0.14, 0.0)) * 2.7);
     let gz = noise((xz + vec2<f32>(0.0, 0.14)) * 2.7);
-    n = normalize(n + vec3<f32>(g0 - gx, 0.0, g0 - gz) * mix(0.28, 0.04, wet_face));
+    n = normalize(n + vec3<f32>(g0 - gx, 0.0, g0 - gz) * mix(0.38, 0.05, wet_face));
     // Dark saturated soil. The noon tan read as flat beige.
     let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
     let soaked = vec3<f32>(0.04, 0.022, 0.012);
@@ -385,8 +385,18 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Standing water is drawn as its own sheet. A mirror bed under that film
     // is the gray metal disc.
     let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(0.97, 0.30, sheen * (1.0 - drowned)), 0.94, drowned);
-    return present(shade(in.world, n, albedo, rough_out, vec3<f32>(0.0)));
+    let rough_out = mix(mix(0.96, 0.22, sheen * (1.0 - drowned)), 0.94, drowned);
+    var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+    // The sun sits low, so a tight Phong highlight misses this camera.
+    // A broad warm sheen is what makes wet soil read from above.
+    let view = normalize(frame.cam_pos.xyz - in.world);
+    let ndotv = clamp(dot(n, view), 0.0, 1.0);
+    let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
+    let facing = pow(1.0 - ndotv, 2.0);
+    let broad = pow(clamp(dot(n, halfv), 0.0, 1.0), 5.0);
+    let wet_spec = (facing * 0.65 + broad * 0.85) * sheen * (1.0 - drowned);
+    lit += vec3<f32>(0.10, 0.055, 0.026) * wet_spec;
+    return present(lit);
 }
 
 struct WaterOut {
@@ -445,21 +455,21 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     }
     let n = ripple_normal(in.world.xz, frame.misc.x);
     // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.4, 1.0, n.z * 0.4));
+    let nrm = normalize(vec3<f32>(n.x * 0.55, 1.0, n.z * 0.55));
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 3.0);
-    let depth_t = smoothstep(0.012, 0.14, in.depth);
+    let fres = pow(1.0 - ndotv, 2.4);
+    let depth_t = smoothstep(0.01, 0.16, in.depth);
     // Red-heavy mud. A gray mix here is what read as a metal disc from above.
-    let shore_col = vec3<f32>(0.07, 0.032, 0.014);
-    let deep_col = vec3<f32>(0.018, 0.008, 0.004);
+    let shore_col = vec3<f32>(0.095, 0.042, 0.016);
+    let deep_col = vec3<f32>(0.010, 0.004, 0.002);
     let absorption = mix(shore_col, deep_col, depth_t);
-    // Flat dull sky. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.10, 0.11, 0.12);
-    var col = mix(absorption, quiet, 0.04 + fres * 0.09);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 48.0);
-    col += vec3<f32>(0.04, 0.025, 0.012) * spec * shadow_factor(in.world, nrm) * 0.04;
+    // Warm dusk, not a gray sky. sky_color carries the sun disc and white clouds.
+    let quiet = vec3<f32>(0.20, 0.11, 0.05);
+    var col = mix(absorption, quiet, 0.05 + fres * 0.16);
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 36.0);
+    col += vec3<f32>(0.16, 0.08, 0.03) * spec * shadow_factor(in.world, nrm) * 0.22;
     let shore = smoothstep(0.002, 0.07, in.depth);
     // Only a cut of a couple of centimetres thins the film, and only on that cut.
     // The rest of the pond stays a dark cover, shore and middle alike.
@@ -518,21 +528,22 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     // rgb albedo, a roughness. Panel ids match the vehicle solver.
     let grit = hash12(floor(world.xz * 8.0 + vec2<f32>(world.y, world.y * 0.3)));
     if (panel < 0.5) {
-        return vec4<f32>(vec3<f32>(0.16, 0.17, 0.18) * (0.9 + grit * 0.15), 0.38);
+        return vec4<f32>(vec3<f32>(0.28, 0.30, 0.32) * (0.92 + grit * 0.1), 0.22);
     } else if (panel < 1.5) {
-        return vec4<f32>(vec3<f32>(0.78, 0.24, 0.035) * (0.92 + grit * 0.12), 0.72);
+        return vec4<f32>(vec3<f32>(0.82, 0.26, 0.04) * (0.94 + grit * 0.08), 0.38);
     } else if (panel < 2.5) {
-        return vec4<f32>(vec3<f32>(0.72, 0.20, 0.03), 0.74);
+        return vec4<f32>(vec3<f32>(0.74, 0.20, 0.03), 0.42);
     } else if (panel < 3.5) {
-        return vec4<f32>(vec3<f32>(0.70, 0.19, 0.028), 0.74);
+        return vec4<f32>(vec3<f32>(0.72, 0.19, 0.028), 0.42);
     } else if (panel < 4.5) {
-        return vec4<f32>(vec3<f32>(0.62, 0.16, 0.025), 0.76);
+        return vec4<f32>(vec3<f32>(0.55, 0.14, 0.02), 0.46);
     } else if (panel < 5.5) {
-        return vec4<f32>(vec3<f32>(0.10, 0.09, 0.08), 0.7);
+        return vec4<f32>(vec3<f32>(0.08, 0.07, 0.06), 0.62);
     } else if (panel < 9.5) {
-        return vec4<f32>(vec3<f32>(0.66, 0.18, 0.03), 0.7);
+        return vec4<f32>(vec3<f32>(0.70, 0.18, 0.03), 0.40);
     } else if (panel < 10.5) {
-        return vec4<f32>(vec3<f32>(0.18, 0.18, 0.19), 0.55);
+        // Springs and the engine. Bright enough to read as steel from above.
+        return vec4<f32>(vec3<f32>(0.55, 0.56, 0.58) * (0.9 + grit * 0.12), 0.24);
     } else if (panel < 11.5) {
         return vec4<f32>(vec3<f32>(0.045, 0.04, 0.038), 0.8);
     } else if (panel < 16.5) {
@@ -651,10 +662,13 @@ fn vs_particle(in: PartIn) -> PartOut {
 @fragment
 fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     let d = length(in.uv - vec2<f32>(0.5));
-    if (d > 0.5) {
+    // Broken clod edge. A round falloff stacked into an orange coin.
+    let wobble = 0.10 * sin(in.uv.x * 11.0 + in.uv.y * 7.0)
+        + 0.06 * sin(in.uv.x * 23.0 - in.uv.y * 17.0);
+    if (d > 0.40 + wobble) {
         discard;
     }
-    let fall = smoothstep(0.5, 0.05, d);
+    let fall = smoothstep(0.40, 0.12, d);
     // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
-    return vec4<f32>(in.color.rgb, in.color.a * fall);
+    return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
 }

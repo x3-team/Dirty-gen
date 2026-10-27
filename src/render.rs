@@ -1028,15 +1028,15 @@ fn build_particles(out: &mut Vec<ParticleVertex>, items: &[Particle], eye: Vec3,
         }
         let life = (p.life / p.max_life).clamp(0.0, 1.0);
         let (color, scale) = match p.kind {
-            // Display-space mud. These values are the pixels. Paler than this
-            // reads as a white cloud against the track.
-            0 => ([0.42, 0.18, 0.06, 1.0], 1.65),
-            1 => ([0.28, 0.12, 0.045, 0.98], 1.3),
-            // Impact clumps and droplets. Darker than the driving spray, and
-            // large enough to read from the isometric frame while they fall.
-            3 => ([0.16, 0.07, 0.025, 1.0], 3.6),
-            4 => ([0.22, 0.09, 0.03, 1.0], 2.6),
-            _ => ([0.11, 0.055, 0.025, life * 0.85], 0.7),
+            // Display-space mud. Hue stays with the soil (green about half the
+            // red). The old (0.42, 0.18, 0.06) landed as orange coins on the puddle.
+            0 => ([0.22, 0.12, 0.055, 0.92], 1.15),
+            1 => ([0.20, 0.11, 0.050, 0.94], 1.15),
+            // Impact clumps. Big enough to read while they fall, small enough
+            // that they separate instead of one dark disc over the splash.
+            3 => ([0.24, 0.13, 0.060, 0.90], 2.05),
+            4 => ([0.20, 0.11, 0.050, 0.88], 1.35),
+            _ => ([0.16, 0.09, 0.045, life * 0.8], 0.7),
         };
         let h = p.size * scale;
         let c = p.pos;

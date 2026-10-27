@@ -494,14 +494,15 @@ pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
         let lower_f = Vec3::new(sign * 0.28, -0.02, z + 0.18);
         let lower_r = Vec3::new(sign * 0.28, -0.02, z - 0.18);
         let knuckle = Vec3::new(wc.x - sign * 0.04, wc.y, wc.z);
-        add_tube(&mut m, lower_f, knuckle, 0.04, arm, 4);
-        add_tube(&mut m, lower_r, knuckle, 0.04, arm, 4);
-        let upright_top = knuckle + Vec3::Y * 0.16;
-        add_tube(&mut m, knuckle, upright_top, 0.032, spring, 4);
-        let tower = Vec3::new(sign * 0.28, 0.46, z);
-        let perch = knuckle + Vec3::Y * 0.04;
-        add_helix(&mut m, tower, perch, 0.09, 0.034, 3, 4, spring);
-        add_tube(&mut m, tower, perch, 0.02, spring, 4);
+        add_tube(&mut m, lower_f, knuckle, 0.055, arm, 5);
+        add_tube(&mut m, lower_r, knuckle, 0.055, arm, 5);
+        let upright_top = knuckle + Vec3::Y * 0.18;
+        add_tube(&mut m, knuckle, upright_top, 0.04, spring, 4);
+        let tower = Vec3::new(sign * 0.30, 0.50, z);
+        let perch = knuckle + Vec3::Y * 0.05;
+        // Three fat turns. A thin helix disappears at this camera distance.
+        add_helix(&mut m, tower, perch, 0.11, 0.036, 3, 5, spring);
+        add_tube(&mut m, tower, perch, 0.022, spring, 4);
     }
     m
 }
