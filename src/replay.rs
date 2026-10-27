@@ -164,22 +164,34 @@ pub fn replay_camera(view: ReplayView, vehicle: &Vehicle) -> CameraPose {
             eye: pos + right * 5.6 + Vec3::Y * 1.15,
             target: pos + Vec3::Y * 0.4,
             ortho_width: None,
+            fov_deg: None,
+            near: None,
+            cockpit: false,
         },
         ReplayView::Top => CameraPose {
             eye: pos + Vec3::Y * 18.0,
             target: pos + Vec3::Y * 0.2,
             ortho_width: Some(11.0),
+            fov_deg: None,
+            near: None,
+            cockpit: false,
         },
         ReplayView::Bumper => CameraPose {
             // Low and just ahead of the nose, looking back at the front wheels.
             eye: pos + forward * 3.8 + right * 0.4 + Vec3::Y * -0.08,
             target: pos + Vec3::Y * 0.28,
             ortho_width: None,
+            fov_deg: None,
+            near: None,
+            cockpit: false,
         },
         ReplayView::RearThreeQuarter => CameraPose {
             eye: pos - forward * 4.4 + right * 2.5 + Vec3::Y * 1.65,
             target: pos + forward * 0.8 + Vec3::Y * 0.45,
             ortho_width: None,
+            fov_deg: None,
+            near: None,
+            cockpit: false,
         },
     }
 }

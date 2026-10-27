@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod cockpit_mesh;
 mod mesh;
 mod minimap;
 mod mud_look;
@@ -16,6 +17,7 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
+use silt::cockpit::{cockpit_pose, DriveCam};
 use silt::lap::LapClock;
 use silt::replay::LapReplay;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
@@ -91,7 +93,7 @@ struct App {
     keys: Keys,
     orbit_yaw: f32,
     orbit_pitch: f32,
-    chase_cam: bool,
+    cam: DriveCam,
     drive_bike: bool,
     replay: LapReplay,
     /// Set once the player presses a drive key. Until then both vehicles run
@@ -137,7 +139,7 @@ impl ApplicationHandler for App {
                 }
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
+                        PhysicalKey::Code(KeyCode::KeyC) => self.cam = self.cam.cycle(),
                         PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
                         // R replays the one recorded lap. It is a press, not a hold.
                         PhysicalKey::Code(KeyCode::KeyR) => {
@@ -321,16 +323,22 @@ impl App {
         };
         let pose = if self.replay.is_playing() {
             self.replay.camera(&self.world.vehicle)
-        } else if self.chase_cam {
-            chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
         } else {
-            demo_camera(
-                self.world.time,
-                self.world.vehicle.pos,
-                self.world.vehicle.yaw,
-            )
+            match self.cam {
+                DriveCam::Chase => chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch),
+                DriveCam::Iso => demo_camera(
+                    self.world.time,
+                    self.world.vehicle.pos,
+                    self.world.vehicle.yaw,
+                ),
+                DriveCam::Cockpit(index) => cockpit_pose(&self.world.vehicle, index),
+            }
         };
-        let pose = lift_camera(&self.world, pose);
+        let pose = if pose.cockpit {
+            pose
+        } else {
+            lift_camera(&self.world, pose)
+        };
         let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
@@ -406,6 +414,9 @@ fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
         eye,
         target,
         ortho_width: None,
+        fov_deg: None,
+        near: None,
+        cockpit: false,
     }
 }
 
@@ -439,7 +450,7 @@ fn run_window() {
         },
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
-        chase_cam: false,
+        cam: DriveCam::Iso,
         drive_bike: false,
         replay: LapReplay::new(),
         player_drove: false,
