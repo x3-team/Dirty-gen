@@ -1,22 +1,34 @@
 //! Thin wgpu runtime. The soil and the buggy are drawn from the solver state:
 //! height and material live in textures, mud mass lives in a per-draw uniform.
 
+#[path = "lighting.rs"]
+mod lighting;
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
+use silt::bike::Bike;
+use silt::cockpit::wheel_local;
 use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
-use silt::bike::{Bike, BIKE_RADIUS};
-use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
+use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP};
 use silt::world::{CameraPose, World};
 
+use crate::buggy_gltf::{self, pose_suspension, PbrVertex};
+use crate::cockpit_mesh;
+use crate::debris_mesh::debris_mesh;
+use crate::dust_draw::dust_billboards;
+use crate::exhaust_pass::ExhaustPass;
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bank_mesh, environment_mesh, mud_chunks, terrain_mesh, CpuMesh, MeshVertex, ParticleVertex,
+    TerrainVertex,
+};
+use crate::vehicle_mesh::{
+    bike_body, bike_suspension, bike_wheel, BIKE_SUSP_INDICES, BIKE_SUSP_VERTS,
 };
 
 const SHADOW: u32 = 2048;
-const MODEL_SLOTS: u64 = 12;
+const MODEL_SLOTS: u64 = 13;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -79,34 +91,62 @@ pub struct Renderer {
     terrain: GpuMesh,
     body: GpuMesh,
     wheel: GpuMesh,
+    buggy: buggy_gltf::BuggyAsset,
+    buggy_susp_indices: u32,
+    bike_wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
+    bank: GpuMesh,
+    cockpit: GpuMesh,
+    cockpit_wheel: GpuMesh,
     susp_v: wgpu::Buffer,
     susp_i: wgpu::Buffer,
     bike_susp_v: wgpu::Buffer,
     bike_susp_i: wgpu::Buffer,
-    #[allow(dead_code)]
     particles: wgpu::Buffer,
+    fuel_v: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
     chunk_i: wgpu::Buffer,
+    debris_v: wgpu::Buffer,
+    debris_i: wgpu::Buffer,
+    dent_v: wgpu::Buffer,
+    dent_i: wgpu::Buffer,
+    loose_v: wgpu::Buffer,
+    loose_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
+    pipe_pbr: wgpu::RenderPipeline,
+    pipe_shadow_pbr: wgpu::RenderPipeline,
+    pbr_bg: wgpu::BindGroup,
+    #[allow(dead_code)]
+    normal_tex: wgpu::Texture,
+    #[allow(dead_code)]
+    normal_view: wgpu::TextureView,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
+    pipe_dust: wgpu::RenderPipeline,
+    pipe_fuel: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
+    lens: crate::lens_pass::LensPass,
+    pub show_lens: bool,
+    /// Dust, debris, fuel, exhaust, dents, mud clods, and the cockpit.
+    /// The hero stills turn this off so those cards do not cover the cage.
+    pub show_effects: bool,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
+    minimap: crate::minimap::Minimap,
     mat_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
     height_bytes: Vec<u8>,
     height_packed: bool,
     depth_format: wgpu::TextureFormat,
+    exhaust_fx: ExhaustPass,
 }
 
 pub struct GpuFormats {
@@ -217,7 +257,7 @@ impl Renderer {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(lighting::apply(silt_shader_source()).into()),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -484,6 +524,32 @@ impl Renderer {
             bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl],
             push_constant_ranges: &[],
         });
+        let pbr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("buggy-pbr"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pbr_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pbr-layout"),
+            bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &pbr_bgl],
+            push_constant_ranges: &[],
+        });
         let solo_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("solo-layout"),
             bind_group_layouts: &[&frame_bgl],
@@ -553,6 +619,22 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_pbr = pipeline(
+            &device,
+            &shader,
+            &pbr_layout,
+            "vs_pbr",
+            Some("fs_pbr"),
+            pbr_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_sky = pipeline(
             &device,
             &shader,
@@ -575,6 +657,42 @@ impl Renderer {
             &solo_layout,
             "vs_particle",
             Some("fs_particle"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
+        let pipe_dust = pipeline(
+            &device,
+            &shader,
+            &solo_layout,
+            "vs_particle",
+            Some("fs_dust"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
+        let fuel_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fuel-show"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fuel_show.wgsl").into()),
+        });
+        let pipe_fuel = pipeline(
+            &device,
+            &fuel_shader,
+            &solo_layout,
+            "vs_fuel",
+            Some("fs_fuel"),
             particle_buffers(),
             color_format,
             Some(depth_state(
@@ -609,6 +727,18 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_shadow_pbr = pipeline(
+            &device,
+            &shader,
+            &shadow_layout,
+            "vs_shadow_pbr",
+            Some("fs_shadow"),
+            pbr_buffers(),
+            color_format,
+            Some(shadow_depth_state(formats.depth)),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_blit = pipeline(
             &device,
             &blit_shader,
@@ -633,6 +763,8 @@ impl Renderer {
             false,
             None,
         );
+        let lens = crate::lens_pass::LensPass::new(&device, color_format, formats.depth);
+        let exhaust_fx = ExhaustPass::new(&device, width, height, formats.depth);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -649,37 +781,74 @@ impl Renderer {
 
         let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
         let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
-        let body_cpu = buggy_body();
-        let body = upload_cpu(&device, &body_cpu, "body");
-        let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
-        let bike_body = upload_cpu(&device, &bike_body(), "bike");
-        let env = upload_cpu(&device, &environment_mesh(), "env");
+        let buggy = buggy_gltf::load_buggy();
+        let body = upload_pbr(&device, &buggy.chassis.vertices, &buggy.chassis.indices, "buggy");
+        let wheel = upload_pbr(&device, &buggy.wheel.vertices, &buggy.wheel.indices, "buggy-wheel");
+        let (normal_tex, normal_view) = upload_normal(&device, &queue, &buggy.normal_png);
+        let normal_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("buggy-normal"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let pbr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("buggy-pbr-bg"),
+            layout: &pbr_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&normal_samp),
+                },
+            ],
+        });
+        let posed = pose_suspension(&silt::vehicle::Vehicle::new(), &buggy);
+        let buggy_susp_indices = posed.indices.len() as u32;
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
-            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
+            size: (posed.vertices.len() * std::mem::size_of::<PbrVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-i"),
-            size: (32768 * 4) as u64,
+            size: (posed.indices.len() * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        queue.write_buffer(&susp_i, 0, bytemuck::cast_slice(&posed.indices));
+        let bike_wheel = upload_cpu(&device, &bike_wheel(), "bike-wheel");
+        let bike_body = upload_cpu(&device, &bike_body(), "bike");
+        let env = upload_cpu(&device, &environment_mesh(), "env");
+        let bank = upload_cpu(&device, &bank_mesh(), "bank");
+        let cockpit = upload_cpu(&device, &cockpit_mesh::shell(), "cockpit");
+        let cockpit_wheel = upload_cpu(&device, &cockpit_mesh::wheel(), "cockpit-wheel");
         let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-v"),
-            size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
+            size: (BIKE_SUSP_VERTS * std::mem::size_of::<MeshVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bike_susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-i"),
-            size: (16384 * 4) as u64,
+            size: (BIKE_SUSP_INDICES * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("particles"),
+            size: (6144 * std::mem::size_of::<ParticleVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fuel_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fuel"),
             size: (6144 * std::mem::size_of::<ParticleVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -693,6 +862,43 @@ impl Renderer {
         let chunk_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunks-i"),
             size: (48000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let minimap = crate::minimap::Minimap::new(&device);
+        let debris_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debris-v"),
+            size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let debris_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debris-i"),
+            size: (24000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dent_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dent-v"),
+            size: (4096 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dent_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dent-i"),
+            size: (12288 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let loose_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("loose-v"),
+            size: (4096 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let loose_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("loose-i"),
+            size: (12288 * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -725,32 +931,57 @@ impl Renderer {
             terrain,
             body,
             wheel,
+            buggy,
+            buggy_susp_indices,
+            bike_wheel,
             bike_body,
             env,
+            bank,
+            cockpit,
+            cockpit_wheel,
             susp_v,
             susp_i,
             bike_susp_v,
             bike_susp_i,
             particles,
+            fuel_v,
             chunk_v,
             chunk_i,
+            debris_v,
+            debris_i,
+            dent_v,
+            dent_i,
+            loose_v,
+            loose_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
             pipe_mesh,
+            pipe_pbr,
+            pipe_shadow_pbr,
+            pbr_bg,
+            normal_tex,
+            normal_view,
             pipe_particle,
+            pipe_dust,
+            pipe_fuel,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
+            lens,
+            show_lens: true,
+            show_effects: true,
             blit_shader,
             blit_layout,
+            minimap,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
             height_packed: formats.height_packed,
             depth_format: formats.depth,
+            exhaust_fx,
         }
     }
 
@@ -797,6 +1028,7 @@ impl Renderer {
         self.depth_view = depth_view;
         self.readback = readback;
         self.padded_row = padded_row;
+        self.exhaust_fx.resize(&self.device, width, height);
         let nearest = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -829,31 +1061,44 @@ impl Renderer {
         readback: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
-        let susp = suspension_mesh(&world.vehicle);
-        let susp_index_count = susp.indices.len() as u32;
+        let susp = pose_suspension(&world.vehicle, &self.buggy);
+        if susp.indices.len() as u32 != self.buggy_susp_indices {
+            panic!(
+                "posed suspension index count changed ({} -> {})",
+                self.buggy_susp_indices,
+                susp.indices.len()
+            );
+        }
         self.queue
             .write_buffer(&self.susp_v, 0, bytemuck::cast_slice(&susp.vertices));
-        self.queue
-            .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.bike_susp_v, 0, bytemuck::cast_slice(&bike_susp.vertices));
-        self.queue
-            .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
+        self.queue.write_buffer(
+            &self.bike_susp_v,
+            0,
+            bytemuck::cast_slice(&bike_susp.vertices),
+        );
+        self.queue.write_buffer(
+            &self.bike_susp_i,
+            0,
+            bytemuck::cast_slice(&bike_susp.indices),
+        );
 
-        let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
+        let up = silt::replay::view_up(cam.eye, cam.target);
+        let view = Mat4::look_at_rh(cam.eye, cam.target, up);
         let aspect = self.width as f32 / self.height as f32;
         let proj = if let Some(width) = cam.ortho_width {
             let half_w = width * 0.5;
             let half_h = half_w / aspect.max(0.1);
             Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.2, 260.0)
         } else {
-            Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
+            let fov = cam.fov_deg.unwrap_or(46.0).to_radians();
+            let near = cam.near.unwrap_or(0.15).max(0.02);
+            Mat4::perspective_rh(fov, aspect, near, 180.0)
         };
         let view_proj = proj * view;
-        // Low sun so rut walls and the buggy contact shadow separate from the ground.
-        let sun = Vec3::new(0.88, 0.32, 0.24).normalize();
+        let sky = lighting::overcast();
+        let sun = sky.sun;
         let light_target = Vec3::new(0.0, 0.0, 2.0);
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
         let light_proj = Mat4::orthographic_rh(-36.0, 36.0, -36.0, 36.0, 1.0, 130.0);
@@ -864,10 +1109,10 @@ impl Renderer {
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
             sun_dir: vec4(sun, 0.0),
-            sun_color: [1.15, 0.74, 0.42, 1.0],
-            sky_zenith: [0.13, 0.26, 0.52, 1.0],
-            sky_horizon: [0.50, 0.28, 0.18, 1.0],
-            amb: [0.10, 0.062, 0.038, 1.0],
+            sun_color: sky.sun_color,
+            sky_zenith: sky.sky_zenith,
+            sky_horizon: sky.sky_horizon,
+            amb: sky.ambient,
             params: [
                 self.width as f32,
                 self.height as f32,
@@ -886,15 +1131,47 @@ impl Renderer {
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
+        let dents = crate::dents::dent_mesh(&world.damage);
+        let loose = crate::dents::loose_mesh(&world.damage);
+        let dent_count = upload_dynamic(&self.queue, &self.dent_v, &self.dent_i, &dents);
+        let loose_count = upload_dynamic(&self.queue, &self.loose_v, &self.loose_i, &loose);
+        self.write_loose_panel(&world.vehicle, &world.damage);
+
         let chunks = mud_chunks(&world.particles.items);
         let chunk_count = chunks.indices.len() as u32;
+        let dust_verts = dust_billboards(&world.dust, cam.eye, cam.target);
+        let dust_count = dust_verts.len() as u32;
+        if dust_count > 0 {
+            self.queue
+                .write_buffer(&self.particles, 0, bytemuck::cast_slice(&dust_verts));
+        }
         if chunk_count > 0 {
             self.queue
                 .write_buffer(&self.chunk_v, 0, bytemuck::cast_slice(&chunks.vertices));
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
+        let stuck = debris_mesh(&world.vehicle, &world.debris);
+        let debris_count = stuck.indices.len() as u32;
+        if debris_count > 0 {
+            self.queue
+                .write_buffer(&self.debris_v, 0, bytemuck::cast_slice(&stuck.vertices));
+            self.queue
+                .write_buffer(&self.debris_i, 0, bytemuck::cast_slice(&stuck.indices));
+        }
+        // Dust keeps the shared particle buffer. The ribbon uses its own so a
+        // frame can draw both.
+        let mut fuel_verts = silt::fuel_show::vertices(&world.fuel, cam.eye, &world.soil);
+        if fuel_verts.len() > 6000 {
+            fuel_verts.truncate(6000);
+        }
+        let fuel_count = fuel_verts.len() as u32;
+        if fuel_count > 0 {
+            self.queue
+                .write_buffer(&self.fuel_v, 0, bytemuck::cast_slice(&fuel_verts));
+        }
 
+        let show_effects = self.show_effects;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -932,10 +1209,22 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
-            self.draw_bike(&mut pass, bike_susp_count);
+            draw_indexed(&mut pass, &self.bank);
+            pass.set_pipeline(&self.pipe_shadow_pbr);
+            self.draw_buggy(&mut pass);
             pass.set_pipeline(&self.pipe_shadow_mesh);
-            self.draw_chunks(&mut pass, chunk_count);
+            if show_effects {
+                self.draw_body_damage(&mut pass, dent_count, loose_count);
+            }
+            self.draw_bike(&mut pass, bike_susp_count);
+            if cam.cockpit && show_effects {
+                self.draw_cockpit(&mut pass);
+            }
+            pass.set_pipeline(&self.pipe_shadow_mesh);
+            if show_effects {
+                self.draw_chunks(&mut pass, chunk_count);
+                self.draw_debris(&mut pass, debris_count);
+            }
         }
 
         {
@@ -971,15 +1260,90 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
+            draw_indexed(&mut pass, &self.bank);
+            pass.set_pipeline(&self.pipe_pbr);
+            pass.set_bind_group(3, &self.pbr_bg, &[]);
+            self.draw_buggy(&mut pass);
+            pass.set_pipeline(&self.pipe_mesh);
+            if show_effects {
+                self.draw_body_damage(&mut pass, dent_count, loose_count);
+            }
             self.draw_bike(&mut pass, bike_susp_count);
+            if cam.cockpit && show_effects {
+                self.draw_cockpit(&mut pass);
+            }
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
-            pass.set_pipeline(&self.pipe_mesh);
-            self.draw_chunks(&mut pass, chunk_count);
+            if show_effects {
+                pass.set_pipeline(&self.pipe_mesh);
+                self.draw_chunks(&mut pass, chunk_count);
+                if dust_count > 0 {
+                    pass.set_pipeline(&self.pipe_dust);
+                    pass.set_vertex_buffer(0, self.particles.slice(..));
+                    pass.draw(0..dust_count, 0..1);
+                }
+                self.draw_debris(&mut pass, debris_count);
+                if fuel_count > 0 {
+                    pass.set_pipeline(&self.pipe_fuel);
+                    pass.set_bind_group(0, &self.frame_bg, &[]);
+                    pass.set_vertex_buffer(0, self.fuel_v.slice(..));
+                    pass.draw(0..fuel_count, 0..1);
+                }
+            }
         }
+
+        if show_effects {
+            self.exhaust_fx.draw(
+                &mut encoder,
+                &self.queue,
+                &self.color,
+                &self.color_view,
+                &self.depth_view,
+                &world.exhaust,
+                view_proj,
+                cam.eye,
+                cam.target,
+                self.width,
+                self.height,
+            );
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lens"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let aspect = self.width as f32 / self.height.max(1) as f32;
+            self.lens
+                .composite(&mut pass, &self.queue, world, &cam, aspect, self.show_lens);
+        }
+
+        self.minimap.draw(
+            &mut encoder,
+            &self.queue,
+            &self.color_view,
+            self.width,
+            self.height,
+            world,
+        );
 
         if let Some((view, srgb)) = present {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1159,19 +1523,75 @@ impl Renderer {
                 bytemuck::bytes_of(slot),
             );
         }
+        let steered = model(body * wheel_local(vehicle.wheels[0].steer), mud, [0.0; 4]);
+        self.queue.write_buffer(
+            &self.model_buf,
+            11 * self.model_stride as u64,
+            bytemuck::bytes_of(&steered),
+        );
     }
 
-    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
+    fn draw_cockpit(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        draw_indexed(pass, &self.cockpit);
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 11]);
+        draw_indexed(pass, &self.cockpit_wheel);
+    }
+
+    fn write_loose_panel(&self, vehicle: &Vehicle, damage: &silt::BodyDamage) {
+        let mut mud = [[0.0; 4]; PANEL_COUNT];
+        for (i, panel) in vehicle.panels.iter().enumerate() {
+            mud[i] = [
+                panel.mass / PANEL_MUD_CAP,
+                panel.drip,
+                panel.streak,
+                panel.wet,
+            ];
+        }
+        let slot = model(
+            crate::dents::loose_transform(vehicle, damage),
+            mud,
+            [0.0, 0.0, 0.0, 0.0],
+        );
+        self.queue.write_buffer(
+            &self.model_buf,
+            12 * self.model_stride as u64,
+            bytemuck::bytes_of(&slot),
+        );
+    }
+
+    fn draw_buggy(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(2, &self.model_bg, &[0]);
         draw_indexed(pass, &self.body);
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
             draw_indexed(pass, &self.wheel);
         }
+        // Slot 6 is the body matrix. Posed arms and coils are already in body space.
         pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 6]);
         pass.set_vertex_buffer(0, self.susp_v.slice(..));
         pass.set_index_buffer(self.susp_i.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..susp_indices, 0, 0..1);
+        pass.draw_indexed(0..self.buggy_susp_indices, 0, 0..1);
+    }
+
+    fn draw_body_damage(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        dent_indices: u32,
+        loose_indices: u32,
+    ) {
+        if dent_indices > 0 {
+            pass.set_bind_group(2, &self.model_bg, &[0]);
+            pass.set_vertex_buffer(0, self.dent_v.slice(..));
+            pass.set_index_buffer(self.dent_i.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..dent_indices, 0, 0..1);
+        }
+        if loose_indices > 0 {
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 12]);
+            pass.set_vertex_buffer(0, self.loose_v.slice(..));
+            pass.set_index_buffer(self.loose_i.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..loose_indices, 0, 0..1);
+        }
     }
 
     fn write_bike_models(&self, bike: &Bike) {
@@ -1205,7 +1625,7 @@ impl Renderer {
         draw_indexed(pass, &self.bike_body);
         for i in 0..2 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (8 + i)]);
-            draw_indexed(pass, &self.wheel);
+            draw_indexed(pass, &self.bike_wheel);
         }
         pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 10]);
         pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
@@ -1223,17 +1643,25 @@ impl Renderer {
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
+
+    fn draw_debris(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        if count == 0 {
+            return;
+        }
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+        pass.set_vertex_buffer(0, self.debris_v.slice(..));
+        pass.set_index_buffer(self.debris_i.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..count, 0, 0..1);
+    }
 }
 
 fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
     let local = bike.wheel_center_local(index);
     let wheel = bike.wheels[index];
-    let radius = BIKE_RADIUS / WHEEL_RADIUS;
     let world = body
         * Mat4::from_translation(local)
         * Mat4::from_rotation_y(wheel.steer)
-        * Mat4::from_rotation_x(wheel.spin)
-        * Mat4::from_scale(Vec3::new(0.62, radius, radius));
+        * Mat4::from_rotation_x(wheel.spin);
     model(
         world,
         mud,
@@ -1265,6 +1693,34 @@ fn model(world: Mat4, mud: [[f32; 4]; 12], extra: [f32; 4]) -> ModelData {
 
 fn vec4(v: Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
+}
+
+fn upload_dynamic(
+    queue: &wgpu::Queue,
+    vbuf: &wgpu::Buffer,
+    ibuf: &wgpu::Buffer,
+    mesh: &CpuMesh,
+) -> u32 {
+    if mesh.indices.is_empty() {
+        return 0;
+    }
+    let vbytes = bytemuck::cast_slice::<MeshVertex, u8>(&mesh.vertices);
+    let ibytes = bytemuck::cast_slice::<u32, u8>(&mesh.indices);
+    assert!(
+        vbytes.len() as u64 <= vbuf.size(),
+        "dent vertices {} overflow {}",
+        mesh.vertices.len(),
+        vbuf.size()
+    );
+    assert!(
+        ibytes.len() as u64 <= ibuf.size(),
+        "dent indices {} overflow {}",
+        mesh.indices.len(),
+        ibuf.size()
+    );
+    queue.write_buffer(vbuf, 0, vbytes);
+    queue.write_buffer(ibuf, 0, ibytes);
+    mesh.indices.len() as u32
 }
 
 fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
@@ -1415,6 +1871,116 @@ fn terrain_buffers() -> &'static [wgpu::VertexBufferLayout<'static>] {
             },
         ],
     }]
+}
+
+fn pbr_buffers() -> &'static [wgpu::VertexBufferLayout<'static>] {
+    &[wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<PbrVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 16,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 28,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 32,
+                shader_location: 4,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 48,
+                shader_location: 5,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 64,
+                shader_location: 6,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 72,
+                shader_location: 7,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 76,
+                shader_location: 8,
+            },
+        ],
+    }]
+}
+
+fn upload_pbr(
+    device: &wgpu::Device,
+    vertices: &[PbrVertex],
+    indices: &[u32],
+    label: &str,
+) -> GpuMesh {
+    upload_mesh(device, vertices, indices, label)
+}
+
+fn upload_normal(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    png_bytes: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().expect("buggy normal map");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("buggy normal frame");
+    buf.truncate(info.buffer_size());
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("buggy-normal"),
+        size: wgpu::Extent3d {
+            width: info.width,
+            height: info.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &buf,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(info.width * 4),
+            rows_per_image: Some(info.height),
+        },
+        wgpu::Extent3d {
+            width: info.width,
+            height: info.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 fn mesh_buffers() -> &'static [wgpu::VertexBufferLayout<'static>] {
@@ -1575,3 +2141,53 @@ fn fs_blit_tosrgb(in: V) -> @location(0) vec4<f32> {
     return vec4<f32>(pow(c.rgb, vec3<f32>(2.2)), c.a);
 }
 "#;
+
+fn silt_shader_source() -> String {
+    include_str!("shader.wgsl")
+        .replace(
+            "// MUD_FIELD_LOOK_HOOK",
+            include_str!("mud_field_look.wgsl"),
+        )
+        .replace(
+            "// MUD_VEHICLE_LOOK_HOOK",
+            include_str!("vehicle_shade.wgsl"),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lighting, silt_shader_source};
+
+    #[test]
+    fn look_helpers_are_declared_before_use() {
+        let src = lighting::apply(silt_shader_source());
+        let field = src.find("fn rut_chevron_scale").expect("rut helper");
+        let terrain = src.find("fn vs_terrain").expect("vs_terrain");
+        let paint = src.find("fn vehicle_panel_paint").expect("vehicle paint");
+        let mesh = src.find("fn fs_mesh").expect("fs_mesh");
+        assert!(
+            field < terrain,
+            "field look must precede the terrain vertex stage"
+        );
+        assert!(paint < mesh, "vehicle paint must precede fs_mesh");
+        assert!(
+            src.contains("fn puddle_color") && src.contains("fn vehicle_wheel"),
+            "mud and wheel helpers are part of the shader"
+        );
+    }
+
+    #[test]
+    fn shader_is_valid_wgsl() {
+        let src = lighting::apply(silt_shader_source());
+        let module = wgpu::naga::front::wgsl::parse_str(&src).unwrap_or_else(|err| {
+            panic!("wgsl parse failed: {err:?}");
+        });
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        if let Err(err) = validator.validate(&module) {
+            panic!("wgsl validation failed: {err:?}");
+        }
+    }
+}

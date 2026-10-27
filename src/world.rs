@@ -3,6 +3,11 @@
 use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
+use crate::body_damage::BodyDamage;
+use crate::debris::Debris;
+use crate::dust::Dust;
+use crate::exhaust::{Exhaust, Tailpipe};
+use crate::fuel_show::FuelShow;
 use crate::particles::Particles;
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
@@ -50,6 +55,12 @@ pub struct CameraPose {
     pub target: Vec3,
     /// Full width of an orthographic frame, in metres. Empty means a perspective lens.
     pub ortho_width: Option<f32>,
+    /// Vertical field of view in degrees. Empty keeps the chase lens.
+    pub fov_deg: Option<f32>,
+    /// Perspective near plane in metres. Empty keeps the default.
+    pub near: Option<f32>,
+    /// Seat view. The renderer draws the wheel, dash and muddy hood only then.
+    pub cockpit: bool,
 }
 
 pub struct World {
@@ -57,8 +68,13 @@ pub struct World {
     pub vehicle: Vehicle,
     pub bike: Bike,
     pub particles: Particles,
+    pub dust: Dust,
+    pub debris: Debris,
+    pub exhaust: Exhaust,
+    pub fuel: FuelShow,
     pub time: f32,
     pub telemetry: Telemetry,
+    pub damage: BodyDamage,
     drip_acc: f32,
     crest_armed: bool,
     air_time: f32,
@@ -127,11 +143,16 @@ impl World {
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
+            dust: Dust::new(),
+            debris: Debris::new(),
+            exhaust: Exhaust::new(),
+            fuel: FuelShow::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
                 ..Telemetry::default()
             },
+            damage: BodyDamage::new(),
             drip_acc: 0.0,
             crest_armed: false,
             air_time: 0.0,
@@ -144,12 +165,17 @@ impl World {
         }
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.dust.clear();
+        world.debris.clear();
+        world.exhaust.clear();
+        world.fuel = FuelShow::new();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
             ..Telemetry::default()
         };
         world.drip_acc = 0.0;
+        world.damage = BodyDamage::new();
         world.bike.place_on(&world.soil);
         world
     }
@@ -161,11 +187,16 @@ impl World {
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
+            dust: Dust::new(),
+            debris: Debris::new(),
+            exhaust: Exhaust::new(),
+            fuel: FuelShow::new(),
             time: 0.0,
             telemetry: Telemetry {
                 min_speed_in_soft: 99.0,
                 ..Telemetry::default()
             },
+            damage: BodyDamage::new(),
             drip_acc: 0.0,
             crest_armed: false,
             air_time: 0.0,
@@ -180,12 +211,24 @@ impl World {
         }
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.dust.clear();
+        world.debris.clear();
+        world.exhaust.clear();
+        world.fuel = FuelShow::new();
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
             ..Telemetry::default()
         };
+        world.damage = BodyDamage::new();
         world
+    }
+
+    fn resolve_chassis_contacts(&mut self) {
+        let mut bodies = [self.vehicle.contact_body(), self.bike.contact_body()];
+        crate::contact::solve(&mut bodies);
+        self.vehicle.apply_contact_body(&bodies[0]);
+        self.bike.apply_contact_body(&bodies[1]);
     }
 
     fn place_on_soil(&mut self) {
@@ -200,12 +243,23 @@ impl World {
         for _ in 0..substeps {
             self.substep(h, input);
         }
+        self.exhaust
+            .hook_tailpipe(Tailpipe::buggy(&self.vehicle), input.throttle, dt);
+        self.exhaust.sim(dt);
         self.time += dt;
+        self.fuel.tick(
+            dt,
+            &self.vehicle,
+            &self.soil,
+            &mut self.particles,
+            self.telemetry.impact_time,
+        );
     }
 
     /// Integrate the bike only. Does not advance `time`, water, or particles.
     /// Call it before [`step`](Self::step) so the buggy path tests stay put
-    /// and the shared particle step still runs once.
+    /// and the shared particle step still runs once. Tailpipe smoke for the
+    /// bike is emitted here and carried by that same `step`.
     pub fn step_bike(&mut self, dt: f32, input: &Input) {
         let substeps = 2;
         let h = dt / substeps as f32;
@@ -241,7 +295,10 @@ impl World {
             self.bike
                 .note_flight(&mut self.soil, &mut self.particles, planted, h);
             self.bike.integrate(&contacts, h);
+            self.resolve_chassis_contacts();
         }
+        self.exhaust
+            .hook_tailpipe(Tailpipe::bike(&self.bike), input.throttle, dt);
     }
 
     fn substep(&mut self, dt: f32, input: &Input) {
@@ -292,6 +349,8 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
+        self.resolve_chassis_contacts();
+        self.debris.step(&self.vehicle, &contacts, &self.soil, dt);
 
         let speed = self.vehicle.speed();
         for c in &contacts {
@@ -316,6 +375,15 @@ impl World {
                     speed.max(1.0),
                 );
             }
+            self.dust.note_wheel(
+                c.index,
+                c.contact_point,
+                c.forward,
+                c.right,
+                speed,
+                c.sample.wetness,
+                c.sample.water,
+            );
         }
 
         self.drip_acc += dt;
@@ -332,7 +400,9 @@ impl World {
         }
 
         self.particles.update(&mut self.soil, dt);
+        self.dust.update(dt);
         self.soil.step_water(dt);
+        self.damage.step(dt);
 
         let softness = self.vehicle.mean_softness(&contacts);
         let sink = contacts.iter().map(|c| c.sinkage).fold(0.0, f32::max);
@@ -436,6 +506,8 @@ impl World {
         let h = self.soil.sample(x, z).height;
         let spawned = self.particles.impact_burst(Vec3::new(x, h + 0.15, z));
         stick_impact_mud(&mut self.vehicle, &self.soil);
+        // Landing contact. Creases the panels and tears one fender. No extra force.
+        self.damage.note_contact(vy);
         self.telemetry.impact_depth = self.telemetry.impact_depth.max(dug);
         self.telemetry.impact_sprays = self.telemetry.impact_sprays.saturating_add(spawned);
         self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(spawned);
@@ -521,7 +593,8 @@ pub fn demo_drive(world: &World) -> Input {
     )
 }
 
-/// Same loop as the buggy, one tyre-width inside it, so the two stay side by side.
+/// Same loop as the buggy, one lane outside it. The inside line meets the
+/// buggy where it bogs after the lip.
 pub fn demo_drive_bike(world: &World) -> Input {
     chase_line(
         world.time,
@@ -529,7 +602,7 @@ pub fn demo_drive_bike(world: &World) -> Input {
         world.bike.yaw,
         world.bike.speed(),
         &world.soil,
-        -0.55,
+        1.15,
     )
 }
 
@@ -553,7 +626,17 @@ fn chase_line(
     // The scripted lap was riding the outside berm and missing the lip.
     // Aim at the lip until the car is on it. The player gets the same crest.
     let aim_lip = pos.x < -1.0 && (-6.3..2.4).contains(&pos.z);
-    let desired = if pos.x < -2.2 && (-4.2..2.4).contains(&pos.z) {
+    // The bike rides the outside lane. It still has to cross this lip, which
+    // the buggy then blocks by bogging in the puddle. Merge onto the kicker,
+    // nose outward while the tyres are planted, and the jump lands clear.
+    let bike_lane = lane_bias.abs() > 0.2;
+    let merging = bike_lane && pos.z < 0.15 && pos.x > -6.15 && pos.x < -1.0;
+    let nose_out = bike_lane && pos.x < -5.70 && (-0.25..1.70).contains(&pos.z);
+    let desired = if nose_out {
+        -0.55
+    } else if merging {
+        ((-6.45 - pos.x) * 0.42).clamp(-0.85, 0.15)
+    } else if pos.x < -2.2 && (-4.2..2.4).contains(&pos.z) {
         // Due north on the straight. A point ahead and to the west kept the
         // nose pointed off the puddle, so the landing missed the water.
         ((-6.35 - pos.x) * 0.28).clamp(-0.42, 0.42)
@@ -564,7 +647,7 @@ fn chase_line(
     };
     let mut err = wrap_pi(desired - yaw);
     // Positive offset is outside the loop (left of the clockwise heading).
-    if !aim_lip {
+    if !aim_lip && !nose_out && !merging {
         err += ((off - lane_bias) * 0.22).clamp(-0.55, 0.55);
     }
     let steer = (err / if aim_lip { 0.36 } else { 0.30 }).clamp(-1.0, 1.0);
@@ -619,7 +702,7 @@ pub fn dig_input(t: f32) -> Input {
     }
 }
 
-/// Fixed oblique orthographic view of the whole loop. The chase camera is a toggle.
+/// Fixed oblique orthographic view of the whole loop. Chase and the cockpit cycle off it.
 pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
     let target = Vec3::new(0.0, 0.4, 1.4);
     let eye = target + Vec3::new(-14.5, 12.2, -13.0);
@@ -627,6 +710,9 @@ pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
         eye,
         target,
         ortho_width: Some(25.5),
+        fov_deg: None,
+        near: None,
+        cockpit: false,
     }
 }
 

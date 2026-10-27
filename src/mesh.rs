@@ -13,10 +13,10 @@ pub const PANEL_LIGHT: f32 = 16.0;
 pub const PANEL_TAIL: f32 = 17.0;
 pub const PANEL_SKIRT: f32 = 40.0;
 pub const PANEL_HILL: f32 = 41.0;
-#[allow(dead_code)]
 pub const PANEL_ROCK: f32 = 42.0;
-#[allow(dead_code)]
 pub const PANEL_REED: f32 = 43.0;
+/// Lighter wet silt around a puddle. Not a heightfield edit.
+pub const PANEL_SHORE: f32 = 47.0;
 pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
 /// Wet mud clod. Not body paint, and not a camera-facing card.
@@ -167,6 +167,7 @@ fn add_tube(mesh: &mut CpuMesh, a: Vec3, b: Vec3, radius: f32, panel: f32, segs:
 }
 
 /// Grooved tire. Local axle is +X, radius matches the solver.
+#[allow(dead_code)]
 pub fn wheel_mesh() -> CpuMesh {
     let mut mesh = CpuMesh::new();
     let segs = 18;
@@ -296,6 +297,7 @@ fn add_fender_lip(mesh: &mut CpuMesh, sign: f32, z: f32, panel: f32) {
 
 /// Open-wheel buggy in vehicle local space. Y up, Z forward, origin at the CG.
 /// The chassis stays inside the tires so the wheels read as separate from above.
+#[allow(dead_code)]
 pub fn buggy_body() -> CpuMesh {
     let mut m = CpuMesh::new();
     let cage = 0.0;
@@ -485,6 +487,7 @@ pub fn buggy_body() -> CpuMesh {
 
 /// One A-arm and one coil per wheel, in the body frame. Ends track `wheel_center_local`,
 /// so the spring shortens when the tire compresses and hangs long at droop.
+#[allow(dead_code)]
 pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
     let mut m = CpuMesh::new();
     let hp = hardpoints();
@@ -513,6 +516,7 @@ pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
 /// Dirt bike in the same local space as the solver: Y up, Z forward, origin at the CG.
 /// Forks and the swingarm live in `bike_suspension` so they follow the wheels.
 /// The tubes are fat on purpose: a 3 cm spine disappears at the isometric distance.
+#[allow(dead_code)]
 pub fn bike_body() -> CpuMesh {
     let mut m = CpuMesh::new();
     let frame = 10.0;
@@ -645,6 +649,7 @@ pub fn bike_body() -> CpuMesh {
 
 /// Fork, swingarm and shock. Ends track the bike's wheel centers, so the
 /// spring shortens under load and hangs at droop in the air.
+#[allow(dead_code)]
 pub fn bike_suspension(bike: &Bike) -> CpuMesh {
     let mut m = CpuMesh::new();
     let front = bike.wheel_center_local(0);
@@ -670,7 +675,14 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
         4,
     );
     let pivot = Vec3::new(0.0, 0.02, -0.12);
-    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot,
+        rear + Vec3::new(0.0, 0.02, 0.0),
+        0.03,
+        arm,
+        5,
+    );
     add_tube(
         &mut m,
         pivot + Vec3::new(0.06, 0.0, 0.0),
@@ -916,8 +928,7 @@ fn add_tri_smooth(
         push_smooth(mesh, b, nb, panel);
         push_smooth(mesh, c, nc, panel);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
 /// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
@@ -986,15 +997,7 @@ fn add_lump(
         let a = ring(1, i);
         let b = ring(1, i + 1);
         add_tri_smooth(
-            mesh,
-            pts[0],
-            nrm[0],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
     for s in 1..stacks.saturating_sub(1) {
@@ -1004,26 +1007,10 @@ fn add_lump(
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
             add_tri_smooth(
-                mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
+                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center,
             );
             add_tri_smooth(
-                mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
+                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center,
             );
         }
     }
@@ -1033,29 +1020,14 @@ fn add_lump(
         let a = ring(last, i + 1);
         let b = ring(last, i);
         add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
     add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded,
     );
 }
 
@@ -1065,7 +1037,7 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    for kind in [3u8, 1, 4, 0, 2] {
+    for kind in [3u8, 5, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
@@ -1073,7 +1045,9 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
             if mesh.vertices.len() + 700 > MAX_VERTS {
                 return mesh;
             }
-            if p.kind == 3 {
+            if p.kind == 5 {
+                crate::mud_look::add_spray_sheet(&mut mesh, p);
+            } else if p.kind == 3 {
                 add_piece(&mut mesh, p, 8, 16);
                 // Two side lobes so the clump is a soft mass, not one pebble.
                 for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {
@@ -1107,4 +1081,473 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
         }
     }
     mesh
+}
+
+/// Reeds, wet stones and puddle shores. The heightfield is only sampled so
+/// the pieces sit on the bank; it is not rewritten.
+pub fn bank_mesh() -> CpuMesh {
+    let soil = silt::soil::SoilField::demo();
+    let mut mesh = CpuMesh::new();
+    let puddles = [
+        (-6.15_f32, 5.05, 2.35, 2.55, 11_u32),
+        (silt::soil::TRACK_R, 2.4, 2.3, 1.8, 29),
+        (1.15, 9.25, 2.15, 2.05, 47),
+    ];
+    for (cx, cz, rx, rz, seed) in puddles {
+        add_puddle_shore(&mut mesh, &soil, cx, cz, rx, rz, seed, true);
+    }
+    // Infield pond. A tight silt ring on the waterline, no reed bed in the bowl.
+    add_puddle_shore(&mut mesh, &soil, 0.0, 1.05, 3.65, 3.55, 71, false);
+    add_oval_bank(&mut mesh, &soil);
+    mesh
+}
+
+fn bank_clear(x: f32, z: f32) -> bool {
+    // Keep the driven groove, the ski jump and the pond's dig lip empty.
+    // Props there would read as solid, and the solver does not collide with them.
+    silt::soil::track_offset(x, z).abs() > 1.8
+        && !silt::soil::on_launch_crest(x, z)
+        && !((x + 6.6).abs() < 1.7 && (-0.5..2.9).contains(&z))
+        && !(x.abs() < 3.2 && (z - 2.55).abs() < 1.2)
+}
+
+fn oval_xz(u: f32, rad: f32) -> (f32, f32) {
+    let straight = silt::soil::TRACK_ZN - silt::soil::TRACK_ZS;
+    let half = std::f32::consts::PI * rad;
+    let q = half * 0.5;
+    let total = 2.0 * straight + 2.0 * half;
+    let s = (u - u.floor()) * total;
+    if s < q {
+        let a = -std::f32::consts::FRAC_PI_2 - (s / q) * std::f32::consts::FRAC_PI_2;
+        (rad * a.cos(), silt::soil::TRACK_ZS + rad * a.sin())
+    } else if s < q + straight {
+        let t = (s - q) / straight;
+        (-rad, silt::soil::TRACK_ZS + t * straight)
+    } else if s < q + straight + half {
+        let uu = (s - q - straight) / half;
+        let a = std::f32::consts::PI - uu * std::f32::consts::PI;
+        (rad * a.cos(), silt::soil::TRACK_ZN + rad * a.sin())
+    } else if s < q + 2.0 * straight + half {
+        let t = (s - q - straight - half) / straight;
+        (rad, silt::soil::TRACK_ZN - t * straight)
+    } else {
+        let uu = (s - q - 2.0 * straight - half) / q.max(0.001);
+        let a = -uu * std::f32::consts::FRAC_PI_2;
+        (rad * a.cos(), silt::soil::TRACK_ZS + rad * a.sin())
+    }
+}
+
+fn add_quad_up(mesh: &mut CpuMesh, p: [Vec3; 4], panel: f32) {
+    let n = (p[1] - p[0]).cross(p[2] - p[0]);
+    if n.y >= 0.0 {
+        add_quad(mesh, p, panel);
+    } else {
+        add_quad(mesh, [p[0], p[3], p[2], p[1]], panel);
+    }
+}
+
+fn shore_corner(
+    soil: &silt::soil::SoilField,
+    cx: f32,
+    cz: f32,
+    rx: f32,
+    rz: f32,
+    r: f32,
+    ang: f32,
+    lift: f32,
+    seed: u32,
+    slot: u32,
+) -> Vec3 {
+    let j = 0.94 + hash(seed ^ slot.wrapping_mul(0x9E37)) * 0.12;
+    let x = cx + ang.cos() * rx * r * j;
+    let z = cz + ang.sin() * rz * r * j;
+    let y = soil.sample(x, z).height + lift;
+    Vec3::new(x, y, z)
+}
+
+fn add_puddle_shore(
+    mesh: &mut CpuMesh,
+    soil: &silt::soil::SoilField,
+    cx: f32,
+    cz: f32,
+    rx: f32,
+    rz: f32,
+    seed: u32,
+    with_reeds: bool,
+) {
+    let segs = 64usize;
+    // Narrow bands just outside the water so the quads sit on the bank
+    // instead of sheeting across the bowl.
+    let bands = [
+        (1.02_f32, 1.10, 0.015, 0.035, 1_u32, 2),
+        (1.10, 1.18, 0.035, 0.06, 2, 3),
+        (1.18, 1.28, 0.06, 0.04, 3, 4),
+        (1.28, 1.38, 0.04, 0.015, 4, 5),
+    ];
+    for i in 0..segs {
+        let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+        let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+        let mid = (t0 + t1) * 0.5;
+        let mx = cx + mid.cos() * rx * 1.12;
+        let mz = cz + mid.sin() * rz * 1.12;
+        if !bank_clear(mx, mz) {
+            continue;
+        }
+        for (r0, r1, y0, y1, s0, s1) in bands {
+            let quad = [
+                shore_corner(soil, cx, cz, rx, rz, r0, t0, y0, seed, (i as u32) * 8 + s0),
+                shore_corner(
+                    soil,
+                    cx,
+                    cz,
+                    rx,
+                    rz,
+                    r0,
+                    t1,
+                    y0,
+                    seed,
+                    ((i + 1) as u32) * 8 + s0,
+                ),
+                shore_corner(
+                    soil,
+                    cx,
+                    cz,
+                    rx,
+                    rz,
+                    r1,
+                    t1,
+                    y1,
+                    seed,
+                    ((i + 1) as u32) * 8 + s1,
+                ),
+                shore_corner(soil, cx, cz, rx, rz, r1, t0, y1, seed, (i as u32) * 8 + s1),
+            ];
+            let mut ymin = f32::MAX;
+            let mut ymax = f32::MIN;
+            for p in quad {
+                ymin = ymin.min(p.y);
+                ymax = ymax.max(p.y);
+            }
+            // A tall quad is a sheet draped over a berm, not a shore.
+            if ymax - ymin > 0.28 {
+                continue;
+            }
+            add_quad_up(mesh, quad, PANEL_SHORE);
+        }
+        if with_reeds && i % 2 == 0 {
+            let a = mid + (hash(seed.wrapping_add(i as u32)) - 0.5) * 0.18;
+            let rad = 1.28 + hash(seed.wrapping_add(80 + i as u32)) * 0.28;
+            let x = cx + a.cos() * rx * rad;
+            let z = cz + a.sin() * rz * rad;
+            if bank_clear(x, z) {
+                // Lean into the puddle, the way the stills' reeds overhang the water.
+                add_reed_clump(
+                    mesh,
+                    soil,
+                    x,
+                    z,
+                    seed.wrapping_add(200 + i as u32),
+                    Some(mid + std::f32::consts::PI),
+                );
+            }
+        }
+        let pebbles = 3usize;
+        for k in 0..pebbles {
+            if (i + k) % 2 != 0 {
+                continue;
+            }
+            let s = seed.wrapping_add(140 + i as u32 * 5 + k as u32);
+            let a = mid + (hash(s) - 0.5) * 0.22;
+            let rad = 0.98 + hash(s.wrapping_add(1)) * 0.48;
+            let x = cx + a.cos() * rx * rad;
+            let z = cz + a.sin() * rz * rad;
+            if bank_clear(x, z) {
+                let scale = 0.42 + hash(s.wrapping_add(2)) * 0.55;
+                add_wet_stone(mesh, soil, x, z, s, scale);
+            }
+        }
+        if i % 8 == 0 {
+            let rad = 1.08 + hash(seed.wrapping_add(300 + i as u32)) * 0.2;
+            let x = cx + mid.cos() * rx * rad;
+            let z = cz + mid.sin() * rz * rad;
+            if bank_clear(x, z) {
+                add_wet_stone(
+                    mesh,
+                    soil,
+                    x,
+                    z,
+                    seed.wrapping_add(500 + i as u32),
+                    1.35 + hash(seed.wrapping_add(510 + i as u32)) * 0.45,
+                );
+            }
+        }
+    }
+}
+
+fn add_oval_bank(mesh: &mut CpuMesh, soil: &silt::soil::SoilField) {
+    let clumps = 54usize;
+    for i in 0..clumps {
+        let u = (i as f32 + hash(700 + i as u32) * 0.28) / clumps as f32;
+        let off = 2.55 + hash(730 + i as u32) * 1.15;
+        let (x, z) = oval_xz(u, silt::soil::TRACK_R + off);
+        if !bank_clear(x, z) {
+            continue;
+        }
+        add_reed_clump(mesh, soil, x, z, 900 + i as u32, None);
+        // Second row so the bank reads as a bed, not a single ring of stalks.
+        let (x2, z2) = oval_xz(u + 0.008, silt::soil::TRACK_R + off + 0.46);
+        if bank_clear(x2, z2) {
+            add_reed_clump(mesh, soil, x2, z2, 1100 + i as u32, None);
+        }
+    }
+    let stones = 28usize;
+    for i in 0..stones {
+        let u = (i as f32 + 0.37) / stones as f32;
+        let off = 2.2 + hash(1300 + i as u32) * 1.55;
+        let (x, z) = oval_xz(u, silt::soil::TRACK_R + off);
+        if !bank_clear(x, z) {
+            continue;
+        }
+        let scale = if i % 5 == 0 { 1.55 } else { 0.72 };
+        add_wet_stone(mesh, soil, x, z, 1500 + i as u32, scale);
+    }
+}
+
+fn push_panel(mesh: &mut CpuMesh, p: Vec3, n: Vec3, uv: [f32; 2], panel: f32) {
+    mesh.vertices.push(MeshVertex {
+        pos: p.to_array(),
+        nrm: n.normalize_or_zero().to_array(),
+        uv,
+        panel,
+    });
+}
+
+fn add_reed_tri(
+    mesh: &mut CpuMesh,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    ta: f32,
+    tb: f32,
+    tc: f32,
+    kind: f32,
+) {
+    let n = (b - a).cross(c - a);
+    if n.length_squared() < 1.0e-8 {
+        return;
+    }
+    let n = n.normalize();
+    let base = mesh.vertices.len() as u32;
+    push_panel(mesh, a, n, [kind, ta], PANEL_REED);
+    push_panel(mesh, b, n, [kind, tb], PANEL_REED);
+    push_panel(mesh, c, n, [kind, tc], PANEL_REED);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+fn add_reed_blade(
+    mesh: &mut CpuMesh,
+    base: Vec3,
+    yaw: f32,
+    height: f32,
+    lean: f32,
+    width: f32,
+    kind: f32,
+) {
+    let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let side = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+    let segs = 4usize;
+    let mut spine = Vec::with_capacity(segs + 1);
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let bend = lean * t * t;
+        spine.push((base + Vec3::Y * (height * t) + fwd * (bend * height), t));
+    }
+    for i in 0..segs {
+        let (c0, t0) = spine[i];
+        let (c1, t1) = spine[i + 1];
+        let width_at = |t: f32| {
+            // Straw clumps flare into a seed head. Green blades stay tapered.
+            if kind > 0.42 && t > 0.64 {
+                let u = (t - 0.64) / 0.36;
+                width * (0.26 + u * 0.95)
+            } else {
+                width * (1.0 - t * 0.78)
+            }
+        };
+        let w0 = width_at(t0);
+        let w1 = width_at(t1);
+        let p0 = c0 - side * w0;
+        let p1 = c0 + side * w0;
+        let p2 = c1 + side * w1;
+        let p3 = c1 - side * w1;
+        add_reed_tri(mesh, p0, p1, p2, t0, t0, t1, kind);
+        add_reed_tri(mesh, p0, p2, p3, t0, t1, t1, kind);
+        add_reed_tri(mesh, p0, p2, p1, t0, t1, t0, kind);
+        add_reed_tri(mesh, p0, p3, p2, t0, t1, t1, kind);
+    }
+}
+
+fn add_reed_clump(
+    mesh: &mut CpuMesh,
+    soil: &silt::soil::SoilField,
+    x: f32,
+    z: f32,
+    seed: u32,
+    lean_toward: Option<f32>,
+) {
+    let y = soil.sample(x, z).height;
+    // Straw beds, with a few greener stands. The stills are mostly gold.
+    let kind = 0.48 + hash(seed.wrapping_add(3)) * 0.52;
+    let n = 9 + (hash(seed.wrapping_add(5)) * 4.0) as usize;
+    for i in 0..n {
+        let s = seed.wrapping_add(17 + i as u32 * 13);
+        let yaw = if let Some(dir) = lean_toward {
+            dir + (hash(s) - 0.5) * 1.4
+        } else {
+            hash(s) * std::f32::consts::TAU
+        };
+        let height = 0.85 + hash(s.wrapping_add(1)) * 0.6;
+        let lean = 0.05 + hash(s.wrapping_add(2)) * 0.28;
+        let width = 0.055 + hash(s.wrapping_add(4)) * 0.04;
+        let ox = (hash(s.wrapping_add(6)) - 0.5) * 0.42;
+        let oz = (hash(s.wrapping_add(7)) - 0.5) * 0.42;
+        let root = Vec3::new(x + ox, y - 0.04, z + oz);
+        add_reed_blade(mesh, root, yaw, height, lean, width, kind);
+    }
+}
+
+fn add_wet_stone(
+    mesh: &mut CpuMesh,
+    soil: &silt::soil::SoilField,
+    x: f32,
+    z: f32,
+    seed: u32,
+    scale: f32,
+) {
+    let gy = soil.sample(x, z).height;
+    let rx = (0.16 + hash(seed) * 0.26) * scale;
+    let ry = rx * (0.42 + hash(seed.wrapping_add(1)) * 0.28);
+    let rz = rx * (0.75 + hash(seed.wrapping_add(2)) * 0.5);
+    let yaw = hash(seed.wrapping_add(3)) * std::f32::consts::TAU;
+    // Half buried so the stone grows out of the silt.
+    let center = Vec3::new(x, gy - ry * 0.2, z);
+    let (stacks, slices) = if scale < 0.95 { (3, 5) } else { (4, 7) };
+    add_ellipsoid(
+        mesh,
+        center,
+        Vec3::new(rx, ry, rz),
+        yaw,
+        seed,
+        PANEL_ROCK,
+        stacks,
+        slices,
+    );
+}
+
+fn add_ellipsoid(
+    mesh: &mut CpuMesh,
+    center: Vec3,
+    radii: Vec3,
+    yaw: f32,
+    seed: u32,
+    panel: f32,
+    stacks: usize,
+    slices: usize,
+) {
+    let rot = Quat::from_rotation_y(yaw);
+    let mut pts = Vec::with_capacity(2 + (stacks - 1) * slices);
+    let mut nrm = Vec::with_capacity(pts.capacity());
+    let place = |dir: Vec3, slot: u32| {
+        let j = 0.9 + hash(seed.wrapping_add(slot.wrapping_mul(19))) * 0.16;
+        let local = Vec3::new(
+            dir.x * radii.x * j,
+            dir.y * radii.y * j,
+            dir.z * radii.z * j,
+        );
+        let n = Vec3::new(
+            dir.x / radii.x.max(0.04),
+            dir.y / radii.y.max(0.04),
+            dir.z / radii.z.max(0.04),
+        );
+        (center + rot * local, rot * n)
+    };
+    let (p, n) = place(Vec3::Y, 1);
+    pts.push(p);
+    nrm.push(n);
+    for s in 1..stacks {
+        let phi = s as f32 / stacks as f32 * std::f32::consts::PI;
+        for i in 0..slices {
+            let th = i as f32 / slices as f32 * std::f32::consts::TAU;
+            let dir = Vec3::new(th.cos() * phi.sin(), phi.cos(), th.sin() * phi.sin());
+            let (p, n) = place(dir, (s * 16 + i) as u32);
+            pts.push(p);
+            nrm.push(n);
+        }
+    }
+    let (p, n) = place(-Vec3::Y, 2);
+    pts.push(p);
+    nrm.push(n);
+    let ring = |s: usize, i: usize| 1 + (s - 1) * slices + (i % slices);
+    let last = pts.len() - 1;
+    for i in 0..slices {
+        let a = ring(1, i);
+        let b = ring(1, i + 1);
+        add_tri_smooth(
+            mesh,
+            pts[0],
+            nrm[0],
+            pts[a],
+            nrm[a],
+            pts[b],
+            nrm[b],
+            panel,
+            center,
+        );
+    }
+    for s in 1..stacks - 1 {
+        for i in 0..slices {
+            let a = ring(s, i);
+            let b = ring(s, i + 1);
+            let c = ring(s + 1, i);
+            let d = ring(s + 1, i + 1);
+            add_tri_smooth(
+                mesh,
+                pts[a],
+                nrm[a],
+                pts[b],
+                nrm[b],
+                pts[c],
+                nrm[c],
+                panel,
+                center,
+            );
+            add_tri_smooth(
+                mesh,
+                pts[b],
+                nrm[b],
+                pts[d],
+                nrm[d],
+                pts[c],
+                nrm[c],
+                panel,
+                center,
+            );
+        }
+    }
+    let bot = stacks - 1;
+    for i in 0..slices {
+        let a = ring(bot, i);
+        let b = ring(bot, i + 1);
+        add_tri_smooth(
+            mesh,
+            pts[a],
+            nrm[a],
+            pts[last],
+            nrm[last],
+            pts[b],
+            nrm[b],
+            panel,
+            center,
+        );
+    }
 }

@@ -39,14 +39,16 @@ cargo test
 | S / Down | Brake, then reverse once the buggy is slow |
 | A / Left, D / Right | Steer |
 | V | Switch which vehicle the pedals drive. The other one keeps riding the lap |
-| C | Toggle the chase camera. The default is a fixed isometric view of the loop. Chase follows whichever vehicle V selected |
+| C | Cycle the camera: fixed isometric, chase, then the cockpit seats. Chase and the isometric view stay in the cycle |
+| L | Toggle mud on the lens. The coat shows on chase and in the cockpit after a puddle. The isometric frame stays clean |
 | Q / E | Orbit the chase camera |
-| R / F | Raise / lower the chase camera |
+| R | Replay the recorded lap from the side, top, bumper, and rear three-quarter |
+| T / F | Raise / lower the chase camera |
 | Esc | Quit |
 
-The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V.
+The isometric camera stays put so the whole loop, the puddles and the rut read at once. A small map in the top-right corner shows that oval and a dot for each vehicle. The chase camera follows the vehicle selected with V. The cockpit is the buggy's own seats: the wheel, the wet dash and the muddy hood, from the driver, the passenger, and the outside angles. C walks into that view without dropping the other two. L toggles the mud on the glass. C is only the camera cycle. R replays the first closed lap from a fresh start, walking the side, top, bumper, and rear three-quarter cameras.
 
-Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
+Opening the window plays that lap with both vehicles. The page opens on a start screen: pick the buggy or the bike, then Start hands that one the keys. Restart returns both to the lap. On a phone the wheel sits on the left and the gas and brake on the right; those pedals take the selected vehicle the same way a drive key does. The other vehicle keeps the lap. The capture is the same lap, with nobody at the wheel.
 
 ## Браузер
 
@@ -58,7 +60,7 @@ Opening the window or the page plays that lap with both vehicles. The first driv
 trunk serve --release
 ```
 
-Страница: http://127.0.0.1:8080 . Сборка без `--release` слишком медленная, чтобы набрать скорость на гребень. Кликните по сцене, иначе клавиши уходят странице.
+Страница: http://127.0.0.1:8080 . Сборка без `--release` слишком медленная, чтобы набрать скорость на гребень. Кликните по сцене, иначе клавиши уходят странице. В правом верхнем углу маленькая карта круга: овал и точка на каждую машину.
 
 | Клавиша | Действие |
 | --- | --- |
@@ -66,12 +68,14 @@ trunk serve --release
 | S / ↓ | тормоз, затем задний ход |
 | A / ←, D / → | руль |
 | V | кого ведёте: багги или кроссовый мотоцикл. Вторая машина продолжает круг |
-| C | камера погони. По умолчанию изометрия. Погоня следует за выбранной машиной |
+| C | цикл камеры: изометрия, погоня, затем кабина. Изометрия и погоня остаются в цикле |
+| L | грязь на стекле камеры. Видна в погоне и в кабине после лужи. Изометрия остаётся чистой |
 | Q / E | орбита камеры погони |
-| R / F | выше / ниже |
+| R | повтор записанного круга: сбоку, сверху, с бампера, затем сзади в три четверти |
+| T / F | выше / ниже |
 | Esc | выход |
 
-Адрес с `?gl` принудительно включает WebGL2.
+Адрес с `?gl` принудительно включает WebGL2. На странице сначала экран старта: багги или мотоцикл, затем «Старт». «Заново» возвращает обе машины на круг. На телефоне руль слева, газ и тормоз справа.
 
 ## What the soil does
 
@@ -93,7 +97,7 @@ A motocross bike runs the same loop, just inside the buggy's line. It is the sam
 
 ## Not in this slice
 
-A race mode, a track editor, menus, multiplayer, and a large world are intentionally absent. The field is one short loop — a few puddles, low berms, and the ground around them — so the soil model can be seen running in real time.
+A race mode, a track editor, multiplayer, and a large world are intentionally absent. The field is one short loop — a few puddles, low berms, and the ground around them — so the soil model can be seen running in real time. The page does have a start screen and on-screen pedals.
 
 ## Layout
 

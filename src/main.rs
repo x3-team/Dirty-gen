@@ -2,8 +2,19 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod buggy_gltf;
+mod cockpit_mesh;
+mod debris_mesh;
+mod dents;
+mod dust_draw;
+mod exhaust_pass;
+mod lens_pass;
 mod mesh;
+mod minimap;
+mod mud_look;
 mod render;
+mod start_menu;
+mod vehicle_mesh;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
@@ -13,6 +24,9 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
+use silt::cockpit::{cockpit_pose, DriveCam};
+use silt::lap::LapClock;
+use silt::replay::LapReplay;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -37,11 +51,13 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
-            let rest: Vec<String> = args.collect();
-            capture(&rest);
-        } else {
-            run_window();
+        match args.next().as_deref() {
+            Some("capture") => {
+                let rest: Vec<String> = args.collect();
+                capture(&rest);
+            }
+            Some("light-stills") => light_stills(),
+            _ => run_window(),
         }
     }
 }
@@ -55,6 +71,21 @@ struct Keys {
     orbit_right: bool,
     orbit_up: bool,
     orbit_down: bool,
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Self {
+            throttle: false,
+            reverse: false,
+            left: false,
+            right: false,
+            orbit_left: false,
+            orbit_right: false,
+            orbit_up: false,
+            orbit_down: false,
+        }
+    }
 }
 
 impl Keys {
@@ -77,6 +108,73 @@ impl Keys {
     }
 }
 
+/// On-screen phone pedals. `driven` flips the lap over to the player the same
+/// way the first keyboard pedal does. Released controls leave the keyboard
+/// values alone, so a phone and a keyboard can share one vehicle.
+#[derive(Clone, Copy, Debug)]
+struct TouchDrive {
+    throttle: f32,
+    brake: f32,
+    steer: f32,
+    steer_on: bool,
+    driven: bool,
+}
+
+impl TouchDrive {
+    const IDLE: Self = Self {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: 0.0,
+        steer_on: false,
+        driven: false,
+    };
+
+    fn apply(self, input: Input, speed: f32) -> Input {
+        if !self.driven {
+            return input;
+        }
+        let mut throttle = input.throttle;
+        let mut brake = input.brake;
+        let mut steer = input.steer;
+        if self.throttle > 0.0 {
+            let gas = self.throttle.clamp(0.0, 1.0);
+            throttle = if throttle < 0.0 {
+                gas
+            } else {
+                gas.max(throttle)
+            };
+        }
+        if self.brake > 0.0 {
+            let held = self.brake.clamp(0.0, 1.0);
+            if speed < 0.55 && throttle <= 0.0 {
+                throttle = -held;
+                brake = 0.0;
+            } else {
+                brake = held.max(brake);
+            }
+        }
+        if self.steer_on {
+            steer = self.steer.clamp(-1.0, 1.0);
+        }
+        Input {
+            throttle,
+            brake,
+            steer,
+        }
+    }
+}
+
+fn read_touch_drive() -> TouchDrive {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_touch_drive()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        TouchDrive::IDLE
+    }
+}
+
 struct App {
     window: Option<std::sync::Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -86,12 +184,18 @@ struct App {
     keys: Keys,
     orbit_yaw: f32,
     orbit_pitch: f32,
-    chase_cam: bool,
+    cam: DriveCam,
+    /// Lens mud on chase and cockpit. L toggles it. C stays the camera cycle.
+    show_lens: bool,
     drive_bike: bool,
-    /// Set once the player presses a drive key. Until then both vehicles run
-    /// the scripted lap. After that, the selected one takes the keys and the
-    /// other keeps the lap.
+    replay: LapReplay,
+    /// Set once the player presses a drive key or an on-screen pedal. Until
+    /// then both vehicles run the scripted lap. After that, the selected one
+    /// takes the controls and the other keeps the lap.
     player_drove: bool,
+    lap: LapClock,
+    /// Start screen is up. Both vehicles stay on the lap until Start.
+    menu_holding: bool,
     acc: f32,
     last: Instant,
     srgb: bool,
@@ -130,8 +234,21 @@ impl ApplicationHandler for App {
                 }
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
-                        PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
+                        PhysicalKey::Code(KeyCode::KeyC) => self.cam = self.cam.cycle(),
+                        // Lens mud used to share C with the chase toggle. C is the cockpit cycle.
+                        PhysicalKey::Code(KeyCode::KeyL) => self.show_lens = !self.show_lens,
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            if !self.menu_holding {
+                                self.drive_bike = !self.drive_bike;
+                            }
+                        }
+                        // R replays the one recorded lap. It is a press, not a hold.
+                        PhysicalKey::Code(KeyCode::KeyR) => {
+                            if self.replay.start() {
+                                self.world = World::demo();
+                                self.acc = 0.0;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -139,31 +256,31 @@ impl ApplicationHandler for App {
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
                         self.keys.throttle = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
                         self.keys.reverse = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
                         self.keys.left = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
                         self.keys.right = down;
-                        if down {
+                        if down && !self.menu_holding {
                             self.player_drove = true;
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyQ) => self.keys.orbit_left = down,
                     PhysicalKey::Code(KeyCode::KeyE) => self.keys.orbit_right = down,
-                    PhysicalKey::Code(KeyCode::KeyR) => self.keys.orbit_up = down,
+                    PhysicalKey::Code(KeyCode::KeyT) => self.keys.orbit_up = down,
                     PhysicalKey::Code(KeyCode::KeyF) => self.keys.orbit_down = down,
                     _ => {}
                 }
@@ -232,6 +349,7 @@ impl App {
     }
 
     fn frame(&mut self) {
+        self.apply_start_menu();
         #[cfg(target_arch = "wasm32")]
         if self.renderer.is_none() {
             if !self.take_web_gpu() {
@@ -254,26 +372,73 @@ impl App {
         if self.keys.orbit_down {
             self.orbit_pitch = (self.orbit_pitch - dt * 0.7).max(-0.35);
         }
+        let touch = read_touch_drive();
+        if touch.driven && !self.menu_holding {
+            self.player_drove = true;
+        }
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
-            // The page opens on the lap: buggy and bike both chase the loop.
-            // A drive key takes the selected vehicle. The other one stays on
-            // the script, so the track never drops to a single machine.
-            let bike_input = if self.player_drove && self.drive_bike {
-                self.keys.input(self.world.bike.speed())
+            if self.replay.is_playing() {
+                if let Some((buggy_input, bike_input)) = self.replay.take_inputs() {
+                    self.world.step_bike(step, &bike_input);
+                    self.world.step(step, &buggy_input);
+                    self.acc -= step;
+                    continue;
+                }
+            }
+            // Until Start, and again after Restart, both vehicles stay on the
+            // lap. Start hands the chosen one the keys. A drive key, or a
+            // thumb on the on-screen pedals, takes the selected vehicle. The
+            // other one stays on the script.
+            let driving = self.player_drove && !self.menu_holding;
+            let bike_speed = self.world.bike.speed();
+            let buggy_speed = self.world.vehicle.speed();
+            let bike_input = if driving && self.drive_bike {
+                touch.apply(self.keys.input(bike_speed), bike_speed)
             } else {
                 demo_drive_bike(&self.world)
             };
-            let buggy_input = if self.player_drove && !self.drive_bike {
-                self.keys.input(self.world.vehicle.speed())
+            let buggy_input = if driving && !self.drive_bike {
+                touch.apply(self.keys.input(buggy_speed), buggy_speed)
             } else {
                 demo_drive(&self.world)
             };
             self.world.step_bike(step, &bike_input);
             self.world.step(step, &buggy_input);
+            // The readout follows the vehicle V has selected, scripted lap
+            // included, and starts when that vehicle takes the south gate.
+            let (who, pos) = if self.drive_bike {
+                (1, self.world.bike.pos)
+            } else {
+                (0, self.world.vehicle.pos)
+            };
+            self.lap.advance(step, who, pos);
+            self.replay
+                .note(buggy_input, bike_input, self.world.vehicle.pos);
             self.acc -= step;
         }
+        #[cfg(target_arch = "wasm32")]
+        set_lap_readout(self.lap.readout());
+        let driving = self.player_drove && !self.menu_holding;
+        let heard = if self.drive_bike {
+            if driving {
+                touch.apply(
+                    self.keys.input(self.world.bike.speed()),
+                    self.world.bike.speed(),
+                )
+            } else {
+                demo_drive_bike(&self.world)
+            }
+        } else if driving {
+            touch.apply(
+                self.keys.input(self.world.vehicle.speed()),
+                self.world.vehicle.speed(),
+            )
+        } else {
+            demo_drive(&self.world)
+        };
+        silt::audio::tick(&self.world, dt, self.drive_bike, heard.throttle);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -285,16 +450,24 @@ impl App {
         } else {
             (self.world.vehicle.pos, self.world.vehicle.yaw)
         };
-        let pose = if self.chase_cam {
-            chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
+        let pose = if self.replay.is_playing() {
+            self.replay.camera(&self.world.vehicle)
         } else {
-            demo_camera(
-                self.world.time,
-                self.world.vehicle.pos,
-                self.world.vehicle.yaw,
-            )
+            match self.cam {
+                DriveCam::Chase => chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch),
+                DriveCam::Iso => demo_camera(
+                    self.world.time,
+                    self.world.vehicle.pos,
+                    self.world.vehicle.yaw,
+                ),
+                DriveCam::Cockpit(index) => cockpit_pose(&self.world.vehicle, index),
+            }
         };
-        let pose = lift_camera(&self.world, pose);
+        let pose = if pose.cockpit {
+            pose
+        } else {
+            lift_camera(&self.world, pose)
+        };
         let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
@@ -309,6 +482,7 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
+        renderer.show_lens = self.show_lens;
         renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
         frame.present();
     }
@@ -356,6 +530,42 @@ impl App {
         self.renderer = Some(ready.renderer);
         true
     }
+
+    fn apply_start_menu(&mut self) {
+        let Some(hook) = start_menu::poll() else {
+            return;
+        };
+        match hook.action {
+            start_menu::MenuAction::Start => {
+                self.reset_run();
+                self.drive_bike = hook.ride == start_menu::Ride::Bike;
+                self.player_drove = true;
+                self.menu_holding = false;
+            }
+            start_menu::MenuAction::Restart => {
+                self.reset_run();
+                self.drive_bike = hook.ride == start_menu::Ride::Bike;
+                self.menu_holding = true;
+            }
+            start_menu::MenuAction::None => {
+                self.menu_holding = hook.holding;
+                if hook.holding {
+                    self.drive_bike = hook.ride == start_menu::Ride::Bike;
+                }
+            }
+        }
+    }
+
+    fn reset_run(&mut self) {
+        self.world = World::demo();
+        self.keys = Keys::default();
+        self.player_drove = false;
+        self.acc = 0.0;
+        self.orbit_yaw = 0.0;
+        self.orbit_pitch = 0.0;
+        self.lap = LapClock::new();
+        self.replay = LapReplay::new();
+    }
 }
 
 fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
@@ -370,6 +580,9 @@ fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
         eye,
         target,
         ortho_width: None,
+        fov_deg: None,
+        near: None,
+        cockpit: false,
     }
 }
 
@@ -391,21 +604,16 @@ fn run_window() {
         config: None,
         renderer: None,
         world: World::demo(),
-        keys: Keys {
-            throttle: false,
-            reverse: false,
-            left: false,
-            right: false,
-            orbit_left: false,
-            orbit_right: false,
-            orbit_up: false,
-            orbit_down: false,
-        },
+        keys: Keys::default(),
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
-        chase_cam: false,
+        cam: DriveCam::Iso,
+        show_lens: true,
         drive_bike: false,
+        replay: LapReplay::new(),
         player_drove: false,
+        lap: LapClock::new(),
+        menu_holding: false,
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
@@ -434,6 +642,62 @@ struct CaptureArgs {
     still_start: PathBuf,
     still_puddle: PathBuf,
     still_ruts: PathBuf,
+    exhaust_stills: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn light_stills() {
+    prepare_software_vulkan();
+    let (_instance, adapter, device, queue) = open_adapter(true, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        1280,
+        720,
+        formats,
+    );
+    renderer.show_lens = false;
+    // The still is the cage and the wet ground. Dust, exhaust, fuel, dents,
+    // debris, mud clods, and the cockpit stay in the playable demo.
+    renderer.show_effects = false;
+    let mut world = World::demo();
+    let dt = 1.0 / 60.0;
+    for _ in 0..(3.4 * 60.0) as u32 {
+        let bike_in = demo_drive_bike(&world);
+        let buggy_in = demo_drive(&world);
+        world.step_bike(dt, &bike_in);
+        world.step(dt, &buggy_in);
+    }
+    let parked = world.bike.pos;
+    world.bike.pos = Vec3::new(80.0, 0.0, 80.0);
+    let pos = world.vehicle.pos;
+    // Same oblique as the oval, pulled in so the cage and the ruts under it fill the frame.
+    let target = pos + Vec3::Y * 0.42;
+    let eye = pos + Vec3::new(-4.6, 2.9, -4.1);
+    let side = lift_camera(
+        &world,
+        CameraPose {
+            eye,
+            target,
+            ortho_width: None,
+            fov_deg: Some(36.0),
+            near: Some(0.08),
+            cockpit: false,
+        },
+    );
+    let rgba = renderer.draw(&world, side, None, true).expect("side readback");
+    let side_path = PathBuf::from(format!("{MEDIA}/demo-buggy-light-side.png"));
+    write_png(&side_path, 1280, 720, &rgba).expect("side png");
+    println!("wrote {}", side_path.display());
+
+    world.bike.pos = parked;
+    let oval = demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw);
+    let rgba = renderer.draw(&world, oval, None, true).expect("oval readback");
+    let oval_path = PathBuf::from(format!("{MEDIA}/demo-buggy-light-oval.png"));
+    write_png(&oval_path, 1280, 720, &rgba).expect("oval png");
+    println!("wrote {}", oval_path.display());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -452,6 +716,10 @@ fn capture(args: &[String]) {
         parsed.height,
         formats,
     );
+    if parsed.exhaust_stills {
+        write_exhaust_stills(&mut renderer, parsed.width, parsed.height);
+        return;
+    }
     let mut world = World::demo();
     let frames = (parsed.seconds * parsed.fps as f32).round() as u32;
     let steps = (60.0 / parsed.fps as f32).round().max(1.0) as u32;
@@ -588,6 +856,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
     let mut still_ruts = PathBuf::from(format!("{MEDIA}/mud-demo-ruts.png"));
+    let mut exhaust_stills = false;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -608,6 +877,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--still-start" => still_start = PathBuf::from(val(&mut i)),
             "--still-puddle" => still_puddle = PathBuf::from(val(&mut i)),
             "--still-ruts" => still_ruts = PathBuf::from(val(&mut i)),
+            "--exhaust-stills" => exhaust_stills = true,
             other => panic!("unknown capture flag {other}"),
         }
         i += 1;
@@ -624,7 +894,75 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         still_start,
         still_puddle,
         still_ruts,
+        exhaust_stills,
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exhaust_cam(outlet: Vec3, forward: Vec3, rear: bool) -> CameraPose {
+    let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+    let right = Vec3::new(forward.z, 0.0, -forward.x);
+    let focus = outlet + Vec3::Y * 0.12;
+    let eye = if rear {
+        outlet - forward * 2.15 + Vec3::Y * 0.62 + right * 0.28
+    } else {
+        outlet + right * 1.85 + Vec3::Y * 0.38 - forward * 0.15
+    };
+    CameraPose {
+        eye,
+        target: focus,
+        ortho_width: None,
+        fov_deg: None,
+        near: None,
+        cockpit: false,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_exhaust_stills(renderer: &mut Renderer, width: u32, height: u32) {
+    let mut world = World::demo();
+    let dt = 1.0 / 60.0;
+    for _ in 0..120 {
+        let bike = demo_drive_bike(&world);
+        world.step_bike(dt, &bike);
+        let input = demo_drive(&world);
+        world.step(dt, &input);
+    }
+    let shots = [
+        ("buggy-side", false, false),
+        ("buggy-rear", false, true),
+        ("bike-side", true, false),
+        ("bike-rear", true, true),
+    ];
+    for (name, bike, rear) in shots {
+        let (outlet, forward) = if bike {
+            let pipe = silt::exhaust::Tailpipe::bike(&world.bike);
+            (pipe.outlets()[0], world.bike.forward())
+        } else {
+            let pipe = silt::exhaust::Tailpipe::buggy(&world.vehicle);
+            let mid = (pipe.outlets()[0] + pipe.outlets()[1]) * 0.5;
+            (mid, world.vehicle.forward())
+        };
+        let pose = lift_camera(&world, exhaust_cam(outlet, forward, rear));
+        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        let path = PathBuf::from(format!("/tmp/exhaust-{name}.png"));
+        write_png(&path, width, height, &rgba).expect("exhaust still");
+        println!(
+            "exhaust still {} smoke {} plumes buggy {:.2} bike {:.2}",
+            path.display(),
+            world.exhaust.alive_count(),
+            world.exhaust.plumes()[0].strength,
+            world.exhaust.plumes()[2].strength,
+        );
+    }
+    let pose = lift_camera(
+        &world,
+        demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
+    );
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    let path = PathBuf::from("/tmp/exhaust-overview.png");
+    write_png(&path, width, height, &rgba).expect("overview");
+    println!("exhaust still {}", path.display());
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -671,6 +1009,19 @@ fn set_web_status(text: &str) {
         return;
     };
     if let Some(node) = document.get_element_by_id("backend") {
+        node.set_text_content(Some(text));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_lap_readout(text: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    if let Some(node) = document.get_element_by_id("lap") {
         node.set_text_content(Some(text));
     }
 }
@@ -798,4 +1149,106 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
         srgb: format.is_srgb(),
         label,
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_touch_drive() -> TouchDrive {
+    use wasm_bindgen::JsValue;
+    let Some(window) = web_sys::window() else {
+        return TouchDrive::IDLE;
+    };
+    let num = |name: &str| -> f32 {
+        js_sys::Reflect::get(window.as_ref(), &JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0) as f32
+    };
+    TouchDrive {
+        throttle: num("siltThrottle").clamp(0.0, 1.0),
+        brake: num("siltBrake").clamp(0.0, 1.0),
+        steer: num("siltSteer").clamp(-1.0, 1.0),
+        steer_on: num("siltSteerOn") != 0.0,
+        driven: num("siltDriven") != 0.0,
+    }
+}
+
+#[cfg(test)]
+mod touch_drive {
+    use super::TouchDrive;
+    use silt::world::Input;
+
+    fn idle_keys() -> Input {
+        Input {
+            throttle: 0.0,
+            brake: 0.0,
+            steer: 0.4,
+        }
+    }
+
+    #[test]
+    fn untouched_screen_keeps_the_keyboard() {
+        let touch = TouchDrive {
+            throttle: 1.0,
+            brake: 1.0,
+            steer: -1.0,
+            steer_on: true,
+            driven: false,
+        };
+        let input = touch.apply(idle_keys(), 0.0);
+        assert_eq!(input.throttle, 0.0);
+        assert_eq!(input.steer, 0.4);
+    }
+
+    #[test]
+    fn gas_and_a_slow_brake_match_the_pedal_keys() {
+        let gas = TouchDrive {
+            throttle: 1.0,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        assert_eq!(gas.apply(Input::default(), 0.0).throttle, 1.0);
+
+        let brake = TouchDrive {
+            brake: 1.0,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        let slow = brake.apply(Input::default(), 0.2);
+        assert_eq!(slow.throttle, -1.0);
+        assert_eq!(slow.brake, 0.0);
+        let fast = brake.apply(Input::default(), 3.0);
+        assert_eq!(fast.throttle, 0.0);
+        assert_eq!(fast.brake, 1.0);
+    }
+
+    #[test]
+    fn holding_both_pedals_brakes_instead_of_reversing() {
+        let both = TouchDrive {
+            throttle: 1.0,
+            brake: 1.0,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        let input = both.apply(Input::default(), 0.0);
+        assert_eq!(input.throttle, 1.0);
+        assert_eq!(input.brake, 1.0);
+    }
+
+    #[test]
+    fn wheel_right_is_positive_and_a_released_wheel_does_not_cancel_keys() {
+        let held = TouchDrive {
+            steer: 0.5,
+            steer_on: true,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        assert_eq!(held.apply(idle_keys(), 1.0).steer, 0.5);
+        let released = TouchDrive {
+            steer: 0.5,
+            steer_on: false,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        assert_eq!(released.apply(idle_keys(), 1.0).steer, 0.4);
+    }
 }

@@ -48,6 +48,8 @@ pub struct Bike {
     pub wheels: [Wheel; 2],
     pub panels: [PanelMud; PANEL_COUNT],
     pub jump_hold: f32,
+    /// Seconds after a chassis hit during which the rider assist stays soft.
+    pub collision_loose: f32,
     crest_armed: bool,
     air_time: f32,
     impact_latched: bool,
@@ -72,6 +74,7 @@ impl Bike {
             wheels: [Wheel::default(); 2],
             panels: [PanelMud::default(); PANEL_COUNT],
             jump_hold: 0.0,
+            collision_loose: 0.0,
             crest_armed: false,
             air_time: 0.0,
             impact_latched: false,
@@ -96,6 +99,50 @@ impl Bike {
         let hp = hardpoints()[index];
         let c = self.wheels[index].compression;
         Vec3::new(hp.x, hp.y - REST_LEN + c, hp.z)
+    }
+
+    pub fn contact_body(&self) -> crate::contact::Body {
+        let mut body = crate::contact::Body::kinematic(
+            self.pos,
+            self.vel,
+            self.yaw,
+            self.pitch,
+            self.roll,
+            self.pitch_rate,
+            self.yaw_rate,
+            self.roll_rate,
+            MASS,
+            Vec3::new(1.0 / I_PITCH, 1.0 / I_YAW, 1.0 / I_ROLL),
+            self.collision_loose,
+        );
+        body.push_shape(crate::contact::Shape::cube(
+            Vec3::new(0.0, 0.18, 0.02),
+            Vec3::new(0.26, 0.52, 0.70),
+            0.0,
+        ));
+        for (i, wheel) in self.wheels.iter().enumerate() {
+            body.push_shape(crate::contact::Shape::cube(
+                self.wheel_center_local(i),
+                Vec3::new(0.11, BIKE_RADIUS, BIKE_RADIUS),
+                wheel.steer,
+            ));
+        }
+        body
+    }
+
+    pub fn apply_contact_body(&mut self, body: &crate::contact::Body) {
+        if !body.pos.is_finite() || !body.vel.is_finite() {
+            return;
+        }
+        self.pos = body.pos;
+        self.vel = body.vel;
+        self.yaw = body.yaw;
+        self.pitch = body.pitch;
+        self.roll = body.roll;
+        self.pitch_rate = body.pitch_rate;
+        self.yaw_rate = body.yaw_rate;
+        self.roll_rate = body.roll_rate;
+        self.collision_loose = body.loosen.max(0.0);
     }
 
     pub fn place_on(&mut self, soil: &SoilField) {
@@ -192,7 +239,9 @@ impl Bike {
                 let prop_lat = -tau_lat * area * v_lat.signum();
                 let soil_w = smoothstep(0.025, 0.08, sinkage);
                 let pace_long = pacejka_long(slip, normal);
-                let pace_lat = -normal * 0.9 * slip_angle.clamp(-0.6, 0.6).signum()
+                let pace_lat = -normal
+                    * 0.9
+                    * slip_angle.clamp(-0.6, 0.6).signum()
                     * (1.0 - (-slip_angle.abs() / 0.14).exp());
                 long_f = lerp(pace_long, prop_long, soil_w);
                 lat_f = lerp(pace_lat, prop_lat, soil_w);
@@ -226,6 +275,10 @@ impl Bike {
     }
 
     pub fn integrate(&mut self, contacts: &[BikeContact; 2], dt: f32) {
+        let loose = self.collision_loose > 0.0;
+        if self.collision_loose > 0.0 {
+            self.collision_loose = (self.collision_loose - dt).max(0.0);
+        }
         let ori = self.orientation();
         let mut force = Vec3::new(0.0, -MASS * 9.81, 0.0);
         let mut torque_local = Vec3::ZERO;
@@ -255,6 +308,12 @@ impl Bike {
             force.y += -40.0 * self.vel.y;
             torque_local.x -= 12.0 * self.pitch_rate;
             torque_local.z -= 18.0 * self.roll_rate;
+        } else if loose {
+            force.y += -900.0 * self.vel.y;
+            torque_local.z -= self.roll_rate * 28.0;
+            torque_local.x -= self.pitch_rate * 22.0;
+            torque_local.z -= wrap_angle(self.roll) * 36.0;
+            torque_local.x -= wrap_angle(self.pitch) * 28.0;
         } else {
             force.y += -900.0 * self.vel.y;
             // A bike without a rider balance falls over. The spring is the rider.
@@ -265,7 +324,8 @@ impl Bike {
                 torque_local.x -= self.pitch.signum() * (self.pitch.abs() - 0.45) * 2_400.0;
             }
         }
-        torque_local.y -= 40.0 * self.yaw_rate;
+        let yaw_damp = if loose { 8.0 } else { 40.0 };
+        torque_local.y -= yaw_damp * self.yaw_rate;
 
         self.vel += (force / MASS) * dt;
         if airborne {
@@ -283,9 +343,10 @@ impl Bike {
             self.vel = Vec3::ZERO;
         }
         self.pos += self.vel * dt;
-        self.yaw_rate = (self.yaw_rate + torque_local.y / I_YAW * dt).clamp(-2.2, 2.2);
+        let yaw_lim = if loose { 7.0 } else { 2.2 };
+        self.yaw_rate = (self.yaw_rate + torque_local.y / I_YAW * dt).clamp(-yaw_lim, yaw_lim);
         self.yaw += self.yaw_rate * dt;
-        if airborne {
+        if airborne || loose {
             self.pitch_rate = (self.pitch_rate + torque_local.x / I_PITCH * dt).clamp(-8.0, 8.0);
             self.roll_rate = (self.roll_rate + torque_local.z / I_ROLL * dt).clamp(-6.0, 6.0);
             self.pitch = wrap_angle(self.pitch + self.pitch_rate * dt);
@@ -345,7 +406,10 @@ impl Bike {
         let land = self.did_launch
             && !self.impact_latched
             && ((self.air_time > 0.40 && self.vel.y < -2.0 && clearance < 1.55)
-                || (self.jump_hold <= 0.0 && planted >= 2 && self.air_time > 0.18 && clearance < 0.9));
+                || (self.jump_hold <= 0.0
+                    && planted >= 2
+                    && self.air_time > 0.18
+                    && clearance < 0.9));
         if land {
             let vy = self.vel.y.abs();
             let depth = (vy * 0.024).clamp(0.10, 0.22);

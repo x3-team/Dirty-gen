@@ -77,9 +77,25 @@ fn scripted_drive_cuts_ruts_and_picks_up_mud() {
         world.vehicle.pos,
         world.telemetry.max_sink
     );
+    eprintln!(
+        "debris stuck {} falling {} grass {} twig {} clod {}",
+        world.debris.stuck_count(),
+        world.debris.falling_count(),
+        world.debris.kind_count(silt::debris::KIND_GRASS),
+        world.debris.kind_count(silt::debris::KIND_TWIG),
+        world.debris.kind_count(silt::debris::KIND_CLOD)
+    );
     assert!(rut1 > rut0 + 0.04, "rut depth did not grow");
     assert!(mud1 > mud0 + 0.12, "body mud did not accumulate");
     assert!(wheels > 0.05, "tires stayed clean");
+    assert!(
+        world.debris.stuck_count() >= 6,
+        "grass and clods did not stick, {}",
+        world.debris.stuck_count()
+    );
+    assert!(world.debris.kind_count(silt::debris::KIND_GRASS) > 0);
+    assert!(world.debris.kind_count(silt::debris::KIND_TWIG) > 0);
+    assert!(world.debris.kind_count(silt::debris::KIND_CLOD) > 0);
     assert!(span1 > span0 + 3.0, "track did not lengthen");
     assert!(world.telemetry.splash_bursts > 5, "puddle did not splash");
     assert!(
@@ -168,6 +184,30 @@ fn crest_impact_cuts_rut_and_sprays() {
         "airborne pitch {:.2} is a hop, not a tumble",
         world.telemetry.max_air_pitch
     );
+    assert!(world.damage.hit, "landing did not dent the body");
+    assert!(
+        world.damage.dent > 0.5,
+        "dent {:.2} is a scuff",
+        world.damage.dent
+    );
+}
+
+#[test]
+fn landing_tears_a_panel() {
+    let mut world = World::demo();
+    let mut steps = 0;
+    while world.telemetry.impact_time <= 0.0 && steps < 30 * 60 {
+        let input = silt::demo_drive(&world);
+        world.step(1.0 / 60.0, &input);
+        steps += 1;
+    }
+    assert!(world.damage.hit, "no dent after {steps} steps");
+    world.run_seconds(2.0, |_| Input::default());
+    assert!(
+        world.damage.loose > 0.45,
+        "torn fender did not hang, {:.3}",
+        world.damage.loose
+    );
 }
 
 #[test]
@@ -199,9 +239,7 @@ fn both_stay_on_the_loop() {
             samples += 1;
         }
     }
-    eprintln!(
-        "samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}"
-    );
+    eprintln!("samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}");
     assert!(samples > 10, "lap was not sampled");
     assert!(buggy_far < 3, "buggy left the loop");
     assert!(bike_far < 3, "bike left the loop");
@@ -261,7 +299,10 @@ fn rolling_tires_leave_a_pair_of_grooves() {
         prev2 = prev;
         prev = rut;
     }
-    eprintln!("groove peaks at z={z}: {peaks:?} pos {:?}", world.vehicle.pos);
+    eprintln!(
+        "groove peaks at z={z}: {peaks:?} pos {:?}",
+        world.vehicle.pos
+    );
     assert!(
         peaks.len() >= 2,
         "expected a pair of tire grooves behind the buggy, got {peaks:?}"
@@ -287,6 +328,37 @@ fn rolling_tires_leave_a_pair_of_grooves() {
             "groove {depth:.3} at x={x:.2} has no shoulder: floor {floor:.3} shoulder {shoulder:.3}"
         );
     }
+}
+
+#[test]
+fn leaving_mud_for_dry_dirt_throws_tan_dust() {
+    let mut world = World::demo();
+    let mut peak = 0usize;
+    let mut at = glam::Vec3::ZERO;
+    for _ in 0..(7.0 * 60.0) as u32 {
+        world.step(1.0 / 60.0, &silt::demo_drive(&world));
+        let n = world.dust.alive_count();
+        if n > peak {
+            peak = n;
+            at = world.vehicle.pos;
+        }
+    }
+    let wet = world.soil.sample(at.x, at.z).wetness;
+    eprintln!(
+        "dust peak {peak} at ({:.2},{:.2}) wet {wet:.2} t {:.2}",
+        at.x, at.z, world.time
+    );
+    assert!(
+        peak > 24,
+        "no tan dust when the buggy left the mud, peak {peak}"
+    );
+    let mut firm = World::flat(0.12);
+    firm.run_seconds(2.0, |_| Input {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+    });
+    assert_eq!(firm.dust.alive_count(), 0, "firm pad should not dust");
 }
 
 #[test]

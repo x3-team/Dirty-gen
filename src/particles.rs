@@ -1,7 +1,7 @@
 //! Short-lived splash. Pieces are ballistic solids: they arc, then rest in the
 //! soil. The renderer turns them into soft wet clods, not stones or cards.
 
-use glam::{EulerRot, Quat, Vec3};
+use glam::{EulerRot, Mat3, Quat, Vec3};
 
 use crate::soil::SoilField;
 
@@ -12,7 +12,8 @@ pub struct Particle {
     pub life: f32,
     pub max_life: f32,
     pub size: f32,
-    /// 0 tire droplet, 1 flung clod, 2 drip, 3 impact chunk, 4 impact droplet.
+    /// 0 tire droplet, 1 flung clod, 2 drip, 3 impact chunk, 4 impact droplet,
+    /// 5 mud sheet. Kind 5 does not write the soil.
     pub kind: u8,
     pub alive: bool,
     pub seed: u32,
@@ -111,24 +112,51 @@ impl Particles {
     }
 
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
-        let _ = water;
-        // One droplet, and not on top of one that is already in the air.
-        // A spawn every step became a pale cloud from the isometric camera.
-        let side = if self.rnd() > 0.5 { 1.0 } else { -1.0 };
-        let pos = origin - forward * (0.1 + self.rnd() * 0.16)
-            + right * side * (0.3 + self.rnd() * 0.14)
-            + Vec3::Y * (0.48 + self.rnd() * 0.18);
+        let fwd = forward.normalize_or_zero();
+        let side = right.normalize_or_zero();
+        if fwd.length_squared() < 0.5 || side.length_squared() < 0.5 {
+            return;
+        }
+        // One curtain per puddle patch. Four tires must not fill the particle list.
         let crowded = self
             .items
             .iter()
-            .any(|p| p.alive && p.kind == 0 && (p.pos - pos).length() < 0.36);
+            .any(|p| p.alive && p.kind == 5 && (p.pos - origin).length() < 0.9);
         if crowded {
             return;
         }
-        let kick = (0.4 + speed * 0.12).clamp(0.3, 1.15);
-        let vel = -forward * kick + right * side * 0.3 + Vec3::Y * (0.9 + self.rnd() * 0.4);
-        // Small solid droplet. A camera-facing quad read as an orange coin.
-        self.spawn(pos, vel, 0.55, 0.09, 0);
+        let kick = (0.55 + speed * 0.08).clamp(0.4, 1.4);
+        let scale = (0.75 + water * 3.0).clamp(0.75, 1.25);
+        for i in 0..5 {
+            let s = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let pos = origin + side * s * (0.38 + self.rnd() * 0.16)
+                - fwd * (0.12 + i as f32 * 0.07)
+                + Vec3::Y * (0.16 + self.rnd() * 0.1);
+            let vel = side * s * (0.45 + self.rnd() * 0.25) - fwd * kick * 0.35
+                + Vec3::Y * (0.12 + self.rnd() * 0.16);
+            let size = (0.22 + self.rnd() * 0.08) * scale;
+            let life = 0.48 + self.rnd() * 0.07;
+            self.spawn_sheet(pos, vel, life, size, sheet_rot(side * s));
+        }
+        for i in 0..4 {
+            let pos = origin - fwd * (0.32 + i as f32 * 0.09)
+                + side * (self.rnd() - 0.5) * 0.45
+                + Vec3::Y * (0.14 + self.rnd() * 0.12);
+            let vel = -fwd * kick
+                + Vec3::Y * (0.08 + self.rnd() * 0.12)
+                + side * (self.rnd() - 0.5) * 0.2;
+            let size = (0.24 + self.rnd() * 0.08) * scale;
+            let life = 0.5 + self.rnd() * 0.06;
+            self.spawn_sheet(pos, vel, life, size, sheet_rot(-fwd));
+        }
+    }
+
+    fn spawn_sheet(&mut self, pos: Vec3, vel: Vec3, life: f32, size: f32, rot: Quat) {
+        self.spawn(pos, vel, life, size, 5);
+        if let Some(p) = self.items.iter_mut().rev().find(|p| p.alive && p.kind == 5) {
+            p.rot = rot;
+            p.spin = Vec3::new(0.0, 0.4, 0.0);
+        }
     }
 
     pub fn clod(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32) {
@@ -205,6 +233,7 @@ impl Particles {
                 1 => 0.8,
                 3 => 0.22,
                 4 => 0.55,
+                5 => 0.7,
                 _ => 0.4,
             };
             p.vel.y -= 9.81 * dt;
@@ -216,6 +245,7 @@ impl Particles {
             let belly = match p.kind {
                 3 => 0.12,
                 1 => 0.22,
+                5 => 0.20,
                 _ => 0.32,
             };
             let sit = h + p.size * belly;
@@ -243,5 +273,49 @@ impl Particles {
                 p.spin = Vec3::ZERO;
             }
         }
+    }
+}
+
+fn sheet_rot(normal: Vec3) -> Quat {
+    let z = normal.normalize_or_zero();
+    let mut x = Vec3::Y.cross(z);
+    if x.length_squared() < 1.0e-6 {
+        x = Vec3::X;
+    }
+    x = x.normalize();
+    let y = z.cross(x).normalize();
+    Quat::from_mat3(&Mat3::from_cols(x, y, z))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sheet_spray_faces_side_and_rear_without_wetting_soil() {
+        let mut soil = SoilField::flat(0.2);
+        let before: f32 = soil.wetness.iter().copied().sum();
+        let mut parts = Particles::new();
+        let forward = Vec3::Z;
+        let right = Vec3::X;
+        parts.spray(Vec3::new(1.0, 0.4, 2.0), forward, right, 2.0, 0.2);
+        let sheets: Vec<_> = parts.items.iter().filter(|p| p.kind == 5).collect();
+        assert!(sheets.len() >= 8, "sheets {}", sheets.len());
+        assert!(
+            sheets.iter().any(|p| p.vel.dot(right).abs() > 0.2),
+            "a side sheet should leave sideways"
+        );
+        assert!(
+            sheets.iter().any(|p| p.vel.dot(forward) < -0.2),
+            "a rear sheet should leave backward"
+        );
+        for _ in 0..200 {
+            parts.update(&mut soil, 1.0 / 60.0);
+        }
+        let after: f32 = soil.wetness.iter().copied().sum();
+        assert!(
+            (after - before).abs() < 1.0e-4,
+            "sheet spray wrote the soil"
+        );
     }
 }
