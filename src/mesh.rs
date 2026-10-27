@@ -285,6 +285,8 @@ fn add_helix(
 }
 
 /// Short inboard plate. The tire sits outside it.
+/// The drawn buggy is the glTF now; this lip only belonged to the stick body.
+#[allow(dead_code)]
 fn add_fender_lip(mesh: &mut CpuMesh, sign: f32, z: f32, panel: f32) {
     add_box(
         mesh,
@@ -294,8 +296,9 @@ fn add_fender_lip(mesh: &mut CpuMesh, sign: f32, z: f32, panel: f32) {
     );
 }
 
-/// Open-wheel buggy in vehicle local space. Y up, Z forward, origin at the CG.
-/// The chassis stays inside the tires so the wheels read as separate from above.
+/// Stick buggy kept so the old panel layout stays readable next to the solver.
+/// The renderer draws `assets/buggy.glb` instead.
+#[allow(dead_code)]
 pub fn buggy_body() -> CpuMesh {
     let mut m = CpuMesh::new();
     let cage = 0.0;
@@ -483,8 +486,9 @@ pub fn buggy_body() -> CpuMesh {
     m
 }
 
-/// One A-arm and one coil per wheel, in the body frame. Ends track `wheel_center_local`,
-/// so the spring shortens when the tire compresses and hangs long at droop.
+/// Procedural arms. The glTF suspension is what gets drawn; this stays as the
+/// reference for how a corner used to track `wheel_center_local`.
+#[allow(dead_code)]
 pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
     let mut m = CpuMesh::new();
     let hp = hardpoints();
