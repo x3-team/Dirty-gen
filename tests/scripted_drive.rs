@@ -171,6 +171,47 @@ fn crest_impact_cuts_rut_and_sprays() {
 }
 
 #[test]
+fn both_stay_on_the_loop() {
+    use silt::soil::track_offset;
+    let mut world = World::demo();
+    let mut buggy_far = 0;
+    let mut bike_far = 0;
+    let mut samples = 0;
+    let mut max_sep = 0.0_f32;
+    for _ in 0..(12.0 * 60.0) as u32 {
+        let bike = silt::demo_drive_bike(&world);
+        world.step_bike(1.0 / 60.0, &bike);
+        let buggy = silt::demo_drive(&world);
+        world.step(1.0 / 60.0, &buggy);
+        if ((world.time * 60.0) as i32) % 30 == 0 {
+            let b = world.vehicle.pos;
+            let k = world.bike.pos;
+            let bo = track_offset(b.x, b.z).abs();
+            let ko = track_offset(k.x, k.z).abs();
+            let sep = (b - k).length();
+            if bo > 3.2 {
+                buggy_far += 1;
+            }
+            if ko > 3.2 {
+                bike_far += 1;
+            }
+            max_sep = max_sep.max(sep);
+            samples += 1;
+        }
+    }
+    eprintln!(
+        "samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}"
+    );
+    assert!(samples > 10, "lap was not sampled");
+    assert!(buggy_far < 3, "buggy left the loop");
+    assert!(bike_far < 3, "bike left the loop");
+    assert!(
+        max_sep > 6.0,
+        "buggy and bike stayed stacked, separation {max_sep:.1}"
+    );
+}
+
+#[test]
 fn bike_rides_and_compresses_beside_the_buggy() {
     let mut world = World::demo();
     let start = world.bike.pos;

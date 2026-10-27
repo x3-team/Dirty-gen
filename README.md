@@ -38,7 +38,7 @@ cargo test
 | W / Up | Throttle |
 | S / Down | Brake, then reverse once the buggy is slow |
 | A / Left, D / Right | Steer |
-| V | Switch between the buggy and the dirt bike. The other vehicle holds |
+| V | Switch which vehicle the pedals drive. The other one keeps riding the lap |
 | C | Toggle the chase camera. The default is a fixed isometric view of the loop. Chase follows whichever vehicle V selected |
 | Q / E | Orbit the chase camera |
 | R / F | Raise / lower the chase camera |
@@ -46,9 +46,11 @@ cargo test
 
 The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V.
 
+Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
+
 ## Браузер
 
-Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. V переключает багги и мотоцикл. Скорость на западной прямой (справа в этом виде) по-прежнему срывает выбранную машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.
+Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. Пока не нажата педаль, багги и мотоцикл сами едут круг. Первая клавиша газа, тормоза или руля забирает выбранную машину; вторая продолжает круг. V переключает, кого ведёте. Скорость на западной прямой (справа в этом виде) по-прежнему срывает машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.
 
 Нужен [trunk](https://trunkrs.dev/). Из корня репозитория:
 
@@ -63,7 +65,7 @@ trunk serve --release
 | W / ↑ | газ |
 | S / ↓ | тормоз, затем задний ход |
 | A / ←, D / → | руль |
-| V | переключить багги и кроссовый мотоцикл. Вторая машина стоит |
+| V | кого ведёте: багги или кроссовый мотоцикл. Вторая машина продолжает круг |
 | C | камера погони. По умолчанию изометрия. Погоня следует за выбранной машиной |
 | Q / E | орбита камеры погони |
 | R / F | выше / ниже |
@@ -85,7 +87,7 @@ The field is a grid (40 m, 192 cells on a side). Each cell stores height, loose 
 
 The buggy is a short-travel 4x4: four wheels, a spring matched to the Bekker load, equal drive torque, steer on the front axle. The picture is a procedural open-wheel frame — cage, seats, arms and coil springs that shorten with the spring travel and hang at droop in the air. It is not a multibody A-arm model.
 
-A motocross bike sits beside the buggy at the gate. V gives it the pedals. It is the same soil — Bekker, Janosi–Hanamoto, the wheel stamp, and the crest launch — on a lighter chassis with a front fork and a rear shock. Those shorten when the tire loads and hang at droop in the air. The crest flips it and the landing throws the same wet clumps. The isometric camera stays the default.
+A motocross bike runs the same loop, just inside the buggy's line. It is the same soil — Bekker, Janosi–Hanamoto, the wheel stamp, and the crest launch — on a lighter chassis with a front fork and a rear shock. Those shorten when the tire loads and hang at droop in the air. The crest flips it and the landing throws the same wet clumps. V hands it the pedals. The isometric camera stays the default.
 
 `.github/workflows/pages.yml` builds that page with `trunk build --release`. https://x3-team.github.io/Dirty-gen/ is the project address once Pages is enabled and the source is GitHub Actions.
 

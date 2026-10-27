@@ -13,9 +13,7 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
-#[cfg(not(target_arch = "wasm32"))]
-use silt::world::{demo_drive, demo_drive_bike};
-use silt::world::{demo_camera, CameraPose, Input, World};
+use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -90,6 +88,10 @@ struct App {
     orbit_pitch: f32,
     chase_cam: bool,
     drive_bike: bool,
+    /// Set once the player presses a drive key. Until then both vehicles run
+    /// the scripted lap. After that, the selected one takes the keys and the
+    /// other keeps the lap.
+    player_drove: bool,
     acc: f32,
     last: Instant,
     srgb: bool,
@@ -136,16 +138,28 @@ impl ApplicationHandler for App {
                 let down = event.state == ElementState::Pressed;
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
-                        self.keys.throttle = down
+                        self.keys.throttle = down;
+                        if down {
+                            self.player_drove = true;
+                        }
                     }
                     PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
-                        self.keys.reverse = down
+                        self.keys.reverse = down;
+                        if down {
+                            self.player_drove = true;
+                        }
                     }
                     PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                        self.keys.left = down
+                        self.keys.left = down;
+                        if down {
+                            self.player_drove = true;
+                        }
                     }
                     PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
-                        self.keys.right = down
+                        self.keys.right = down;
+                        if down {
+                            self.player_drove = true;
+                        }
                     }
                     PhysicalKey::Code(KeyCode::KeyQ) => self.keys.orbit_left = down,
                     PhysicalKey::Code(KeyCode::KeyE) => self.keys.orbit_right = down,
@@ -243,14 +257,21 @@ impl App {
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
-            if self.drive_bike {
-                let input = self.keys.input(self.world.bike.speed());
-                self.world.step_bike(step, &input);
-                self.world.step(step, &Input::default());
+            // The page opens on the lap: buggy and bike both chase the loop.
+            // A drive key takes the selected vehicle. The other one stays on
+            // the script, so the track never drops to a single machine.
+            let bike_input = if self.player_drove && self.drive_bike {
+                self.keys.input(self.world.bike.speed())
             } else {
-                let input = self.keys.input(self.world.vehicle.speed());
-                self.world.step(step, &input);
-            }
+                demo_drive_bike(&self.world)
+            };
+            let buggy_input = if self.player_drove && !self.drive_bike {
+                self.keys.input(self.world.vehicle.speed())
+            } else {
+                demo_drive(&self.world)
+            };
+            self.world.step_bike(step, &bike_input);
+            self.world.step(step, &buggy_input);
             self.acc -= step;
         }
         let Some(renderer) = self.renderer.as_mut() else {
@@ -384,6 +405,7 @@ fn run_window() {
         orbit_pitch: 0.0,
         chase_cam: false,
         drive_bike: false,
+        player_drove: false,
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
