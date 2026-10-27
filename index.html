@@ -6,6 +6,8 @@
     <title>Silt</title>
     <link data-trunk rel="rust" data-bin="silt" data-wasm-opt="0" />
     <link data-trunk rel="css" href="ui/touch.css" />
+    <link data-trunk rel="css" href="ui/start-menu.css" />
+    <link data-trunk rel="copy-file" href="ui/start-menu.js" />
     <style>
       html,
       body {
@@ -56,11 +58,13 @@
     </div>
     <div id="lap">Старт · 0 кругов · 0:00.0</div>
     <div id="hud">
-      Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C изометрия, погоня, кабина, L грязь на стекле.
+      Старт отдаёт руль выбранной машине, вторая едет круг. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C изометрия, погоня, кабина, L грязь на стекле.
       На экране телефона: руль слева, газ и тормоз справа.
       <span id="backend">загрузка…</span>
     </div>
     <script data-trunk src="ui/touch.js"></script>
+    <div id="silt-menu-state" data-phase="menu" data-vehicle="buggy" data-action="" hidden></div>
+    <script type="module" src="start-menu.js"></script>
     <script>
       const canvas = document.getElementById("silt");
       const focus = () => canvas.focus();
@@ -69,6 +73,9 @@
       window.addEventListener(
         "keydown",
         (event) => {
+          if (event.target instanceof Element && event.target.closest("button")) {
+            return;
+          }
           if (
             event.key === "ArrowUp" ||
             event.key === "ArrowDown" ||
