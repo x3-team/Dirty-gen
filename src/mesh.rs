@@ -4,7 +4,7 @@
 //! into paint, rubber or mud. Wheel and shock meshes stay in the spaces the
 //! vehicle solver already uses, so the picture matches the contact model.
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
 use silt::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
 
@@ -18,6 +18,8 @@ pub const PANEL_ROCK: f32 = 42.0;
 pub const PANEL_REED: f32 = 43.0;
 pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
+/// Wet mud clod. Not body paint, and not a camera-facing card.
+pub const PANEL_CLOD: f32 = 46.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -677,4 +679,158 @@ pub fn environment_mesh() -> CpuMesh {
         }
     }
     m
+}
+
+fn chunk_hash(seed: u32, n: u32) -> f32 {
+    let mut x = seed ^ n.wrapping_mul(0x9E37_79B9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    (x & 0xFFFF) as f32 / 65535.0
+}
+
+fn add_tri_out(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32, center: Vec3) {
+    let n = (b - a).cross(c - a);
+    if n.dot(a - center) < 0.0 {
+        add_tri(mesh, a, c, b, panel);
+    } else {
+        add_tri(mesh, a, b, c, panel);
+    }
+}
+
+fn add_octa(mesh: &mut CpuMesh, center: Vec3, rot: Quat, radius: f32, seed: u32) {
+    let axis = Vec3::new(
+        0.62 + chunk_hash(seed, 1) * 0.85,
+        0.48 + chunk_hash(seed, 2) * 0.95,
+        0.58 + chunk_hash(seed, 3) * 0.9,
+    );
+    let p = |v: Vec3| center + rot * (v * radius * axis);
+    let y = p(Vec3::Y);
+    let ny = p(-Vec3::Y);
+    let x = p(Vec3::X);
+    let nx = p(-Vec3::X);
+    let z = p(Vec3::Z);
+    let nz = p(-Vec3::Z);
+    let faces = [
+        [y, z, x],
+        [y, x, nz],
+        [y, nz, nx],
+        [y, nx, z],
+        [ny, x, z],
+        [ny, nz, x],
+        [ny, nx, nz],
+        [ny, z, nx],
+    ];
+    for f in faces {
+        add_tri_out(mesh, f[0], f[1], f[2], PANEL_CLOD, center);
+    }
+}
+
+fn add_lump(
+    mesh: &mut CpuMesh,
+    center: Vec3,
+    rot: Quat,
+    radius: f32,
+    seed: u32,
+    stacks: usize,
+    slices: usize,
+) {
+    let axis = Vec3::new(
+        0.72 + chunk_hash(seed, 1) * 0.7,
+        0.5 + chunk_hash(seed, 2) * 0.55,
+        0.68 + chunk_hash(seed, 3) * 0.75,
+    );
+    let mut pts = Vec::with_capacity(2 + stacks * slices);
+    let place = |local: Vec3| center + rot * (local * axis);
+    pts.push(place(
+        Vec3::Y * radius * (0.78 + chunk_hash(seed, 4) * 0.45),
+    ));
+    for s in 1..stacks {
+        let phi = s as f32 / stacks as f32 * std::f32::consts::PI;
+        for i in 0..slices {
+            let th = i as f32 / slices as f32 * std::f32::consts::TAU;
+            let n = Vec3::new(th.cos() * phi.sin(), phi.cos(), th.sin() * phi.sin());
+            let j = 0.58 + chunk_hash(seed, (s * 16 + i) as u32) * 0.75;
+            pts.push(place(n * radius * j));
+        }
+    }
+    pts.push(place(-Vec3::Y * radius * (0.7 + chunk_hash(seed, 5) * 0.4)));
+    let ring = |s: usize, i: usize| 1 + (s - 1) * slices + (i % slices);
+    for i in 0..slices {
+        add_tri_out(
+            mesh,
+            pts[0],
+            pts[ring(1, i)],
+            pts[ring(1, i + 1)],
+            PANEL_CLOD,
+            center,
+        );
+    }
+    for s in 1..stacks.saturating_sub(1) {
+        for i in 0..slices {
+            let a = ring(s, i);
+            let b = ring(s, i + 1);
+            let c = ring(s + 1, i);
+            let d = ring(s + 1, i + 1);
+            add_tri_out(mesh, pts[a], pts[c], pts[b], PANEL_CLOD, center);
+            add_tri_out(mesh, pts[b], pts[c], pts[d], PANEL_CLOD, center);
+        }
+    }
+    let bot = pts.len() - 1;
+    let last = stacks - 1;
+    for i in 0..slices {
+        add_tri_out(
+            mesh,
+            pts[bot],
+            pts[ring(last, i + 1)],
+            pts[ring(last, i)],
+            PANEL_CLOD,
+            center,
+        );
+    }
+}
+
+/// Faceted mud in world space. Large impacts are a pair of lumps; droplets are
+/// irregular octahedra. Nothing here is a camera-facing quad.
+pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    const MAX_VERTS: usize = 14000;
+    for p in items {
+        if !p.alive || p.life <= 0.0 {
+            continue;
+        }
+        if mesh.vertices.len() + 220 > MAX_VERTS {
+            break;
+        }
+        if p.kind == 3 {
+            add_lump(&mut mesh, p.pos, p.rot, p.size, p.seed, 4, 6);
+            let dir = Vec3::new(
+                chunk_hash(p.seed, 8) * 2.0 - 1.0,
+                chunk_hash(p.seed, 9) * 0.8 - 0.2,
+                chunk_hash(p.seed, 10) * 2.0 - 1.0,
+            )
+            .normalize_or_zero();
+            add_lump(
+                &mut mesh,
+                p.pos + p.rot * dir * p.size * 0.5,
+                p.rot,
+                p.size * 0.58,
+                p.seed ^ 0xA5A5_5A5A,
+                3,
+                5,
+            );
+        } else if p.kind == 1 {
+            add_lump(&mut mesh, p.pos, p.rot, p.size.max(0.08), p.seed, 3, 5);
+        } else {
+            let radius = if p.kind == 2 {
+                p.size.max(0.04)
+            } else {
+                p.size.max(0.07)
+            };
+            add_octa(&mut mesh, p.pos, p.rot, radius, p.seed);
+        }
+    }
+    mesh
 }

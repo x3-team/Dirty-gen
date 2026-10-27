@@ -45,6 +45,30 @@ cargo test
 
 The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the buggy.
 
+## Браузер
+
+Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. Скорость на западной прямой (справа в этом виде) по-прежнему срывает багги с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот.
+
+Нужен [trunk](https://trunkrs.dev/). Из корня репозитория:
+
+```bash
+trunk serve --release
+```
+
+Страница: http://127.0.0.1:8080 . Сборка без `--release` слишком медленная, чтобы набрать скорость на гребень. Кликните по сцене, иначе клавиши уходят странице.
+
+| Клавиша | Действие |
+| --- | --- |
+| W / ↑ | газ |
+| S / ↓ | тормоз, затем задний ход |
+| A / ←, D / → | руль |
+| C | камера погони. По умолчанию изометрия |
+| Q / E | орбита камеры погони |
+| R / F | выше / ниже |
+| Esc | выход |
+
+Адрес с `?gl` принудительно включает WebGL2.
+
 ## What the soil does
 
 The field is a grid (40 m, 192 cells on a side). Each cell stores height, loose mud, wetness and water depth.
@@ -53,7 +77,7 @@ The field is a grid (40 m, 192 cells on a side). Each cell stores height, loose 
 - **Janosi–Hanamoto** shear is the traction. It saturates with slip. On firm ground a simple tire curve still does most of the work; once the rut is deep, the soil term takes over.
 - **Slip-sinkage** digs a plastic rut while the tire is spinning. The displaced soil is piled into berms. The rut stays after the wheel has gone.
 - **Bingham-like drag** is why low speed bogs. Fresh mud resists, but a spinning tire can still creep. Viscosity is what kills speed when you hit the water with momentum. If you stop in the deep part and keep the throttle in, the tire digs a hole and the lip of that hole holds the buggy. Reverse while you are still rolling and you can leave.
-- **Tracks** darken the albedo and change roughness along the contact patch. That is stored in the field, not a decal. The groove in the picture is the heightfield mesh the stamp actually lowered, and the berm it piled beside the tire. A fast straight only cuts about a centimetre; the tires cut several centimetres where they slip in the water. That is the depth the camera shows. Carrying speed over the west-straight crest launches the buggy, rotates it in the air, and the landing digs a crater and throws the live splash. Those clumps are brown soil, and they fall. Wet ground carries a broad sheen, and the pond stays dark toward the middle. The same crest does it for the player. No key.
+- **Tracks** darken the albedo and change roughness along the contact patch. That is stored in the field, not a decal. The groove in the picture is the heightfield mesh the stamp actually lowered, and the berm it piled beside the tire. A fast straight only cuts about a centimetre; the tires cut several centimetres where they slip in the water. That is the depth the camera shows. Carrying speed over the west-straight crest launches the buggy, rotates it in the air, and the landing digs a crater and throws the live splash. The splash is a few large mud clumps with volume, plus smaller droplets. They arc and land on the heightfield. Flat cards are not drawn. Wet ground carries a broad sheen, and the pond stays dark toward the middle. The same crest does it for the player. No key.
 - **Shallow water** is a small pipe scheme. The puddle wets the cells under it. A wheel throws that water forward and raises splash particles.
 - **Adhesion** is an ODE on each tire and on a handful of body panels (nose, sides, belly, fenders, and so on). Pickup grows with slip and speed, mass drips off, and the panel state drives the mud mask: clumps and streaks, not one flat brown multiply.
 

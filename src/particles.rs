@@ -1,6 +1,7 @@
-//! Short-lived splash, flung clods and drips. Ballistic, not a fluid solve.
+//! Short-lived splash. Pieces are ballistic solids: they arc, then rest on the
+//! heightfield. The renderer turns them into faceted clods, not camera cards.
 
-use glam::Vec3;
+use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::SoilField;
 
@@ -11,9 +12,15 @@ pub struct Particle {
     pub life: f32,
     pub max_life: f32,
     pub size: f32,
-    /// 0 spray, 1 clod, 2 drip.
+    /// 0 tire droplet, 1 flung clod, 2 drip, 3 impact chunk, 4 impact droplet.
     pub kind: u8,
     pub alive: bool,
+    pub seed: u32,
+    pub spin: Vec3,
+    pub rot: Quat,
+    /// Sitting on the soil after the arc. The mesh stays until `life` ends.
+    pub grounded: bool,
+    pub deposited: bool,
 }
 
 impl Default for Particle {
@@ -26,6 +33,11 @@ impl Default for Particle {
             size: 0.08,
             kind: 0,
             alive: false,
+            seed: 0,
+            spin: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            grounded: false,
+            deposited: false,
         }
     }
 }
@@ -61,22 +73,21 @@ impl Particles {
     }
 
     pub fn spawn(&mut self, pos: Vec3, vel: Vec3, life: f32, size: f32, kind: u8) {
-        if self.items.len() > 900 {
-            if let Some(slot) = self.items.iter_mut().find(|p| !p.alive || p.life <= 0.0) {
-                *slot = Particle {
-                    pos,
-                    vel,
-                    life,
-                    max_life: life,
-                    size,
-                    kind,
-                    alive: true,
-                };
-                return;
-            }
-            return;
-        }
-        self.items.push(Particle {
+        let seed = self.rng;
+        let _ = self.rnd();
+        let rate = if kind == 3 { 3.4 } else { 6.5 };
+        let spin = Vec3::new(
+            (self.rnd() - 0.5) * rate,
+            (self.rnd() - 0.5) * rate,
+            (self.rnd() - 0.5) * rate,
+        );
+        let rot = Quat::from_euler(
+            EulerRot::YXZ,
+            self.rnd() * std::f32::consts::TAU,
+            (self.rnd() - 0.5) * 2.4,
+            (self.rnd() - 0.5) * 2.4,
+        );
+        let piece = Particle {
             pos,
             vel,
             life,
@@ -84,7 +95,19 @@ impl Particles {
             size,
             kind,
             alive: true,
-        });
+            seed,
+            spin,
+            rot,
+            grounded: false,
+            deposited: false,
+        };
+        if self.items.len() > 900 {
+            if let Some(slot) = self.items.iter_mut().find(|p| !p.alive || p.life <= 0.0) {
+                *slot = piece;
+            }
+            return;
+        }
+        self.items.push(piece);
     }
 
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
@@ -104,7 +127,8 @@ impl Particles {
         }
         let kick = (0.4 + speed * 0.12).clamp(0.3, 1.15);
         let vel = -forward * kick + right * side * 0.3 + Vec3::Y * (0.9 + self.rnd() * 0.4);
-        self.spawn(pos, vel, 0.42, 0.2, 0);
+        // Small solid droplet. A camera-facing quad read as an orange coin.
+        self.spawn(pos, vel, 0.55, 0.09, 0);
     }
 
     pub fn clod(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32) {
@@ -116,34 +140,37 @@ impl Particles {
         self.spawn(origin + Vec3::Y * 0.08, vel, life, size, 1);
     }
 
-    /// Clumps and droplets born at the impact, in world space. They fall
-    /// under the same gravity as the rest of the spray.
+    /// A few large clods and a ring of smaller solid droplets. They leave the
+    /// contact in an arc and are still alive when they meet the heightfield.
     pub fn impact_burst(&mut self, origin: Vec3) -> u32 {
         let mut n = 0u32;
-        for i in 0..48 {
-            let ang = self.rnd() * std::f32::consts::TAU;
-            let speed = 3.4 + self.rnd() * 5.2;
-            let up = 3.0 + self.rnd() * 4.6;
+        for i in 0..8 {
+            let ang = i as f32 / 8.0 * std::f32::consts::TAU + (self.rnd() - 0.5) * 0.4;
+            let speed = 2.2 + self.rnd() * 2.6;
+            let up = 4.4 + self.rnd() * 2.4;
             let vel = Vec3::new(ang.cos() * speed, up, ang.sin() * speed);
-            let clod = i < 30;
-            let life = if clod {
-                1.15 + self.rnd() * 0.8
-            } else {
-                0.85 + self.rnd() * 0.65
-            };
-            let size = if clod {
-                0.22 + self.rnd() * 0.2
-            } else {
-                0.10 + self.rnd() * 0.08
-            };
-            let kind = if clod { 3 } else { 4 };
+            let size = 0.40 + self.rnd() * 0.22;
+            let life = 2.5 + self.rnd() * 0.7;
+            let pos = origin
+                + Vec3::new(ang.cos(), 0.25 + self.rnd() * 0.15, ang.sin())
+                    * (0.2 + self.rnd() * 0.35);
+            self.spawn(pos, vel, life, size, 3);
+            n += 1;
+        }
+        for _ in 0..16 {
+            let ang = self.rnd() * std::f32::consts::TAU;
+            let speed = 1.8 + self.rnd() * 5.4;
+            let up = 2.6 + self.rnd() * 4.0;
+            let vel = Vec3::new(ang.cos() * speed, up, ang.sin() * speed);
+            let size = 0.11 + self.rnd() * 0.12;
+            let life = 1.6 + self.rnd() * 0.8;
             let pos = origin
                 + Vec3::new(
-                    (self.rnd() - 0.5) * 0.35,
-                    self.rnd() * 0.1,
-                    (self.rnd() - 0.5) * 0.35,
+                    (self.rnd() - 0.5) * 0.5,
+                    0.15 + self.rnd() * 0.2,
+                    (self.rnd() - 0.5) * 0.5,
                 );
-            self.spawn(pos, vel, life, size, kind);
+            self.spawn(pos, vel, life, size, 4);
             n += 1;
         }
         n
@@ -169,32 +196,44 @@ impl Particles {
                 p.alive = false;
                 continue;
             }
+            if p.grounded {
+                continue;
+            }
             let drag = match p.kind {
                 0 => 1.6,
                 1 => 0.8,
-                3 => 0.45,
-                4 => 0.7,
+                3 => 0.22,
+                4 => 0.55,
                 _ => 0.4,
             };
             p.vel.y -= 9.81 * dt;
             p.vel *= (1.0 - dt * drag).max(0.0);
             p.pos += p.vel * dt;
+            p.rot = Quat::from_scaled_axis(p.spin * dt) * p.rot;
             let h = soil.sample(p.pos.x, p.pos.z).height;
-            if p.pos.y < h + 0.02 {
-                if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
-                    match p.kind {
-                        0 | 4 => {
-                            soil.wetness[idx] = (soil.wetness[idx] + 0.03).min(1.0);
-                            soil.darken[idx] = (soil.darken[idx] + 0.02).min(1.0);
+            // Rest with most of the volume above the soil, the belly in it.
+            let sit = h + p.size * 0.62;
+            if p.pos.y <= sit {
+                if !p.deposited {
+                    if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
+                        match p.kind {
+                            0 | 4 => {
+                                soil.wetness[idx] = (soil.wetness[idx] + 0.03).min(1.0);
+                                soil.darken[idx] = (soil.darken[idx] + 0.02).min(1.0);
+                            }
+                            1 | 2 | 3 => {
+                                soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
+                                soil.loose[idx] = (soil.loose[idx] + 0.008).min(0.16);
+                            }
+                            _ => {}
                         }
-                        1 | 2 | 3 => {
-                            soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
-                            soil.loose[idx] = (soil.loose[idx] + 0.004).min(0.16);
-                        }
-                        _ => {}
                     }
+                    p.deposited = true;
                 }
-                p.alive = false;
+                p.grounded = true;
+                p.pos.y = sit;
+                p.vel = Vec3::ZERO;
+                p.spin = Vec3::ZERO;
             }
         }
     }

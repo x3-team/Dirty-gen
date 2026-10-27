@@ -169,3 +169,29 @@ fn crest_impact_cuts_rut_and_sprays() {
         world.telemetry.max_air_pitch
     );
 }
+
+#[test]
+fn impact_chunks_land_on_the_heightfield() {
+    let mut world = World::demo();
+    world.run_seconds_with(6.4, silt::demo_drive);
+    let grounded = world
+        .particles
+        .items
+        .iter()
+        .filter(|p| p.alive && p.grounded && p.kind == 3)
+        .count();
+    let airborne = world
+        .particles
+        .items
+        .iter()
+        .filter(|p| p.alive && !p.grounded && (p.kind == 3 || p.kind == 4))
+        .count();
+    eprintln!(
+        "chunks grounded {grounded} still airborne {airborne} impact t {:.2}",
+        world.telemetry.impact_time
+    );
+    assert!(
+        grounded >= 3,
+        "large clumps should be sitting on the soil, grounded {grounded} airborne {airborne}"
+    );
+}

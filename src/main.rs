@@ -5,29 +5,46 @@
 mod mesh;
 mod render;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use glam::Vec3;
-use silt::world::{demo_camera, demo_drive, CameraPose, Input, World};
+#[cfg(not(target_arch = "wasm32"))]
+use silt::world::demo_drive;
+use silt::world::{demo_camera, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use render::{open_adapter, prepare_software_vulkan, write_png, Renderer};
+use render::Renderer;
+#[cfg(not(target_arch = "wasm32"))]
+use render::{open_adapter, prepare_software_vulkan, write_png};
 
+#[cfg(not(target_arch = "wasm32"))]
 const MEDIA: &str = "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media";
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("capture") {
-        let rest: Vec<String> = args.collect();
-        capture(&rest);
-    } else {
+    #[cfg(target_arch = "wasm32")]
+    {
+        console_error_panic_hook::set_once();
         run_window();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("capture") {
+            let rest: Vec<String> = args.collect();
+            capture(&rest);
+        } else {
+            run_window();
+        }
     }
 }
 
@@ -82,51 +99,10 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let window = std::sync::Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("Silt")
-                        .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720)),
-                )
-                .expect("window"),
-        );
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-        let surface = instance.create_surface(window.clone()).expect("surface");
-        let (_instance, adapter, device, queue) = open_adapter(false, Some(&surface));
-        let size = window.inner_size();
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| {
-                matches!(
-                    f,
-                    wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
-                )
-            })
-            .unwrap_or(caps.formats[0]);
-        let srgb = format.is_srgb();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&device, &config);
-        let name = adapter.get_info().name;
-        let mut renderer = Renderer::new(device, queue, name, config.width, config.height);
-        renderer.set_present_format(format);
-        self.window = Some(window);
-        self.surface = Some(surface);
-        self.config = Some(config);
-        self.renderer = Some(renderer);
-        self.srgb = srgb;
+        #[cfg(target_arch = "wasm32")]
+        self.start_web(event_loop);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.start_native(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -189,7 +165,64 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_native(&mut self, event_loop: &ActiveEventLoop) {
+        let window = std::sync::Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Silt")
+                        .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720)),
+                )
+                .expect("window"),
+        );
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(window.clone()).expect("surface");
+        let (_instance, adapter, device, queue) = open_adapter(false, Some(&surface));
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| {
+                matches!(
+                    f,
+                    wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+                )
+            })
+            .unwrap_or(caps.formats[0]);
+        let srgb = format.is_srgb();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+        let name = adapter.get_info().name;
+        let formats = render::gpu_formats(&adapter);
+        let mut renderer = Renderer::new(device, queue, name, config.width, config.height, formats);
+        renderer.set_present_format(format);
+        self.window = Some(window);
+        self.surface = Some(surface);
+        self.config = Some(config);
+        self.renderer = Some(renderer);
+        self.srgb = srgb;
+    }
+
     fn frame(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if self.renderer.is_none() {
+            if !self.take_web_gpu() {
+                return;
+            }
+            self.last = Instant::now();
+        }
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.05);
         self.last = now;
@@ -245,6 +278,50 @@ impl App {
         renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
         frame.present();
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn start_web(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::platform::web::WindowAttributesExtWebSys;
+        let canvas = web_canvas();
+        let window = std::sync::Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Silt")
+                        .with_canvas(Some(canvas))
+                        .with_append(false)
+                        .with_prevent_default(true)
+                        .with_focusable(true),
+                )
+                .expect("window"),
+        );
+        window.focus_window();
+        set_web_status("загрузка…");
+        let gpu_window = window.clone();
+        self.window = Some(window);
+        wasm_bindgen_futures::spawn_local(async move {
+            match build_web_gpu(gpu_window).await {
+                Ok(ready) => WEB_GPU.with(|slot| *slot.borrow_mut() = Some(ready)),
+                Err(err) => {
+                    web_sys::console::error_1(&err.into());
+                    set_web_status("ошибка GPU");
+                }
+            }
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn take_web_gpu(&mut self) -> bool {
+        let Some(ready) = WEB_GPU.with(|slot| slot.borrow_mut().take()) else {
+            return false;
+        };
+        set_web_status(&ready.label);
+        self.srgb = ready.srgb;
+        self.config = Some(ready.config);
+        self.surface = Some(ready.surface);
+        self.renderer = Some(ready.renderer);
+        true
+    }
 }
 
 fn chase(world: &World, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
@@ -275,7 +352,7 @@ fn lift_camera(world: &World, mut pose: CameraPose) -> CameraPose {
 fn run_window() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App {
+    let app = App {
         window: None,
         surface: None,
         config: None,
@@ -298,9 +375,19 @@ fn run_window() {
         last: Instant::now(),
         srgb: false,
     };
-    event_loop.run_app(&mut app).expect("run");
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        event_loop.spawn_app(app);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut app = app;
+        event_loop.run_app(&mut app).expect("run");
+    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct CaptureArgs {
     software: bool,
     width: u32,
@@ -314,18 +401,21 @@ struct CaptureArgs {
     still_ruts: PathBuf,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture(args: &[String]) {
     let parsed = parse_capture(args);
     if parsed.software {
         prepare_software_vulkan();
     }
     let (_instance, adapter, device, queue) = open_adapter(parsed.software, None);
+    let formats = render::gpu_formats(&adapter);
     let mut renderer = Renderer::new(
         device,
         queue,
         adapter.get_info().name,
         parsed.width,
         parsed.height,
+        formats,
     );
     let mut world = World::demo();
     let frames = (parsed.seconds * parsed.fps as f32).round() as u32;
@@ -447,6 +537,7 @@ fn capture(args: &[String]) {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut software = false;
     let mut width = 1280u32;
@@ -495,4 +586,177 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         still_puddle,
         still_ruts,
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct WebGpu {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    renderer: Renderer,
+    srgb: bool,
+    label: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WEB_GPU: std::cell::RefCell<Option<WebGpu>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_canvas() -> web_sys::HtmlCanvasElement {
+    use wasm_bindgen::JsCast;
+    let window = web_sys::window().expect("window");
+    let document = window.document().expect("document");
+    let canvas = document
+        .get_element_by_id("silt")
+        .expect("canvas #silt")
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .expect("canvas");
+    let mut width = canvas.client_width();
+    let mut height = canvas.client_height();
+    if width < 32 || height < 32 {
+        width = 1280;
+        height = 720;
+    }
+    canvas.set_width(width as u32);
+    canvas.set_height(height as u32);
+    canvas
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_web_status(text: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    if let Some(node) = document.get_element_by_id("backend") {
+        node.set_text_content(Some(text));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn force_webgl() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .map(|query| {
+            query.split(['?', '&']).any(|part| {
+                let part = part.trim();
+                part == "gl" || part.starts_with("gl=")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn backend_label(info: &wgpu::AdapterInfo) -> String {
+    let kind = match info.backend {
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        wgpu::Backend::Gl => "WebGL2",
+        other => return format!("{other:?} · {}", info.name),
+    };
+    format!("{kind} · {}", info.name)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String> {
+    let force_gl = force_webgl();
+    let mut desc = wgpu::InstanceDescriptor::default();
+    let instance = if force_gl {
+        desc.backends = wgpu::Backends::GL;
+        wgpu::Instance::new(desc)
+    } else {
+        wgpu::util::new_instance_with_webgpu_detection(desc).await
+    };
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|err| format!("surface: {err}"))?;
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        })
+        .await
+        .ok_or_else(|| {
+            if force_gl {
+                "нет адаптера WebGL2".to_string()
+            } else {
+                "нет адаптера WebGPU или WebGL2".to_string()
+            }
+        })?;
+    let info = adapter.get_info();
+    let label = backend_label(&info);
+    web_sys::console::log_1(&format!("silt {label}").into());
+    let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+    let limits = if limits.check_limits(&adapter.limits()) {
+        limits
+    } else {
+        adapter.limits()
+    };
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("silt"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        )
+        .await
+        .map_err(|err| format!("device: {err}"))?;
+    let size = window.inner_size();
+    let max_dim = device.limits().max_texture_dimension_2d;
+    let width = size.width.max(1).min(max_dim);
+    let height = size.height.max(1).min(max_dim);
+    let caps = surface.get_capabilities(&adapter);
+    if caps.formats.is_empty() {
+        return Err("поверхность без формата".into());
+    }
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|fmt| {
+            matches!(
+                fmt,
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+            )
+        })
+        .unwrap_or(caps.formats[0]);
+    let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+        wgpu::PresentMode::Fifo
+    } else {
+        caps.present_modes[0]
+    };
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width,
+        height,
+        present_mode,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats: vec![],
+    };
+    surface.configure(&device, &config);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        info.name,
+        config.width,
+        config.height,
+        formats,
+    );
+    renderer.set_present_format(format);
+    Ok(WebGpu {
+        surface,
+        config,
+        renderer,
+        srgb: format.is_srgb(),
+        label,
+    })
 }

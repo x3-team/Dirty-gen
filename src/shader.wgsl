@@ -37,7 +37,7 @@ struct Model {
 @group(1) @binding(0) var height_tex: texture_2d<f32>;
 @group(1) @binding(1) var mat_tex: texture_2d<f32>;
 @group(1) @binding(2) var mat_samp: sampler;
-@group(1) @binding(3) var shadow_tex: texture_depth_2d;
+@group(1) @binding(3) var shadow_tex: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -93,6 +93,17 @@ fn sky_color(dir_in: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
+fn decode_depth(c: vec4<f32>) -> f32 {
+    return dot(c, vec4<f32>(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0));
+}
+
+fn encode_depth(d: f32) -> vec4<f32> {
+    var enc = vec4<f32>(1.0, 255.0, 65025.0, 16581375.0) * clamp(d, 0.0, 0.9999);
+    enc = fract(enc);
+    enc = enc - enc.yzww * vec4<f32>(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);
+    return enc;
+}
+
 fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let lp = frame.light_vp * vec4<f32>(world, 1.0);
     let ndc = lp.xyz / lp.w;
@@ -104,18 +115,19 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let base = vec2<i32>(uv * dims);
     // Flat ground can shadow a few centimetres of rut. A wall keeps a larger bias.
     let slope = clamp(1.0 - n.y, 0.0, 1.0);
-    let bias = 0.00004 + slope * 0.0011;
+    let bias = 0.00015 + slope * 0.0014;
     var blocked = 0.0;
     for (var y: i32 = -1; y <= 1; y = y + 1) {
         for (var x: i32 = -1; x <= 1; x = x + 1) {
             let c = clamp(base + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
-            let s = textureLoad(shadow_tex, c, 0);
+            let s = decode_depth(textureLoad(shadow_tex, c, 0));
             if (ndc.z > s + bias) {
                 blocked = blocked + 1.0;
             }
         }
     }
-    return 1.0 - blocked / 9.0 * 0.86;
+    // 0.92 so the airborne buggy and the clods throw a shadow you can see.
+    return 1.0 - blocked / 9.0 * 0.92;
 }
 
 fn shade(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough: f32, emit: vec3<f32>) -> vec3<f32> {
@@ -167,17 +179,26 @@ struct TerrOut {
     @location(1) ij: vec2<f32>,
 }
 
-fn height_at(ij: vec2<i32>) -> f32 {
+fn load_height_stamp(ij: vec2<i32>) -> vec2<f32> {
     let dims = vec2<i32>(textureDimensions(height_tex));
     let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
-    return textureLoad(height_tex, c, 0).r;
+    let t = textureLoad(height_tex, c, 0);
+    // WebGL path packs 16-bit height and stamp into an RGBA8 texel.
+    if (frame.misc.z > 0.5) {
+        let h = (floor(t.r * 255.0 + 0.5) * 256.0 + floor(t.g * 255.0 + 0.5)) / 65535.0;
+        let s = (floor(t.b * 255.0 + 0.5) * 256.0 + floor(t.a * 255.0 + 0.5)) / 65535.0;
+        return vec2<f32>(h * 3.5 - 1.0, s * 1.5 - 0.75);
+    }
+    return t.rg;
+}
+
+fn height_at(ij: vec2<i32>) -> f32 {
+    return load_height_stamp(ij).x;
 }
 
 // Metres the stamp added. Negative is soil the tire removed.
 fn stamp_at(ij: vec2<i32>) -> f32 {
-    let dims = vec2<i32>(textureDimensions(height_tex));
-    let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
-    return textureLoad(height_tex, c, 0).g;
+    return load_height_stamp(ij).y;
 }
 
 fn mat_at(ij: vec2<i32>) -> vec4<f32> {
@@ -320,13 +341,6 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     return o;
 }
 
-@vertex
-fn vs_shadow_terrain(in: TerrIn) -> @builtin(position) vec4<f32> {
-    let h = height_bilinear(in.xz);
-    let world = vec3<f32>(in.xz.x, h, in.xz.y);
-    return frame.light_vp * vec4<f32>(world, 1.0);
-}
-
 @fragment
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
@@ -385,7 +399,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Standing water is drawn as its own sheet. A mirror bed under that film
     // is the gray metal disc.
     let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(0.96, 0.22, sheen * (1.0 - drowned)), 0.94, drowned);
+    let rough_out = mix(mix(0.96, 0.16, sheen * (1.0 - drowned)), 0.94, drowned);
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
     // A broad warm sheen is what makes wet soil read from above.
@@ -394,8 +408,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
     let facing = pow(1.0 - ndotv, 2.0);
     let broad = pow(clamp(dot(n, halfv), 0.0, 1.0), 5.0);
-    let wet_spec = (facing * 0.65 + broad * 0.85) * sheen * (1.0 - drowned);
-    lit += vec3<f32>(0.10, 0.055, 0.026) * wet_spec;
+    let wet_spec = (facing * 0.85 + broad * 1.05) * sheen * (1.0 - drowned);
+    lit += vec3<f32>(0.16, 0.085, 0.038) * wet_spec;
     return present(lit);
 }
 
@@ -455,21 +469,21 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     }
     let n = ripple_normal(in.world.xz, frame.misc.x);
     // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.55, 1.0, n.z * 0.55));
+    let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.4);
-    let depth_t = smoothstep(0.01, 0.16, in.depth);
+    let fres = pow(1.0 - ndotv, 2.2);
+    let depth_t = smoothstep(0.008, 0.20, in.depth);
     // Red-heavy mud. A gray mix here is what read as a metal disc from above.
-    let shore_col = vec3<f32>(0.095, 0.042, 0.016);
-    let deep_col = vec3<f32>(0.010, 0.004, 0.002);
+    let shore_col = vec3<f32>(0.12, 0.058, 0.022);
+    let deep_col = vec3<f32>(0.004, 0.002, 0.001);
     let absorption = mix(shore_col, deep_col, depth_t);
     // Warm dusk, not a gray sky. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.20, 0.11, 0.05);
-    var col = mix(absorption, quiet, 0.05 + fres * 0.16);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 36.0);
-    col += vec3<f32>(0.16, 0.08, 0.03) * spec * shadow_factor(in.world, nrm) * 0.22;
+    let quiet = vec3<f32>(0.22, 0.12, 0.05);
+    var col = mix(absorption, quiet, 0.04 + fres * 0.20);
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
+    col += vec3<f32>(0.20, 0.10, 0.035) * spec * shadow_factor(in.world, nrm) * 0.34;
     let shore = smoothstep(0.002, 0.07, in.depth);
     // Only a cut of a couple of centimetres thins the film, and only on that cut.
     // The rest of the pond stays a dark cover, shore and middle alike.
@@ -509,10 +523,35 @@ fn vs_mesh(in: MeshIn) -> MeshOut {
     return o;
 }
 
+struct ShadowOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) depth: f32,
+}
+
 @vertex
-fn vs_shadow_mesh(in: MeshIn) -> @builtin(position) vec4<f32> {
+fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
+    let h = height_bilinear(in.xz);
+    let world = vec3<f32>(in.xz.x, h, in.xz.y);
+    let clip = frame.light_vp * vec4<f32>(world, 1.0);
+    var o: ShadowOut;
+    o.clip = clip;
+    o.depth = clip.z / max(clip.w, 1e-5);
+    return o;
+}
+
+@vertex
+fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
     let world = model.world * vec4<f32>(in.pos, 1.0);
-    return frame.light_vp * world;
+    let clip = frame.light_vp * world;
+    var o: ShadowOut;
+    o.clip = clip;
+    o.depth = clip.z / max(clip.w, 1e-5);
+    return o;
+}
+
+@fragment
+fn fs_shadow(in: ShadowOut) -> @location(0) vec4<f32> {
+    return encode_depth(in.depth);
 }
 
 
@@ -568,6 +607,12 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     } else if (panel < 45.5) {
         let g = noise(world.xz * 3.0 + vec2<f32>(world.y * 2.0, 0.0));
         return vec4<f32>(vec3<f32>(0.10, 0.058, 0.032) * (0.8 + g * 0.35), 0.92);
+    } else if (panel < 46.5) {
+        // Wet clod. Dark soil with a little shine. The orange frame stays on panel 1.
+        let g = noise(world.xz * 4.5 + vec2<f32>(world.y * 3.0, 0.4));
+        // Dark wet soil, light enough that a lit face is brown mud rather than coal.
+        let col = mix(vec3<f32>(0.062, 0.032, 0.016), vec3<f32>(0.14, 0.072, 0.030), g);
+        return vec4<f32>(col, 0.30);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -635,7 +680,18 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         emit = vec3<f32>(0.9, 0.02, 0.01);
     }
 
-    return present(shade(in.world, nrm, albedo, rough, emit));
+    var lit = shade(in.world, nrm, albedo, rough, emit);
+    // The low sun leaves the top of a clod almost black. A warm fill keeps the
+    // lit face brown mud, and the underside stays darker so the chunk has volume.
+    if (in.panel > 45.5 && in.panel < 46.5) {
+        let up = clamp(nrm.y * 0.65 + 0.35, 0.0, 1.0);
+        lit += vec3<f32>(0.07, 0.034, 0.014) * up;
+        let sun = normalize(frame.sun_dir.xyz);
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let glint = pow(clamp(dot(normalize(nrm), normalize(sun + view)), 0.0, 1.0), 20.0);
+        lit += vec3<f32>(0.09, 0.045, 0.016) * glint;
+    }
+    return present(lit);
 }
 
 struct PartIn {

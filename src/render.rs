@@ -1,17 +1,17 @@
 //! Thin wgpu runtime. The soil and the buggy are drawn from the solver state:
 //! height and material live in textures, mud mass lives in a per-draw uniform.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
-use silt::particles::Particle;
 use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP};
 use silt::world::{CameraPose, World};
 
 use crate::mesh::{
-    buggy_body, environment_mesh, suspension_mesh, terrain_mesh, wheel_mesh, CpuMesh, MeshVertex,
-    ParticleVertex, TerrainVertex,
+    buggy_body, environment_mesh, mud_chunks, suspension_mesh, terrain_mesh, wheel_mesh, CpuMesh,
+    MeshVertex, ParticleVertex, TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
@@ -70,6 +70,9 @@ pub struct Renderer {
     #[allow(dead_code)]
     shadow: wgpu::Texture,
     shadow_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    shadow_depth: wgpu::Texture,
+    shadow_depth_view: wgpu::TextureView,
     readback: wgpu::Buffer,
     padded_row: u32,
     terrain: GpuMesh,
@@ -78,11 +81,15 @@ pub struct Renderer {
     env: GpuMesh,
     susp_v: wgpu::Buffer,
     susp_i: wgpu::Buffer,
+    #[allow(dead_code)]
     particles: wgpu::Buffer,
+    chunk_v: wgpu::Buffer,
+    chunk_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
+    #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
@@ -93,8 +100,53 @@ pub struct Renderer {
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
+    height_bytes: Vec<u8>,
+    height_packed: bool,
+    depth_format: wgpu::TextureFormat,
 }
 
+pub struct GpuFormats {
+    pub depth: wgpu::TextureFormat,
+    pub height: wgpu::TextureFormat,
+    pub height_packed: bool,
+}
+
+pub fn gpu_formats(adapter: &wgpu::Adapter) -> GpuFormats {
+    let depth_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    let depth = [
+        wgpu::TextureFormat::Depth32Float,
+        wgpu::TextureFormat::Depth24Plus,
+    ]
+    .into_iter()
+    .find(|fmt| {
+        adapter
+            .get_texture_format_features(*fmt)
+            .allowed_usages
+            .contains(depth_usage)
+    })
+    .unwrap_or(wgpu::TextureFormat::Depth24Plus);
+    let sample = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+    let rg = wgpu::TextureFormat::Rg32Float;
+    if adapter
+        .get_texture_format_features(rg)
+        .allowed_usages
+        .contains(sample)
+    {
+        GpuFormats {
+            depth,
+            height: rg,
+            height_packed: false,
+        }
+    } else {
+        GpuFormats {
+            depth,
+            height: wgpu::TextureFormat::Rgba8Unorm,
+            height_packed: true,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn prepare_software_vulkan() {
     let icd = "/usr/share/vulkan/icd.d/lvp_icd.json";
     if Path::new(icd).exists() {
@@ -109,6 +161,7 @@ pub fn prepare_software_vulkan() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn open_adapter(
     software: bool,
     surface: Option<&wgpu::Surface<'_>>,
@@ -156,6 +209,7 @@ impl Renderer {
         adapter_name: String,
         width: u32,
         height: u32,
+        formats: GpuFormats,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
@@ -207,7 +261,7 @@ impl Renderer {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -304,7 +358,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg32Float,
+            format: formats.height,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -332,14 +386,26 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let shadow_view = shadow.create_view(&wgpu::TextureViewDescriptor {
-            aspect: wgpu::TextureAspect::DepthOnly,
-            ..Default::default()
+        let shadow_view = shadow.create_view(&Default::default());
+        let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow-depth"),
+            size: wgpu::Extent3d {
+                width: SHADOW,
+                height: SHADOW,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: formats.depth,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
         });
+        let shadow_depth_view = shadow_depth.create_view(&Default::default());
         let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -388,7 +454,7 @@ impl Renderer {
         });
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&device, width, height);
+            make_targets(&device, width, height, formats.depth);
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
             layout: &blit_bgl,
@@ -443,7 +509,11 @@ impl Renderer {
             Some("fs_terrain"),
             terrain_buffers(),
             color_format,
-            Some(depth_state(true, wgpu::CompareFunction::Less)),
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
             false,
             Some(wgpu::Face::Back),
         );
@@ -455,7 +525,11 @@ impl Renderer {
             Some("fs_water"),
             terrain_buffers(),
             color_format,
-            Some(depth_state(false, wgpu::CompareFunction::Less)),
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
             true,
             None,
         );
@@ -467,7 +541,11 @@ impl Renderer {
             Some("fs_mesh"),
             mesh_buffers(),
             color_format,
-            Some(depth_state(true, wgpu::CompareFunction::Less)),
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
             false,
             Some(wgpu::Face::Back),
         );
@@ -479,7 +557,11 @@ impl Renderer {
             Some("fs_sky"),
             &[],
             color_format,
-            Some(depth_state(false, wgpu::CompareFunction::Always)),
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Always,
+            )),
             false,
             None,
         );
@@ -491,7 +573,11 @@ impl Renderer {
             Some("fs_particle"),
             particle_buffers(),
             color_format,
-            Some(depth_state(false, wgpu::CompareFunction::Less)),
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
             true,
             None,
         );
@@ -500,10 +586,10 @@ impl Renderer {
             &shader,
             &shadow_layout,
             "vs_shadow_terrain",
-            None,
+            Some("fs_shadow"),
             terrain_buffers(),
             color_format,
-            Some(shadow_depth_state()),
+            Some(shadow_depth_state(formats.depth)),
             false,
             Some(wgpu::Face::Back),
         );
@@ -512,10 +598,10 @@ impl Renderer {
             &shader,
             &shadow_layout,
             "vs_shadow_mesh",
-            None,
+            Some("fs_shadow"),
             mesh_buffers(),
             color_format,
-            Some(shadow_depth_state()),
+            Some(shadow_depth_state(formats.depth)),
             false,
             Some(wgpu::Face::Back),
         );
@@ -543,8 +629,18 @@ impl Renderer {
             false,
             None,
         );
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let fut = device.pop_error_scope();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Some(err) = fut.await {
+                    web_sys::console::error_1(&format!("wgpu pipeline: {err}").into());
+                }
+            });
         }
 
         let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
@@ -571,6 +667,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let chunk_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunks-v"),
+            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let chunk_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunks-i"),
+            size: (48000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -593,6 +701,8 @@ impl Renderer {
             depth_view,
             shadow,
             shadow_view,
+            shadow_depth,
+            shadow_depth_view,
             readback,
             padded_row,
             terrain,
@@ -602,6 +712,8 @@ impl Renderer {
             susp_v,
             susp_i,
             particles,
+            chunk_v,
+            chunk_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
@@ -616,6 +728,9 @@ impl Renderer {
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
+            height_bytes: vec![0; MAP_RES * MAP_RES * 4],
+            height_packed: formats.height_packed,
+            depth_format: formats.depth,
         }
     }
 
@@ -655,7 +770,7 @@ impl Renderer {
         self.width = width;
         self.height = height;
         let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&self.device, width, height);
+            make_targets(&self.device, width, height, self.depth_format);
         self.color = color;
         self.color_view = color_view;
         self.depth = depth;
@@ -733,19 +848,25 @@ impl Renderer {
                 MAP_SIZE / MAP_RES as f32,
                 MAP_RES as f32,
             ],
-            misc: [world.time, SHADOW as f32, 0.0, 0.0],
+            misc: [
+                world.time,
+                SHADOW as f32,
+                if self.height_packed { 1.0 } else { 0.0 },
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
         self.write_models(&world.vehicle);
 
-        let mut quads = Vec::<ParticleVertex>::new();
-        build_particles(&mut quads, &world.particles.items, cam.eye, cam.target);
-        if !quads.is_empty() {
+        let chunks = mud_chunks(&world.particles.items);
+        let chunk_count = chunks.indices.len() as u32;
+        if chunk_count > 0 {
             self.queue
-                .write_buffer(&self.particles, 0, bytemuck::cast_slice(&quads));
+                .write_buffer(&self.chunk_v, 0, bytemuck::cast_slice(&chunks.vertices));
+            self.queue
+                .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
-        let particle_count = quads.len() as u32;
 
         let mut encoder = self
             .device
@@ -756,9 +877,16 @@ impl Renderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.shadow_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -778,6 +906,8 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
+            pass.set_pipeline(&self.pipe_shadow_mesh);
+            self.draw_chunks(&mut pass, chunk_count);
         }
 
         {
@@ -818,11 +948,8 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
-            if particle_count > 0 {
-                pass.set_pipeline(&self.pipe_particle);
-                pass.set_vertex_buffer(0, self.particles.slice(..));
-                pass.draw(0..particle_count, 0..1);
-            }
+            pass.set_pipeline(&self.pipe_mesh);
+            self.draw_chunks(&mut pass, chunk_count);
         }
 
         if let Some((view, srgb)) = present {
@@ -909,21 +1036,50 @@ impl Renderer {
             // Current height minus the surface the stamp started from.
             px[1] = soil.height[i] - soil.initial_height[i];
         }
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.height_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&self.height_scratch),
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(res * 8),
-                rows_per_image: Some(res),
-            },
-            extent,
-        );
+        if self.height_packed {
+            for (i, px) in self.height_bytes.chunks_exact_mut(4).enumerate() {
+                let h = ((soil.height[i] + 1.0) / 3.5).clamp(0.0, 1.0);
+                let stamp = soil.height[i] - soil.initial_height[i];
+                let s = ((stamp + 0.75) / 1.5).clamp(0.0, 1.0);
+                let hq = (h * 65535.0).round() as u32;
+                let sq = (s * 65535.0).round() as u32;
+                px[0] = (hq >> 8) as u8;
+                px[1] = (hq & 255) as u8;
+                px[2] = (sq >> 8) as u8;
+                px[3] = (sq & 255) as u8;
+            }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.height_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.height_bytes,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(res * 4),
+                    rows_per_image: Some(res),
+                },
+                extent,
+            );
+        } else {
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.height_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&self.height_scratch),
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(res * 8),
+                    rows_per_image: Some(res),
+                },
+                extent,
+            );
+        }
         for (i, px) in self.mat_scratch.chunks_exact_mut(4).enumerate() {
             px[0] = (soil.wetness[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[1] = ((soil.water[i] / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
@@ -988,6 +1144,17 @@ impl Renderer {
         pass.set_index_buffer(self.susp_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..susp_indices, 0, 0..1);
     }
+
+    fn draw_chunks(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        if count == 0 {
+            return;
+        }
+        // Slot 5 is the identity transform. Chunk vertices are already in world space.
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+        pass.set_vertex_buffer(0, self.chunk_v.slice(..));
+        pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..count, 0, 0..1);
+    }
 }
 
 fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
@@ -1014,48 +1181,6 @@ fn model(world: Mat4, mud: [[f32; 4]; 12], extra: [f32; 4]) -> ModelData {
 
 fn vec4(v: Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
-}
-
-fn build_particles(out: &mut Vec<ParticleVertex>, items: &[Particle], eye: Vec3, target: Vec3) {
-    let forward = (target - eye).normalize_or_zero();
-    let inv = Mat4::look_at_rh(eye, target, Vec3::Y).inverse();
-    let right = Vec3::new(inv.x_axis.x, inv.x_axis.y, inv.x_axis.z).normalize_or_zero();
-    let up = Vec3::new(inv.y_axis.x, inv.y_axis.y, inv.y_axis.z).normalize_or_zero();
-    let _ = forward;
-    for p in items {
-        if !p.alive || p.life <= 0.0 {
-            continue;
-        }
-        let life = (p.life / p.max_life).clamp(0.0, 1.0);
-        let (color, scale) = match p.kind {
-            // Display-space mud. Hue stays with the soil (green about half the
-            // red). The old (0.42, 0.18, 0.06) landed as orange coins on the puddle.
-            0 => ([0.22, 0.12, 0.055, 0.92], 1.15),
-            1 => ([0.20, 0.11, 0.050, 0.94], 1.15),
-            // Impact clumps. Big enough to read while they fall, small enough
-            // that they separate instead of one dark disc over the splash.
-            3 => ([0.24, 0.13, 0.060, 0.90], 2.05),
-            4 => ([0.20, 0.11, 0.050, 0.88], 1.35),
-            _ => ([0.16, 0.09, 0.045, life * 0.8], 0.7),
-        };
-        let h = p.size * scale;
-        let c = p.pos;
-        let pts = [
-            c - right * h - up * h,
-            c + right * h - up * h,
-            c + right * h + up * h,
-            c - right * h + up * h,
-        ];
-        let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let tri = [0, 1, 2, 0, 2, 3];
-        for k in tri {
-            out.push(ParticleVertex {
-                pos: pts[k].to_array(),
-                color,
-                uv: uvs[k],
-            });
-        }
-    }
 }
 
 fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
@@ -1096,6 +1221,7 @@ fn make_targets(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    depth_format: wgpu::TextureFormat,
 ) -> (
     wgpu::Texture,
     wgpu::TextureView,
@@ -1131,7 +1257,7 @@ fn make_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
+        format: depth_format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -1160,9 +1286,13 @@ fn uniform_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayou
     }
 }
 
-fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStencilState {
+fn depth_state(
+    format: wgpu::TextureFormat,
+    write: bool,
+    compare: wgpu::CompareFunction,
+) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth32Float,
+        format,
         depth_write_enabled: write,
         depth_compare: compare,
         stencil: wgpu::StencilState::default(),
@@ -1170,9 +1300,9 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStenci
     }
 }
 
-fn shadow_depth_state() -> wgpu::DepthStencilState {
+fn shadow_depth_state(format: wgpu::TextureFormat) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
-        format: wgpu::TextureFormat::Depth32Float,
+        format,
         depth_write_enabled: true,
         depth_compare: wgpu::CompareFunction::Less,
         stencil: wgpu::StencilState::default(),
@@ -1315,6 +1445,7 @@ fn pipeline(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
