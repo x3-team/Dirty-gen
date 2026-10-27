@@ -5,14 +5,14 @@
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
-use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::bike::{Bike, BIKE_RADIUS};
+use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, mud_spray,
+    suspension_mesh, terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
@@ -837,10 +837,16 @@ impl Renderer {
             .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.bike_susp_v, 0, bytemuck::cast_slice(&bike_susp.vertices));
-        self.queue
-            .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
+        self.queue.write_buffer(
+            &self.bike_susp_v,
+            0,
+            bytemuck::cast_slice(&bike_susp.vertices),
+        );
+        self.queue.write_buffer(
+            &self.bike_susp_i,
+            0,
+            bytemuck::cast_slice(&bike_susp.indices),
+        );
 
         let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
         let aspect = self.width as f32 / self.height as f32;
@@ -893,6 +899,12 @@ impl Renderer {
                 .write_buffer(&self.chunk_v, 0, bytemuck::cast_slice(&chunks.vertices));
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
+        }
+        let spray = mud_spray(&world.particles.items, cam.eye);
+        let spray_verts = spray.len() as u32;
+        if spray_verts > 0 {
+            self.queue
+                .write_buffer(&self.particles, 0, bytemuck::cast_slice(&spray));
         }
 
         let mut encoder = self
@@ -979,6 +991,7 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
+            self.draw_spray(&mut pass, spray_verts);
         }
 
         if let Some((view, srgb)) = present {
@@ -1222,6 +1235,15 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.chunk_v.slice(..));
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+    }
+
+    fn draw_spray(&self, pass: &mut wgpu::RenderPass<'_>, verts: u32) {
+        if verts < 3 {
+            return;
+        }
+        pass.set_pipeline(&self.pipe_particle);
+        pass.set_vertex_buffer(0, self.particles.slice(..));
+        pass.draw(0..verts, 0..1);
     }
 }
 
