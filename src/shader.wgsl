@@ -622,8 +622,94 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        // Cockpit wet metal. cockpit_shade replaces the light; this is the fallback albedo.
+        return vec4<f32>(vec3<f32>(0.045, 0.048, 0.052), 0.14);
+    } else if (panel < 48.5) {
+        return vec4<f32>(vec3<f32>(0.04, 0.037, 0.034), 0.88);
+    } else if (panel < 49.5) {
+        return vec4<f32>(vec3<f32>(0.09, 0.042, 0.016), 0.2);
+    } else if (panel < 50.5) {
+        return vec4<f32>(vec3<f32>(0.02, 0.018, 0.017), 0.24);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
+}
+
+// Cockpit panels from cockpit_mesh.rs. 47 wet metal, 48 cloth, 49 cowl, 50 rim.
+// The tub is open, so this only tints those panels. Body paint is untouched.
+fn cockpit_shade(panel: f32, world: vec3<f32>, n_in: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    var n = normalize(n_in);
+    let sun = normalize(frame.sun_dir.xyz);
+    let view = normalize(frame.cam_pos.xyz - world);
+    let halfv = normalize(sun + view);
+    // The roof shadows the tub. A fully black cabin does not read as a cockpit.
+    let shadow = mix(0.62, 1.0, shadow_factor(world + n * 0.02, n));
+    let grit = noise(world.xy * 5.0 + world.zx * 2.0);
+
+    var albedo = vec3<f32>(0.05, 0.052, 0.056);
+    var spec_col = vec3<f32>(0.55, 0.52, 0.48);
+    var spec_pow = 48.0;
+    var spec_gain = 0.7;
+
+    if (panel < 47.5) {
+        albedo = vec3<f32>(0.042, 0.046, 0.052) * (0.86 + grit * 0.22);
+        let fleck = noise(world.xy * 11.0 + vec2<f32>(world.z * 7.0, 1.3));
+        let mud = smoothstep(0.60, 0.82, fleck);
+        albedo = mix(albedo, vec3<f32>(0.09, 0.042, 0.016), mud * 0.9);
+        spec_gain = mix(0.85, 0.2, mud);
+        let bead = smoothstep(0.80, 0.92, noise(world.xy * 46.0 + world.yz * 28.0));
+        spec_col = mix(spec_col, vec3<f32>(0.72, 0.70, 0.66), bead);
+        spec_gain = spec_gain + bead * 0.55;
+    } else if (panel < 48.5) {
+        let rib_src = select(world.z * 46.0, world.x * 78.0, abs(n.y) < 0.55);
+        let rib = 0.5 + 0.5 * sin(rib_src);
+        albedo = mix(vec3<f32>(0.09, 0.084, 0.078), vec3<f32>(0.18, 0.168, 0.15), rib);
+        albedo = albedo * (0.92 + grit * 0.12);
+        let splat = noise(world.xz * 5.5 + vec2<f32>(world.y * 2.0, 2.0));
+        let mud = smoothstep(0.62, 0.84, splat);
+        albedo = mix(albedo, vec3<f32>(0.22, 0.11, 0.04), mud * 0.8);
+        spec_pow = 14.0;
+        spec_gain = 0.06;
+        spec_col = vec3<f32>(0.22, 0.18, 0.14);
+    } else if (panel < 49.5) {
+        let e = 0.045;
+        let h0 = noise(world.xz * 4.2);
+        let hx = noise((world.xz + vec2<f32>(e, 0.0)) * 4.2);
+        let hz = noise((world.xz + vec2<f32>(0.0, e)) * 4.2);
+        n = normalize(n + vec3<f32>(h0 - hx, 0.0, h0 - hz) * 0.65);
+        // uv.y is local z on the cowl sheet. The nose carries more mud.
+        let nose = clamp((uv.y - 0.60) / 0.85, 0.0, 1.0);
+        let smear = noise(world.xz * 2.2 + vec2<f32>(world.y, 0.4));
+        let fine = noise(world.xz * 8.0 + vec2<f32>(1.7, world.y * 2.0));
+        let coat = smoothstep(0.02, 0.40, 0.62 + nose * 0.3 + smear * 0.2);
+        let metal = vec3<f32>(0.07, 0.074, 0.078);
+        let mud = mix(vec3<f32>(0.11, 0.050, 0.018), vec3<f32>(0.26, 0.13, 0.048), fine);
+        albedo = mix(metal, mud, coat);
+        spec_col = mix(vec3<f32>(0.50, 0.48, 0.46), vec3<f32>(0.34, 0.15, 0.05), coat);
+        spec_pow = mix(64.0, 20.0, coat);
+        spec_gain = mix(0.5, 0.95, coat);
+    } else {
+        albedo = vec3<f32>(0.018, 0.017, 0.016) * (0.85 + grit * 0.2);
+        let mud = smoothstep(0.55, 0.78, noise(uv * 8.0 + world.xy * 3.0));
+        albedo = mix(albedo, vec3<f32>(0.08, 0.036, 0.014), mud * 0.65);
+        spec_pow = 28.0;
+        spec_gain = 0.45;
+        spec_col = vec3<f32>(0.35, 0.33, 0.30);
+    }
+
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    let ndotv = clamp(dot(n, view), 0.0, 1.0);
+    let fres = pow(1.0 - ndotv, 2.4);
+    let ndoth = clamp(dot(n, halfv), 0.0, 1.0);
+    let sky = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    let hemi = mix(vec3<f32>(0.11, 0.08, 0.055), vec3<f32>(0.22, 0.23, 0.25), sky);
+    // Cloth faces the tunnel and gets no sun. A flat fill keeps the ribs visible.
+    let cloth = select(0.0, 0.12, panel > 47.5 && panel < 48.5);
+    var lit = albedo * (hemi * 0.9 + vec3<f32>(1.15, 0.74, 0.40) * ndl * shadow * 1.05 + cloth);
+    lit = lit + albedo * vec3<f32>(0.06, 0.055, 0.05) * ndotv;
+    lit = lit + spec_col * pow(ndoth, spec_pow) * spec_gain * shadow;
+    lit = lit + spec_col * fres * spec_gain * 0.35;
+    return lit;
 }
 
 @fragment
@@ -722,6 +808,9 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         lit += gloss * fres * 0.08;
         let belly = smoothstep(0.2, -0.45, n.y);
         lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+    }
+    if (in.panel > 46.5 && in.panel < 50.5) {
+        lit = cockpit_shade(in.panel, in.world, nrm, in.uv);
     }
     return present(lit);
 }

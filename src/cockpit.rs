@@ -1,8 +1,9 @@
 //! Seat cameras for the buggy. C walks isometric, chase, then these views.
 //!
-//! The poses match the cockpit stills: a wheel, a wet dash, a muddy hood,
-//! and the two seats from the driver seat, the passenger seat, and the
-//! outside angles. Chase and the fixed isometric frame stay in the cycle.
+//! The poses sit inside the tube cage: a wheel, a wet dash, muddy cowl,
+//! and the two seats, from the driver seat, the passenger seat, and the
+//! outside angles. The cage stays open, so the track is still in frame.
+//! Chase and the fixed isometric frame stay in the cycle.
 
 use glam::{Mat4, Quat, Vec3};
 
@@ -54,46 +55,46 @@ struct View {
 
 fn views() -> [View; COCKPIT_VIEWS as usize] {
     [
-        // Driver. Wheel to the left, dash and muddy hood ahead, the other seat right.
+        // Driver. Above the seat backs, wheel inboard, muddy cowl ahead, the other bucket low in frame.
         View {
-            eye: Vec3::new(0.10, 0.70, -0.42),
-            target: Vec3::new(0.02, 0.40, 1.40),
-            fov_y_deg: 52.0,
+            eye: Vec3::new(0.00, 0.72, -0.50),
+            target: Vec3::new(-0.06, 0.34, 1.12),
+            fov_y_deg: 62.0,
             near: 0.05,
         },
-        // Passenger, looking across the wheel and the wet dash.
+        // Passenger, up above the bucket, looking across the wheel and the wet dash.
         View {
-            eye: Vec3::new(0.30, 0.66, -0.30),
-            target: Vec3::new(-0.16, 0.46, 0.90),
-            fov_y_deg: 50.0,
+            eye: Vec3::new(0.30, 0.78, 0.22),
+            target: Vec3::new(-0.16, 0.42, 0.90),
+            fov_y_deg: 54.0,
             near: 0.05,
         },
-        // Low, over the lap: the wheel fills the frame and the hood sits beyond it.
+        // Low, over the lap: the wheel, the wet dash, and the muddy cowl.
         View {
-            eye: Vec3::new(0.10, 0.52, 0.02),
-            target: Vec3::new(-0.10, 0.42, 1.05),
-            fov_y_deg: 48.0,
-            near: 0.04,
+            eye: Vec3::new(0.10, 0.64, -0.34),
+            target: Vec3::new(-0.02, 0.30, 1.05),
+            fov_y_deg: 60.0,
+            near: 0.05,
         },
-        // Standing on the muddy hood, looking back at both seats.
+        // On the muddy cowl, looking back under the roof into both seats.
         View {
-            eye: Vec3::new(0.02, 0.68, 1.08),
-            target: Vec3::new(-0.02, 0.44, -0.22),
-            fov_y_deg: 52.0,
+            eye: Vec3::new(0.16, 0.86, 1.02),
+            target: Vec3::new(-0.02, 0.46, -0.22),
+            fov_y_deg: 58.0,
             near: 0.06,
         },
-        // High on the left, into the open cockpit: both seats, wheel, dash.
+        // High on the left, into the open cage: seats, wheel, dash.
         View {
-            eye: Vec3::new(-1.02, 0.92, 0.42),
-            target: Vec3::new(-0.06, 0.46, 0.16),
-            fov_y_deg: 44.0,
+            eye: Vec3::new(-1.28, 1.08, 0.18),
+            target: Vec3::new(0.02, 0.42, 0.02),
+            fov_y_deg: 50.0,
             near: 0.08,
         },
-        // Front quarter. The muddy hood leads, then the dash and the wheel.
+        // Front quarter. The muddy cowl leads, then the dash and the wheel.
         View {
-            eye: Vec3::new(0.42, 1.22, 2.05),
-            target: Vec3::new(-0.06, 0.42, 0.15),
-            fov_y_deg: 42.0,
+            eye: Vec3::new(0.55, 1.18, 2.05),
+            target: Vec3::new(-0.04, 0.38, 0.20),
+            fov_y_deg: 44.0,
             near: 0.08,
         },
     ]
