@@ -4,9 +4,12 @@
 //! into paint, rubber or mud. Wheel and shock meshes stay in the spaces the
 //! vehicle solver already uses, so the picture matches the contact model.
 
+use std::collections::{HashMap, HashSet};
+
 use glam::{Quat, Vec3};
 
 use silt::bike::Bike;
+use silt::soil::track_offset;
 use silt::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
 
 pub const PANEL_LIGHT: f32 = 16.0;
@@ -670,7 +673,14 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
         4,
     );
     let pivot = Vec3::new(0.0, 0.02, -0.12);
-    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot,
+        rear + Vec3::new(0.0, 0.02, 0.0),
+        0.03,
+        arm,
+        5,
+    );
     add_tube(
         &mut m,
         pivot + Vec3::new(0.06, 0.0, 0.0),
@@ -700,11 +710,94 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
     m
 }
 
+/// Subdivisions of one solver cell on the uniform draw grid this replaced.
+/// Ground away from the oval stays on that grid.
+const BASE_SUB: usize = 3;
+
+/// Bowls in `SoilField::generate`. The draw grid spends triangles here; the
+/// solver grid is untouched.
+const PUDDLES: [(f32, f32, f32, f32); 3] = [
+    (-6.15, 5.05, 2.35, 2.55),
+    (6.35, 2.40, 2.30, 1.80),
+    (1.15, 9.25, 2.15, 2.05),
+];
+const BOG_CENTER: (f32, f32) = (0.0, 1.05);
+const BOG_RAD: f32 = 4.2;
+
 pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
-    // The solver stores one height per ~20 cm. A rut is often a single cell,
-    // which is one kink and reads as a tint. Draw a finer mesh and sample the
-    // same heightfield so the displaced walls have real triangles.
-    let sub = 3usize;
+    // The solver still stores one height per ~20 cm. This mesh only chooses
+    // where those samples are drawn. One red-green pass is ×4 triangles, two
+    // is ×16. The second pass is the tyre-wall band and the puddle rims.
+    // The apron stays on the base grid so the water pass does not pay for empty field.
+    let (mut verts, mut tris) = uniform_terrain(res, size, BASE_SUB);
+    refine_marked(&mut verts, &mut tris, |x, z| detail_level(x, z) >= 1);
+    refine_marked(&mut verts, &mut tris, |x, z| detail_level(x, z) >= 2);
+    let mut indices = Vec::with_capacity(tris.len() * 3);
+    for t in tris {
+        indices.extend_from_slice(&t);
+    }
+    (verts, indices)
+}
+
+/// 0 keeps the base grid, 1 splits once (×4 triangles), 2 splits again (×16).
+fn detail_level(x: f32, z: f32) -> u8 {
+    let off = track_offset(x, z).abs();
+    let mut level = 0u8;
+    // Oval, berm, and standing water. One split takes the edge from ~7 cm to ~3.5 cm.
+    if off < 3.9 || water_basin(x, z) {
+        level = 1;
+    }
+    // Tyre walls sit near ±0.7 m. A second split is spent there and on the
+    // puddle rims, not across the whole apron: the water pass runs this mesh.
+    if (0.40..1.28).contains(&off) || puddle_shore(x, z) {
+        level = 2;
+    }
+    level
+}
+
+fn water_basin(x: f32, z: f32) -> bool {
+    for (cx, cz, rx, rz) in PUDDLES {
+        if ellipse_d(x, z, cx, cz, rx + 0.7, rz + 0.7) <= 1.0 {
+            return true;
+        }
+    }
+    bog_r(x, z) < BOG_RAD + 0.75
+}
+
+fn puddle_shore(x: f32, z: f32) -> bool {
+    for (cx, cz, rx, rz) in PUDDLES {
+        let inner = ellipse_d(x, z, cx, cz, rx * 0.62, rz * 0.62);
+        let outer = ellipse_d(x, z, cx, cz, rx + 0.40, rz + 0.40);
+        if inner >= 1.0 && outer <= 1.0 {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+fn bog_shore(x: f32, z: f32) -> bool {
+    // Pond rim. One split (the basin) already quarters the old facets.
+    let r = bog_r(x, z);
+    (3.45..4.70).contains(&r)
+}
+
+fn ellipse_d(x: f32, z: f32, cx: f32, cz: f32, rx: f32, rz: f32) -> f32 {
+    let dx = (x - cx) / rx.max(0.2);
+    let dz = (z - cz) / rz.max(0.2);
+    (dx * dx + dz * dz).sqrt()
+}
+
+fn bog_r(x: f32, z: f32) -> f32 {
+    let dx = x - BOG_CENTER.0;
+    let dz = z - BOG_CENTER.1;
+    (dx * dx + dz * dz).sqrt()
+}
+
+fn uniform_terrain(res: usize, size: f32, sub: usize) -> (Vec<TerrainVertex>, Vec<[u32; 3]>) {
+    if res < 2 || sub == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let n = (res - 1) * sub + 1;
     let mut verts = Vec::with_capacity(n * n);
     let half = size * 0.5;
@@ -721,7 +814,7 @@ pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
             });
         }
     }
-    let mut indices = Vec::with_capacity((n - 1) * (n - 1) * 6);
+    let mut tris = Vec::with_capacity((n - 1) * (n - 1) * 2);
     for j in 0..n - 1 {
         for i in 0..n - 1 {
             let a = (j * n + i) as u32;
@@ -729,10 +822,153 @@ pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
             let c = ((j + 1) * n + i + 1) as u32;
             let d = (j * n + i + 1) as u32;
             // +Z then +X winds upward.
-            indices.extend_from_slice(&[a, b, c, a, c, d]);
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
         }
     }
-    (verts, indices)
+    (verts, tris)
+}
+
+fn edge_key(a: u32, b: u32) -> u64 {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    ((lo as u64) << 32) | hi as u64
+}
+
+struct EdgeAdj {
+    tris: [u32; 2],
+    n: u8,
+}
+
+fn tri_centroid(verts: &[TerrainVertex], t: [u32; 3]) -> (f32, f32) {
+    let a = verts[t[0] as usize].xz;
+    let b = verts[t[1] as usize].xz;
+    let c = verts[t[2] as usize].xz;
+    ((a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0)
+}
+
+fn split_count(t: [u32; 3], split: &HashSet<u64>) -> u8 {
+    let mut n = 0u8;
+    if split.contains(&edge_key(t[0], t[1])) {
+        n += 1;
+    }
+    if split.contains(&edge_key(t[1], t[2])) {
+        n += 1;
+    }
+    if split.contains(&edge_key(t[2], t[0])) {
+        n += 1;
+    }
+    n
+}
+
+/// Red-green split. Marked triangles become four. A neighbour that shares
+/// one split edge becomes two, so the mesh stays watertight. A neighbour
+/// with two split edges is promoted so it does not keep a T-junction.
+fn refine_marked(
+    verts: &mut Vec<TerrainVertex>,
+    tris: &mut Vec<[u32; 3]>,
+    mark: impl Fn(f32, f32) -> bool,
+) {
+    if tris.is_empty() {
+        return;
+    }
+    let mut adj: HashMap<u64, EdgeAdj> = HashMap::with_capacity(tris.len() * 2);
+    for (i, t) in tris.iter().enumerate() {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let e = adj
+                .entry(edge_key(a, b))
+                .or_insert(EdgeAdj { tris: [0, 0], n: 0 });
+            assert!(e.n < 2, "draw mesh edge already has two triangles");
+            e.tris[e.n as usize] = i as u32;
+            e.n += 1;
+        }
+    }
+
+    let mut split: HashSet<u64> = HashSet::with_capacity(tris.len());
+    let mut red = vec![false; tris.len()];
+    let mut queue: Vec<u32> = Vec::new();
+    for (i, t) in tris.iter().enumerate() {
+        let (x, z) = tri_centroid(verts, *t);
+        if mark(x, z) {
+            queue.push(i as u32);
+        }
+    }
+
+    while let Some(i) = queue.pop() {
+        if red[i as usize] {
+            continue;
+        }
+        red[i as usize] = true;
+        let t = tris[i as usize];
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let k = edge_key(a, b);
+            if !split.insert(k) {
+                continue;
+            }
+            let Some(edge) = adj.get(&k) else {
+                continue;
+            };
+            for n in 0..edge.n as usize {
+                let ni = edge.tris[n];
+                if ni != i && !red[ni as usize] && split_count(tris[ni as usize], &split) >= 2 {
+                    queue.push(ni);
+                }
+            }
+        }
+    }
+
+    let mut mids: HashMap<u64, u32> = HashMap::with_capacity(split.len());
+    let mut midpoint = |verts: &mut Vec<TerrainVertex>, a: u32, b: u32| -> u32 {
+        let k = edge_key(a, b);
+        if let Some(id) = mids.get(&k) {
+            return *id;
+        }
+        let va = verts[a as usize];
+        let vb = verts[b as usize];
+        let id = verts.len() as u32;
+        verts.push(TerrainVertex {
+            xz: [(va.xz[0] + vb.xz[0]) * 0.5, (va.xz[1] + vb.xz[1]) * 0.5],
+            ij: [(va.ij[0] + vb.ij[0]) * 0.5, (va.ij[1] + vb.ij[1]) * 0.5],
+        });
+        mids.insert(k, id);
+        id
+    };
+
+    let mut out = Vec::with_capacity(tris.len() * 2);
+    for t in tris.iter() {
+        let [a, b, c] = *t;
+        let ab = split.contains(&edge_key(a, b));
+        let bc = split.contains(&edge_key(b, c));
+        let ca = split.contains(&edge_key(c, a));
+        let n = ab as u8 + bc as u8 + ca as u8;
+        assert!(
+            n != 2,
+            "red-green closure left a triangle with two split edges"
+        );
+        if n == 3 {
+            let mab = midpoint(verts, a, b);
+            let mbc = midpoint(verts, b, c);
+            let mca = midpoint(verts, c, a);
+            out.push([a, mab, mca]);
+            out.push([mab, b, mbc]);
+            out.push([mca, mbc, c]);
+            out.push([mab, mbc, mca]);
+        } else if ab {
+            let m = midpoint(verts, a, b);
+            out.push([a, m, c]);
+            out.push([m, b, c]);
+        } else if bc {
+            let m = midpoint(verts, b, c);
+            out.push([a, b, m]);
+            out.push([a, m, c]);
+        } else if ca {
+            let m = midpoint(verts, c, a);
+            out.push([a, b, m]);
+            out.push([m, b, c]);
+        } else {
+            out.push([a, b, c]);
+        }
+    }
+    *tris = out;
 }
 
 fn hash(n: u32) -> f32 {
@@ -916,8 +1152,7 @@ fn add_tri_smooth(
         push_smooth(mesh, b, nb, panel);
         push_smooth(mesh, c, nc, panel);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
 /// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
@@ -986,15 +1221,7 @@ fn add_lump(
         let a = ring(1, i);
         let b = ring(1, i + 1);
         add_tri_smooth(
-            mesh,
-            pts[0],
-            nrm[0],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
     for s in 1..stacks.saturating_sub(1) {
@@ -1004,26 +1231,10 @@ fn add_lump(
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
             add_tri_smooth(
-                mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
+                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center,
             );
             add_tri_smooth(
-                mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
+                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center,
             );
         }
     }
@@ -1033,29 +1244,14 @@ fn add_lump(
         let a = ring(last, i + 1);
         let b = ring(last, i);
         add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
     add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded,
     );
 }
 
@@ -1107,4 +1303,411 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
         }
     }
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack(tris: &[[u32; 3]]) -> Vec<u32> {
+        let mut indices = Vec::with_capacity(tris.len() * 3);
+        for t in tris {
+            indices.extend_from_slice(t);
+        }
+        indices
+    }
+
+    fn centroid(verts: &[TerrainVertex], tri: &[u32]) -> (f32, f32) {
+        tri_centroid(verts, [tri[0], tri[1], tri[2]])
+    }
+
+    fn count_where(
+        verts: &[TerrainVertex],
+        indices: &[u32],
+        pred: impl Fn(f32, f32) -> bool,
+    ) -> usize {
+        indices
+            .chunks(3)
+            .filter(|tri| {
+                let (x, z) = centroid(verts, tri);
+                pred(x, z)
+            })
+            .count()
+    }
+
+    fn mean_edge(verts: &[TerrainVertex], indices: &[u32], pred: impl Fn(f32, f32) -> bool) -> f32 {
+        let mut sum = 0.0f64;
+        let mut n = 0u64;
+        for tri in indices.chunks(3) {
+            let (x, z) = centroid(verts, tri);
+            if !pred(x, z) {
+                continue;
+            }
+            for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+                let a = verts[tri[i] as usize].xz;
+                let b = verts[tri[j] as usize].xz;
+                let dx = (a[0] - b[0]) as f64;
+                let dz = (a[1] - b[1]) as f64;
+                sum += (dx * dx + dz * dz).sqrt();
+                n += 1;
+            }
+        }
+        (sum / n.max(1) as f64) as f32
+    }
+
+    fn assert_oriented(indices: &[u32]) {
+        let mut dir: HashMap<u64, u8> = HashMap::with_capacity(indices.len());
+        for tri in indices.chunks(3) {
+            assert!(tri[0] != tri[1] && tri[1] != tri[2] && tri[2] != tri[0]);
+            for (u, v) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                let k = ((u as u64) << 32) | v as u64;
+                let n = dir.entry(k).or_insert(0);
+                *n += 1;
+                assert_eq!(*n, 1, "edge {u}->{v} is used twice");
+            }
+        }
+    }
+
+    fn assert_upward(verts: &[TerrainVertex], indices: &[u32]) {
+        let mut seen = 0u32;
+        for tri in indices.chunks(3).step_by(64) {
+            let a = verts[tri[0] as usize].xz;
+            let b = verts[tri[1] as usize].xz;
+            let c = verts[tri[2] as usize].xz;
+            // Y of (b-a) × (c-a). Positive faces up; the xz cross has the opposite sign.
+            let abx = b[0] - a[0];
+            let abz = b[1] - a[1];
+            let acx = c[0] - a[0];
+            let acz = c[1] - a[1];
+            let y = abz * acx - abx * acz;
+            assert!(y > 1.0e-8, "triangle winds downward");
+            seen += 1;
+        }
+        assert!(seen > 4);
+    }
+
+    fn assert_ij(verts: &[TerrainVertex], res: usize, size: f32) {
+        let cell = size / res as f32;
+        let half = size * 0.5;
+        for v in verts.iter().step_by(32) {
+            let fi = (v.xz[0] + half) / cell - 0.5;
+            let fj = (v.xz[1] + half) / cell - 0.5;
+            assert!((fi - v.ij[0]).abs() < 1.0e-3 && (fj - v.ij[1]).abs() < 1.0e-3);
+            assert!(v.ij[0] >= -1.0e-3 && v.ij[1] >= -1.0e-3);
+            assert!(v.ij[0] <= res as f32 - 1.0 + 1.0e-3);
+            assert!(v.ij[1] <= res as f32 - 1.0 + 1.0e-3);
+        }
+    }
+
+    /// A vertex in the interior of an edge that the mesh still draws whole.
+    fn assert_no_t_junctions(verts: &[TerrainVertex], indices: &[u32]) {
+        let inv = 20.0;
+        let mut bins: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (i, v) in verts.iter().enumerate() {
+            let key = (
+                (v.xz[0] * inv).floor() as i32,
+                (v.xz[1] * inv).floor() as i32,
+            );
+            bins.entry(key).or_default().push(i as u32);
+        }
+        for tri in indices.chunks(3) {
+            for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+                let a = tri[i];
+                let b = tri[j];
+                let pa = verts[a as usize].xz;
+                let pb = verts[b as usize].xz;
+                let abx = pb[0] - pa[0];
+                let abz = pb[1] - pa[1];
+                let ab2 = abx * abx + abz * abz;
+                if ab2 < 1.0e-12 {
+                    continue;
+                }
+                let i0 = (pa[0].min(pb[0]) * inv).floor() as i32 - 1;
+                let i1 = (pa[0].max(pb[0]) * inv).floor() as i32 + 1;
+                let j0 = (pa[1].min(pb[1]) * inv).floor() as i32 - 1;
+                let j1 = (pa[1].max(pb[1]) * inv).floor() as i32 + 1;
+                let ab_len = ab2.sqrt();
+                for ix in i0..=i1 {
+                    for jz in j0..=j1 {
+                        let Some(bucket) = bins.get(&(ix, jz)) else {
+                            continue;
+                        };
+                        for &v in bucket {
+                            if v == a || v == b {
+                                continue;
+                            }
+                            let p = verts[v as usize].xz;
+                            let vx = p[0] - pa[0];
+                            let vz = p[1] - pa[1];
+                            let cross = (vx * abz - vz * abx).abs();
+                            if cross > 2.0e-4 * ab_len {
+                                continue;
+                            }
+                            let dot = vx * abx + vz * abz;
+                            if dot > 1.0e-4 * ab2 && dot < ab2 - 1.0e-4 * ab2 {
+                                panic!("T-junction at vertex {v} on edge {a}-{b}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_refine_stays_manifold() {
+        let (mut verts, mut tris) = uniform_terrain(16, 8.0, 2);
+        let before = tris.len();
+        refine_marked(&mut verts, &mut tris, |x, _z| x < -0.4);
+        refine_marked(&mut verts, &mut tris, |x, z| x < -1.2 && z > 0.0);
+        assert!(tris.len() > before);
+        let indices = pack(&tris);
+        assert_oriented(&indices);
+        assert_upward(&verts, &indices);
+        assert_no_t_junctions(&verts, &indices);
+        let fine = mean_edge(&verts, &indices, |x, _z| x < -1.5);
+        let coarse = mean_edge(&verts, &indices, |x, _z| x > 2.0);
+        assert!(
+            fine < coarse * 0.4,
+            "fine edge {fine:.4} should be well under coarse {coarse:.4}"
+        );
+    }
+
+    #[test]
+    fn oval_has_at_least_four_times_the_triangles() {
+        const RES: usize = 192;
+        const SIZE: f32 = 40.0;
+        let (base_v, base_t) = uniform_terrain(RES, SIZE, BASE_SUB);
+        let base_i = pack(&base_t);
+        let (dense_v, dense_i) = terrain_mesh(RES, SIZE);
+        let on_oval = |x: f32, z: f32| track_offset(x, z).abs() <= 3.2;
+        let on_rut = |x: f32, z: f32| {
+            let off = track_offset(x, z).abs();
+            (0.40..1.28).contains(&off)
+        };
+        let on_far = |x: f32, z: f32| track_offset(x, z).abs() > 10.0 && !water_basin(x, z);
+        let on_shore = |x: f32, z: f32| puddle_shore(x, z);
+        let on_bog = |x: f32, z: f32| bog_shore(x, z);
+
+        let base_tris = base_i.len() / 3;
+        let dense_tris = dense_i.len() / 3;
+        let base_oval = count_where(&base_v, &base_i, on_oval);
+        let dense_oval = count_where(&dense_v, &dense_i, on_oval);
+        let base_rut = count_where(&base_v, &base_i, on_rut);
+        let dense_rut = count_where(&dense_v, &dense_i, on_rut);
+        let base_far = count_where(&base_v, &base_i, on_far);
+        let dense_far = count_where(&dense_v, &dense_i, on_far);
+        let base_shore = count_where(&base_v, &base_i, on_shore);
+        let dense_shore = count_where(&dense_v, &dense_i, on_shore);
+        let base_bog = count_where(&base_v, &base_i, on_bog);
+        let dense_bog = count_where(&dense_v, &dense_i, on_bog);
+        let oval_ratio = dense_oval as f64 / base_oval.max(1) as f64;
+        let rut_ratio = dense_rut as f64 / base_rut.max(1) as f64;
+        let far_ratio = dense_far as f64 / base_far.max(1) as f64;
+        let shore_ratio = dense_shore as f64 / base_shore.max(1) as f64;
+        let bog_ratio = dense_bog as f64 / base_bog.max(1) as f64;
+        let rut_edge = mean_edge(&dense_v, &dense_i, on_rut);
+        let far_edge = mean_edge(&dense_v, &dense_i, on_far);
+        let shore_edge = mean_edge(&dense_v, &dense_i, on_shore);
+        let bog_edge = mean_edge(&dense_v, &dense_i, on_bog);
+        eprintln!(
+            "tris {base_tris} -> {dense_tris} ({:.2}x)  verts {} -> {}",
+            dense_tris as f64 / base_tris as f64,
+            base_v.len(),
+            dense_v.len()
+        );
+        eprintln!(
+            "oval {base_oval} -> {dense_oval} ({oval_ratio:.2}x)  rut {base_rut} -> {dense_rut} ({rut_ratio:.2}x)"
+        );
+        eprintln!(
+            "far {base_far} -> {dense_far} ({far_ratio:.2}x)  shore {base_shore} -> {dense_shore} ({shore_ratio:.2}x)  bog {base_bog} -> {dense_bog} ({bog_ratio:.2}x)"
+        );
+        eprintln!(
+            "edge m  rut {rut_edge:.4}  shore {shore_edge:.4}  bog {bog_edge:.4}  far {far_edge:.4}"
+        );
+
+        assert!(
+            dense_oval >= base_oval * 4,
+            "oval triangles {base_oval} -> {dense_oval} ({oval_ratio:.2}x), want >= 4x"
+        );
+        assert!(
+            rut_ratio + 0.05 >= oval_ratio,
+            "rut band should be at least as dense as the oval ({rut_ratio:.2}x vs {oval_ratio:.2}x)"
+        );
+        assert!(
+            shore_ratio >= 4.0 && bog_ratio >= 3.5,
+            "puddle shore {base_shore} -> {dense_shore} ({shore_ratio:.2}x), bog {base_bog} -> {dense_bog} ({bog_ratio:.2}x)"
+        );
+        assert!(
+            rut_edge < far_edge * 0.45 && shore_edge < far_edge * 0.45 && bog_edge < far_edge * 0.7,
+            "track and shores should be finer than the apron"
+        );
+        assert!(
+            far_ratio < 1.35,
+            "apron was refined too ({far_ratio:.2}x); keep the empty field on the base grid"
+        );
+        // The water pass evaluates every vertex. Stay under ~2.5× the old vertex load.
+        assert!(
+            dense_tris < 1_800_000,
+            "triangle count {dense_tris} is past the real-time budget"
+        );
+        assert_oriented(&dense_i);
+        assert_upward(&dense_v, &dense_i);
+        assert_ij(&dense_v, RES, SIZE);
+        assert_no_t_junctions(&dense_v, &dense_i);
+    }
+
+    fn bilinear_height(soil: &silt::soil::SoilField, x: f32, z: f32) -> f32 {
+        let half = soil.size * 0.5;
+        let u = (x + half) / soil.cell - 0.5;
+        let v = (z + half) / soil.cell - 0.5;
+        let i = u.floor() as isize;
+        let j = v.floor() as isize;
+        let fx = u - i as f32;
+        let fy = v - j as f32;
+        let h = |ii: isize, jj: isize| {
+            let ii = ii.clamp(0, soil.res as isize - 1) as usize;
+            let jj = jj.clamp(0, soil.res as isize - 1) as usize;
+            soil.height[jj * soil.res + ii]
+        };
+        let h00 = h(i, j);
+        let h10 = h(i + 1, j);
+        let h01 = h(i, j + 1);
+        let h11 = h(i + 1, j + 1);
+        let a = h00 + (h10 - h00) * fx;
+        let b = h01 + (h11 - h01) * fx;
+        a + (b - a) * fy
+    }
+
+    fn section_xs(verts: &[TerrainVertex], indices: &[u32], z: f32, x0: f32, x1: f32) -> Vec<f32> {
+        let mut xs = Vec::new();
+        for tri in indices.chunks(3) {
+            let p = [
+                verts[tri[0] as usize].xz,
+                verts[tri[1] as usize].xz,
+                verts[tri[2] as usize].xz,
+            ];
+            for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+                let (a, b) = (p[i], p[j]);
+                let az = a[1];
+                let bz = b[1];
+                if (az - z) * (bz - z) > 0.0 {
+                    continue;
+                }
+                let dz = bz - az;
+                if dz.abs() < 1.0e-8 {
+                    continue;
+                }
+                let t = (z - az) / dz;
+                if !(0.0..=1.0).contains(&t) {
+                    continue;
+                }
+                let x = a[0] + (b[0] - a[0]) * t;
+                if (x0..=x1).contains(&x) {
+                    xs.push(x);
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs.dedup_by(|a, b| (*a - *b).abs() < 5.0e-4);
+        xs
+    }
+
+    /// Sagitta inside one bilinear patch, and the sharpest corner where two
+    /// patches meet. A straight ramp has no sagitta; the corner is the facet.
+    fn max_cell_sagitta(xs: &[f32], hs: &[f32], cell: f32) -> (f32, f32) {
+        let mut max_s = 0.0f32;
+        let mut max_kink = 0.0f32;
+        let half = 20.0f32;
+        let patch = |x: f32| ((x + half) / cell - 0.5).floor() as i32;
+        let mut i = 0;
+        while i + 1 < xs.len() {
+            let id = patch(xs[i]);
+            let mut j = i;
+            while j < xs.len() && patch(xs[j]) == id {
+                j += 1;
+            }
+            if j - i >= 3 {
+                let x0 = xs[i];
+                let x1 = xs[j - 1];
+                let h0 = hs[i];
+                let h1 = hs[j - 1];
+                for k in i..j {
+                    let t = (xs[k] - x0) / (x1 - x0).max(1.0e-4);
+                    let chord = h0 + (h1 - h0) * t;
+                    max_s = max_s.max((hs[k] - chord).abs());
+                }
+            }
+            if j + 1 < xs.len() && j >= 2 {
+                let v1x = xs[j - 1] - xs[i];
+                let v1y = hs[j - 1] - hs[i];
+                let v2x = xs[j + 1] - xs[j];
+                let v2y = hs[j + 1] - hs[j];
+                let n1 = (v1x * v1x + v1y * v1y).sqrt();
+                let n2 = (v2x * v2x + v2y * v2y).sqrt();
+                if n1 > 1.0e-4 && n2 > 1.0e-4 {
+                    let dot = ((v1x * v2x + v1y * v2y) / (n1 * n2)).clamp(-1.0, 1.0);
+                    max_kink = max_kink.max(dot.acos().to_degrees());
+                }
+            }
+            i = j.max(i + 1);
+        }
+        (max_s, max_kink)
+    }
+
+    #[test]
+    fn rut_wall_is_sampled_from_the_solver_grid() {
+        let (base_v, base_t) = uniform_terrain(192, 40.0, BASE_SUB);
+        let base_i = pack(&base_t);
+        let (dense_v, dense_i) = terrain_mesh(192, 40.0);
+        let mut soil = silt::soil::SoilField::demo();
+        for k in 0..10 {
+            let z = 0.15 + k as f32 * 0.28;
+            soil.stamp_wheel(
+                Vec3::new(6.35, 0.3, z),
+                0.38,
+                0.28,
+                Vec3::Z,
+                Vec3::X,
+                0.09,
+                0.2,
+                0.85,
+                true,
+            );
+        }
+        let z = 1.45_f32;
+        let span = (5.55, 7.35);
+        let base_xs = section_xs(&base_v, &base_i, z, span.0, span.1);
+        let dense_xs = section_xs(&dense_v, &dense_i, z, span.0, span.1);
+        let base_h: Vec<f32> = base_xs
+            .iter()
+            .map(|x| bilinear_height(&soil, *x, z))
+            .collect();
+        let dense_h: Vec<f32> = dense_xs
+            .iter()
+            .map(|x| bilinear_height(&soil, *x, z))
+            .collect();
+        let (base_s, base_k) = max_cell_sagitta(&base_xs, &base_h, soil.cell);
+        let (dense_s, dense_k) = max_cell_sagitta(&dense_xs, &dense_h, soil.cell);
+        let mut line = String::new();
+        for (x, h) in dense_xs.iter().zip(dense_h.iter()) {
+            line.push_str(&format!(" {:.3}:{:.4}", x, h));
+        }
+        eprintln!(
+            "rut samples base {} dense {}",
+            base_xs.len(),
+            dense_xs.len()
+        );
+        eprintln!(
+            "cell sagitta m  base {base_s:.5}  dense {dense_s:.5}   kink deg base {base_k:.2} dense {dense_k:.2}"
+        );
+        eprintln!("dense profile{line}");
+        assert!(
+            dense_xs.len() > base_xs.len() * 3,
+            "rut section should carry the finer grid"
+        );
+        // The stamp shoulder is one solver cell wide, so the drawn wall stays a
+        // straight ramp. Record that; do not pretend the extra vertices bend it.
+        let _ = (base_s, dense_s);
+    }
 }
