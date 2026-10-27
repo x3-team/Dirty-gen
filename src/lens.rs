@@ -1,9 +1,8 @@
-//! Mud and water on the camera glass after a puddle hit.
+//! Water and mud on the camera glass after a puddle hit.
 //!
-//! The stills this matches are a windshield, not a flat brown filter: caramel
-//! streaks with a bulb at the bottom, round tan drops, and many smaller clear
-//! beads. Gravity runs them down the glass. The isometric frame never draws
-//! this; the chase camera does.
+//! Round beads and a few gravity streaks. The shader refracts the frame through
+//! them, so the scene stays readable instead of disappearing under brown spikes.
+//! The isometric frame never draws this; the chase camera does.
 
 pub const BEAD_CAP: usize = 28;
 pub const RUN_CAP: usize = 16;
@@ -22,7 +21,6 @@ pub struct Bead {
     pub gloss: f32,
     pub kind: f32,
     pub vy: f32,
-    shed: bool,
 }
 
 impl Default for Bead {
@@ -37,7 +35,6 @@ impl Default for Bead {
             gloss: 0.0,
             kind: 0.0,
             vy: 0.0,
-            shed: false,
         }
     }
 }
@@ -273,27 +270,29 @@ impl LensMud {
     fn splat(&mut self, power: f32, force: bool) {
         let p = power.clamp(0.2, 1.25);
         self.film = (self.film + 0.5 * p.min(1.0)).min(1.0);
-        let from_left = self.next_f() < 0.5;
-        let anchor = if from_left { 0.24 } else { 0.76 };
-        let fan = if from_left { 0.62 } else { -0.62 };
-        let mud_runs = (4.0 + p * 6.0).round() as usize;
-        let clear_runs = (2.0 + p * 2.0).round() as usize;
-        let mud_beads = (3.0 + p * 5.0).round() as usize;
-        let clear_beads = (4.0 + p * 6.0).round() as usize;
-        for _ in 0..mud_runs {
-            let clustered = self.next_f() < 0.4;
-            let x = if clustered {
-                (anchor + (self.next_f() - 0.5) * 0.42).clamp(0.05, 0.95)
-            } else {
-                0.05 + self.next_f() * 0.9
-            };
-            let y = self.next_f() * 0.42;
-            let len = 0.24 + self.next_f() * 0.5;
-            let u = self.next_f();
-            let width = 0.007 + u * 0.012 + if u > 0.84 { 0.014 } else { 0.0 };
-            let diag = if self.next_f() < 0.78 { 0.18 } else { 0.85 };
-            let slant = fan * (0.08 + self.next_f() * 0.7) * diag;
-            let alpha = 0.86 + self.next_f() * 0.12;
+        // A hard hit leaves a few streaks and a scatter of round drops.
+        // Trickles while still in the water only add a bead or two.
+        let heavy = p > 0.7;
+        let mud_runs = if heavy { 4 } else { 1 };
+        let clear_runs = if heavy { 3 } else { 1 };
+        let mud_beads = if heavy {
+            (5.0 + p * 2.0).round() as usize
+        } else {
+            2
+        };
+        let clear_beads = if heavy {
+            (8.0 + p * 3.0).round() as usize
+        } else {
+            3
+        };
+        for i in 0..mud_runs {
+            let slot = (i as f32 + 0.5) / mud_runs as f32;
+            let x = (slot + (self.next_f() - 0.5) * 0.14).clamp(0.08, 0.92);
+            let y = 0.03 + self.next_f() * 0.08;
+            let len = 0.36 + self.next_f() * 0.12;
+            let width = 0.010 + self.next_f() * 0.008;
+            let slant = (self.next_f() - 0.5) * 0.5;
+            let alpha = 0.9 + self.next_f() * 0.1;
             self.write_run(
                 x,
                 y,
@@ -302,44 +301,43 @@ impl LensMud {
                 alpha,
                 slant,
                 MUD,
-                0.1 + width * 1.4,
+                0.07 + width * 1.6,
                 force,
             );
         }
-        for _ in 0..clear_runs {
-            let x = 0.04 + self.next_f() * 0.92;
-            let y = self.next_f() * 0.35;
-            let len = 0.28 + self.next_f() * 0.55;
-            let width = 0.0024 + self.next_f() * 0.0035;
-            let slant = (self.next_f() - 0.5) * 0.16;
-            let alpha = 0.45 + self.next_f() * 0.4;
-            let vy = 0.09 + self.next_f() * 0.04;
+        for i in 0..clear_runs {
+            let slot = (i as f32 + 0.2) / clear_runs as f32;
+            let x = (slot + (self.next_f() - 0.5) * 0.12).clamp(0.06, 0.94);
+            let y = 0.02 + self.next_f() * 0.06;
+            let len = 0.34 + self.next_f() * 0.12;
+            let width = 0.0065 + self.next_f() * 0.0045;
+            let slant = (self.next_f() - 0.5) * 0.22;
+            let alpha = 0.72 + self.next_f() * 0.25;
+            let vy = 0.08 + self.next_f() * 0.04;
             self.write_run(x, y, len, width, alpha, slant, CLEAR, vy, force);
         }
         for _ in 0..mud_beads {
-            let x = if self.next_f() < 0.65 {
-                (anchor + (self.next_f() - 0.5) * 0.46).clamp(0.05, 0.95)
-            } else {
-                0.05 + self.next_f() * 0.9
-            };
-            let y = 0.12 + self.next_f() * 0.78;
-            let mut size = 0.016 + self.next_f() * 0.03;
-            if self.next_f() < 0.22 {
+            let x = 0.05 + self.next_f() * 0.9;
+            let y = 0.08 + self.next_f() * 0.82;
+            let mut size = 0.02 + self.next_f() * 0.03;
+            if self.next_f() < 0.28 {
                 size *= 1.45;
             }
-            let rx = size * (0.75 + self.next_f() * 0.35);
-            let ry = size * (1.05 + self.next_f() * 0.55);
-            let alpha = 0.78 + self.next_f() * 0.2;
-            let gloss = 0.45 + self.next_f() * 0.5;
-            self.write_bead(x, y, rx, ry, alpha, gloss, MUD, 0.025 + ry * 0.9, force);
+            let ry = size * (0.92 + self.next_f() * 0.16);
+            let alpha = 0.9 + self.next_f() * 0.1;
+            let gloss = 0.55 + self.next_f() * 0.4;
+            self.write_bead(x, y, size, ry, alpha, gloss, MUD, 0.02 + size * 0.45, force);
         }
         for _ in 0..clear_beads {
-            let x = 0.03 + self.next_f() * 0.94;
+            let x = 0.04 + self.next_f() * 0.92;
             let y = 0.04 + self.next_f() * 0.9;
-            let size = 0.007 + self.next_f() * 0.018;
-            let ry = size * (0.9 + self.next_f() * 0.35);
-            let alpha = 0.55 + self.next_f() * 0.4;
-            let gloss = 0.75 + self.next_f() * 0.25;
+            let mut size = 0.012 + self.next_f() * 0.024;
+            if self.next_f() < 0.22 {
+                size *= 1.65;
+            }
+            let ry = size * (0.94 + self.next_f() * 0.12);
+            let alpha = 0.88 + self.next_f() * 0.12;
+            let gloss = 0.78 + self.next_f() * 0.22;
             self.write_bead(
                 x,
                 y,
@@ -348,7 +346,7 @@ impl LensMud {
                 alpha,
                 gloss,
                 CLEAR,
-                0.02 + size * 0.6,
+                0.015 + size * 0.4,
                 force,
             );
         }
@@ -379,7 +377,6 @@ impl LensMud {
             gloss,
             kind,
             vy,
-            shed: false,
         };
     }
 
@@ -451,45 +448,18 @@ impl LensMud {
         self.age += h;
         self.scroll = (self.scroll + h * 0.05).rem_euclid(1.0);
         self.film = (self.film - h * 0.09).max(0.0);
-        let mut shed: [Run; 8] = [Run::default(); 8];
-        let mut shed_n = 0usize;
         for bead in &mut self.beads {
             if bead.alpha < 0.03 {
                 continue;
             }
+            // Gravity slides a bead. It does not stretch it into a spike.
             bead.y += bead.vy * h;
-            bead.x = (bead.x + (bead.seed * 12.0).sin() * 0.012 * h).clamp(0.0, 1.0);
-            if bead.kind < 0.5 {
-                bead.ry = (bead.ry + h * 0.012).min(bead.rx * 2.3);
-                bead.alpha = (bead.alpha - h * 0.1).max(0.0);
-                if !bead.shed && bead.ry > bead.rx * 1.9 && bead.alpha > 0.4 && shed_n < shed.len()
-                {
-                    bead.shed = true;
-                    shed[shed_n] = Run {
-                        x: bead.x,
-                        y: (bead.y - bead.ry).max(0.0),
-                        len: bead.ry * 2.4,
-                        width: bead.rx * 0.42,
-                        alpha: bead.alpha * 0.55,
-                        seed: bead.seed,
-                        slant: (bead.seed - 0.5) * 0.2,
-                        kind: MUD,
-                        vy: 0.12 + bead.rx,
-                    };
-                    shed_n += 1;
-                    bead.ry = bead.rx * 1.15;
-                }
-            } else {
-                bead.alpha = (bead.alpha - h * 0.14).max(0.0);
-            }
-            if bead.y > 1.08 || bead.alpha < 0.03 {
+            bead.x = (bead.x + (bead.seed * 12.0).sin() * 0.008 * h).clamp(0.02, 0.98);
+            let fade = if bead.kind < 0.5 { 0.1 } else { 0.14 };
+            bead.alpha = (bead.alpha - h * fade).max(0.0);
+            if bead.y > 1.06 || bead.alpha < 0.03 {
                 bead.alpha = 0.0;
             }
-        }
-        for run in shed.iter().take(shed_n) {
-            self.write_run(
-                run.x, run.y, run.len, run.width, run.alpha, run.slant, run.kind, run.vy, false,
-            );
         }
         for run in &mut self.runs {
             if run.alpha < 0.03 {
@@ -497,7 +467,7 @@ impl LensMud {
             }
             run.y += run.vy * h;
             run.slant *= 1.0 - (h * 0.45).min(0.25);
-            run.len = (run.len + h * 0.035).min(0.72);
+            run.len = (run.len + h * 0.01).min(0.58);
             let fade = if run.kind < 0.5 { 0.11 } else { 0.14 };
             run.alpha = (run.alpha - h * fade).max(0.0);
             if run.y > 1.02 || run.alpha < 0.03 {
@@ -553,6 +523,31 @@ mod tests {
             .beads
             .iter()
             .any(|b| b.params[3] > 0.5 && b.params[0] > 0.3));
+        assert!(
+            lens.mud_runs() <= 6,
+            "a few mud streaks, got {}",
+            lens.mud_runs()
+        );
+        for bead in &gpu.beads {
+            if bead.params[0] > 0.03 && bead.radii[1] > 1.0e-4 {
+                let ratio = bead.radii[0] / bead.radii[1];
+                assert!(
+                    (0.8..1.25).contains(&ratio),
+                    "bead should stay round, rx/ry {ratio}"
+                );
+            }
+        }
+        for run in &gpu.runs {
+            if run.params[0] > 0.03 {
+                assert!(
+                    run.len_w[0] > run.len_w[1] * 6.0,
+                    "streak should be thin, len {} width {}",
+                    run.len_w[0],
+                    run.len_w[1]
+                );
+                assert!(run.len_w[0] < 0.62, "streak too long {}", run.len_w[0]);
+            }
+        }
     }
 
     #[test]
