@@ -14,8 +14,8 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bank_mesh, bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks,
+    suspension_mesh, terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
@@ -84,6 +84,7 @@ pub struct Renderer {
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
+    bank: GpuMesh,
     susp_v: wgpu::Buffer,
     susp_i: wgpu::Buffer,
     bike_susp_v: wgpu::Buffer,
@@ -657,6 +658,7 @@ impl Renderer {
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
+        let bank = upload_cpu(&device, &bank_mesh(), "bank");
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
             size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -730,6 +732,7 @@ impl Renderer {
             wheel,
             bike_body,
             env,
+            bank,
             susp_v,
             susp_i,
             bike_susp_v,
@@ -936,6 +939,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
+            draw_indexed(&mut pass, &self.bank);
             self.draw_vehicle(&mut pass, susp_index_count);
             self.draw_bike(&mut pass, bike_susp_count);
             pass.set_pipeline(&self.pipe_shadow_mesh);
@@ -975,6 +979,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
+            draw_indexed(&mut pass, &self.bank);
             self.draw_vehicle(&mut pass, susp_index_count);
             self.draw_bike(&mut pass, bike_susp_count);
 
