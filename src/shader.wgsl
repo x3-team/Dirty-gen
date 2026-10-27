@@ -761,20 +761,28 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
 }
 
-// Tan dust. Pale at the rim, warmer in the body, soft enough to read as one cloud.
+// Soft silt. Density is a fat gaussian with a lumpy edge, so overlapping
+// puffs melt into one billow. A shaded sphere on the same card read as a bubble.
 @fragment
 fn fs_dust(in: PartOut) -> @location(0) vec4<f32> {
     let q = in.uv - vec2<f32>(0.5);
-    let n = sin(q.x * 14.0 + q.y * 9.0) * 0.035 + sin(q.x * 27.0 - q.y * 19.0) * 0.02;
-    let d = length(q) + n;
-    let edge = smoothstep(0.50, 0.04, d);
-    if (edge < 0.05) {
+    let phase = fract(sin(dot(in.color.rgb, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
+    let p = q * 2.4 + vec2<f32>(phase * 6.4, phase * 2.2);
+    let n = noise(p);
+    let n2 = noise(p * 1.8 + vec2<f32>(3.1, 8.4));
+    let lobe = (n - 0.48) * 0.16 + (n2 - 0.5) * 0.07;
+    let dist = length(q) - lobe;
+    let grain = 0.82 + 0.18 * n2;
+    let dens = exp(-dist * dist * 4.4) * grain;
+    let alpha = clamp(in.color.a * dens, 0.0, 0.78);
+    if (alpha < 0.025) {
         discard;
     }
-    let core = smoothstep(0.30, 0.02, d);
-    let rim = smoothstep(0.08, 0.42, d);
-    var rgb = mix(in.color.rgb, in.color.rgb * vec3<f32>(1.12, 1.08, 0.98), rim);
-    rgb = mix(rgb, rgb * vec3<f32>(0.82, 0.70, 0.52), core * 0.45);
-    let a = in.color.a * edge;
-    return vec4<f32>(rgb, a);
+    // A little more light on the crown, still the same tan. White rims were the ribbon.
+    let crown = clamp(0.45 - q.y, 0.0, 1.0);
+    var rgb = in.color.rgb * mix(0.90, 1.04, crown);
+    let knot = smoothstep(0.62, 0.92, n);
+    rgb = mix(rgb, rgb * vec3<f32>(0.86, 0.76, 0.62), knot * 0.22);
+    rgb = min(rgb, vec3<f32>(0.86, 0.68, 0.44));
+    return vec4<f32>(rgb, alpha);
 }

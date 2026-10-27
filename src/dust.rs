@@ -1,13 +1,13 @@
 //! Tan dust kicked up when a tire rolls off mud onto drier ground.
 //!
-//! The plume is a low, wide cloud that stays behind the tread: ochre and
-//! dense at the tire, pale sand as it thins. It does not wet the soil and it
-//! does not change the mud spray.
+//! The plume is a volume: dense ochre next to the tread, softer and paler as
+//! the billows rise and drift behind. It is not a flat trail. It does not wet
+//! the soil and it does not change the mud spray.
 
 use glam::Vec3;
 
-/// One soft puff. `wide` stretches it along the camera's horizon so the cloud
-/// reads as a trail from the side and a fan from the rear.
+/// Soft ball of silt. `wide` stays near 1 — a horizon stretch reads as a ribbon.
+/// `kind` is [`DUST_BILLOW`], [`DUST_CORE`], or [`DUST_GRIT`].
 #[derive(Clone, Copy, Debug)]
 pub struct DustMote {
     pub pos: Vec3,
@@ -16,12 +16,27 @@ pub struct DustMote {
     pub max_life: f32,
     pub size: f32,
     pub grow: f32,
+    /// Optical density of the ball, not a flat card opacity.
     pub alpha: f32,
     pub rgb: [f32; 3],
     pub wide: f32,
     pub floor: f32,
+    pub kind: u8,
     pub alive: bool,
 }
+
+pub const DUST_BILLOW: u8 = 0;
+pub const DUST_CORE: u8 = 1;
+pub const DUST_GRIT: u8 = 2;
+
+#[derive(Clone, Copy)]
+enum Role {
+    Billow,
+    Core,
+    Grit,
+}
+
+const MOTE_CAP: usize = 480;
 
 #[derive(Clone, Debug)]
 pub struct Dust {
@@ -100,7 +115,7 @@ impl Dust {
         }
         if self.trail[index] > 0.0 && dry && speed > 1.05 && self.cool[index] <= 0.0 {
             self.puff(contact, forward, right, outward, speed, rear);
-            self.cool[index] = if rear { 0.040 } else { 0.085 };
+            self.cool[index] = if rear { 0.045 } else { 0.085 };
         }
         self.armed[index] = true;
     }
@@ -114,11 +129,14 @@ impl Dust {
         speed: f32,
         rear: bool,
     ) {
-        let n = if rear { 18 } else { 7 };
+        let n = if rear { 24 } else { 8 };
         for k in 0..n {
-            let grit = k % 4 == 0;
-            let along = k as f32 / n as f32;
-            self.mote(contact, forward, right, outward, speed, rear, grit, along);
+            let role = match k % 6 {
+                0 => Role::Grit,
+                1 | 2 => Role::Core,
+                _ => Role::Billow,
+            };
+            self.mote(contact, forward, right, outward, speed, rear, role, k, n);
         }
     }
 
@@ -131,19 +149,14 @@ impl Dust {
         speed: f32,
         rear: bool,
     ) {
-        let n = if rear { 3 } else { 1 };
+        let n = if rear { 5 } else { 2 };
         for k in 0..n {
-            let along = self.rnd() * 0.22;
-            self.mote(
-                contact,
-                forward,
-                right,
-                outward,
-                speed,
-                rear,
-                rear && k == 2,
-                along,
-            );
+            let role = match k % 4 {
+                0 => Role::Core,
+                3 => Role::Grit,
+                _ => Role::Billow,
+            };
+            self.mote(contact, forward, right, outward, speed, rear, role, k, n);
         }
     }
 
@@ -155,60 +168,102 @@ impl Dust {
         outward: f32,
         speed: f32,
         rear: bool,
-        grit: bool,
-        along: f32,
+        role: Role,
+        k: usize,
+        n: usize,
     ) {
-        let along = if grit {
-            0.05 + self.rnd() * 0.35
-        } else {
-            along * if rear { 1.25 } else { 0.55 } + self.rnd() * 0.12
+        let n = n.max(2);
+        let along_t = k as f32 / (n - 1) as f32;
+        let lift_t = ((k * 3 + 1) % n) as f32 / (n - 1) as f32;
+        let side_t = ((k * 2 + 5) % n) as f32 / (n - 1) as f32;
+        let fan = side_t - 0.5;
+        let rear_scale = if rear { 1.0 } else { 0.62 };
+
+        let (along, lift, spread) = match role {
+            Role::Core => (
+                0.04 + along_t * 0.42,
+                0.12 + lift_t * 0.50,
+                0.05 + side_t * 0.36,
+            ),
+            Role::Billow => (
+                0.08 + along_t * 1.05,
+                0.18 + lift_t * 0.78,
+                0.08 + side_t * 0.82,
+            ),
+            Role::Grit => (
+                0.02 + along_t * 0.28,
+                0.16 + lift_t * 0.34,
+                0.03 + side_t * 0.20,
+            ),
         };
-        let side = outward * (0.06 + self.rnd() * if rear { 0.78 } else { 0.36 })
-            + (self.rnd() - 0.5) * 0.28;
-        let lift = if grit {
-            0.10 + self.rnd() * 0.22
+        // Some of the outer silt folds back toward the axle so the two
+        // tires read as one cloud from behind, not two separate streaks.
+        let inward = if matches!(role, Role::Billow) && self.rnd() > 0.64 {
+            -0.55
         } else {
-            0.04 + along * 0.16 + self.rnd() * 0.08
+            1.0
         };
-        let pos = origin - forward * along + right * side + Vec3::Y * lift;
-        let slip = (0.12 + self.rnd() * 0.40) * (0.30 + speed * 0.05).min(1.15);
-        let vel = -forward * slip
-            + right * outward * (0.20 + self.rnd() * if rear { 0.95 } else { 0.45 })
-            + Vec3::Y
-                * if grit {
-                    0.55 + self.rnd() * 0.90
-                } else {
-                    0.12 + self.rnd() * 0.38 + along * 0.15
-                };
-        let (life, size, grow, alpha, wide, rgb) = if grit {
-            (
-                0.32 + self.rnd() * 0.22,
-                0.05 + self.rnd() * 0.04,
-                0.05,
-                0.82,
-                0.9,
-                [0.52, 0.32, 0.14],
-            )
-        } else if self.rnd() > 0.42 {
-            // Pale sand at the thin end of the plume.
-            (
-                0.95 + self.rnd() * 0.55,
-                0.28 + self.rnd() * 0.18,
-                0.50 + self.rnd() * 0.30,
-                0.46 + self.rnd() * 0.10,
-                1.9 + self.rnd() * 0.65,
-                [0.91, 0.73, 0.46],
-            )
-        } else {
-            // Ochre body, denser next to the tread.
-            (
-                0.75 + self.rnd() * 0.40,
-                0.20 + self.rnd() * 0.14,
-                0.36 + self.rnd() * 0.20,
-                0.64 + self.rnd() * 0.12,
-                1.4 + self.rnd() * 0.4,
-                [0.80, 0.54, 0.26],
-            )
+        let along = (along + (self.rnd() - 0.5) * 0.10) * rear_scale;
+        let lift = (lift + (self.rnd() - 0.5) * 0.08) * if rear { 1.0 } else { 0.7 };
+        let side = outward * inward * spread * rear_scale
+            + fan * if rear { 0.78 } else { 0.30 }
+            + (self.rnd() - 0.5) * 0.14;
+        let pos = origin - forward * along.max(0.0) + right * side + Vec3::Y * lift.max(0.04);
+
+        let kick = (0.55 + speed * 0.06).clamp(0.55, 1.25);
+        let (back, out, up) = match role {
+            Role::Core => (
+                0.30 + self.rnd() * 0.50,
+                0.22 + self.rnd() * 0.48,
+                0.75 + self.rnd() * 0.85,
+            ),
+            Role::Billow => (
+                0.12 + self.rnd() * 0.40,
+                0.30 + self.rnd() * 0.80,
+                0.50 + self.rnd() * 0.95,
+            ),
+            Role::Grit => (
+                0.45 + self.rnd() * 0.65,
+                0.35 + self.rnd() * 0.55,
+                1.55 + self.rnd() * 1.40,
+            ),
+        };
+        let side_dir = outward * inward.signum();
+        let vel = (-forward * back + right * side_dir * out + Vec3::Y * up) * kick;
+
+        let (life, size, grow, alpha, wide, rgb, kind) = match role {
+            Role::Core => (
+                0.70 + self.rnd() * 0.30,
+                (0.24 + self.rnd() * 0.12) * rear_scale.max(0.8),
+                0.12 + self.rnd() * 0.08,
+                0.62 + self.rnd() * 0.16,
+                0.92 + self.rnd() * 0.16,
+                tan([0.58, 0.36, 0.16], [0.72, 0.46, 0.22], lift_t, self.rnd()),
+                DUST_CORE,
+            ),
+            Role::Billow => (
+                1.05 + self.rnd() * 0.50,
+                (0.50 + self.rnd() * 0.26) * if rear { 1.1 } else { 0.82 },
+                0.14 + self.rnd() * 0.10,
+                0.28 + self.rnd() * 0.10,
+                0.90 + self.rnd() * 0.18,
+                tan([0.66, 0.46, 0.24], [0.82, 0.60, 0.34], lift_t, self.rnd()),
+                DUST_BILLOW,
+            ),
+            Role::Grit => (
+                0.26 + self.rnd() * 0.18,
+                0.07 + self.rnd() * 0.045,
+                0.02,
+                0.95,
+                0.94 + self.rnd() * 0.10,
+                tan(
+                    [0.34, 0.18, 0.08],
+                    [0.46, 0.26, 0.12],
+                    self.rnd(),
+                    self.rnd(),
+                ),
+                DUST_GRIT,
+            ),
         };
         let mote = DustMote {
             pos,
@@ -220,11 +275,24 @@ impl Dust {
             alpha,
             rgb,
             wide,
-            floor: origin.y + 0.03,
+            floor: origin.y + 0.02,
+            kind,
             alive: true,
         };
-        if self.motes.len() > 460 {
-            if let Some(slot) = self.motes.iter_mut().find(|m| !m.alive || m.life <= 0.0) {
+        self.spawn(mote);
+    }
+
+    fn spawn(&mut self, mote: DustMote) {
+        if let Some(slot) = self.motes.iter_mut().find(|m| !m.alive || m.life <= 0.0) {
+            *slot = mote;
+            return;
+        }
+        if self.motes.len() >= MOTE_CAP {
+            if let Some(slot) = self
+                .motes
+                .iter_mut()
+                .min_by(|a, b| a.life.total_cmp(&b.life))
+            {
                 *slot = mote;
             }
             return;
@@ -248,16 +316,36 @@ impl Dust {
                 m.alive = false;
                 continue;
             }
-            m.vel *= (1.0 - dt * 1.35).max(0.0);
-            m.vel.y -= dt * 0.22;
+            let youth = (m.life / m.max_life).clamp(0.0, 1.0);
+            m.vel *= (1.0 - dt * 0.7).max(0.0);
+            // Young silt lifts into a billow, then settles. A hard floor pin
+            // was pressing the whole plume into a sheet.
+            if youth > 0.62 {
+                m.vel.y += dt * 0.55;
+            }
+            m.vel.y -= dt * 1.05;
+            let phase = m.pos.x * 1.8 + m.pos.z * 1.4 + (1.0 - youth) * 7.0;
+            m.vel.x += phase.sin() * dt * 0.7;
+            m.vel.z += (phase * 1.3).cos() * dt * 0.5;
             m.pos += m.vel * dt;
             if m.pos.y < m.floor {
                 m.pos.y = m.floor;
-                m.vel.y = m.vel.y.max(0.12);
+                m.vel.y = 0.0;
             }
-            m.size = (m.size + m.grow * dt).min(1.35);
+            let cap = if m.kind == DUST_GRIT { 0.16 } else { 0.95 };
+            m.size = (m.size + m.grow * dt).min(cap);
         }
     }
+}
+
+fn tan(dark: [f32; 3], light: [f32; 3], t: f32, jitter: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let j = (jitter - 0.5) * 0.05;
+    [
+        (dark[0] + (light[0] - dark[0]) * t + j).clamp(0.15, 0.88),
+        (dark[1] + (light[1] - dark[1]) * t + j * 0.8).clamp(0.10, 0.70),
+        (dark[2] + (light[2] - dark[2]) * t + j * 0.5).clamp(0.05, 0.48),
+    ]
 }
 
 impl Default for Dust {
@@ -319,5 +407,58 @@ mod tests {
         assert_eq!(dust.alive_count(), 0);
         wheel(&mut dust, 2, 2.4, 0.18, 0.0, 6);
         assert!(dust.alive_count() > 8);
+    }
+
+    #[test]
+    fn plume_is_a_volume_of_round_billows() {
+        let mut dust = Dust::new();
+        wheel(&mut dust, 2, 3.4, 0.92, 0.0, 30);
+        wheel(&mut dust, 2, 3.4, 0.18, 0.0, 36);
+        let alive: Vec<_> = dust
+            .motes
+            .iter()
+            .filter(|m| m.alive && m.life > 0.0)
+            .collect();
+        assert!(alive.len() > 24, "thin plume: {}", alive.len());
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        let mut high = 0usize;
+        let mut dense = 0usize;
+        for m in &alive {
+            assert!(
+                (0.8..1.25).contains(&m.wide),
+                "wide {} would stretch a ribbon",
+                m.wide
+            );
+            assert!(
+                m.rgb[0] > m.rgb[2] + 0.08,
+                "dust left the tan range {:?}",
+                m.rgb
+            );
+            assert!(m.rgb[0] < 0.90, "dust is paper-white {:?}", m.rgb);
+            min = min.min(m.pos);
+            max = max.max(m.pos);
+            if m.pos.y > 0.42 {
+                high += 1;
+            }
+            if m.kind == DUST_CORE && m.alpha > 0.55 {
+                dense += 1;
+            }
+        }
+        let span = max - min;
+        assert!(
+            span.y > 0.55,
+            "plume is flat, height {:.2} span {:?}",
+            span.y,
+            span
+        );
+        assert!(span.x > 0.45, "plume has no width {:.2}", span.x);
+        assert!(span.z > 0.35, "plume has no depth {:.2}", span.z);
+        assert!(
+            high * 4 > alive.len(),
+            "only {high} of {} motes left the ground",
+            alive.len()
+        );
+        assert!(dense > 3, "no dense core in the plume");
     }
 }
