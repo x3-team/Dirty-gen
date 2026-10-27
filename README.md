@@ -45,7 +45,7 @@ cargo test
 | T / F | Raise / lower the chase camera |
 | Esc | Quit |
 
-The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V. R replays the first closed lap from a fresh start, walking the side, top, bumper, and rear three-quarter cameras.
+The isometric camera stays put so the whole loop, the puddles and the rut read at once. A small map in the top-right corner shows that oval and a dot for each vehicle. The chase camera follows the vehicle selected with V. R replays the first closed lap from a fresh start, walking the side, top, bumper, and rear three-quarter cameras.
 
 Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
 
@@ -59,7 +59,7 @@ Opening the window or the page plays that lap with both vehicles. The first driv
 trunk serve --release
 ```
 
-Страница: http://127.0.0.1:8080 . Сборка без `--release` слишком медленная, чтобы набрать скорость на гребень. Кликните по сцене, иначе клавиши уходят странице.
+Страница: http://127.0.0.1:8080 . Сборка без `--release` слишком медленная, чтобы набрать скорость на гребень. Кликните по сцене, иначе клавиши уходят странице. В правом верхнем углу маленькая карта круга: овал и точка на каждую машину.
 
 | Клавиша | Действие |
 | --- | --- |

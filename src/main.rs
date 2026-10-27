@@ -3,6 +3,7 @@
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
 mod mesh;
+mod minimap;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
