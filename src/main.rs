@@ -77,6 +77,73 @@ impl Keys {
     }
 }
 
+/// On-screen phone pedals. `driven` flips the lap over to the player the same
+/// way the first keyboard pedal does. Released controls leave the keyboard
+/// values alone, so a phone and a keyboard can share one vehicle.
+#[derive(Clone, Copy, Debug)]
+struct TouchDrive {
+    throttle: f32,
+    brake: f32,
+    steer: f32,
+    steer_on: bool,
+    driven: bool,
+}
+
+impl TouchDrive {
+    const IDLE: Self = Self {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: 0.0,
+        steer_on: false,
+        driven: false,
+    };
+
+    fn apply(self, input: Input, speed: f32) -> Input {
+        if !self.driven {
+            return input;
+        }
+        let mut throttle = input.throttle;
+        let mut brake = input.brake;
+        let mut steer = input.steer;
+        if self.throttle > 0.0 {
+            let gas = self.throttle.clamp(0.0, 1.0);
+            throttle = if throttle < 0.0 {
+                gas
+            } else {
+                gas.max(throttle)
+            };
+        }
+        if self.brake > 0.0 {
+            let held = self.brake.clamp(0.0, 1.0);
+            if speed < 0.55 && throttle <= 0.0 {
+                throttle = -held;
+                brake = 0.0;
+            } else {
+                brake = held.max(brake);
+            }
+        }
+        if self.steer_on {
+            steer = self.steer.clamp(-1.0, 1.0);
+        }
+        Input {
+            throttle,
+            brake,
+            steer,
+        }
+    }
+}
+
+fn read_touch_drive() -> TouchDrive {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_touch_drive()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        TouchDrive::IDLE
+    }
+}
+
 struct App {
     window: Option<std::sync::Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -88,9 +155,9 @@ struct App {
     orbit_pitch: f32,
     chase_cam: bool,
     drive_bike: bool,
-    /// Set once the player presses a drive key. Until then both vehicles run
-    /// the scripted lap. After that, the selected one takes the keys and the
-    /// other keeps the lap.
+    /// Set once the player presses a drive key or an on-screen pedal. Until
+    /// then both vehicles run the scripted lap. After that, the selected one
+    /// takes the controls and the other keeps the lap.
     player_drove: bool,
     acc: f32,
     last: Instant,
@@ -254,19 +321,25 @@ impl App {
         if self.keys.orbit_down {
             self.orbit_pitch = (self.orbit_pitch - dt * 0.7).max(-0.35);
         }
+        let touch = read_touch_drive();
+        if touch.driven {
+            self.player_drove = true;
+        }
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
             // The page opens on the lap: buggy and bike both chase the loop.
-            // A drive key takes the selected vehicle. The other one stays on
-            // the script, so the track never drops to a single machine.
+            // A drive key, or a thumb on the on-screen pedals, takes the
+            // selected vehicle. The other one stays on the script.
+            let bike_speed = self.world.bike.speed();
+            let buggy_speed = self.world.vehicle.speed();
             let bike_input = if self.player_drove && self.drive_bike {
-                self.keys.input(self.world.bike.speed())
+                touch.apply(self.keys.input(bike_speed), bike_speed)
             } else {
                 demo_drive_bike(&self.world)
             };
             let buggy_input = if self.player_drove && !self.drive_bike {
-                self.keys.input(self.world.vehicle.speed())
+                touch.apply(self.keys.input(buggy_speed), buggy_speed)
             } else {
                 demo_drive(&self.world)
             };
@@ -798,4 +871,106 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
         srgb: format.is_srgb(),
         label,
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_touch_drive() -> TouchDrive {
+    use wasm_bindgen::JsValue;
+    let Some(window) = web_sys::window() else {
+        return TouchDrive::IDLE;
+    };
+    let num = |name: &str| -> f32 {
+        js_sys::Reflect::get(window.as_ref(), &JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0) as f32
+    };
+    TouchDrive {
+        throttle: num("siltThrottle").clamp(0.0, 1.0),
+        brake: num("siltBrake").clamp(0.0, 1.0),
+        steer: num("siltSteer").clamp(-1.0, 1.0),
+        steer_on: num("siltSteerOn") != 0.0,
+        driven: num("siltDriven") != 0.0,
+    }
+}
+
+#[cfg(test)]
+mod touch_drive {
+    use super::TouchDrive;
+    use silt::world::Input;
+
+    fn idle_keys() -> Input {
+        Input {
+            throttle: 0.0,
+            brake: 0.0,
+            steer: 0.4,
+        }
+    }
+
+    #[test]
+    fn untouched_screen_keeps_the_keyboard() {
+        let touch = TouchDrive {
+            throttle: 1.0,
+            brake: 1.0,
+            steer: -1.0,
+            steer_on: true,
+            driven: false,
+        };
+        let input = touch.apply(idle_keys(), 0.0);
+        assert_eq!(input.throttle, 0.0);
+        assert_eq!(input.steer, 0.4);
+    }
+
+    #[test]
+    fn gas_and_a_slow_brake_match_the_pedal_keys() {
+        let gas = TouchDrive {
+            throttle: 1.0,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        assert_eq!(gas.apply(Input::default(), 0.0).throttle, 1.0);
+
+        let brake = TouchDrive {
+            brake: 1.0,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        let slow = brake.apply(Input::default(), 0.2);
+        assert_eq!(slow.throttle, -1.0);
+        assert_eq!(slow.brake, 0.0);
+        let fast = brake.apply(Input::default(), 3.0);
+        assert_eq!(fast.throttle, 0.0);
+        assert_eq!(fast.brake, 1.0);
+    }
+
+    #[test]
+    fn holding_both_pedals_brakes_instead_of_reversing() {
+        let both = TouchDrive {
+            throttle: 1.0,
+            brake: 1.0,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        let input = both.apply(Input::default(), 0.0);
+        assert_eq!(input.throttle, 1.0);
+        assert_eq!(input.brake, 1.0);
+    }
+
+    #[test]
+    fn wheel_right_is_positive_and_a_released_wheel_does_not_cancel_keys() {
+        let held = TouchDrive {
+            steer: 0.5,
+            steer_on: true,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        assert_eq!(held.apply(idle_keys(), 1.0).steer, 0.5);
+        let released = TouchDrive {
+            steer: 0.5,
+            steer_on: false,
+            driven: true,
+            ..TouchDrive::IDLE
+        };
+        assert_eq!(released.apply(idle_keys(), 1.0).steer, 0.4);
+    }
 }
