@@ -102,6 +102,7 @@ pub struct Renderer {
     pipe_blit_srgb: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
+    minimap: crate::minimap::Minimap,
     mat_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
     height_bytes: Vec<u8>,
@@ -696,6 +697,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let minimap = crate::minimap::Minimap::new(&device);
 
         Self {
             device,
@@ -746,6 +748,7 @@ impl Renderer {
             pipe_blit_srgb,
             blit_shader,
             blit_layout,
+            minimap,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
@@ -980,6 +983,15 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
+
+        self.minimap.draw(
+            &mut encoder,
+            &self.queue,
+            &self.color_view,
+            self.width,
+            self.height,
+            world,
+        );
 
         if let Some((view, srgb)) = present {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
