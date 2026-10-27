@@ -287,8 +287,9 @@ fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
     let mag = length(raw);
     // A centimetre of wall stays a shallow tilt. Millimetre noise does not
     // become a cord, and a few centimetres does not become a cliff.
-    if (mag > 1e-4) {
-        let gain = min(4.0, 0.08 / mag);
+    // A few centimetres of tire wall. Sub-millimetre noise stays under the grit.
+    if (mag > 0.004) {
+        let gain = min(3.5, 0.07 / mag);
         n = normalize(n + raw * gain);
     }
     let grit = noise(xz * 2.4);
@@ -379,35 +380,36 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let shoulder = max(max(s_px, s_nx), max(s_pz, s_nz));
     let low = min(min(s_px, s_nx), min(s_pz, s_nz));
     let drop = max(shoulder - stamp, 0.0);
-    // A centimetre is only a hint. A few centimetres — what the tires cut in the
-    // water — reads as a floor. It stops there, so a deeper cell is not a blacker trench.
-    let groove = smoothstep(0.012, 0.028, drop);
-    albedo *= mix(1.0, 0.32, groove);
+    // The floor is soil the tire removed. A few centimetres reads from this camera;
+    // a millimetre scuff does not. It stops there, so a crater is not a blacker trench.
+    let groove = smoothstep(0.016, 0.038, drop);
+    // Dark mud in the cut. A wide sheen here turned the floor into a tan stripe.
+    albedo = mix(albedo, vec3<f32>(0.010, 0.0045, 0.002), groove * 0.88);
     let pile = max(stamp - low, 0.0);
-    let lip = smoothstep(0.006, 0.018, pile) * (1.0 - groove);
-    albedo = mix(albedo, albedo * vec3<f32>(1.55, 1.32, 1.12), lip);
+    let lip = smoothstep(0.008, 0.02, pile) * (1.0 - groove);
+    // Loose soil on the shoulder. Lighter than the lane, only where the stamp piled it.
+    albedo = mix(albedo, vec3<f32>(0.15, 0.078, 0.034), lip * 0.92);
 
     // Wet rim on the soil. The sky reflection is the water sheet, not this grid.
     let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
     albedo = mix(albedo, vec3<f32>(0.012, 0.008, 0.006), rim * 0.85);
 
-    // The lane is already damp and stays matte. Shine is the rut floor and
-    // the soil ringing a puddle. A film on every wet cell washed the track pale.
+    // The lane stays matte. Shine is the soil ringing a puddle. The same lobe
+    // on the tire cut turned the groove into a tan stripe, so the floor stays dark.
     let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
-    let fresh = max(groove, shore);
     // Standing water is drawn as its own sheet. A mirror bed under that film
     // is the gray metal disc.
     let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(0.94, 0.18, fresh * (1.0 - drowned)), 0.90, drowned);
+    let rough_out = mix(mix(0.94, 0.2, shore * (1.0 - drowned)), 0.90, drowned);
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
-    // A wide lobe on the cut and the shore is the wet sheen.
+    // A wide lobe on the shore is the wet sheen.
     let view = normalize(frame.cam_pos.xyz - in.world);
     let ndotv = clamp(dot(n, view), 0.0, 1.0);
     let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
     let facing = pow(1.0 - ndotv, 2.0);
     let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
-    let wet_spec = (facing * 0.75 + wide * 1.15) * fresh * mix(1.0, 0.16, drowned);
+    let wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
     lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
     return present(lit);
 }

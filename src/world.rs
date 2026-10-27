@@ -2,6 +2,7 @@
 
 use glam::Vec3;
 
+use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
@@ -54,6 +55,7 @@ pub struct CameraPose {
 pub struct World {
     pub soil: SoilField,
     pub vehicle: Vehicle,
+    pub bike: Bike,
     pub particles: Particles,
     pub time: f32,
     pub telemetry: Telemetry,
@@ -69,6 +71,7 @@ impl World {
         let mut world = Self {
             soil: SoilField::demo(),
             vehicle: Vehicle::new(),
+            bike: Bike::new(),
             particles: Particles::new(),
             time: 0.0,
             telemetry: Telemetry {
@@ -93,6 +96,7 @@ impl World {
             ..Telemetry::default()
         };
         world.drip_acc = 0.0;
+        world.bike.place_on(&world.soil);
         world
     }
 
@@ -101,6 +105,7 @@ impl World {
         let mut world = Self {
             soil: SoilField::flat(wetness),
             vehicle: Vehicle::new(),
+            bike: Bike::new(),
             particles: Particles::new(),
             time: 0.0,
             telemetry: Telemetry {
@@ -142,6 +147,41 @@ impl World {
             self.substep(h, input);
         }
         self.time += dt;
+    }
+
+    /// Integrate the bike only. Does not advance `time`, water, or particles.
+    /// Call it before [`step`](Self::step) so the buggy path tests stay put
+    /// and the shared particle step still runs once.
+    pub fn step_bike(&mut self, dt: f32, input: &Input) {
+        let substeps = 2;
+        let h = dt / substeps as f32;
+        for _ in 0..substeps {
+            self.bike.update_steer(input.steer, h);
+            let contacts = self
+                .bike
+                .contacts(&self.soil, input.throttle, input.brake, h);
+            if self.bike.jump_hold <= 0.0 {
+                for c in &contacts {
+                    if c.sinkage < 0.004 {
+                        continue;
+                    }
+                    self.soil.stamp_wheel(
+                        c.wheel_center,
+                        BIKE_RADIUS,
+                        BIKE_WIDTH,
+                        c.forward,
+                        c.right,
+                        c.sinkage,
+                        c.slip,
+                        h,
+                    );
+                }
+            }
+            let planted = contacts.iter().filter(|c| c.active).count();
+            self.bike
+                .note_flight(&mut self.soil, &mut self.particles, planted, h);
+            self.bike.integrate(&contacts, h);
+        }
     }
 
     fn substep(&mut self, dt: f32, input: &Input) {
@@ -399,12 +439,39 @@ fn panel_drip_point(index: usize) -> Vec3 {
 /// One lap of the mud loop. Pure pursuit on the stadium centerline.
 /// Deterministic: same pose always produces the same pedal and wheel.
 pub fn demo_drive(world: &World) -> Input {
-    if world.time < 0.50 {
+    chase_line(
+        world.time,
+        world.vehicle.pos,
+        world.vehicle.yaw,
+        world.vehicle.speed(),
+        &world.soil,
+        0.0,
+    )
+}
+
+/// Same loop as the buggy, one tyre-width inside it, so the two stay side by side.
+pub fn demo_drive_bike(world: &World) -> Input {
+    chase_line(
+        world.time,
+        world.bike.pos,
+        world.bike.yaw,
+        world.bike.speed(),
+        &world.soil,
+        -0.55,
+    )
+}
+
+fn chase_line(
+    time: f32,
+    pos: Vec3,
+    yaw: f32,
+    speed: f32,
+    soil: &SoilField,
+    lane_bias: f32,
+) -> Input {
+    if time < 0.50 {
         return Input::default();
     }
-    let pos = world.vehicle.pos;
-    let yaw = world.vehicle.yaw;
-    let speed = world.vehicle.speed();
     let s = closest_s(pos);
     let off = track_offset(pos.x, pos.z);
     // Short lookahead when the buggy drifts, so it stays on the ribbon
@@ -426,10 +493,10 @@ pub fn demo_drive(world: &World) -> Input {
     let mut err = wrap_pi(desired - yaw);
     // Positive offset is outside the loop (left of the clockwise heading).
     if !aim_lip {
-        err += (off * 0.22).clamp(-0.55, 0.55);
+        err += ((off - lane_bias) * 0.22).clamp(-0.55, 0.55);
     }
     let steer = (err / if aim_lip { 0.36 } else { 0.30 }).clamp(-1.0, 1.0);
-    let under = world.soil.sample(pos.x, pos.z);
+    let under = soil.sample(pos.x, pos.z);
     // Full throttle on the firm run-up. The lip, not a key, is what launches.
     let on_runup = aim_lip || (pos.x < -4.0 && (-3.6..3.0).contains(&pos.z));
     // Ease off on the straight, and brake in standing water so the tires

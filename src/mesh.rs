@@ -6,6 +6,7 @@
 
 use glam::{Quat, Vec3};
 
+use silt::bike::Bike;
 use silt::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
 
 pub const PANEL_LIGHT: f32 = 16.0;
@@ -506,6 +507,196 @@ pub fn suspension_mesh(vehicle: &Vehicle) -> CpuMesh {
         add_helix(&mut m, tower, perch, 0.11, 0.036, 3, 5, spring);
         add_tube(&mut m, tower, perch, 0.022, spring, 4);
     }
+    m
+}
+
+/// Dirt bike in the same local space as the solver: Y up, Z forward, origin at the CG.
+/// Forks and the swingarm live in `bike_suspension` so they follow the wheels.
+/// The tubes are fat on purpose: a 3 cm spine disappears at the isometric distance.
+pub fn bike_body() -> CpuMesh {
+    let mut m = CpuMesh::new();
+    let frame = 10.0;
+    let tank = 1.0;
+    let seat = 11.0;
+    let plastic = 4.0;
+    let jersey = 2.0;
+    // Spine and cradle.
+    add_tube(
+        &mut m,
+        Vec3::new(0.0, 0.02, -0.50),
+        Vec3::new(0.0, 0.10, 0.46),
+        0.055,
+        frame,
+        6,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, -0.02, -0.05),
+        Vec3::new(0.10, 0.06, 0.18),
+        frame,
+    );
+    // Engine, low, between the wheels.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, -0.04, -0.06),
+        Vec3::new(0.16, 0.12, 0.20),
+        10.0,
+    );
+    // Tank. The orange block is what reads from the isometric camera.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.26, 0.16),
+        Vec3::new(0.16, 0.10, 0.26),
+        tank,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.34, 0.20),
+        Vec3::new(0.11, 0.04, 0.16),
+        tank,
+    );
+    // Seat and tail.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.24, -0.16),
+        Vec3::new(0.11, 0.05, 0.24),
+        seat,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.20, -0.42),
+        Vec3::new(0.07, 0.04, 0.12),
+        plastic,
+    );
+    // Steering head and bar. The fork itself is the moving mesh.
+    add_tube(
+        &mut m,
+        Vec3::new(0.0, 0.18, 0.36),
+        Vec3::new(0.0, 0.52, 0.48),
+        0.04,
+        frame,
+        5,
+    );
+    add_tube(
+        &mut m,
+        Vec3::new(-0.28, 0.56, 0.30),
+        Vec3::new(0.28, 0.56, 0.30),
+        0.028,
+        frame,
+        5,
+    );
+    // Front number plate and headlight.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.34, 0.58),
+        Vec3::new(0.10, 0.08, 0.015),
+        0.0,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.22, 0.62),
+        Vec3::new(0.05, 0.035, 0.02),
+        PANEL_LIGHT,
+    );
+    // Crouched rider. A bare frame reads as a second buggy at this distance.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.42, -0.02),
+        Vec3::new(0.13, 0.12, 0.10),
+        jersey,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.58, 0.06),
+        Vec3::new(0.09, 0.09, 0.09),
+        0.0,
+    );
+    add_box(
+        &mut m,
+        Vec3::new(0.0, 0.64, 0.10),
+        Vec3::new(0.08, 0.07, 0.08),
+        seat,
+    );
+    add_tube(
+        &mut m,
+        Vec3::new(-0.10, 0.46, 0.02),
+        Vec3::new(-0.22, 0.56, 0.22),
+        0.035,
+        jersey,
+        5,
+    );
+    add_tube(
+        &mut m,
+        Vec3::new(0.10, 0.46, 0.02),
+        Vec3::new(0.22, 0.56, 0.22),
+        0.035,
+        jersey,
+        5,
+    );
+    // Belly, where impact mud sticks.
+    add_box(
+        &mut m,
+        Vec3::new(0.0, -0.16, -0.02),
+        Vec3::new(0.10, 0.025, 0.30),
+        5.0,
+    );
+    m
+}
+
+/// Fork, swingarm and shock. Ends track the bike's wheel centers, so the
+/// spring shortens under load and hangs at droop in the air.
+pub fn bike_suspension(bike: &Bike) -> CpuMesh {
+    let mut m = CpuMesh::new();
+    let front = bike.wheel_center_local(0);
+    let rear = bike.wheel_center_local(1);
+    let steel = 10.0;
+    let arm = 1.0;
+    let head = Vec3::new(0.0, 0.46, 0.40);
+    add_tube(&mut m, head, front, 0.028, steel, 5);
+    add_tube(
+        &mut m,
+        head + Vec3::new(0.045, 0.0, 0.0),
+        front + Vec3::new(0.045, 0.02, 0.0),
+        0.02,
+        steel,
+        4,
+    );
+    add_tube(
+        &mut m,
+        head + Vec3::new(-0.045, 0.0, 0.0),
+        front + Vec3::new(-0.045, 0.02, 0.0),
+        0.02,
+        steel,
+        4,
+    );
+    let pivot = Vec3::new(0.0, 0.02, -0.12);
+    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot + Vec3::new(0.06, 0.0, 0.0),
+        rear + Vec3::new(0.05, 0.0, 0.04),
+        0.02,
+        arm,
+        4,
+    );
+    let tower = Vec3::new(0.0, 0.30, -0.22);
+    let perch = rear + Vec3::new(0.0, 0.08, 0.12);
+    add_helix(&mut m, tower, perch, 0.055, 0.02, 4, 4, steel);
+    add_tube(&mut m, tower, perch, 0.012, steel, 4);
+    // Fenders ride with the wheels. A plate above each tyre is what separates
+    // the silhouette from the buggy's open wheels.
+    add_box(
+        &mut m,
+        front + Vec3::new(0.0, 0.28, 0.02),
+        Vec3::new(0.09, 0.025, 0.20),
+        arm,
+    );
+    add_box(
+        &mut m,
+        rear + Vec3::new(0.0, 0.30, -0.02),
+        Vec3::new(0.10, 0.025, 0.22),
+        arm,
+    );
     m
 }
 

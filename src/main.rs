@@ -14,7 +14,7 @@ use web_time::Instant;
 
 use glam::Vec3;
 #[cfg(not(target_arch = "wasm32"))]
-use silt::world::demo_drive;
+use silt::world::{demo_drive, demo_drive_bike};
 use silt::world::{demo_camera, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -89,6 +89,7 @@ struct App {
     orbit_yaw: f32,
     orbit_pitch: f32,
     chase_cam: bool,
+    drive_bike: bool,
     acc: f32,
     last: Instant,
     srgb: bool,
@@ -125,11 +126,12 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
-                {
-                    self.chase_cam = !self.chase_cam;
+                if event.state == ElementState::Pressed && !event.repeat {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
+                        PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
+                        _ => {}
+                    }
                 }
                 let down = event.state == ElementState::Pressed;
                 match event.physical_key {
@@ -241,8 +243,14 @@ impl App {
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
-            let input = self.keys.input(self.world.vehicle.speed());
-            self.world.step(step, &input);
+            if self.drive_bike {
+                let input = self.keys.input(self.world.bike.speed());
+                self.world.step_bike(step, &input);
+                self.world.step(step, &Input::default());
+            } else {
+                let input = self.keys.input(self.world.vehicle.speed());
+                self.world.step(step, &input);
+            }
             self.acc -= step;
         }
         let Some(renderer) = self.renderer.as_mut() else {
@@ -251,8 +259,13 @@ impl App {
         let Some(surface) = self.surface.as_ref() else {
             return;
         };
+        let (cam_pos, cam_yaw) = if self.drive_bike {
+            (self.world.bike.pos, self.world.bike.yaw)
+        } else {
+            (self.world.vehicle.pos, self.world.vehicle.yaw)
+        };
         let pose = if self.chase_cam {
-            chase(&self.world, self.orbit_yaw, self.orbit_pitch)
+            chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
         } else {
             demo_camera(
                 self.world.time,
@@ -324,9 +337,8 @@ impl App {
     }
 }
 
-fn chase(world: &World, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
-    let pos = world.vehicle.pos;
-    let yaw = world.vehicle.yaw + orbit_yaw;
+fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
+    let yaw = yaw + orbit_yaw;
     let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
     let right = Vec3::new(forward.z, 0.0, -forward.x);
     let dist = 7.4;
@@ -371,6 +383,7 @@ fn run_window() {
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
         chase_cam: false,
+        drive_bike: false,
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
@@ -457,6 +470,8 @@ fn capture(args: &[String]) {
                 next += 1;
                 continue;
             }
+            let bike = demo_drive_bike(&world);
+            world.step_bike(1.0 / 60.0, &bike);
             let input = demo_drive(&world);
             world.step(1.0 / 60.0, &input);
         }
@@ -484,6 +499,8 @@ fn capture(args: &[String]) {
             }
         }
         for _ in 0..steps {
+            let bike = demo_drive_bike(&world);
+            world.step_bike(1.0 / 60.0, &bike);
             let input = demo_drive(&world);
             world.step(1.0 / 60.0, &input);
         }

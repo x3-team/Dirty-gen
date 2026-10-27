@@ -171,6 +171,84 @@ fn crest_impact_cuts_rut_and_sprays() {
 }
 
 #[test]
+fn bike_rides_and_compresses_beside_the_buggy() {
+    let mut world = World::demo();
+    let start = world.bike.pos;
+    let mut min_c = 1.0_f32;
+    let mut max_c = 0.0_f32;
+    let mut launched = false;
+    for _ in 0..(8.0 * 60.0) as u32 {
+        let bike = silt::demo_drive_bike(&world);
+        world.step_bike(1.0 / 60.0, &bike);
+        let buggy = silt::demo_drive(&world);
+        world.step(1.0 / 60.0, &buggy);
+        for w in &world.bike.wheels {
+            min_c = min_c.min(w.compression);
+            max_c = max_c.max(w.compression);
+        }
+        if world.bike.jump_hold > 0.0 || world.bike.pitch.abs() > 0.8 {
+            launched = true;
+        }
+    }
+    let travelled = (world.bike.pos - start).length();
+    assert!(travelled > 8.0, "bike did not ride the loop, {travelled}");
+    assert!(
+        max_c > min_c + 0.04,
+        "suspension did not move, {min_c:.3}..{max_c:.3}"
+    );
+    assert!(launched, "bike did not leave the ground on the crest");
+}
+
+#[test]
+fn rolling_tires_leave_a_pair_of_grooves() {
+    let mut world = World::demo();
+    world.run_seconds_with(4.0, silt::demo_drive);
+    // The south cap is already behind the buggy. A constant-z slice cuts both tires.
+    let z = -4.0;
+    let mut prev2 = 0.0_f32;
+    let mut prev = 0.0_f32;
+    let mut peaks: Vec<(f32, f32)> = Vec::new();
+    for k in -50..20 {
+        let x = k as f32 * 0.15;
+        let rut = world.soil.sample(x, z).rut;
+        if prev >= prev2 && prev >= rut && prev > 0.03 {
+            let px = (k as f32 - 1.0) * 0.15;
+            if peaks.last().is_none_or(|(lx, _)| px - *lx > 0.45) {
+                peaks.push((px, prev));
+            }
+        }
+        prev2 = prev;
+        prev = rut;
+    }
+    eprintln!("groove peaks at z={z}: {peaks:?} pos {:?}", world.vehicle.pos);
+    assert!(
+        peaks.len() >= 2,
+        "expected a pair of tire grooves behind the buggy, got {peaks:?}"
+    );
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let sep = (peaks[0].0 - peaks[1].0).abs();
+    assert!(
+        (0.9..2.4).contains(&sep),
+        "grooves {:?} are not one axle apart",
+        peaks
+    );
+    assert!(
+        (world.vehicle.pos.z - z).abs() > 2.0 || (world.vehicle.pos.x - peaks[0].0).abs() > 2.0,
+        "buggy is still sitting on the grooves"
+    );
+    for (x, depth) in [peaks[0], peaks[1]] {
+        let floor = world.soil.sample(x, z).height;
+        let left = world.soil.sample(x - 0.42, z).height;
+        let right = world.soil.sample(x + 0.42, z).height;
+        let shoulder = left.max(right);
+        assert!(
+            shoulder > floor + 0.02,
+            "groove {depth:.3} at x={x:.2} has no shoulder: floor {floor:.3} shoulder {shoulder:.3}"
+        );
+    }
+}
+
+#[test]
 fn impact_chunks_land_on_the_heightfield() {
     let mut world = World::demo();
     world.run_seconds_with(6.4, silt::demo_drive);

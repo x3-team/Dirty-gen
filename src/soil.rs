@@ -367,10 +367,15 @@ impl SoilField {
         }
         let len = contact_length(radius, sinkage).max(radius * 0.35);
         let slip_n = slip.abs().min(1.2);
-        // Slip-sinkage: spinning raises the plastic target above static Bekker sinkage.
-        // The rate is deliberately slow so a driver can back out before the rut locks.
-        let want = sinkage * (0.48 + 0.90 * slip_n);
-        let want = want.min(0.40);
+        // The groove is the Bekker bite. A fast straight used to leave only a few
+        // millimetres: the plastic rate was tuned for a spun puddle, and the tire
+        // was gone before that cut arrived, so the lane behind the vehicle stayed
+        // smooth. The first several centimetres now stay in the heightfield after
+        // one pass. Slip still digs deeper than that, on the slow rate, so a driver
+        // can back out of a hole they are spinning.
+        let groove = (sinkage * 0.82).min(0.055);
+        let spun = sinkage * (0.48 + 0.90 * slip_n);
+        let want = spun.max(groove).min(0.40);
         let reach = len * 0.5 + width + self.cell * 2.0;
         let half = self.size * 0.5;
         let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
@@ -396,21 +401,27 @@ impl SoilField {
                 let lz = rel_x * forward.x + rel_z * forward.z;
                 let half_w = width * 0.5;
                 let half_l = len * 0.5;
+                // Cells the tire overlaps, not only those whose centre sits inside
+                // the tread. Otherwise a 28 cm tire writes one dashed cell.
+                let tread = half_w + self.cell * 0.5;
+                let along_reach = half_l + self.cell * 0.5;
                 let idx = j as usize * self.res + i as usize;
 
-                let on_tread = lx.abs() <= half_w && lz.abs() <= half_l + 0.02;
-                let on_berm = lx.abs() > half_w
-                    && lx.abs() < half_w + self.cell * 1.35
-                    && lz.abs() <= half_l + 0.05;
+                let on_tread = lx.abs() <= tread && lz.abs() <= along_reach;
+                let on_berm = lx.abs() > tread
+                    && lx.abs() < tread + self.cell * 0.85
+                    && lz.abs() <= along_reach;
 
                 if on_tread {
-                    let across = 1.0 - (lx.abs() / half_w).clamp(0.0, 1.0);
-                    let along = 1.0 - (lz.abs() / half_l.max(0.05)).clamp(0.0, 1.0);
+                    let across = 1.0 - (lx.abs() / tread).clamp(0.0, 1.0);
+                    let along = 1.0 - (lz.abs() / along_reach.max(0.05)).clamp(0.0, 1.0);
                     let wgt = (across * along).clamp(0.0, 1.0);
                     let already = (self.initial_height[idx] - self.height[idx]).max(0.0);
                     if already < want && wgt > 0.04 {
                         let room = (want - already).min(0.40 - already).max(0.0);
-                        let drop = room * (1.0 - (-dt * 2.2).exp()) * (0.35 + 0.65 * wgt);
+                        // Groove depth in one pass. Deeper than `groove` stays slow.
+                        let rate = if already < groove { 48.0 } else { 2.2 };
+                        let drop = room * (1.0 - (-dt * rate).exp()) * (0.62 + 0.38 * wgt);
                         self.height[idx] -= drop;
                         self.loose[idx] = (self.loose[idx] + drop * 0.45).min(0.16);
                         vol += drop * area;
@@ -435,7 +446,9 @@ impl SoilField {
             }
         }
 
-        let berm_vol = vol * 0.72;
+        // Most of the cut soil sits on the shoulder, so the berm is the light lip
+        // beside each groove. A wide scatter made a film instead of a ridge.
+        let berm_vol = vol * 0.9;
         let n_berm = (n_left + n_right).max(1) as f32;
         let dh = berm_vol / (n_berm * area);
         for k in 0..n_left {

@@ -6,16 +6,17 @@ use std::path::Path;
 
 use glam::{Mat4, Vec3};
 use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
-use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP};
+use silt::bike::{Bike, BIKE_RADIUS};
+use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
 use crate::mesh::{
-    buggy_body, environment_mesh, mud_chunks, suspension_mesh, terrain_mesh, wheel_mesh, CpuMesh,
-    MeshVertex, ParticleVertex, TerrainVertex,
+    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
+    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
-const MODEL_SLOTS: u64 = 8;
+const MODEL_SLOTS: u64 = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -78,9 +79,12 @@ pub struct Renderer {
     terrain: GpuMesh,
     body: GpuMesh,
     wheel: GpuMesh,
+    bike_body: GpuMesh,
     env: GpuMesh,
     susp_v: wgpu::Buffer,
     susp_i: wgpu::Buffer,
+    bike_susp_v: wgpu::Buffer,
+    bike_susp_i: wgpu::Buffer,
     #[allow(dead_code)]
     particles: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
@@ -648,6 +652,7 @@ impl Renderer {
         let body_cpu = buggy_body();
         let body = upload_cpu(&device, &body_cpu, "body");
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
+        let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
         let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-v"),
@@ -658,6 +663,18 @@ impl Renderer {
         let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("susp-i"),
             size: (32768 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bike-susp-v"),
+            size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bike_susp_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bike-susp-i"),
+            size: (16384 * 4) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -708,9 +725,12 @@ impl Renderer {
             terrain,
             body,
             wheel,
+            bike_body,
             env,
             susp_v,
             susp_i,
+            bike_susp_v,
+            bike_susp_i,
             particles,
             chunk_v,
             chunk_i,
@@ -815,6 +835,12 @@ impl Renderer {
             .write_buffer(&self.susp_v, 0, bytemuck::cast_slice(&susp.vertices));
         self.queue
             .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
+        let bike_susp = bike_suspension(&world.bike);
+        let bike_susp_count = bike_susp.indices.len() as u32;
+        self.queue
+            .write_buffer(&self.bike_susp_v, 0, bytemuck::cast_slice(&bike_susp.vertices));
+        self.queue
+            .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
 
         let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
         let aspect = self.width as f32 / self.height as f32;
@@ -858,6 +884,7 @@ impl Renderer {
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
         self.write_models(&world.vehicle);
+        self.write_bike_models(&world.bike);
 
         let chunks = mud_chunks(&world.particles.items);
         let chunk_count = chunks.indices.len() as u32;
@@ -906,6 +933,7 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
+            self.draw_bike(&mut pass, bike_susp_count);
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
@@ -944,6 +972,7 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass, susp_index_count);
+            self.draw_bike(&mut pass, bike_susp_count);
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
@@ -1145,6 +1174,45 @@ impl Renderer {
         pass.draw_indexed(0..susp_indices, 0, 0..1);
     }
 
+    fn write_bike_models(&self, bike: &Bike) {
+        let body = Mat4::from_translation(bike.pos) * Mat4::from_quat(bike.orientation());
+        let mut mud = [[0.0; 4]; PANEL_COUNT];
+        for (i, panel) in bike.panels.iter().enumerate() {
+            mud[i] = [
+                panel.mass / PANEL_MUD_CAP,
+                panel.drip,
+                panel.streak,
+                panel.wet,
+            ];
+        }
+        let slots = [
+            (7u64, model(body, mud, [0.0, 0.0, 0.0, 0.0])),
+            (8, bike_wheel_model(bike, body, mud, 0)),
+            (9, bike_wheel_model(bike, body, mud, 1)),
+            (10, model(body, mud, [0.0, 0.0, 0.0, 0.0])),
+        ];
+        for (i, slot) in slots {
+            self.queue.write_buffer(
+                &self.model_buf,
+                i * self.model_stride as u64,
+                bytemuck::bytes_of(&slot),
+            );
+        }
+    }
+
+    fn draw_bike(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 7]);
+        draw_indexed(pass, &self.bike_body);
+        for i in 0..2 {
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (8 + i)]);
+            draw_indexed(pass, &self.wheel);
+        }
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 10]);
+        pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
+        pass.set_index_buffer(self.bike_susp_i.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..susp_indices, 0, 0..1);
+    }
+
     fn draw_chunks(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
         if count == 0 {
             return;
@@ -1155,6 +1223,22 @@ impl Renderer {
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
+}
+
+fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
+    let local = bike.wheel_center_local(index);
+    let wheel = bike.wheels[index];
+    let radius = BIKE_RADIUS / WHEEL_RADIUS;
+    let world = body
+        * Mat4::from_translation(local)
+        * Mat4::from_rotation_y(wheel.steer)
+        * Mat4::from_rotation_x(wheel.spin)
+        * Mat4::from_scale(Vec3::new(0.62, radius, radius));
+    model(
+        world,
+        mud,
+        [1.0, (wheel.mud / 1.5).clamp(0.0, 1.4), 0.0, 0.0],
+    )
 }
 
 fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
