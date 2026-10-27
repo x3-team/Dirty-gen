@@ -13,6 +13,7 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
+use silt::lap::LapClock;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -92,6 +93,7 @@ struct App {
     /// the scripted lap. After that, the selected one takes the keys and the
     /// other keeps the lap.
     player_drove: bool,
+    lap: LapClock,
     acc: f32,
     last: Instant,
     srgb: bool,
@@ -272,8 +274,18 @@ impl App {
             };
             self.world.step_bike(step, &bike_input);
             self.world.step(step, &buggy_input);
+            // The readout follows the vehicle V has selected, scripted lap
+            // included, and starts when that vehicle takes the south gate.
+            let (who, pos) = if self.drive_bike {
+                (1, self.world.bike.pos)
+            } else {
+                (0, self.world.vehicle.pos)
+            };
+            self.lap.advance(step, who, pos);
             self.acc -= step;
         }
+        #[cfg(target_arch = "wasm32")]
+        set_lap_readout(self.lap.readout());
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -406,6 +418,7 @@ fn run_window() {
         chase_cam: false,
         drive_bike: false,
         player_drove: false,
+        lap: LapClock::new(),
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
@@ -671,6 +684,19 @@ fn set_web_status(text: &str) {
         return;
     };
     if let Some(node) = document.get_element_by_id("backend") {
+        node.set_text_content(Some(text));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_lap_readout(text: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    if let Some(node) = document.get_element_by_id("lap") {
         node.set_text_content(Some(text));
     }
 }
