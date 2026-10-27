@@ -1,6 +1,9 @@
 //! Thin wgpu runtime. The soil and the buggy are drawn from the solver state:
 //! height and material live in textures, mud mass lives in a per-draw uniform.
 
+#[path = "lighting.rs"]
+mod lighting;
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
@@ -217,7 +220,7 @@ impl Renderer {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(lighting::shader_source().into()),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -853,8 +856,8 @@ impl Renderer {
             Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
         };
         let view_proj = proj * view;
-        // Low sun so rut walls and the buggy contact shadow separate from the ground.
-        let sun = Vec3::new(0.88, 0.32, 0.24).normalize();
+        let sky = lighting::overcast();
+        let sun = sky.sun;
         let light_target = Vec3::new(0.0, 0.0, 2.0);
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
         let light_proj = Mat4::orthographic_rh(-36.0, 36.0, -36.0, 36.0, 1.0, 130.0);
@@ -865,10 +868,10 @@ impl Renderer {
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
             sun_dir: vec4(sun, 0.0),
-            sun_color: [1.15, 0.74, 0.42, 1.0],
-            sky_zenith: [0.13, 0.26, 0.52, 1.0],
-            sky_horizon: [0.50, 0.28, 0.18, 1.0],
-            amb: [0.10, 0.062, 0.038, 1.0],
+            sun_color: sky.sun_color,
+            sky_zenith: sky.sky_zenith,
+            sky_horizon: sky.sky_horizon,
+            amb: sky.ambient,
             params: [
                 self.width as f32,
                 self.height as f32,
