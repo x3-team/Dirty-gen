@@ -48,7 +48,7 @@ The isometric camera stays put so the whole loop, the puddles and the rut read a
 
 ## Браузер
 
-Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. V переключает багги и мотоцикл. Скорость на западной прямой (справа в этом виде) по-прежнему срывает выбранную машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Страница также опубликована: https://x3-team.github.io/Dirty-gen/
+Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. V переключает багги и мотоцикл. Скорость на западной прямой (справа в этом виде) по-прежнему срывает выбранную машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.
 
 Нужен [trunk](https://trunkrs.dev/). Из корня репозитория:
 
@@ -87,7 +87,7 @@ The buggy is a short-travel 4x4: four wheels, a spring matched to the Bekker loa
 
 A motocross bike sits beside the buggy at the gate. V gives it the pedals. It is the same soil — Bekker, Janosi–Hanamoto, the wheel stamp, and the crest launch — on a lighter chassis with a front fork and a rear shock. Those shorten when the tire loads and hang at droop in the air. The crest flips it and the landing throws the same wet clumps. The isometric camera stays the default.
 
-The browser build is also on GitHub Pages: https://x3-team.github.io/Dirty-gen/
+`.github/workflows/pages.yml` builds that page with `trunk build --release`. https://x3-team.github.io/Dirty-gen/ is the project address once Pages is enabled and the source is GitHub Actions.
 
 ## Not in this slice
 
