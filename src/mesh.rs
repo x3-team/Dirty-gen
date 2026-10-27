@@ -691,43 +691,46 @@ fn chunk_hash(seed: u32, n: u32) -> f32 {
     (x & 0xFFFF) as f32 / 65535.0
 }
 
-fn add_tri_out(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32, center: Vec3) {
-    let n = (b - a).cross(c - a);
-    if n.dot(a - center) < 0.0 {
-        add_tri(mesh, a, c, b, panel);
+fn push_smooth(mesh: &mut CpuMesh, p: Vec3, n: Vec3, panel: f32) {
+    mesh.vertices.push(MeshVertex {
+        pos: p.to_array(),
+        nrm: n.normalize_or_zero().to_array(),
+        uv: uv_of(p),
+        panel,
+    });
+}
+
+fn add_tri_smooth(
+    mesh: &mut CpuMesh,
+    a: Vec3,
+    na: Vec3,
+    b: Vec3,
+    nb: Vec3,
+    c: Vec3,
+    nc: Vec3,
+    panel: f32,
+    center: Vec3,
+) {
+    let face = (b - a).cross(c - a);
+    if face.length_squared() < 1.0e-10 {
+        return;
+    }
+    let base = mesh.vertices.len() as u32;
+    if face.dot(a - center) < 0.0 {
+        push_smooth(mesh, a, na, panel);
+        push_smooth(mesh, c, nc, panel);
+        push_smooth(mesh, b, nb, panel);
     } else {
-        add_tri(mesh, a, b, c, panel);
+        push_smooth(mesh, a, na, panel);
+        push_smooth(mesh, b, nb, panel);
+        push_smooth(mesh, c, nc, panel);
     }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2]);
 }
 
-fn add_octa(mesh: &mut CpuMesh, center: Vec3, rot: Quat, radius: f32, seed: u32) {
-    let axis = Vec3::new(
-        0.62 + chunk_hash(seed, 1) * 0.85,
-        0.48 + chunk_hash(seed, 2) * 0.95,
-        0.58 + chunk_hash(seed, 3) * 0.9,
-    );
-    let p = |v: Vec3| center + rot * (v * radius * axis);
-    let y = p(Vec3::Y);
-    let ny = p(-Vec3::Y);
-    let x = p(Vec3::X);
-    let nx = p(-Vec3::X);
-    let z = p(Vec3::Z);
-    let nz = p(-Vec3::Z);
-    let faces = [
-        [y, z, x],
-        [y, x, nz],
-        [y, nz, nx],
-        [y, nx, z],
-        [ny, x, z],
-        [ny, nz, x],
-        [ny, nx, nz],
-        [ny, z, nx],
-    ];
-    for f in faces {
-        add_tri_out(mesh, f[0], f[1], f[2], PANEL_CLOD, center);
-    }
-}
-
+/// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
+/// `slump` flattens a piece that has already landed.
 fn add_lump(
     mesh: &mut CpuMesh,
     center: Vec3,
@@ -736,34 +739,69 @@ fn add_lump(
     seed: u32,
     stacks: usize,
     slices: usize,
+    slump: bool,
 ) {
     let axis = Vec3::new(
-        0.72 + chunk_hash(seed, 1) * 0.7,
-        0.5 + chunk_hash(seed, 2) * 0.55,
-        0.68 + chunk_hash(seed, 3) * 0.75,
+        0.88 + chunk_hash(seed, 1) * 0.22,
+        0.80 + chunk_hash(seed, 2) * 0.24,
+        0.86 + chunk_hash(seed, 3) * 0.22,
     );
+    // Landed mud spreads and sinks. A tall axis reads as a stone sitting on the soil.
+    let squash = if slump {
+        Vec3::new(1.48, 0.36, 1.48)
+    } else {
+        Vec3::ONE
+    };
+    let center = if slump {
+        center - Vec3::Y * radius * 0.16
+    } else {
+        center
+    };
     let mut pts = Vec::with_capacity(2 + stacks * slices);
-    let place = |local: Vec3| center + rot * (local * axis);
-    pts.push(place(
-        Vec3::Y * radius * (0.78 + chunk_hash(seed, 4) * 0.45),
-    ));
+    let mut nrm = Vec::with_capacity(pts.capacity());
+    let place = |dir: Vec3, rad: f32| {
+        let shaped = Vec3::new(
+            dir.x * rad * axis.x * squash.x,
+            dir.y * rad * axis.y * squash.y,
+            dir.z * rad * axis.z * squash.z,
+        );
+        let n = Vec3::new(
+            dir.x / squash.x.max(0.05),
+            dir.y / squash.y.max(0.05),
+            dir.z / squash.z.max(0.05),
+        );
+        (center + rot * shaped, (rot * n).normalize_or_zero())
+    };
+    let (p, n) = place(Vec3::Y, radius * (0.92 + chunk_hash(seed, 4) * 0.12));
+    pts.push(p);
+    nrm.push(n);
     for s in 1..stacks {
         let phi = s as f32 / stacks as f32 * std::f32::consts::PI;
         for i in 0..slices {
             let th = i as f32 / slices as f32 * std::f32::consts::TAU;
-            let n = Vec3::new(th.cos() * phi.sin(), phi.cos(), th.sin() * phi.sin());
-            let j = 0.58 + chunk_hash(seed, (s * 16 + i) as u32) * 0.75;
-            pts.push(place(n * radius * j));
+            let dir = Vec3::new(th.cos() * phi.sin(), phi.cos(), th.sin() * phi.sin());
+            // Mild swell. A wide jitter makes spikes, and spikes read as broken rock.
+            let j = 0.90 + chunk_hash(seed, (s * 16 + i) as u32) * 0.18;
+            let (p, n) = place(dir, radius * j);
+            pts.push(p);
+            nrm.push(n);
         }
     }
-    pts.push(place(-Vec3::Y * radius * (0.7 + chunk_hash(seed, 5) * 0.4)));
+    let (p, n) = place(-Vec3::Y, radius * (0.88 + chunk_hash(seed, 5) * 0.14));
+    pts.push(p);
+    nrm.push(n);
     let ring = |s: usize, i: usize| 1 + (s - 1) * slices + (i % slices);
     for i in 0..slices {
-        add_tri_out(
+        let a = ring(1, i);
+        let b = ring(1, i + 1);
+        add_tri_smooth(
             mesh,
             pts[0],
-            pts[ring(1, i)],
-            pts[ring(1, i + 1)],
+            nrm[0],
+            pts[a],
+            nrm[a],
+            pts[b],
+            nrm[b],
             PANEL_CLOD,
             center,
         );
@@ -774,62 +812,107 @@ fn add_lump(
             let b = ring(s, i + 1);
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
-            add_tri_out(mesh, pts[a], pts[c], pts[b], PANEL_CLOD, center);
-            add_tri_out(mesh, pts[b], pts[c], pts[d], PANEL_CLOD, center);
+            add_tri_smooth(
+                mesh,
+                pts[a],
+                nrm[a],
+                pts[c],
+                nrm[c],
+                pts[b],
+                nrm[b],
+                PANEL_CLOD,
+                center,
+            );
+            add_tri_smooth(
+                mesh,
+                pts[b],
+                nrm[b],
+                pts[c],
+                nrm[c],
+                pts[d],
+                nrm[d],
+                PANEL_CLOD,
+                center,
+            );
         }
     }
     let bot = pts.len() - 1;
     let last = stacks - 1;
     for i in 0..slices {
-        add_tri_out(
+        let a = ring(last, i + 1);
+        let b = ring(last, i);
+        add_tri_smooth(
             mesh,
             pts[bot],
-            pts[ring(last, i + 1)],
-            pts[ring(last, i)],
+            nrm[bot],
+            pts[a],
+            nrm[a],
+            pts[b],
+            nrm[b],
             PANEL_CLOD,
             center,
         );
     }
 }
 
-/// Faceted mud in world space. Large impacts are a pair of lumps; droplets are
-/// irregular octahedra. Nothing here is a camera-facing quad.
+fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
+    add_lump(
+        mesh,
+        p.pos,
+        p.rot,
+        p.size,
+        p.seed,
+        stacks,
+        slices,
+        p.grounded,
+    );
+}
+
+/// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
+/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
-    for p in items {
-        if !p.alive || p.life <= 0.0 {
-            continue;
-        }
-        if mesh.vertices.len() + 220 > MAX_VERTS {
-            break;
-        }
-        if p.kind == 3 {
-            add_lump(&mut mesh, p.pos, p.rot, p.size, p.seed, 4, 6);
-            let dir = Vec3::new(
-                chunk_hash(p.seed, 8) * 2.0 - 1.0,
-                chunk_hash(p.seed, 9) * 0.8 - 0.2,
-                chunk_hash(p.seed, 10) * 2.0 - 1.0,
-            )
-            .normalize_or_zero();
-            add_lump(
-                &mut mesh,
-                p.pos + p.rot * dir * p.size * 0.5,
-                p.rot,
-                p.size * 0.58,
-                p.seed ^ 0xA5A5_5A5A,
-                3,
-                5,
-            );
-        } else if p.kind == 1 {
-            add_lump(&mut mesh, p.pos, p.rot, p.size.max(0.08), p.seed, 3, 5);
-        } else {
-            let radius = if p.kind == 2 {
-                p.size.max(0.04)
+    // Draw the big clumps first so a full splash cannot crowd them out.
+    for kind in [3u8, 1, 4, 0, 2] {
+        for p in items {
+            if !p.alive || p.life <= 0.0 || p.kind != kind {
+                continue;
+            }
+            if mesh.vertices.len() + 700 > MAX_VERTS {
+                return mesh;
+            }
+            if p.kind == 3 {
+                add_piece(&mut mesh, p, 8, 16);
+                // Two side lobes so the clump is a soft mass, not one pebble.
+                for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {
+                    let dir = Vec3::new(
+                        chunk_hash(p.seed, slot) * 2.0 - 1.0,
+                        chunk_hash(p.seed, slot + 1) * 0.28,
+                        chunk_hash(p.seed, slot + 2) * 2.0 - 1.0,
+                    )
+                    .normalize_or_zero();
+                    let lobe = silt::particles::Particle {
+                        pos: p.pos + p.rot * dir * p.size * dist,
+                        size: p.size * scale,
+                        seed: p.seed ^ 0xA5A5_5A5Au32.wrapping_mul(slot | 1),
+                        ..*p
+                    };
+                    add_piece(&mut mesh, &lobe, 6, 12);
+                }
+            } else if p.kind == 1 {
+                let mut q = *p;
+                q.size = p.size.max(0.08);
+                add_piece(&mut mesh, &q, 4, 6);
             } else {
-                p.size.max(0.07)
-            };
-            add_octa(&mut mesh, p.pos, p.rot, radius, p.seed);
+                let mut q = *p;
+                q.size = if p.kind == 2 {
+                    p.size.max(0.045)
+                } else {
+                    p.size.max(0.07)
+                };
+                add_piece(&mut mesh, &q, 4, 7);
+            }
         }
     }
     mesh

@@ -1,5 +1,5 @@
-//! Short-lived splash. Pieces are ballistic solids: they arc, then rest on the
-//! heightfield. The renderer turns them into faceted clods, not camera cards.
+//! Short-lived splash. Pieces are ballistic solids: they arc, then rest in the
+//! soil. The renderer turns them into soft wet clods, not stones or cards.
 
 use glam::{EulerRot, Quat, Vec3};
 
@@ -146,8 +146,9 @@ impl Particles {
         let mut n = 0u32;
         for i in 0..8 {
             let ang = i as f32 / 8.0 * std::f32::consts::TAU + (self.rnd() - 0.5) * 0.4;
-            let speed = 2.2 + self.rnd() * 2.6;
-            let up = 4.4 + self.rnd() * 2.4;
+            // A short arc that falls back into the crater, not a stone tossed across the lane.
+            let speed = 0.55 + self.rnd() * 1.05;
+            let up = 2.5 + self.rnd() * 1.5;
             let vel = Vec3::new(ang.cos() * speed, up, ang.sin() * speed);
             let size = 0.40 + self.rnd() * 0.22;
             let life = 2.5 + self.rnd() * 0.7;
@@ -159,8 +160,8 @@ impl Particles {
         }
         for _ in 0..16 {
             let ang = self.rnd() * std::f32::consts::TAU;
-            let speed = 1.8 + self.rnd() * 5.4;
-            let up = 2.6 + self.rnd() * 4.0;
+            let speed = 1.1 + self.rnd() * 2.4;
+            let up = 2.0 + self.rnd() * 2.2;
             let vel = Vec3::new(ang.cos() * speed, up, ang.sin() * speed);
             let size = 0.11 + self.rnd() * 0.12;
             let life = 1.6 + self.rnd() * 0.8;
@@ -211,8 +212,13 @@ impl Particles {
             p.pos += p.vel * dt;
             p.rot = Quat::from_scaled_axis(p.spin * dt) * p.rot;
             let h = soil.sample(p.pos.x, p.pos.z).height;
-            // Rest with most of the volume above the soil, the belly in it.
-            let sit = h + p.size * 0.62;
+            // Belly in the crater, the wet cap still above the soil.
+            let belly = match p.kind {
+                3 => 0.12,
+                1 => 0.22,
+                _ => 0.32,
+            };
+            let sit = h + p.size * belly;
             if p.pos.y <= sit {
                 if !p.deposited {
                     if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
@@ -224,6 +230,7 @@ impl Particles {
                             1 | 2 | 3 => {
                                 soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
                                 soil.loose[idx] = (soil.loose[idx] + 0.008).min(0.16);
+                                soil.wetness[idx] = (soil.wetness[idx] + 0.1).min(1.0);
                             }
                             _ => {}
                         }

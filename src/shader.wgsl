@@ -391,25 +391,24 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
     albedo = mix(albedo, vec3<f32>(0.012, 0.008, 0.006), rim * 0.85);
 
-    // The dry parking cut is only mildly wet. Keep a sheen in the floor
-    // so the bottom of the groove reads as damp soil, not a flat tint.
-    let wet_amt = smoothstep(0.08, 0.40, wet);
-    // The groove is a shadow in the soil, not a wetter mirror than the lane.
-    let sheen = wet_amt * mix(0.62, 1.0, smoothstep(0.25, 0.9, wet));
+    // The lane is already damp and stays matte. Shine is the rut floor and
+    // the soil ringing a puddle. A film on every wet cell washed the track pale.
+    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
+    let fresh = max(groove, shore);
     // Standing water is drawn as its own sheet. A mirror bed under that film
     // is the gray metal disc.
     let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(0.96, 0.16, sheen * (1.0 - drowned)), 0.94, drowned);
+    let rough_out = mix(mix(0.94, 0.18, fresh * (1.0 - drowned)), 0.90, drowned);
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
-    // A broad warm sheen is what makes wet soil read from above.
+    // A wide lobe on the cut and the shore is the wet sheen.
     let view = normalize(frame.cam_pos.xyz - in.world);
     let ndotv = clamp(dot(n, view), 0.0, 1.0);
     let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
     let facing = pow(1.0 - ndotv, 2.0);
-    let broad = pow(clamp(dot(n, halfv), 0.0, 1.0), 5.0);
-    let wet_spec = (facing * 0.85 + broad * 1.05) * sheen * (1.0 - drowned);
-    lit += vec3<f32>(0.16, 0.085, 0.038) * wet_spec;
+    let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
+    let wet_spec = (facing * 0.75 + wide * 1.15) * fresh * mix(1.0, 0.16, drowned);
+    lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
     return present(lit);
 }
 
@@ -473,24 +472,34 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.2);
-    let depth_t = smoothstep(0.008, 0.20, in.depth);
+    let fres = pow(1.0 - ndotv, 2.4);
+    // Stored water tops out near a decimetre after the shader scale, so the
+    // middle of a puddle has to go dark inside that range.
+    let depth_t = smoothstep(0.004, 0.065, in.depth);
+    // Wide enough that the rim is a band, not a one-pixel shore.
+    // The middle of the pond is past this and stays the dark absorption.
+    let rim = 1.0 - smoothstep(0.006, 0.055, in.depth);
     // Red-heavy mud. A gray mix here is what read as a metal disc from above.
-    let shore_col = vec3<f32>(0.12, 0.058, 0.022);
-    let deep_col = vec3<f32>(0.004, 0.002, 0.001);
+    let shore_col = vec3<f32>(0.09, 0.042, 0.016);
+    let deep_col = vec3<f32>(0.0016, 0.0009, 0.0005);
     let absorption = mix(shore_col, deep_col, depth_t);
-    // Warm dusk, not a gray sky. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.22, 0.12, 0.05);
-    var col = mix(absorption, quiet, 0.04 + fres * 0.20);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
-    col += vec3<f32>(0.20, 0.10, 0.035) * spec * shadow_factor(in.world, nrm) * 0.34;
+    // Reflection stays on the rim. sky_color carries the sun disc and white clouds.
+    let quiet = vec3<f32>(0.40, 0.18, 0.065);
+    let reflect_amt = rim * (0.58 + fres * 0.75);
+    var col = mix(absorption, quiet, reflect_amt);
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 6.0);
+    // The glint stays on the rim. The middle is the dark absorption only.
+    col += vec3<f32>(0.30, 0.14, 0.045) * spec * shadow_factor(in.world, nrm) * rim;
     let shore = smoothstep(0.002, 0.07, in.depth);
     // Only a cut of a couple of centimetres thins the film, and only on that cut.
     // The rest of the pond stays a dark cover, shore and middle alike.
     let dug = max(-stamp_bilinear(in.world.xz), 0.0);
     let reveal = smoothstep(0.016, 0.034, dug);
     let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
-    let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal);
+    // The rim reflection has to be opaque or the soil underneath eats it.
+    // The middle keeps the old cover. reveal still opens a cut tire track.
+    let cover_a = shore * mix(0.88, 0.98, depth_t);
+    let alpha = mix(cover_a, max(cover_a, 0.96), rim) * mix(1.0, open, reveal);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
@@ -608,11 +617,10 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.0 + vec2<f32>(world.y * 2.0, 0.0));
         return vec4<f32>(vec3<f32>(0.10, 0.058, 0.032) * (0.8 + g * 0.35), 0.92);
     } else if (panel < 46.5) {
-        // Wet clod. Dark soil with a little shine. The orange frame stays on panel 1.
-        let g = noise(world.xz * 4.5 + vec2<f32>(world.y * 3.0, 0.4));
-        // Dark wet soil, light enough that a lit face is brown mud rather than coal.
-        let col = mix(vec3<f32>(0.062, 0.032, 0.016), vec3<f32>(0.14, 0.072, 0.030), g);
-        return vec4<f32>(col, 0.30);
+        // Wet clod. Dark saturated mud. The orange frame stays on panel 1.
+        let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
+        let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
+        return vec4<f32>(col, 0.06);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -681,15 +689,38 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
-    // The low sun leaves the top of a clod almost black. A warm fill keeps the
-    // lit face brown mud, and the underside stays darker so the chunk has volume.
+    // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
     if (in.panel > 45.5 && in.panel < 46.5) {
-        let up = clamp(nrm.y * 0.65 + 0.35, 0.0, 1.0);
-        lit += vec3<f32>(0.07, 0.034, 0.014) * up;
+        var n = normalize(nrm);
+        // Soft skin. A strong bump turns the highlight into gravel.
+        let e = 0.06;
+        let h0 = noise(in.world.xz * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
+        let hx = noise((in.world.xz + vec2<f32>(e, 0.0)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
+        let hz = noise((in.world.xz + vec2<f32>(0.0, e)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
+        n = normalize(n + vec3<f32>(h0 - hx, 0.04, h0 - hz) * 0.28);
         let sun = normalize(frame.sun_dir.xyz);
         let view = normalize(frame.cam_pos.xyz - in.world);
-        let glint = pow(clamp(dot(normalize(nrm), normalize(sun + view)), 0.0, 1.0), 20.0);
-        lit += vec3<f32>(0.09, 0.045, 0.016) * glint;
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let ndotv = clamp(dot(n, view), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        // Darker than the berm. A crown in the soil's own brown reads as a dry stone.
+        let tone = clamp((albedo.r - 0.016) / 0.018, 0.0, 1.0);
+        let body = mix(vec3<f32>(0.0090, 0.0031, 0.0011), vec3<f32>(0.0155, 0.0052, 0.0018), tone);
+        let wrap = ndl * 0.28 + 0.72;
+        lit = body * (0.85 + wrap * shadow * 0.22);
+        // The flat top has almost one normal from this camera, so a Phong lobe
+        // paints the whole crown the color of a dry stone. Gloss is short streaks.
+        let streak = noise(in.world.xz * 6.5 + vec2<f32>(in.world.y * 4.0, 0.4));
+        let wetspot = smoothstep(0.80, 0.94, streak);
+        let facing = pow(ndotv, 16.0);
+        let fres = pow(1.0 - ndotv, 3.0);
+        let gloss = vec3<f32>(0.22, 0.08, 0.026);
+        let shine = 0.45 + shadow * 0.55;
+        lit += gloss * facing * 0.65 * shine;
+        lit += gloss * wetspot * clamp(n.y, 0.0, 1.0) * shine;
+        lit += gloss * fres * 0.08;
+        let belly = smoothstep(0.2, -0.45, n.y);
+        lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
     }
     return present(lit);
 }
