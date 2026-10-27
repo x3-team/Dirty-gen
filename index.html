@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Silt</title>
     <link data-trunk rel="rust" data-bin="silt" data-wasm-opt="0" />
+    <link data-trunk rel="css" href="ui/touch.css" />
     <style>
       html,
       body {
@@ -50,12 +51,16 @@
     </style>
   </head>
   <body>
-    <canvas id="silt" tabindex="0"></canvas>
+    <div id="stage">
+      <canvas id="silt" tabindex="0"></canvas>
+    </div>
     <div id="lap">Старт · 0 кругов · 0:00.0</div>
     <div id="hud">
       Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C изометрия, погоня, кабина, L грязь на стекле.
+      На экране телефона: руль слева, газ и тормоз справа.
       <span id="backend">загрузка…</span>
     </div>
+    <script data-trunk src="ui/touch.js"></script>
     <script>
       const canvas = document.getElementById("silt");
       const focus = () => canvas.focus();
