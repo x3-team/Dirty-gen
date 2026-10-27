@@ -842,7 +842,8 @@ impl Renderer {
         self.queue
             .write_buffer(&self.bike_susp_i, 0, bytemuck::cast_slice(&bike_susp.indices));
 
-        let view = Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
+        let up = silt::replay::view_up(cam.eye, cam.target);
+        let view = Mat4::look_at_rh(cam.eye, cam.target, up);
         let aspect = self.width as f32 / self.height as f32;
         let proj = if let Some(width) = cam.ortho_width {
             let half_w = width * 0.5;
