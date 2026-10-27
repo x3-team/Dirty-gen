@@ -1557,6 +1557,104 @@ mod tests {
         assert_no_t_junctions(&dense_v, &dense_i);
     }
 
+    /// Cells. Must match `DRAW_SIGMA` / `draw_axis` in shader.wgsl.
+    const DRAW_SIGMA: f32 = 0.64;
+
+    fn draw_gauss(d: f32) -> f32 {
+        let q = d / DRAW_SIGMA;
+        (-0.5 * q * q).exp()
+    }
+
+    /// Normalized 5-tap gaussian and d(weight)/d(index). `f` is the fractional index.
+    fn draw_axis(f: f32) -> ([f32; 5], [f32; 5]) {
+        let mut g = [0.0; 5];
+        let mut dg = [0.0; 5];
+        let inv_s2 = 1.0 / (DRAW_SIGMA * DRAW_SIGMA);
+        let mut sum = 0.0;
+        let mut dsum = 0.0;
+        for i in 0..5 {
+            let d = f - (i as f32 - 2.0);
+            let gi = draw_gauss(d);
+            let dgi = gi * (-d * inv_s2);
+            g[i] = gi;
+            dg[i] = dgi;
+            sum += gi;
+            dsum += dgi;
+        }
+        let mut w = [0.0; 5];
+        let mut dw = [0.0; 5];
+        let inv = 1.0 / sum;
+        let inv2 = inv * inv;
+        for i in 0..5 {
+            w[i] = g[i] * inv;
+            dw[i] = (dg[i] * sum - g[i] * dsum) * inv2;
+        }
+        (w, dw)
+    }
+
+    fn sample_height(soil: &silt::soil::SoilField, i: isize, j: isize) -> f32 {
+        let ii = i.clamp(0, soil.res as isize - 1) as usize;
+        let jj = j.clamp(0, soil.res as isize - 1) as usize;
+        soil.height[jj * soil.res + ii]
+    }
+
+    /// Draw height. Same gather the terrain vertex shader uses.
+    fn draw_height(soil: &silt::soil::SoilField, x: f32, z: f32) -> f32 {
+        let half = soil.size * 0.5;
+        let u = (x + half) / soil.cell - 0.5;
+        let v = (z + half) / soil.cell - 0.5;
+        let (wx, _) = draw_axis(u - u.floor());
+        let (wz, _) = draw_axis(v - v.floor());
+        let i0 = u.floor() as isize;
+        let j0 = v.floor() as isize;
+        let mut h = 0.0;
+        for j in 0..5 {
+            let mut row = 0.0;
+            for i in 0..5 {
+                row += wx[i] * sample_height(soil, i0 + i as isize - 2, j0 + j as isize - 2);
+            }
+            h += wz[j] * row;
+        }
+        h
+    }
+
+    fn draw_slope_x(soil: &silt::soil::SoilField, x: f32, z: f32) -> f32 {
+        let half = soil.size * 0.5;
+        let u = (x + half) / soil.cell - 0.5;
+        let v = (z + half) / soil.cell - 0.5;
+        let (_wx, dwx) = draw_axis(u - u.floor());
+        let (wz, _) = draw_axis(v - v.floor());
+        let i0 = u.floor() as isize;
+        let j0 = v.floor() as isize;
+        let mut dhdu = 0.0;
+        for j in 0..5 {
+            let mut drow = 0.0;
+            for i in 0..5 {
+                drow += dwx[i] * sample_height(soil, i0 + i as isize - 2, j0 + j as isize - 2);
+            }
+            dhdu += wz[j] * drow;
+        }
+        dhdu / soil.cell
+    }
+
+    fn max_turn_deg(xs: &[f32], hs: &[f32]) -> f32 {
+        let mut max_k = 0.0f32;
+        for i in 1..xs.len().saturating_sub(1) {
+            let v1x = xs[i] - xs[i - 1];
+            let v1y = hs[i] - hs[i - 1];
+            let v2x = xs[i + 1] - xs[i];
+            let v2y = hs[i + 1] - hs[i];
+            let n1 = (v1x * v1x + v1y * v1y).sqrt();
+            let n2 = (v2x * v2x + v2y * v2y).sqrt();
+            if n1 < 1.0e-4 || n2 < 1.0e-4 {
+                continue;
+            }
+            let dot = ((v1x * v2x + v1y * v2y) / (n1 * n2)).clamp(-1.0, 1.0);
+            max_k = max_k.max(dot.acos().to_degrees());
+        }
+        max_k
+    }
+
     fn bilinear_height(soil: &silt::soil::SoilField, x: f32, z: f32) -> f32 {
         let half = soil.size * 0.5;
         let u = (x + half) / soil.cell - 0.5;
@@ -1683,12 +1781,30 @@ mod tests {
             .iter()
             .map(|x| bilinear_height(&soil, *x, z))
             .collect();
-        let dense_h: Vec<f32> = dense_xs
+        let dense_bi: Vec<f32> = dense_xs
             .iter()
             .map(|x| bilinear_height(&soil, *x, z))
             .collect();
+        let dense_h: Vec<f32> = dense_xs.iter().map(|x| draw_height(&soil, *x, z)).collect();
         let (base_s, base_k) = max_cell_sagitta(&base_xs, &base_h, soil.cell);
-        let (dense_s, dense_k) = max_cell_sagitta(&dense_xs, &dense_h, soil.cell);
+        let bi_turn = max_turn_deg(&dense_xs, &dense_bi);
+        let draw_turn = max_turn_deg(&dense_xs, &dense_h);
+        let mut max_dev = 0.0f32;
+        let mut bi_min = f32::MAX;
+        let mut draw_at_bi_min = 0.0f32;
+        for (x, (bi, draw)) in dense_xs.iter().zip(dense_bi.iter().zip(dense_h.iter())) {
+            max_dev = max_dev.max((draw - bi).abs());
+            if *bi < bi_min {
+                bi_min = *bi;
+                draw_at_bi_min = *draw;
+            }
+            let _ = x;
+        }
+        let slope_x = 6.70_f32;
+        let numerical = (draw_height(&soil, slope_x + 0.002, z)
+            - draw_height(&soil, slope_x - 0.002, z))
+            / 0.004;
+        let analytic = draw_slope_x(&soil, slope_x, z);
         let mut line = String::new();
         for (x, h) in dense_xs.iter().zip(dense_h.iter()) {
             line.push_str(&format!(" {:.3}:{:.4}", x, h));
@@ -1699,15 +1815,49 @@ mod tests {
             dense_xs.len()
         );
         eprintln!(
-            "cell sagitta m  base {base_s:.5}  dense {dense_s:.5}   kink deg base {base_k:.2} dense {dense_k:.2}"
+            "cell sagitta m bilinear {base_s:.5}  patch kink {base_k:.2}  turn deg bilinear {bi_turn:.2} draw {draw_turn:.2}  max |draw-bi| {max_dev:.4}  floor bi {bi_min:.4} draw {draw_at_bi_min:.4}"
         );
-        eprintln!("dense profile{line}");
+        eprintln!("slope dh/dx num {numerical:.4} ana {analytic:.4}");
+        eprintln!("draw profile{line}");
         assert!(
             dense_xs.len() > base_xs.len() * 3,
             "rut section should carry the finer grid"
         );
-        // The stamp shoulder is one solver cell wide, so the drawn wall stays a
-        // straight ramp. Record that; do not pretend the extra vertices bend it.
-        let _ = (base_s, dense_s);
+        assert!(
+            (analytic - numerical).abs() < 0.02,
+            "draw slope {analytic:.4} disagrees with finite difference {numerical:.4}"
+        );
+        // The solver lip is still a corner. The draw height has to leave that ramp.
+        assert!(
+            bi_turn > 18.0,
+            "expected the bilinear tyre lip to stay a sharp corner, got {bi_turn:.1}°"
+        );
+        assert!(
+            draw_turn < 12.0 && draw_turn < bi_turn * 0.5,
+            "draw lip still corners at {draw_turn:.1}° (bilinear {bi_turn:.1}°)"
+        );
+        assert!(
+            max_dev > 0.008,
+            "draw height stayed on the bilinear ramp (max deviation {max_dev:.4} m)"
+        );
+        assert!(
+            (draw_at_bi_min - bi_min).abs() < 0.015,
+            "rut floor moved from {bi_min:.4} to {draw_at_bi_min:.4}"
+        );
+        let _ = base_s;
+    }
+
+    #[test]
+    fn draw_kernel_stays_normalized() {
+        for t in [0.0_f32, 0.17, 0.5, 0.83] {
+            let (w, dw) = draw_axis(t);
+            let sum: f32 = w.iter().sum();
+            let dsum: f32 = dw.iter().sum();
+            assert!((sum - 1.0).abs() < 1.0e-4, "weights sum to {sum} at {t}");
+            assert!(
+                dsum.abs() < 1.0e-4,
+                "weight derivative sums to {dsum} at {t}"
+            );
+        }
     }
 }
