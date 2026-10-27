@@ -1,5 +1,6 @@
-// Exhaust wisps and the heat shimmer just aft of the tailpipe.
-// Smoke is a cool gray streak. The haze pass only moves texels.
+// Volumetric exhaust. Each card is a soft gray-blue wisp with density
+// inside it, not a white dash. The haze pass refracts the scene through
+// the hot column: a small bend plus a faint color split, no flame tint.
 
 struct SmokeFrame {
     view_proj: mat4x4<f32>,
@@ -40,35 +41,36 @@ fn noise(p: vec2<f32>) -> f32 {
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+fn fbm(p: vec2<f32>) -> f32 {
+    let a = noise(p);
+    let b = noise(p * 2.13 + vec2<f32>(1.7, 9.2));
+    let c = noise(p * 4.07 + vec2<f32>(8.3, 2.8));
+    return a * 0.55 + b * 0.30 + c * 0.15;
+}
+
 @vertex
 fn vs_smoke(in: Vin) -> Vout {
     let right = smoke.cam_right.xyz;
     let up = smoke.cam_up.xyz;
+    // A volume card, a little taller than it is wide, leaning with the curl.
+    // Velocity does not stretch it into a streak.
     let vel = in.vel.xyz;
-    let v_right = dot(vel, right);
-    let v_up = dot(vel, up);
-    let v_len = length(vec2<f32>(v_right, v_up));
-    var axis = up;
-    var sidev = right;
-    if (v_len > 0.08) {
-        axis = (right * v_right + up * v_up) / v_len;
-        sidev = right * v_up - up * v_right;
-        sidev = sidev / max(length(sidev), 0.0001);
-    }
-    var width = max(in.geom.x, 0.01);
-    var len = width * (1.25 + clamp(length(vel), 0.0, 1.2) * 0.35);
+    let lean = clamp(dot(vel, right) * 1.1, -0.4, 0.4);
+    var axis = up + right * lean;
+    axis = axis / max(length(axis), 0.0001);
+    var sidev = right - axis * dot(right, axis);
+    sidev = sidev / max(length(sidev), 0.0001);
+
+    var width = max(in.geom.x, 0.02);
+    // Almost round. A tall card reads as a dash once the wisp is thin.
+    var len = width * 1.22;
     let c0 = smoke.view_proj * vec4<f32>(in.pos.xyz, 1.0);
     let c1 = smoke.view_proj * vec4<f32>(in.pos.xyz + sidev * width, 1.0);
     let px = length((c1.xy / max(c1.w, 0.0001) - c0.xy / max(c0.w, 0.0001)) * vec2<f32>(smoke.params.y, smoke.params.z) * 0.5);
-    // Wide shots still need a readable wisp. Close-ups already clear this floor.
-    if (px > 0.25 && px < 4.5) {
-        let s = 4.5 / px;
-        width = width * s;
-        len = len * s;
-    }
-    // A puff that reaches the lens stays a wisp, not a white disc.
-    if (px > 36.0) {
-        let s = 36.0 / px;
+    // Only a puff that has reached the lens is capped, so a close wisp
+    // stays a volume and a far one is not inflated into a white tick.
+    if (px > 150.0) {
+        let s = 150.0 / px;
         width = width * s;
         len = len * s;
     }
@@ -84,17 +86,26 @@ fn vs_smoke(in: Vin) -> Vout {
 
 @fragment
 fn fs_smoke(in: Vout) -> @location(0) vec4<f32> {
-    let q = (in.uv - vec2<f32>(0.5)) * vec2<f32>(1.2, 0.7);
-    let d = length(q);
-    var a = smoothstep(0.52, 0.04, d);
-    let strand = noise(vec2<f32>(in.uv.x * 4.0 + in.seed * 9.0, in.uv.y * 2.4 + smoke.params.x * 0.2));
-    let gap = noise(vec2<f32>(in.uv.y * 2.6 - smoke.params.x * 0.3, in.seed * 11.0));
-    // Soft breaks, not dashed strokes. The wisp stays thin because alpha is low.
-    a = a * mix(0.55, 1.0, smoothstep(0.15, 0.75, strand * 0.65 + gap * 0.35)) * in.color.a;
-    if (a < 0.02) {
+    let t = smoke.params.x;
+    let seed = in.seed;
+    let flow = vec2<f32>(in.uv.x * 2.5 + seed * 5.2, in.uv.y * 2.7 + seed * 1.4 - t * 0.12);
+    let w1 = fbm(flow);
+    let w2 = fbm(flow * 1.8 + vec2<f32>(3.4, 7.1));
+    var p = in.uv - vec2<f32>(0.5);
+    // Warp the ball into an irregular wisp. The body stays continuous.
+    p = p + vec2<f32>(w1 - 0.5, w2 - 0.5) * 0.30;
+    let q = p * vec2<f32>(1.18, 1.02);
+    let body = exp(-dot(q, q) * 5.2);
+    let grain = smoothstep(0.20, 0.80, fbm(flow * 2.1 + vec2<f32>(w1, t * 0.08)));
+    // Feather the card itself so the quad corners never read as a square.
+    let mask = smoothstep(0.50, 0.16, length((in.uv - vec2<f32>(0.5)) * vec2<f32>(1.02, 0.90)));
+    // The floor keeps a soft volume. Grain only models the inside of it.
+    let density = body * mix(0.50, 1.0, grain) * (0.14 + in.color.a) * mask;
+    if (density < 0.018) {
         discard;
     }
-    return vec4<f32>(in.color.rgb, a);
+    let rgb = in.color.rgb * mix(vec3<f32>(0.93, 0.98, 1.06), vec3<f32>(1.0, 1.02, 1.04), grain);
+    return vec4<f32>(min(rgb, vec3<f32>(0.86, 0.90, 0.96)), density);
 }
 
 struct Plume {
@@ -147,21 +158,25 @@ fn one_plume(origin_s: vec4<f32>, axis_len: vec4<f32>, radii: vec4<f32>, px: vec
     let q = a.xy + ab * t;
     let dist = length(px - q);
     let mouth = project_px(origin + haze.cam_right.xyz * max(radii.x, 0.02));
-    let floor_px = 12.0 * (haze.params.z / 720.0);
+    let floor_px = 8.0 * (haze.params.z / 720.0);
     let r0 = max(length(mouth.xy - a.xy), floor_px);
     let r1 = max(r0 * (radii.y / max(radii.x, 0.02)), r0);
     let r = mix(r0, r1, t);
-    let fall = smoothstep(r, r * 0.12, dist);
+    let fall = smoothstep(r, r * 0.15, dist);
     if (fall < 0.001) {
         return vec2<f32>(0.0);
     }
     let dir = ab / sqrt(ab_len2);
     let perp = vec2<f32>(-dir.y, dir.x);
     let time = haze.params.x;
-    let n1 = noise(px * 0.065 + vec2<f32>(time * 1.5, -time * 2.6));
-    let n2 = noise(px * 0.028 + vec2<f32>(-time * 0.55, time * 0.4));
-    let amp = fall * strength * mix(1.0, 0.22, t) * 11.0 * (haze.params.z / 720.0);
-    return perp * (n1 - 0.5) * amp + dir * (n2 - 0.5) * amp * 0.28;
+    // Broad heat cells, plus a finer ripple, so the column reads as a volume.
+    let n1 = fbm(px * 0.014 + vec2<f32>(time * 0.45, -time * 0.70));
+    let n2 = noise(px * 0.032 + vec2<f32>(-time * 1.1, time * 0.55) + vec2<f32>(n1, 3.0));
+    let cell = (n1 - 0.5) * 0.70 + (n2 - 0.5) * 0.30;
+    let amp = fall * strength * mix(0.62, 1.0, n1) * mix(1.0, 0.45, t);
+    // A few pixels at the lip, softer up the column. Enough to bend an edge.
+    let scale = 16.0 * (haze.params.z / 720.0);
+    return perp * cell * amp * scale + dir * (n2 - 0.5) * amp * scale * 0.30;
 }
 
 @fragment
@@ -171,8 +186,18 @@ fn fs_haze(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     off = off + one_plume(haze.plumes[1].origin_s, haze.plumes[1].axis_len, haze.plumes[1].radii, px);
     off = off + one_plume(haze.plumes[2].origin_s, haze.plumes[2].axis_len, haze.plumes[2].radii, px);
     let mag = max(length(off), 0.0001);
-    let cap = 6.5 * (haze.params.z / 720.0);
+    // Cap the bend so the refraction stays a shimmer.
+    let cap = 7.5 * (haze.params.z / 720.0);
     off = off * min(cap / mag, 1.0);
-    let uv = clamp((px + off) / haze.params.yz, vec2<f32>(0.001), vec2<f32>(0.999));
-    return textureSample(scene_tex, scene_samp, uv);
+    let base = px / haze.params.yz;
+    let delta = off / haze.params.yz;
+    let edge = vec2<f32>(0.001);
+    let limit = vec2<f32>(0.999);
+    let uv_r = clamp(base + delta * 1.35, edge, limit);
+    let uv_g = clamp(base + delta, edge, limit);
+    let uv_b = clamp(base + delta * 0.62, edge, limit);
+    let sample_r = textureSample(scene_tex, scene_samp, uv_r);
+    let sample_g = textureSample(scene_tex, scene_samp, uv_g);
+    let sample_b = textureSample(scene_tex, scene_samp, uv_b);
+    return vec4<f32>(sample_r.r, sample_g.g, sample_b.b, sample_g.a);
 }

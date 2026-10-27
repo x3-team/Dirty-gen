@@ -1,8 +1,9 @@
-//! Thin exhaust smoke and the heat shimmer that rides with it.
+//! Volumetric exhaust smoke and the heat shimmer that rides with it.
 //!
 //! The body mesh is left alone. Each machine has a tailpipe point in body
 //! space, and [`Exhaust::hook_tailpipe`] is the only place smoke is born.
-//! Nothing here is fuel, flame, or a blast — the puff stays a cool gray.
+//! Wisps are soft gray-blue volumes that curl up off the lip. The heat is a
+//! refraction of the scene, not a flame and not a white streak.
 
 use glam::{Quat, Vec3};
 
@@ -52,6 +53,11 @@ struct Puff {
     pos: Vec3,
     vel: Vec3,
     side: Vec3,
+    /// Horizontal direction aft of the pipe. Keeps the volume behind the lip.
+    drift: Vec3,
+    /// World velocity of the pipe when the wisp was born, so the plume
+    /// stays with the machine instead of dropping a trail of dashes.
+    carry: Vec3,
     life: f32,
     max_life: f32,
     size: f32,
@@ -125,6 +131,8 @@ pub struct Exhaust {
     puffs: Vec<Puff>,
     plumes: [Plume; PLUMES],
     acc: [f32; PLUMES],
+    prev_outlet: [Vec3; PLUMES],
+    primed: [bool; PLUMES],
     rng: u32,
     time: f32,
 }
@@ -135,6 +143,8 @@ impl Exhaust {
             puffs: Vec::with_capacity(CAP),
             plumes: [Plume::quiet(); PLUMES],
             acc: [0.0; PLUMES],
+            prev_outlet: [Vec3::ZERO; PLUMES],
+            primed: [false; PLUMES],
             rng: 0xE4A1_5C37,
             time: 0.0,
         }
@@ -144,6 +154,8 @@ impl Exhaust {
         self.puffs.clear();
         self.plumes = [Plume::quiet(); PLUMES];
         self.acc = [0.0; PLUMES];
+        self.prev_outlet = [Vec3::ZERO; PLUMES];
+        self.primed = [false; PLUMES];
         self.time = 0.0;
     }
 
@@ -204,14 +216,17 @@ impl Exhaust {
                 continue;
             }
             let age = (1.0 - p.life / p.max_life).clamp(0.0, 1.0);
-            let curl = (self.time * 1.7 + p.seed * 19.0).sin();
-            let curl2 = (self.time * 3.1 + p.seed * 7.0).cos();
-            // The jet dies quickly. What is left climbs and curls, the way the
-            // reference wisps leave the lip instead of laying on the dirt.
-            p.vel += p.side * (curl * (0.2 + age * 0.55) + curl2 * 0.08) * dt;
-            p.vel += Vec3::Y * (0.55 + age * 0.35) * dt;
-            p.vel.x *= 1.0 - 1.6 * dt;
-            p.vel.z *= 1.0 - 1.6 * dt;
+            let phase = self.time * 1.35 + p.seed * 12.0;
+            let curl = phase.sin();
+            let curl2 = (phase * 1.6 + 1.2).cos();
+            // Stay with the pipe, then curl and climb off it.
+            let relax = 1.0 - (-2.4 * dt).exp();
+            p.vel.x += (p.carry.x - p.vel.x) * relax;
+            p.vel.z += (p.carry.z - p.vel.z) * relax;
+            p.vel += p.side * (curl * (0.30 + age * 0.55) + curl2 * 0.08) * dt;
+            p.vel += Vec3::Y * (0.42 + age * 0.28) * dt;
+            p.vel += p.drift * (0.28 + (1.0 - age) * 0.12) * dt;
+            p.vel.y *= 1.0 - 0.28 * dt;
             p.pos += p.vel * dt;
         }
     }
@@ -260,18 +275,26 @@ impl Exhaust {
         port: u8,
     ) {
         let bike = port == PORT_BIKE;
-        let length = if bike {
-            0.28 + throttle * 0.22
+        // Hot air leans out over the dirt and climbs with the wisps, so the
+        // refraction crosses the lip, the bumper edge, and the ground.
+        let raw = back * 1.05 + Vec3::Y * 0.58;
+        let axis = if raw.length_squared() < 1.0e-6 {
+            Vec3::Y
         } else {
-            0.36 + throttle * 0.28
+            raw.normalize()
         };
-        let radius0 = if bike { 0.035 } else { 0.05 };
+        let length = if bike {
+            0.40 + throttle * 0.20
+        } else {
+            0.58 + throttle * 0.30
+        };
+        let radius0 = if bike { 0.06 } else { 0.085 };
         self.plumes[slot] = Plume {
             origin: outlet,
-            axis: back,
+            axis,
             length,
             radius0,
-            radius1: radius0 + length * 0.28,
+            radius1: radius0 + length * 0.48,
             strength: (0.5 + throttle * 0.36 + rpm_n * 0.16).clamp(0.0, 1.0),
         };
     }
@@ -288,33 +311,61 @@ impl Exhaust {
         dt: f32,
     ) {
         let bike = port == PORT_BIKE;
-        let rate = if bike { 16.0 } else { 20.0 } + throttle * 6.0 + rpm_n * 4.0;
+        let rate = if bike { 13.0 } else { 16.0 } + throttle * 5.0 + rpm_n * 2.0;
         self.acc[slot] += dt.max(0.0) * rate;
+        let mut drift = Vec3::new(back.x, 0.0, back.z);
+        if drift.length_squared() < 1.0e-6 {
+            drift = Vec3::new(0.0, 0.0, -1.0);
+        } else {
+            drift = drift.normalize();
+        }
+        let carry = self.pipe_carry(slot, outlet, dt);
         let mut born = 0;
-        while self.acc[slot] >= 1.0 && born < 6 {
+        while self.acc[slot] >= 1.0 && born < 4 {
             self.acc[slot] -= 1.0;
             born += 1;
-            let kick = 0.12 + throttle * 0.16 + rpm_n * 0.08;
-            let vel = back * kick
-                + side * (self.rnd() - 0.5) * 0.04
-                + Vec3::Y * (0.16 + self.rnd() * 0.08);
-            let life = 0.42 + self.rnd() * 0.28;
+            let ring = self.rnd() * std::f32::consts::TAU;
+            let rad = 0.015 + self.rnd() * if bike { 0.03 } else { 0.045 };
+            let base = if bike { 0.085 } else { 0.12 };
+            let life = 0.85 + self.rnd() * 0.30;
             let puff = Puff {
                 pos: outlet
-                    + back * (0.03 + self.rnd() * 0.05)
-                    + side * (self.rnd() - 0.5) * 0.04
-                    + Vec3::Y * self.rnd() * 0.03,
-                vel,
+                    + back * (0.06 + self.rnd() * 0.08)
+                    + side * ring.cos() * rad
+                    + Vec3::Y * (0.05 + self.rnd() * 0.08),
+                vel: carry
+                    + back * (0.10 + throttle * 0.06 + self.rnd() * 0.04)
+                    + side * (self.rnd() - 0.5) * 0.08
+                    + Vec3::Y * (0.18 + self.rnd() * 0.14),
                 side,
+                drift,
+                carry,
                 life,
                 max_life: life,
-                size: if bike { 0.04 } else { 0.062 },
+                size: base * (0.82 + self.rnd() * 0.55),
                 seed: self.rnd(),
                 port,
                 alive: true,
             };
             self.insert(puff);
         }
+    }
+
+    fn pipe_carry(&mut self, slot: usize, outlet: Vec3, dt: f32) -> Vec3 {
+        let prev = self.prev_outlet[slot];
+        let primed = self.primed[slot];
+        self.prev_outlet[slot] = outlet;
+        self.primed[slot] = true;
+        if !primed || dt <= 1.0e-4 {
+            return Vec3::ZERO;
+        }
+        let mut v = (outlet - prev) / dt;
+        let speed = v.length();
+        if speed > 18.0 {
+            v *= 18.0 / speed;
+        }
+        v.y *= 0.25;
+        v
     }
 
     fn insert(&mut self, puff: Puff) {
@@ -354,13 +405,16 @@ fn basis(ori: Quat) -> (Vec3, Vec3) {
 
 fn shade(p: &Puff) -> (Vec3, f32, f32) {
     let age = (1.0 - p.life / p.max_life).clamp(0.0, 1.0);
-    // Cool gray. A redder channel would read as flame, which this pipe does not make.
-    let fresh = Vec3::new(0.58, 0.63, 0.68);
-    let pale = Vec3::new(0.84, 0.86, 0.85);
-    let color = fresh.lerp(pale, age.sqrt());
-    let thin = if p.port == PORT_BIKE { 0.85 } else { 1.0 };
-    let alpha = (0.12 + 0.22 * (1.0 - age).powf(1.05)) * thin;
-    let size = p.size * (1.0 + age * 1.15);
+    // Light gray-blue. Fresh gas is bluer; it stays pale as it thins, and it
+    // does not climb to white.
+    let cool = (p.seed - 0.5) * 0.04;
+    let fresh = Vec3::new(0.64, 0.71, 0.82 + cool);
+    let pale = Vec3::new(0.73, 0.79, 0.88);
+    let color = fresh.lerp(pale, age);
+    let thin = if p.port == PORT_BIKE { 0.88 } else { 1.0 };
+    // Low enough that a few overlapping wisps stay translucent.
+    let alpha = (0.18 + 0.10 * (1.0 - age)) * thin;
+    let size = p.size * (1.0 + age * 1.25);
     (color, alpha, size)
 }
 
@@ -398,15 +452,35 @@ mod tests {
         let mut smoke = Vec::new();
         world.exhaust.fill_smoke(&mut smoke);
         assert!(!smoke.is_empty());
+        let mut rise = 0.0f32;
+        let mut lateral = 0.0f32;
         for puff in &smoke {
             assert!(
                 puff.color.x <= puff.color.z + 0.04,
                 "smoke went hot: {:?}",
                 puff.color
             );
+            assert!(
+                puff.color.z > puff.color.x,
+                "smoke should stay gray-blue: {:?}",
+                puff.color
+            );
+            assert!(puff.color.x < 0.75, "smoke went white: {:?}", puff.color);
             assert!(puff.alpha < 0.4, "wisp is too thick");
+            assert!(puff.alpha > 0.05, "wisp faded out");
             assert!(puff.color.x > 0.45 && puff.color.y > 0.5);
+            assert!(puff.size > 0.08, "wisp is too small to read as a volume");
+            let rel = puff.pos - mid;
+            rise = rise.max(rel.y);
+            let along = rel.dot(aft);
+            lateral = lateral.max((rel - aft * along).length());
         }
+        assert!(rise > 0.08, "smoke should climb off the pipe, rose {rise}");
+        assert!(
+            lateral > 0.03,
+            "smoke should fill a volume, lateral {lateral}"
+        );
+        assert!(plumes[0].axis.y > 0.35, "heat column should rise");
     }
 
     #[test]
