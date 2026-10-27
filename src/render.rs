@@ -135,6 +135,9 @@ pub struct Renderer {
     pipe_blit_srgb: wgpu::RenderPipeline,
     lens: crate::lens_pass::LensPass,
     pub show_lens: bool,
+    /// Dust, debris, fuel, exhaust, dents, mud clods, and the cockpit.
+    /// The hero stills turn this off so those cards do not cover the cage.
+    pub show_effects: bool,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     minimap: crate::minimap::Minimap,
@@ -969,6 +972,7 @@ impl Renderer {
             pipe_blit_srgb,
             lens,
             show_lens: true,
+            show_effects: true,
             blit_shader,
             blit_layout,
             minimap,
@@ -1167,6 +1171,7 @@ impl Renderer {
                 .write_buffer(&self.fuel_v, 0, bytemuck::cast_slice(&fuel_verts));
         }
 
+        let show_effects = self.show_effects;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1208,14 +1213,18 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_pbr);
             self.draw_buggy(&mut pass);
             pass.set_pipeline(&self.pipe_shadow_mesh);
-            self.draw_body_damage(&mut pass, dent_count, loose_count);
+            if show_effects {
+                self.draw_body_damage(&mut pass, dent_count, loose_count);
+            }
             self.draw_bike(&mut pass, bike_susp_count);
-            if cam.cockpit {
+            if cam.cockpit && show_effects {
                 self.draw_cockpit(&mut pass);
             }
             pass.set_pipeline(&self.pipe_shadow_mesh);
-            self.draw_chunks(&mut pass, chunk_count);
-            self.draw_debris(&mut pass, debris_count);
+            if show_effects {
+                self.draw_chunks(&mut pass, chunk_count);
+                self.draw_debris(&mut pass, debris_count);
+            }
         }
 
         {
@@ -1256,44 +1265,50 @@ impl Renderer {
             pass.set_bind_group(3, &self.pbr_bg, &[]);
             self.draw_buggy(&mut pass);
             pass.set_pipeline(&self.pipe_mesh);
-            self.draw_body_damage(&mut pass, dent_count, loose_count);
+            if show_effects {
+                self.draw_body_damage(&mut pass, dent_count, loose_count);
+            }
             self.draw_bike(&mut pass, bike_susp_count);
-            if cam.cockpit {
+            if cam.cockpit && show_effects {
                 self.draw_cockpit(&mut pass);
             }
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
-            pass.set_pipeline(&self.pipe_mesh);
-            self.draw_chunks(&mut pass, chunk_count);
-            if dust_count > 0 {
-                pass.set_pipeline(&self.pipe_dust);
-                pass.set_vertex_buffer(0, self.particles.slice(..));
-                pass.draw(0..dust_count, 0..1);
-            }
-            self.draw_debris(&mut pass, debris_count);
-            if fuel_count > 0 {
-                pass.set_pipeline(&self.pipe_fuel);
-                pass.set_bind_group(0, &self.frame_bg, &[]);
-                pass.set_vertex_buffer(0, self.fuel_v.slice(..));
-                pass.draw(0..fuel_count, 0..1);
+            if show_effects {
+                pass.set_pipeline(&self.pipe_mesh);
+                self.draw_chunks(&mut pass, chunk_count);
+                if dust_count > 0 {
+                    pass.set_pipeline(&self.pipe_dust);
+                    pass.set_vertex_buffer(0, self.particles.slice(..));
+                    pass.draw(0..dust_count, 0..1);
+                }
+                self.draw_debris(&mut pass, debris_count);
+                if fuel_count > 0 {
+                    pass.set_pipeline(&self.pipe_fuel);
+                    pass.set_bind_group(0, &self.frame_bg, &[]);
+                    pass.set_vertex_buffer(0, self.fuel_v.slice(..));
+                    pass.draw(0..fuel_count, 0..1);
+                }
             }
         }
 
-        self.exhaust_fx.draw(
-            &mut encoder,
-            &self.queue,
-            &self.color,
-            &self.color_view,
-            &self.depth_view,
-            &world.exhaust,
-            view_proj,
-            cam.eye,
-            cam.target,
-            self.width,
-            self.height,
-        );
+        if show_effects {
+            self.exhaust_fx.draw(
+                &mut encoder,
+                &self.queue,
+                &self.color,
+                &self.color_view,
+                &self.depth_view,
+                &world.exhaust,
+                view_proj,
+                cam.eye,
+                cam.target,
+                self.width,
+                self.height,
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("lens"),

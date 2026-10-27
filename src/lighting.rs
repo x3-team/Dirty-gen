@@ -1,9 +1,9 @@
-//! Photographic overcast for the wet oval.
+//! Shared overcast for the wet oval and the glTF buggy.
 //!
-//! The Kling stills are a soft gray sky, mist sitting on the ground, and
-//! bright streaks where water fills a rut or a puddle. The soil stays dark.
-//! This module owns those colors and splices `sky_light.wgsl` over the sunny
-//! grade. The glTF buggy uses the same `shade`, sky, and ground fog.
+//! Soft sky, a thin mist on the far ground, and the sky mirrored in a rut.
+//! The soil stays darker than the air. Paint keeps its hue: a mix toward luma
+//! turned the orange cage tan. This module splices `sky_light.wgsl` over the
+//! sunny grade. The buggy uses the same `shade`, sky, and ground fog.
 
 use glam::Vec3;
 
@@ -19,12 +19,13 @@ pub fn overcast() -> SkyLight {
     SkyLight {
         // High and diffuse. Streaks are the sky in the water, not a hard sun.
         sun: Vec3::new(0.22, 0.95, 0.18).normalize(),
-        sun_color: [0.26, 0.28, 0.31, 1.0],
+        // Warm enough that orange paint survives. The sky itself stays gray.
+        sun_color: [0.62, 0.50, 0.36, 1.0],
         // Soft overcast: a light zenith, and a brighter horizon the mist takes.
-        sky_zenith: [0.58, 0.62, 0.68, 1.0],
+        sky_zenith: [0.62, 0.66, 0.74, 1.0],
         sky_horizon: [0.88, 0.90, 0.93, 1.0],
         // Under the sky, so the soil can stay darker than the air.
-        ambient: [0.12, 0.13, 0.15, 1.0],
+        ambient: [0.20, 0.19, 0.17, 1.0],
     }
 }
 
@@ -65,17 +66,17 @@ pub fn apply(mut src: String) -> String {
     let drowned = smoothstep(0.012, 0.05, water);
     let rough_out = mix(0.96, 0.90, drowned);
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
-    // Water in the tyre cut mirrors the bright sky as one ribbon.
-    // A per-cell lobe turned that ribbon into speckles.
-    let in_rut = smoothstep(0.012, 0.030, cut) * smoothstep(0.35, 0.80, wet) * (1.0 - drowned);
-    let axis = streak_axis(xz);
-    let along = vec2<f32>(-axis.y, axis.x);
-    // Bright along the cut, with grain so the highlight is not a flat white decal.
-    let grain = noise(vec2<f32>(dot(xz, along) * 1.3, dot(xz, axis) * 0.35));
-    let spark = smoothstep(0.80, 0.96, noise(xz * 4.5));
-    let shine = frame.sky_horizon.rgb * (0.58 + 0.28 * grain + spark * 0.35);
-    let shore_glint = shore * (1.0 - drowned);
-    lit = mix(lit, shine, clamp(in_rut * 0.86 + shore_glint * 0.25, 0.0, 1.0));
+    // The tyre cut mirrors the sky. A wall of the groove faces the bank, and a
+    // raw mirror of that wall is mud, so the wet floor takes the sky.
+    // Most of the tyre cut sits around wetness 0.2. A gate at 0.6 left that groove black.
+    let in_rut = smoothstep(0.003, 0.008, cut) * smoothstep(0.10, 0.18, wet);
+    let view = normalize(frame.cam_pos.xyz - in.world);
+    let n_up = normalize(mix(n, vec3<f32>(0.0, 1.0, 0.0), 0.78));
+    let sky_hit = reflected_sky(reflect(-view, n_up));
+    let ribbon = water_ribbon(xz);
+    lit = mix(lit, sky_hit, clamp(in_rut * (0.74 + 0.16 * ribbon), 0.0, 0.90));
+    let shore_glint = shore * (1.0 - drowned) * 0.35;
+    lit = mix(lit, sky_hit, shore_glint);
 "#,
     );
     src = patch_all(
@@ -84,22 +85,36 @@ pub fn apply(mut src: String) -> String {
         "return present(ground_fog(lit, in.world));",
         2,
     );
-    // The puddle sheet. Specular is the shared sky, in a few broad ribbons.
+    // The puddle sheet. A tyre cut keeps a sky film; opening that film showed
+    // the black groove underneath instead of the reflection.
     src = patch(
         &src,
         "    var col = puddle_color(in.world, nrm, depth_t, absorption);\n    \
          let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);\n    \
-         col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);\n",
+         col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);\n    \
+         let shore = smoothstep(0.002, 0.07, in.depth);\n    \
+         // Only a cut of a couple of centimetres thins the film, and only on that cut.\n    \
+         // The rest of the pond stays a dark cover, shore and middle alike.\n    \
+         let dug = max(-stamp_bilinear(in.world.xz), 0.0);\n    \
+         let reveal = smoothstep(0.016, 0.034, dug);\n    \
+         let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));\n    \
+         let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal);\n",
         "    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);\n    \
          let fres = pow(1.0 - ndotv, 2.0);\n    \
          let skin = 1.0 - depth_t * 0.62;\n    \
          let body = reflected_sky(reflect(-view, nrm));\n    \
-         let reflect_amt = mix(0.42, 0.72, fres) * mix(0.40, 0.85, skin);\n    \
+         let dug = max(-stamp_bilinear(in.world.xz), 0.0);\n    \
+         let in_rut = smoothstep(0.008, 0.022, dug);\n    \
+         let reflect_amt = mix(mix(0.48, 0.78, fres) * mix(0.45, 0.88, skin), 0.97, in_rut);\n    \
          var col = mix(absorption, body, reflect_amt);\n    \
          let ribbon = water_ribbon(in.world.xz);\n    \
          let wrap = clamp(dot(nrm, sun) * 0.15 + 0.85, 0.0, 1.0);\n    \
          col = col * wrap;\n    \
-         col = mix(col, silver(), ribbon * skin * 0.72);\n",
+         col = mix(col, silver(), max(ribbon * skin * 0.62, in_rut * 0.90));\n    \
+         let shore = smoothstep(0.002, 0.07, in.depth);\n    \
+         let reveal = smoothstep(0.016, 0.034, dug);\n    \
+         let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));\n    \
+         let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal * (1.0 - in_rut));\n",
     );
     src = patch(
         &src,
@@ -180,9 +195,13 @@ mod tests {
         assert_eq!(src.matches("fn streak_axis(").count(), 1);
         assert!(src.contains("ground_fog(lit, in.world)"));
         assert!(src.contains("exp(-above * 2.2)"));
-        assert!(src.contains("smoothstep(18.0, 40.0, dist)"));
-        assert!(src.contains("let in_rut = smoothstep(0.012, 0.030, cut)"));
-        assert!(src.contains("mix(c, vec3<f32>(luma), 0.22)"));
+        assert!(src.contains("smoothstep(26.0, 52.0, dist)"));
+        assert!(src.contains("let in_rut = smoothstep(0.003, 0.008, cut)"));
+        assert!(src.contains("let in_rut = smoothstep(0.008, 0.022, dug)"));
+        assert!(src.contains("reflected_sky(reflect(-view, n_up))"));
+        assert!(src.contains("in_rut * 0.90"));
+        assert!(src.contains("mix(vec3<f32>(luma), col, 1.45)"));
+        assert!(!src.contains("mix(c, vec3<f32>(luma), 0.22)"));
         assert!(!src.contains("pow(d, 900.0)"));
         assert!(!src.contains("0.22, 0.095, 0.032"));
         assert!(!src.contains("vec3<f32>(0.10, 0.042, 0.015)"));

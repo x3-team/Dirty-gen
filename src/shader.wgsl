@@ -947,9 +947,9 @@ fn fs_pbr(in: PbrOut) -> @location(0) vec4<f32> {
         n = normalize(n + t * ts.x * 0.55 + b * ts.y * 0.55);
     }
     let clean = (1.0 - mask) * (1.0 - metal);
-    // Shared shade is dark and cool so the soil stays down. Clean paint is
-    // lifted here so the orange tubes stay orange. Mud is left alone.
-    albedo = mix(albedo, albedo * vec3<f32>(2.05, 1.55, 1.15), clean);
+    // Authored orange is (0.86, 0.28, 0.05). Push red and hold blue so the
+    // shared grade does not turn the cage tan. Mud and metal skip this.
+    albedo = mix(albedo, albedo * vec3<f32>(1.55, 1.05, 0.72), clean);
     let emit = vec3<f32>(in.mat.w) * albedo * 0.15;
     let rough_out = clamp(mix(rough, 0.42, metal * 0.25), 0.05, 1.0);
     let diff = mix(albedo, albedo * 0.35, metal);

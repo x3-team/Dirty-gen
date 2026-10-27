@@ -659,6 +659,9 @@ fn light_stills() {
         formats,
     );
     renderer.show_lens = false;
+    // The still is the cage and the wet ground. Dust, exhaust, fuel, dents,
+    // debris, mud clods, and the cockpit stay in the playable demo.
+    renderer.show_effects = false;
     let mut world = World::demo();
     let dt = 1.0 / 60.0;
     for _ in 0..(3.4 * 60.0) as u32 {
@@ -670,20 +673,16 @@ fn light_stills() {
     let parked = world.bike.pos;
     world.bike.pos = Vec3::new(80.0, 0.0, 80.0);
     let pos = world.vehicle.pos;
-    let yaw = world.vehicle.yaw;
-    let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
-    let right = Vec3::new(forward.z, 0.0, -forward.x);
-    let sun = Vec3::new(0.22, 0.95, 0.18).normalize();
-    let sun_side = if right.dot(sun) >= 0.0 { right } else { -right };
-    let target = pos + Vec3::Y * 0.55 + forward * 0.15;
-    let eye = target + sun_side * 3.4 + Vec3::Y * 0.85 - forward * 0.35;
+    // Same oblique as the oval, pulled in so the cage and the ruts under it fill the frame.
+    let target = pos + Vec3::Y * 0.42;
+    let eye = pos + Vec3::new(-4.6, 2.9, -4.1);
     let side = lift_camera(
         &world,
         CameraPose {
             eye,
             target,
             ortho_width: None,
-            fov_deg: Some(38.0),
+            fov_deg: Some(36.0),
             near: Some(0.08),
             cockpit: false,
         },
