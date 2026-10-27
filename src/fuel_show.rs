@@ -110,6 +110,9 @@ pub struct FuelShow {
     blast_at: Vec3,
     pool_r: [f32; 6],
     seep: f32,
+    /// Seconds since the show was created. Ripple displacement uses the same
+    /// clock the frame uniform feeds the shader.
+    clock: f32,
     acc_ripple: f32,
     acc_bead: f32,
     acc_puff: f32,
@@ -141,6 +144,7 @@ impl FuelShow {
             blast_at: Vec3::ZERO,
             pool_r: [0.8; 6],
             seep: 0.0,
+            clock: 0.0,
             acc_ripple: 0.0,
             acc_bead: 0.0,
             acc_puff: 0.0,
@@ -183,6 +187,7 @@ impl FuelShow {
             return;
         }
         let dt = dt.min(1.0 / 20.0);
+        self.clock += dt;
         if self.phase == Phase::Idle && self.armed(vehicle, impact_time) {
             self.begin(vehicle);
         }
@@ -234,7 +239,8 @@ impl FuelShow {
         self.side = flat_norm(vehicle.orientation() * Vec3::X);
         // Mostly off to the shoulder, so the sheet is not hidden in the rut.
         self.flow = flat_norm(
-            self.side + Vec3::new(back.x, 0.0, back.z) * 0.45
+            self.side
+                + Vec3::new(back.x, 0.0, back.z) * 0.45
                 + Vec3::new(self.rnd() - 0.5, 0.0, self.rnd() - 0.5) * 0.35,
         );
         for i in 0..self.pool_r.len() {
@@ -248,13 +254,7 @@ impl FuelShow {
         (self.rng >> 8) as f32 / 16_777_216.0
     }
 
-    fn pour(
-        &mut self,
-        dt: f32,
-        vehicle: &Vehicle,
-        soil: &SoilField,
-        particles: &mut Particles,
-    ) {
+    fn pour(&mut self, dt: f32, vehicle: &Vehicle, soil: &SoilField, particles: &mut Particles) {
         self.phase_t += dt;
         self.leak = leak_of(vehicle);
         let mouth = self.leak + self.side * 3.4;
@@ -490,7 +490,7 @@ impl FuelShow {
 
     fn puff_over_flame(&mut self, dt: f32) {
         self.acc_puff += dt;
-        if self.acc_puff < 0.12 {
+        if self.acc_puff < 0.13 {
             return;
         }
         self.acc_puff = 0.0;
@@ -505,45 +505,21 @@ impl FuelShow {
             return;
         }
         let pick = hot[(self.rnd() * hot.len() as f32) as usize % hot.len()];
-        let lift = 1.7 + self.rnd() * 0.6;
+        // Wisps above the tips. Cards that cross the soil turn into a depth grid.
+        let lift = 0.95 + self.rnd() * 0.35;
         let pos = self.nodes[pick].pos + Vec3::Y * lift;
-        let rise = 1.3 + self.rnd() * 0.9;
-        let size = 1.15 + self.rnd() * 0.55;
-        self.push_puff(pos, Vec3::new(0.35, rise, 0.15), 1.7, size, 0.08);
+        let rise = 0.4 + self.rnd() * 0.2;
+        let drift = self.rnd() * 0.2 - 0.1;
+        let size = 0.22 + self.rnd() * 0.12;
+        self.push_puff(pos, Vec3::new(drift, rise, drift * 0.2), 1.2, size, 0.0);
     }
 
     fn spawn_blast(&mut self) {
-        let origin = self.blast_at + Vec3::Y * 0.35;
-        for i in 0..12 {
-            let ang = i as f32 / 12.0 * std::f32::consts::TAU;
-            let rise = 1.8 + self.rnd() * 2.0;
-            let out = 0.5 + self.rnd() * 1.2;
-            let life = 1.35 + self.rnd() * 0.35;
-            let size = 1.55 + self.rnd() * 0.75;
-            self.push_puff(
-                origin + Vec3::new(ang.cos(), 1.1, ang.sin()) * 0.85,
-                Vec3::new(ang.cos() * out, rise, ang.sin() * out),
-                life,
-                size,
-                0.62,
-            );
-        }
-        for _ in 0..32 {
-            let ang = self.rnd() * std::f32::consts::TAU;
-            let sp = 3.5 + self.rnd() * 7.5;
-            let up = 2.2 + self.rnd() * 5.5;
-            let life = 0.26 + self.rnd() * 0.22;
-            self.streaks.push(Streak {
-                pos: origin,
-                vel: Vec3::new(ang.cos() * sp, up, ang.sin() * sp),
-                life,
-                max_life: 0.48,
-            });
-        }
+        // The visible blast is the ground ring. Extra cards here z-fight into a grid.
     }
 
     fn push_puff(&mut self, pos: Vec3, vel: Vec3, life: f32, size: f32, dark: f32) {
-        if self.puffs.len() >= 36 {
+        if self.puffs.len() >= 16 {
             return;
         }
         self.puffs.push(Puff {
@@ -712,8 +688,7 @@ pub fn vertices(show: &FuelShow, cam: Vec3, soil: &SoilField) -> Vec<FuelVert> {
         write_stream(&mut out, show, cam, fade);
     }
     write_beads(&mut out, show, cam);
-    write_reflections(&mut out, show, fade);
-    write_flames(&mut out, show, fade);
+    write_flames(&mut out, show, cam, fade);
     if show.phase == Phase::Spark {
         let (right, up) = cam_axes(cam, show.spark_pos);
         push_card(
@@ -724,9 +699,9 @@ pub fn vertices(show: &FuelShow, cam: Vec3, soil: &SoilField) -> Vec<FuelVert> {
             rgba(7, [1.0, 0.96, 0.75], 0.95),
         );
     }
-    write_blast(&mut out, show, cam);
-    write_streaks(&mut out, show);
     write_smoke(&mut out, show, cam);
+    write_blast(&mut out, show, cam, soil);
+    write_streaks(&mut out, show);
     if out.len() > 6000 {
         out.truncate(6000);
     }
@@ -737,61 +712,104 @@ fn write_pool(out: &mut Vec<FuelVert>, show: &FuelShow, soil: &SoilField, fade: 
     if show.nodes.len() < 2 {
         return;
     }
+    let cols = 4;
+    let rows = 3;
     for i in 0..show.nodes.len() - 1 {
         let a = &show.nodes[i];
         let b = &show.nodes[i + 1];
         let tangent = flat_norm(b.pos - a.pos);
         let right = Vec3::new(-tangent.z, 0.0, tangent.x);
-        let quad = [
-            on_sheet(soil, a.pos + right * a.half_l),
-            on_sheet(soil, a.pos - right * a.half_r),
-            on_sheet(soil, b.pos - right * b.half_r),
-            on_sheet(soil, b.pos + right * b.half_l),
-        ];
-        let ca = liquid_rgba(a.heat, 0.94 * fade);
-        let cb = liquid_rgba(b.heat, 0.94 * fade);
-        push_quad_c(
-            out,
-            quad,
-            [ca, ca, cb, cb],
-            [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-        );
+        let ca = liquid_rgba(a.heat, 0.96 * fade);
+        let cb = liquid_rgba(b.heat, 0.96 * fade);
+        for row in 0..rows {
+            let t0 = row as f32 / rows as f32;
+            let t1 = (row + 1) as f32 / rows as f32;
+            for col in 0..cols {
+                let s0 = col as f32 / cols as f32;
+                let s1 = (col + 1) as f32 / cols as f32;
+                let p = |t: f32, s: f32| -> Vec3 { sheet_point(show, soil, a, b, right, t, s) };
+                let c0 = lerp_rgba(ca, cb, t0);
+                let c1 = lerp_rgba(ca, cb, t1);
+                push_quad_c(
+                    out,
+                    [p(t0, s0), p(t0, s1), p(t1, s1), p(t1, s0)],
+                    [c0, c0, c1, c1],
+                    [[t0, s0], [t0, s1], [t1, s1], [t1, s0]],
+                );
+            }
+        }
     }
 }
 
 fn write_fan(out: &mut Vec<FuelVert>, show: &FuelShow, soil: &SoilField, fade: f32) {
     let heat = show.heat_at(show.hit);
-    let color = liquid_rgba(heat, 0.94 * fade);
+    let color = liquid_rgba(heat, 0.96 * fade);
     let grow = if show.phase == Phase::Pour {
         (0.4 + show.phase_t / 0.45).clamp(0.4, 1.0)
     } else {
         1.0
     };
-    let center = on_sheet(soil, show.hit);
-    let n = show.pool_r.len();
-    for i in 0..n {
-        let a0 = i as f32 / n as f32 * std::f32::consts::TAU;
-        let a1 = (i + 1) as f32 / n as f32 * std::f32::consts::TAU;
-        let r0 = show.pool_r[i] * grow;
-        let r1 = show.pool_r[(i + 1) % n] * grow;
-        let p0 = on_sheet(soil, center + Vec3::new(a0.cos() * r0, 0.0, a0.sin() * r0));
-        let p1 = on_sheet(soil, center + Vec3::new(a1.cos() * r1, 0.0, a1.sin() * r1));
-        push_tri(
-            out,
-            [center, p0, p1],
-            color,
-            [[0.5, 0.5], [0.0, 0.0], [1.0, 0.0]],
-        );
+    let mut center = on_sheet(soil, show.hit);
+    center.y += liquid_lift(center, show.hit, show.clock) + 0.02;
+    let segs = 16;
+    let rings = 4;
+    for ring in 0..rings {
+        let u0 = ring as f32 / rings as f32;
+        let u1 = (ring + 1) as f32 / rings as f32;
+        for i in 0..segs {
+            let a0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+            let at = |ang: f32, u: f32| -> Vec3 {
+                let r = pool_radius(show, ang) * grow * u;
+                let mut p = on_sheet(
+                    soil,
+                    Vec3::new(center.x + ang.cos() * r, 0.0, center.z + ang.sin() * r),
+                );
+                p.y += liquid_lift(p, show.hit, show.clock) + (1.0 - u) * 0.02;
+                p
+            };
+            let p2 = at(a1, u1);
+            let p3 = at(a0, u1);
+            // uv.y is 0.5 on the crown and 0 on the rim, so the shader cuts the lip.
+            let y0 = 0.5 * (1.0 - u0);
+            let y1 = 0.5 * (1.0 - u1);
+            if ring == 0 {
+                push_tri(
+                    out,
+                    [center, p2, p3],
+                    color,
+                    [
+                        [0.5, 0.5],
+                        [a1 / std::f32::consts::TAU, y1],
+                        [a0 / std::f32::consts::TAU, y1],
+                    ],
+                );
+            } else {
+                let p0 = at(a0, u0);
+                let p1 = at(a1, u0);
+                push_quad(
+                    out,
+                    [p0, p1, p2, p3],
+                    color,
+                    [
+                        [a0 / std::f32::consts::TAU, y0],
+                        [a1 / std::f32::consts::TAU, y0],
+                        [a1 / std::f32::consts::TAU, y1],
+                        [a0 / std::f32::consts::TAU, y1],
+                    ],
+                );
+            }
+        }
     }
 }
 
 fn write_ripples(out: &mut Vec<FuelVert>, show: &FuelShow, soil: &SoilField) {
     for ripple in &show.ripples {
-        let alpha = (ripple.life / ripple.max_life).clamp(0.0, 1.0) * 0.55;
-        let color = rgba(2, [0.8, 0.86, 0.92], alpha);
-        let segs = 10;
-        let inner = (ripple.radius - 0.07).max(0.05);
-        let outer = ripple.radius + 0.06;
+        let alpha = (ripple.life / ripple.max_life).clamp(0.0, 1.0) * 0.22;
+        let color = rgba(2, [0.48, 0.54, 0.6], alpha);
+        let segs = 48;
+        let inner = (ripple.radius - 0.12).max(0.06);
+        let outer = ripple.radius + 0.12;
         for i in 0..segs {
             let a0 = i as f32 / segs as f32 * std::f32::consts::TAU;
             let a1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
@@ -817,14 +835,10 @@ fn write_ripples(out: &mut Vec<FuelVert>, show: &FuelShow, soil: &SoilField) {
 
 fn write_stream(out: &mut Vec<FuelVert>, show: &FuelShow, cam: Vec3, fade: f32) {
     let top = show.stream_top();
-    let bot = show.hit + Vec3::Y * 0.07;
+    let bot = show.hit + Vec3::Y * 0.16;
     let right = sheet_right((bot - top).normalize_or_zero(), cam, top);
     let color = rgba(1, [0.02, 0.01, 0.008], 0.9 * fade);
-    let threads = [
-        (0.0, 0.08, 0.28),
-        (-0.12, 0.04, 0.12),
-        (0.11, 0.035, 0.1),
-    ];
+    let threads = [(0.0, 0.1, 0.34), (-0.15, 0.035, 0.11), (0.14, 0.03, 0.09)];
     for (off, w0, w1) in threads {
         push_stream(out, cam, top + right * off, bot, w0, w1, color);
     }
@@ -837,40 +851,14 @@ fn write_beads(out: &mut Vec<FuelVert>, show: &FuelShow, cam: Vec3) {
         push_card(
             out,
             bead.pos,
-            right * 0.055,
-            up * 0.07,
+            right * 0.07,
+            up * 0.09,
             rgba(3, [0.02, 0.014, 0.01], 0.9 * a),
         );
     }
 }
 
-fn write_reflections(out: &mut Vec<FuelVert>, show: &FuelShow, fade: f32) {
-    let len = show.nodes.len();
-    for (i, node) in show.nodes.iter().enumerate() {
-        if node.heat < 0.34 || node.liquid < 0.18 {
-            continue;
-        }
-        let tangent = if i + 1 < len {
-            flat_norm(show.nodes[i + 1].pos - node.pos)
-        } else if i > 0 {
-            flat_norm(node.pos - show.nodes[i - 1].pos)
-        } else {
-            Vec3::Z
-        };
-        let right = Vec3::new(-tangent.z, 0.0, tangent.x);
-        let span = node.half_l + node.half_r;
-        let color = rgba(5, [0.95, 0.32, 0.04], 0.5 * node.heat * fade);
-        push_card(
-            out,
-            node.pos + Vec3::Y * 0.03,
-            right * span * 0.42,
-            tangent * span * 0.32,
-            color,
-        );
-    }
-}
-
-fn write_flames(out: &mut Vec<FuelVert>, show: &FuelShow, fade: f32) {
+fn write_flames(out: &mut Vec<FuelVert>, show: &FuelShow, cam: Vec3, fade: f32) {
     let len = show.nodes.len();
     for (i, node) in show.nodes.iter().enumerate() {
         if node.heat < 0.48 || node.liquid < 0.18 {
@@ -883,23 +871,28 @@ fn write_flames(out: &mut Vec<FuelVert>, show: &FuelShow, fade: f32) {
         } else {
             Vec3::Z
         };
-        let span = (node.half_l + node.half_r).clamp(0.55, 1.45);
-        // Low tongues on the wet patch, not a torch above the roll cage.
-        let height = 0.32 + node.heat * 0.75 * node.liquid;
-        let alpha = (0.55 + 0.4 * node.heat) * fade;
-        let color = rgba(4, [1.0, 0.7, 0.2], alpha);
-        for k in 0..3 {
-            let along = tangent * ((k as f32 - 1.0) * 0.16);
-            let ang = i as f32 * 0.4 + k as f32 * 1.05;
-            let across = Vec3::new(ang.cos(), 0.0, ang.sin()) * span * 0.22;
-            push_card(
-                out,
-                node.pos + along + Vec3::Y * 0.02,
-                across,
-                Vec3::Y * height,
-                color,
-            );
+        // Stay on this node. The burn test rejects verts on the cold or dry neighbours.
+        let height = 0.42 + node.heat * 0.48 * node.liquid;
+        let alpha = (0.86 + 0.1 * node.heat) * fade;
+        let color = rgba(4, [1.0, 0.36, 0.03], alpha);
+        let base = node.pos + Vec3::Y * 0.14;
+        let (cam_right, _) = cam_axes(cam, base);
+        let mut face = Vec3::new(cam_right.x, 0.0, cam_right.z);
+        if face.length_squared() < 1.0e-6 {
+            face = Vec3::X;
         }
+        face = face.normalize();
+        let to = (cam - base).normalize_or_zero();
+        let lean = Vec3::new(to.x, 0.0, to.z) * (height * 0.08);
+        // Width stays on this node so the flame does not reach a cold or dry neighbour.
+        push_card(out, base, face * 0.2, Vec3::Y * height + lean, color);
+        push_card(
+            out,
+            base + tangent * 0.06,
+            face * 0.14,
+            Vec3::Y * height * 0.7 + lean,
+            color,
+        );
     }
 }
 
@@ -907,45 +900,66 @@ fn write_smoke(out: &mut Vec<FuelVert>, show: &FuelShow, cam: Vec3) {
     for puff in &show.puffs {
         let (right, up) = cam_axes(cam, puff.pos);
         let life = (puff.life / puff.max_life).clamp(0.0, 1.0);
-        let gray = 1.0 - puff.dark;
-        let rgb = [
-            0.045 + 0.58 * gray,
-            0.045 + 0.60 * gray,
-            0.05 + 0.62 * gray,
-        ];
-        let alpha = life * (0.42 + 0.22 * puff.dark);
+        let rgb = [0.55, 0.56, 0.57];
+        let alpha = life * 0.4;
+        let to_cam = (cam - puff.pos).normalize_or_zero();
+        let pos = puff.pos + Vec3::Y * 0.2 + to_cam * 0.55;
         push_card(
             out,
-            puff.pos,
+            pos,
             right * puff.size,
-            up * puff.size * 0.85,
+            up * puff.size * 0.75,
             rgba(6, rgb, alpha),
         );
     }
 }
 
-fn write_blast(out: &mut Vec<FuelVert>, show: &FuelShow, cam: Vec3) {
+fn write_blast(out: &mut Vec<FuelVert>, show: &FuelShow, cam: Vec3, soil: &SoilField) {
     let (rad, alpha) = show.blast_visual();
     if alpha < 0.03 || rad < 0.05 {
         return;
     }
-    let origin = show.blast_at;
-    let color = rgba(8, [1.0, 0.86, 0.45], alpha);
-    for i in 0..4 {
-        let ang = i as f32 * 0.85;
-        let across = Vec3::new(ang.cos(), 0.0, ang.sin()) * rad;
-        push_card(out, origin, across, Vec3::Y * rad * 1.1, color);
+    let origin = on_sheet(soil, show.blast_at);
+    let segs = 40;
+    let band = (0.22 + rad * 0.07).min(0.55);
+    let dust = rgba(8, [0.55, 0.46, 0.36], alpha * 0.7);
+    for i in 0..segs {
+        let a0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+        let wobble = |ang: f32| 0.86 + 0.14 * (ang * 3.0).sin().abs();
+        let d0 = Vec3::new(a0.cos(), 0.0, a0.sin());
+        let d1 = Vec3::new(a1.cos(), 0.0, a1.sin());
+        let p = |dir: Vec3, r: f32, ang: f32| {
+            let mut q = on_sheet(soil, origin + dir * r * wobble(ang));
+            q.y += 0.05;
+            q
+        };
+        let outer0 = rad;
+        let inner0 = (rad - band).max(0.08);
+        push_quad(
+            out,
+            [
+                p(d0, inner0, a0),
+                p(d0, outer0, a0),
+                p(d1, outer0, a1),
+                p(d1, inner0, a1),
+            ],
+            dust,
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+        );
     }
-    let mid = origin + Vec3::Y * rad * 0.4;
-    let (right, up) = cam_axes(cam, mid);
-    push_card(out, mid, right * rad, up * rad * 0.8, color);
-    push_card(
-        out,
-        origin + Vec3::Y * 0.08,
-        Vec3::X * rad * 1.15,
-        Vec3::Z * rad * 1.15,
-        rgba(5, [0.98, 0.36, 0.05], alpha * 0.7),
-    );
+    // A short hot pop at the center, gone once the ring has left the patch.
+    if rad < 1.7 {
+        let f = ((1.7 - rad) / 1.3).clamp(0.0, 1.0) * alpha;
+        let (right, up) = cam_axes(cam, origin + Vec3::Y * 0.25);
+        push_card(
+            out,
+            origin + Vec3::Y * 0.12,
+            right * 0.42,
+            up * 0.38,
+            rgba(7, [1.0, 0.9, 0.62], f),
+        );
+    }
 }
 
 fn write_streaks(out: &mut Vec<FuelVert>, show: &FuelShow) {
@@ -998,6 +1012,59 @@ fn push_stream(
     }
 }
 
+fn sheet_point(
+    show: &FuelShow,
+    soil: &SoilField,
+    a: &Node,
+    b: &Node,
+    right: Vec3,
+    t: f32,
+    s: f32,
+) -> Vec3 {
+    let half_l = a.half_l + (b.half_l - a.half_l) * t;
+    let half_r = a.half_r + (b.half_r - a.half_r) * t;
+    let center = a.pos.lerp(b.pos, t);
+    let bow = 1.0 + 0.1 * (t * std::f32::consts::PI).sin();
+    let wob = 0.9 + 0.1 * ((center.x * 1.7 + center.z * 2.3).sin() * 0.5 + 0.5);
+    let side = (-half_r + (half_l + half_r) * s) * bow * wob;
+    let mut q = on_sheet(soil, center + right * side);
+    let across = (s - 0.5).abs() * 2.0;
+    q.y += liquid_lift(q, show.hit, show.clock);
+    q.y += (1.0 - across) * 0.016;
+    if across > 0.82 {
+        q.y += 0.012;
+    }
+    q
+}
+
+fn liquid_lift(p: Vec3, origin: Vec3, t: f32) -> f32 {
+    let dx = p.x - origin.x;
+    let dz = p.z - origin.z;
+    let d = (dx * dx + dz * dz).sqrt();
+    let ring = (d * 7.4 - t * 3.5).sin() * (-d * 0.42).exp();
+    let chop = (p.x * 2.4 + p.z * 1.3 + t * 1.7).sin();
+    (0.006 + ring * 0.02 + chop * 0.005).max(0.0)
+}
+
+fn pool_radius(show: &FuelShow, ang: f32) -> f32 {
+    let n = show.pool_r.len() as f32;
+    let x = ang / std::f32::consts::TAU * n;
+    let i0 = x.floor() as usize % show.pool_r.len();
+    let i1 = (i0 + 1) % show.pool_r.len();
+    let f = x.fract();
+    let s = f * f * (3.0 - 2.0 * f);
+    show.pool_r[i0] + (show.pool_r[i1] - show.pool_r[i0]) * s
+}
+
+fn lerp_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
 fn leak_of(vehicle: &Vehicle) -> Vec3 {
     // A point on the rear body. The stream starts here. There is no tank mesh.
     vehicle.pos + vehicle.orientation() * Vec3::new(0.12, 0.2, -1.02)
@@ -1009,7 +1076,8 @@ fn on_soil(soil: &SoilField, p: Vec3) -> Vec3 {
 
 fn on_sheet(soil: &SoilField, p: Vec3) -> Vec3 {
     let h = soil.sample(p.x, p.z).height;
-    Vec3::new(p.x, h + SHEET, p.z)
+    // Extra lift so the sheet clears the ground in the depth buffer.
+    Vec3::new(p.x, h + SHEET + 0.1, p.z)
 }
 
 fn flow_dir(soil: &SoilField, at: Vec3, vehicle: &Vehicle, flow: Vec3) -> Vec3 {
@@ -1172,7 +1240,10 @@ mod tests {
         let cam = Vec3::new(-12.0, 10.0, -11.0);
         let verts = vertices(&show, cam, &soil);
         assert!(verts.iter().any(|v| style_of(v) == 0), "pool");
-        assert!(verts.iter().any(|v| style_of(v) == 1), "stream from the hole");
+        assert!(
+            verts.iter().any(|v| style_of(v) == 1),
+            "stream from the hole"
+        );
         assert!(verts.iter().any(|v| style_of(v) == 2), "ripples");
         assert!(verts.iter().all(|v| style_of(v) != 4), "no flame yet");
         assert!(
@@ -1316,9 +1387,15 @@ mod tests {
             "sequence {seen:?}"
         );
         assert!(early_hot >= 1, "spark did not catch");
-        assert!(late_hot >= early_hot, "burn front {early_hot} -> {late_hot}");
+        assert!(
+            late_hot >= early_hot,
+            "burn front {early_hot} -> {late_hot}"
+        );
         assert!(show.threw_chunks());
-        assert!(!parts.items[0].grounded, "blast left the clump on the ground");
+        assert!(
+            !parts.items[0].grounded,
+            "blast left the clump on the ground"
+        );
         assert!(
             parts.items[0].vel.length() > 2.5,
             "clump vel {}",
@@ -1369,11 +1446,7 @@ mod tests {
         for _ in 0..36 {
             world.step(1.0 / 60.0, &Input::default());
         }
-        assert!(
-            world.fuel.is_live(),
-            "phase {}",
-            world.fuel.label()
-        );
+        assert!(world.fuel.is_live(), "phase {}", world.fuel.label());
         assert!(
             world.fuel.node_count() >= 2,
             "nodes {}",
@@ -1408,7 +1481,8 @@ mod tests {
             }
         }
         assert!(
-            seen.windows(4).any(|w| w == ["pour", "spark", "burn", "blast"]),
+            seen.windows(4)
+                .any(|w| w == ["pour", "spark", "burn", "blast"]),
             "lap sequence {seen:?}"
         );
         assert!(
