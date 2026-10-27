@@ -27,7 +27,7 @@ use crate::vehicle_mesh::{
 };
 
 const SHADOW: u32 = 2048;
-const MODEL_SLOTS: u64 = 12;
+const MODEL_SLOTS: u64 = 13;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -105,6 +105,10 @@ pub struct Renderer {
     chunk_i: wgpu::Buffer,
     debris_v: wgpu::Buffer,
     debris_i: wgpu::Buffer,
+    dent_v: wgpu::Buffer,
+    dent_i: wgpu::Buffer,
+    loose_v: wgpu::Buffer,
+    loose_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
@@ -750,6 +754,30 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dent_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dent-v"),
+            size: (4096 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dent_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dent-i"),
+            size: (12288 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let loose_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("loose-v"),
+            size: (4096 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let loose_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("loose-i"),
+            size: (12288 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -794,6 +822,10 @@ impl Renderer {
             chunk_i,
             debris_v,
             debris_i,
+            dent_v,
+            dent_i,
+            loose_v,
+            loose_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
@@ -959,6 +991,12 @@ impl Renderer {
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
+        let dents = crate::dents::dent_mesh(&world.damage);
+        let loose = crate::dents::loose_mesh(&world.damage);
+        let dent_count = upload_dynamic(&self.queue, &self.dent_v, &self.dent_i, &dents);
+        let loose_count = upload_dynamic(&self.queue, &self.loose_v, &self.loose_i, &loose);
+        self.write_loose_panel(&world.vehicle, &world.damage);
+
         let chunks = mud_chunks(&world.particles.items);
         let chunk_count = chunks.indices.len() as u32;
         let dust_verts = dust_billboards(&world.dust, cam.eye, cam.target);
@@ -1020,7 +1058,7 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
             draw_indexed(&mut pass, &self.bank);
-            self.draw_vehicle(&mut pass, susp_index_count);
+            self.draw_vehicle(&mut pass, susp_index_count, dent_count, loose_count);
             self.draw_bike(&mut pass, bike_susp_count);
             if cam.cockpit {
                 self.draw_cockpit(&mut pass);
@@ -1064,7 +1102,7 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
             draw_indexed(&mut pass, &self.bank);
-            self.draw_vehicle(&mut pass, susp_index_count);
+            self.draw_vehicle(&mut pass, susp_index_count, dent_count, loose_count);
             self.draw_bike(&mut pass, bike_susp_count);
             if cam.cockpit {
                 self.draw_cockpit(&mut pass);
@@ -1288,9 +1326,49 @@ impl Renderer {
         draw_indexed(pass, &self.cockpit_wheel);
     }
 
-    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
+    fn write_loose_panel(&self, vehicle: &Vehicle, damage: &silt::BodyDamage) {
+        let mut mud = [[0.0; 4]; PANEL_COUNT];
+        for (i, panel) in vehicle.panels.iter().enumerate() {
+            mud[i] = [
+                panel.mass / PANEL_MUD_CAP,
+                panel.drip,
+                panel.streak,
+                panel.wet,
+            ];
+        }
+        let slot = model(
+            crate::dents::loose_transform(vehicle, damage),
+            mud,
+            [0.0, 0.0, 0.0, 0.0],
+        );
+        self.queue.write_buffer(
+            &self.model_buf,
+            12 * self.model_stride as u64,
+            bytemuck::bytes_of(&slot),
+        );
+    }
+
+    fn draw_vehicle(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        susp_indices: u32,
+        dent_indices: u32,
+        loose_indices: u32,
+    ) {
         pass.set_bind_group(2, &self.model_bg, &[0]);
         draw_indexed(pass, &self.body);
+        if dent_indices > 0 {
+            pass.set_vertex_buffer(0, self.dent_v.slice(..));
+            pass.set_index_buffer(self.dent_i.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..dent_indices, 0, 0..1);
+        }
+        if loose_indices > 0 {
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 12]);
+            pass.set_vertex_buffer(0, self.loose_v.slice(..));
+            pass.set_index_buffer(self.loose_i.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..loose_indices, 0, 0..1);
+            pass.set_bind_group(2, &self.model_bg, &[0]);
+        }
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
             draw_indexed(pass, &self.wheel);
@@ -1400,6 +1478,34 @@ fn model(world: Mat4, mud: [[f32; 4]; 12], extra: [f32; 4]) -> ModelData {
 
 fn vec4(v: Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
+}
+
+fn upload_dynamic(
+    queue: &wgpu::Queue,
+    vbuf: &wgpu::Buffer,
+    ibuf: &wgpu::Buffer,
+    mesh: &CpuMesh,
+) -> u32 {
+    if mesh.indices.is_empty() {
+        return 0;
+    }
+    let vbytes = bytemuck::cast_slice::<MeshVertex, u8>(&mesh.vertices);
+    let ibytes = bytemuck::cast_slice::<u32, u8>(&mesh.indices);
+    assert!(
+        vbytes.len() as u64 <= vbuf.size(),
+        "dent vertices {} overflow {}",
+        mesh.vertices.len(),
+        vbuf.size()
+    );
+    assert!(
+        ibytes.len() as u64 <= ibuf.size(),
+        "dent indices {} overflow {}",
+        mesh.indices.len(),
+        ibuf.size()
+    );
+    queue.write_buffer(vbuf, 0, vbytes);
+    queue.write_buffer(ibuf, 0, ibytes);
+    mesh.indices.len() as u32
 }
 
 fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {

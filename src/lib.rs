@@ -5,6 +5,7 @@
 //! shear and a Bingham-like drag. Rendering lives in the `silt` binary.
 
 pub mod bike;
+pub mod body_damage;
 pub mod cockpit;
 pub mod debris;
 pub mod dust;
@@ -17,4 +18,5 @@ pub mod ui;
 pub mod vehicle;
 pub mod world;
 
+pub use body_damage::BodyDamage;
 pub use world::{demo_camera, demo_drive, demo_drive_bike, dig_input, CameraPose, Input, World};

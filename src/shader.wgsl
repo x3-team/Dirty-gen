@@ -659,6 +659,28 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 4.0 + vec2<f32>(world.y * 2.4, 0.3));
         let col = mix(vec3<f32>(0.016, 0.008, 0.004), vec3<f32>(0.05, 0.026, 0.012), g);
         return vec4<f32>(col, 0.08);
+    } else if (panel > 52.5 && panel < 53.5) {
+        // Torn lip and the scraped ridge of a dent. Bright metal, mud in the scratches.
+        let g = noise(world.xz * 40.0 + vec2<f32>(world.y * 18.0, 0.4));
+        let scratch = smoothstep(0.45, 0.88, g);
+        let stain = smoothstep(0.4, 0.78, noise(world.xy * 5.5 + vec2<f32>(world.z * 2.0, 1.0)));
+        var col = mix(vec3<f32>(0.42, 0.43, 0.45), vec3<f32>(0.78, 0.78, 0.75), scratch);
+        col = mix(col, vec3<f32>(0.16, 0.08, 0.035), stain * 0.65);
+        return vec4<f32>(col, mix(0.42, 0.14, scratch));
+    } else if (panel > 53.5 && panel < 54.5) {
+        // Creased orange sheet. Paint stays orange; mud is a stain, not a full coat.
+        let n = noise(world.xz * 7.0 + vec2<f32>(world.y * 3.0, 0.7));
+        let scratch = noise(world.xy * 28.0 + vec2<f32>(world.z * 9.0, 2.0));
+        var col = mix(vec3<f32>(0.86, 0.28, 0.045), vec3<f32>(0.58, 0.15, 0.02), smoothstep(0.35, 0.85, n));
+        let mud = smoothstep(0.72, 0.92, n);
+        col = mix(col, vec3<f32>(0.12, 0.055, 0.022), mud * 0.75);
+        col = mix(col, vec3<f32>(0.72, 0.68, 0.62), smoothstep(0.9, 0.98, scratch) * 0.65);
+        return vec4<f32>(col, mix(0.4, 0.15, mud));
+    } else if (panel > 54.5 && panel < 55.5) {
+        // Mud caked on a torn lip. Brown, not the black of a ground clod.
+        let g = noise(world.xz * 10.0 + vec2<f32>(world.y * 6.0, 0.3));
+        let col = mix(vec3<f32>(0.30, 0.14, 0.05), vec3<f32>(0.12, 0.05, 0.018), g);
+        return vec4<f32>(col, 0.25);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }

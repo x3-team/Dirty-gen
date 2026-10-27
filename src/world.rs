@@ -3,6 +3,7 @@
 use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
+use crate::body_damage::BodyDamage;
 use crate::debris::Debris;
 use crate::dust::Dust;
 use crate::particles::Particles;
@@ -69,6 +70,7 @@ pub struct World {
     pub debris: Debris,
     pub time: f32,
     pub telemetry: Telemetry,
+    pub damage: BodyDamage,
     drip_acc: f32,
     crest_armed: bool,
     air_time: f32,
@@ -144,6 +146,7 @@ impl World {
                 min_speed_in_soft: 99.0,
                 ..Telemetry::default()
             },
+            damage: BodyDamage::new(),
             drip_acc: 0.0,
             crest_armed: false,
             air_time: 0.0,
@@ -164,6 +167,7 @@ impl World {
             ..Telemetry::default()
         };
         world.drip_acc = 0.0;
+        world.damage = BodyDamage::new();
         world.bike.place_on(&world.soil);
         world
     }
@@ -182,6 +186,7 @@ impl World {
                 min_speed_in_soft: 99.0,
                 ..Telemetry::default()
             },
+            damage: BodyDamage::new(),
             drip_acc: 0.0,
             crest_armed: false,
             air_time: 0.0,
@@ -203,6 +208,7 @@ impl World {
             min_speed_in_soft: 99.0,
             ..Telemetry::default()
         };
+        world.damage = BodyDamage::new();
         world
     }
 
@@ -362,6 +368,7 @@ impl World {
         self.particles.update(&mut self.soil, dt);
         self.dust.update(dt);
         self.soil.step_water(dt);
+        self.damage.step(dt);
 
         let softness = self.vehicle.mean_softness(&contacts);
         let sink = contacts.iter().map(|c| c.sinkage).fold(0.0, f32::max);
@@ -465,6 +472,8 @@ impl World {
         let h = self.soil.sample(x, z).height;
         let spawned = self.particles.impact_burst(Vec3::new(x, h + 0.15, z));
         stick_impact_mud(&mut self.vehicle, &self.soil);
+        // Landing contact. Creases the panels and tears one fender. No extra force.
+        self.damage.note_contact(vy);
         self.telemetry.impact_depth = self.telemetry.impact_depth.max(dug);
         self.telemetry.impact_sprays = self.telemetry.impact_sprays.saturating_add(spawned);
         self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(spawned);

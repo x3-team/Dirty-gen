@@ -4,6 +4,7 @@
 
 mod cockpit_mesh;
 mod debris_mesh;
+mod dents;
 mod dust_draw;
 mod lens_pass;
 mod mesh;

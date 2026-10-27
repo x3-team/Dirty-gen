@@ -184,6 +184,30 @@ fn crest_impact_cuts_rut_and_sprays() {
         "airborne pitch {:.2} is a hop, not a tumble",
         world.telemetry.max_air_pitch
     );
+    assert!(world.damage.hit, "landing did not dent the body");
+    assert!(
+        world.damage.dent > 0.5,
+        "dent {:.2} is a scuff",
+        world.damage.dent
+    );
+}
+
+#[test]
+fn landing_tears_a_panel() {
+    let mut world = World::demo();
+    let mut steps = 0;
+    while world.telemetry.impact_time <= 0.0 && steps < 30 * 60 {
+        let input = silt::demo_drive(&world);
+        world.step(1.0 / 60.0, &input);
+        steps += 1;
+    }
+    assert!(world.damage.hit, "no dent after {steps} steps");
+    world.run_seconds(2.0, |_| Input::default());
+    assert!(
+        world.damage.loose > 0.45,
+        "torn fender did not hang, {:.3}",
+        world.damage.loose
+    );
 }
 
 #[test]
