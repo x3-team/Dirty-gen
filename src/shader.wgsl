@@ -430,6 +430,19 @@ fn water_depth(xz: vec2<f32>) -> f32 {
     return max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
 }
 
+// A dry patch with water on both sides is a hole in the sheet, not a shore.
+// The outer bank has water on only one side, so this does not grow the pond.
+fn covered_depth(xz: vec2<f32>) -> f32 {
+    let here = water_depth(xz);
+    let e = 1.35;
+    let px = water_depth(xz + vec2<f32>(e, 0.0));
+    let nx = water_depth(xz - vec2<f32>(e, 0.0));
+    let pz = water_depth(xz + vec2<f32>(0.0, e));
+    let nz = water_depth(xz - vec2<f32>(0.0, e));
+    let across = max(min(px, nx), min(pz, nz));
+    return max(here, across);
+}
+
 fn water_bed(xz: vec2<f32>) -> f32 {
     // Blur a single-cell rut out of the sheet so the pool stays one surface.
     let e = 0.55;
@@ -445,7 +458,7 @@ fn water_bed(xz: vec2<f32>) -> f32 {
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
     let bed = water_bed(in.xz);
-    let depth = water_depth(in.xz);
+    let depth = covered_depth(in.xz);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
@@ -473,33 +486,27 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
     let fres = pow(1.0 - ndotv, 2.4);
-    // Stored water tops out near a decimetre after the shader scale, so the
-    // middle of a puddle has to go dark inside that range.
-    let depth_t = smoothstep(0.004, 0.065, in.depth);
-    // Wide enough that the rim is a band, not a one-pixel shore.
-    // The middle of the pond is past this and stays the dark absorption.
-    let rim = 1.0 - smoothstep(0.006, 0.055, in.depth);
-    // Red-heavy mud. A gray mix here is what read as a metal disc from above.
-    let shore_col = vec3<f32>(0.09, 0.042, 0.016);
-    let deep_col = vec3<f32>(0.0016, 0.0009, 0.0005);
+    // Stored water tops out near a decimetre after the shader scale.
+    // The middle goes to dark mud inside that range, not to black.
+    let depth_t = smoothstep(0.006, 0.075, in.depth);
+    // Muddy brown, lighter at the shore. A near-black center read as a hole,
+    // and a bright rim around it read as the lip of that hole.
+    let shore_col = vec3<f32>(0.085, 0.036, 0.013);
+    let deep_col = vec3<f32>(0.026, 0.010, 0.0036);
     let absorption = mix(shore_col, deep_col, depth_t);
-    // Reflection stays on the rim. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.40, 0.18, 0.065);
-    let reflect_amt = rim * (0.58 + fres * 0.75);
+    // Quiet reflection. sky_color carries the sun disc and white clouds.
+    let quiet = vec3<f32>(0.10, 0.042, 0.015);
+    let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);
     var col = mix(absorption, quiet, reflect_amt);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 6.0);
-    // The glint stays on the rim. The middle is the dark absorption only.
-    col += vec3<f32>(0.30, 0.14, 0.045) * spec * shadow_factor(in.world, nrm) * rim;
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
+    col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);
     let shore = smoothstep(0.002, 0.07, in.depth);
     // Only a cut of a couple of centimetres thins the film, and only on that cut.
     // The rest of the pond stays a dark cover, shore and middle alike.
     let dug = max(-stamp_bilinear(in.world.xz), 0.0);
     let reveal = smoothstep(0.016, 0.034, dug);
     let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
-    // The rim reflection has to be opaque or the soil underneath eats it.
-    // The middle keeps the old cover. reveal still opens a cut tire track.
-    let cover_a = shore * mix(0.88, 0.98, depth_t);
-    let alpha = mix(cover_a, max(cover_a, 0.96), rim) * mix(1.0, open, reveal);
+    let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
