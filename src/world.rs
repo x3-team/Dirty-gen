@@ -50,6 +50,12 @@ pub struct CameraPose {
     pub target: Vec3,
     /// Full width of an orthographic frame, in metres. Empty means a perspective lens.
     pub ortho_width: Option<f32>,
+    /// Vertical field of view in degrees. Empty keeps the chase lens.
+    pub fov_deg: Option<f32>,
+    /// Perspective near plane in metres. Empty keeps the default.
+    pub near: Option<f32>,
+    /// Seat view. The renderer draws the wheel, dash and muddy hood only then.
+    pub cockpit: bool,
 }
 
 pub struct World {
@@ -619,7 +625,7 @@ pub fn dig_input(t: f32) -> Input {
     }
 }
 
-/// Fixed oblique orthographic view of the whole loop. The chase camera is a toggle.
+/// Fixed oblique orthographic view of the whole loop. Chase and the cockpit cycle off it.
 pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
     let target = Vec3::new(0.0, 0.4, 1.4);
     let eye = target + Vec3::new(-14.5, 12.2, -13.0);
@@ -627,6 +633,9 @@ pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
         eye,
         target,
         ortho_width: Some(25.5),
+        fov_deg: None,
+        near: None,
+        cockpit: false,
     }
 }
 
