@@ -15,6 +15,7 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP};
 use silt::world::{CameraPose, World};
 
 use crate::cockpit_mesh;
+use crate::debris_mesh::debris_mesh;
 use crate::dust_draw::dust_billboards;
 use crate::mesh::{
     bank_mesh, environment_mesh, mud_chunks, terrain_mesh, CpuMesh, MeshVertex, ParticleVertex,
@@ -102,6 +103,8 @@ pub struct Renderer {
     particles: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
     chunk_i: wgpu::Buffer,
+    debris_v: wgpu::Buffer,
+    debris_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
@@ -732,6 +735,18 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let minimap = crate::minimap::Minimap::new(&device);
+        let debris_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debris-v"),
+            size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let debris_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debris-i"),
+            size: (24000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -774,6 +789,8 @@ impl Renderer {
             particles,
             chunk_v,
             chunk_i,
+            debris_v,
+            debris_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
@@ -951,6 +968,14 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
+        let stuck = debris_mesh(&world.vehicle, &world.debris);
+        let debris_count = stuck.indices.len() as u32;
+        if debris_count > 0 {
+            self.queue
+                .write_buffer(&self.debris_v, 0, bytemuck::cast_slice(&stuck.vertices));
+            self.queue
+                .write_buffer(&self.debris_i, 0, bytemuck::cast_slice(&stuck.indices));
+        }
 
         let mut encoder = self
             .device
@@ -997,6 +1022,7 @@ impl Renderer {
             }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
+            self.draw_debris(&mut pass, debris_count);
         }
 
         {
@@ -1049,6 +1075,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.particles.slice(..));
                 pass.draw(0..dust_count, 0..1);
             }
+            self.draw_debris(&mut pass, debris_count);
         }
 
         self.minimap.draw(
@@ -1313,6 +1340,16 @@ impl Renderer {
         pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
         pass.set_vertex_buffer(0, self.chunk_v.slice(..));
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..count, 0, 0..1);
+    }
+
+    fn draw_debris(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        if count == 0 {
+            return;
+        }
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+        pass.set_vertex_buffer(0, self.debris_v.slice(..));
+        pass.set_index_buffer(self.debris_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
 }

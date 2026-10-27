@@ -3,6 +3,7 @@
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
 mod cockpit_mesh;
+mod debris_mesh;
 mod dust_draw;
 mod mesh;
 mod minimap;
