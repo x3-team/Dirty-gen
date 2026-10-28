@@ -420,11 +420,12 @@ fn sky_dome(dir_in: vec3<f32>) -> vec3<f32> {
     return col;
 }
 
-// Thin sky sheen. Flat mud looks back at the camera and contributes nothing,
-// so standing water cannot fill in as a disc. The highlight is the real
-// heightfield slope: a rut wall or the side of a bowl.
+// Sheen on a wet slope. Flat mud looks back at the camera and contributes
+// nothing, so standing water cannot fill in as a disc. The broad term is the
+// same clay as the lane, darker. The sky is only a thin streak: a wide lobe
+// of the zenith is what read as blue plastic.
 fn mud_sheen(world: vec3<f32>, n_in: vec3<f32>, rough: f32, wet: f32, water: f32) -> vec3<f32> {
-    let film = smoothstep(0.008, 0.04, water);
+    let film = smoothstep(0.004, 0.02, water);
     let wet_g = smoothstep(0.48, 0.88, wet);
     let smooth_g = smoothstep(0.86, 0.32, rough);
     let gate = smooth_g * max(wet_g, film);
@@ -432,7 +433,8 @@ fn mud_sheen(world: vec3<f32>, n_in: vec3<f32>, rough: f32, wet: f32, water: f32
         return vec3<f32>(0.0);
     }
     let n = normalize(n_in);
-    // A few degrees of real wall. Flat film stays matte.
+    // A few degrees of real wall. Flat film stays matte, so the rut floor
+    // is the soil colour from fs_terrain and not this coat.
     let along = smoothstep(0.012, 0.055, 1.0 - n.y);
     if (along <= 0.001) {
         return vec3<f32>(0.0);
@@ -442,18 +444,25 @@ fn mud_sheen(world: vec3<f32>, n_in: vec3<f32>, rough: f32, wet: f32, water: f32
     let halfv = normalize(sun + view);
     let ndoth = clamp(dot(n, halfv), 0.0, 1.0);
     let refl = reflect(-view, n);
-    // Below the horizon the mirror would be a gray ground fill.
     let sky_gate = smoothstep(0.04, 0.22, refl.y);
-    // Wet mud takes the sky in the reflection. Standing water keeps a tighter
-    // sun-aligned streak so the bowl does not fill in.
-    let sky_lobe = pow(clamp(refl.y, 0.0, 1.0), mix(3.2, 6.5, film));
-    let sun_lobe = pow(ndoth, mix(4.5, 9.0, film));
     let sky = sky_dome(refl);
     let shadow = shadow_factor(world + n * 0.02, n);
     let amp = gate * along * sky_gate * shadow;
-    let lobe = mix(sky_lobe * 0.8 + sun_lobe * 0.35, sun_lobe * 0.7 + sky_lobe * 0.25, film);
-    // Capped so a cloud reflection stays a streak, not a white plate.
-    return min(sky * lobe * amp * 5.2, vec3<f32>(0.40));
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    // Shadowed slurry stays brown. A sky-coloured ambient here was the blue.
+    let wrap = 0.58 + 0.42 * ndl * shadow;
+    // Lane clay is (0.105, 0.052, 0.026). This is that hue, darker.
+    let clay = vec3<f32>(0.068, 0.034, 0.017);
+    let standing = smoothstep(0.003, 0.014, water);
+    let body = clay * wrap * gate * along * mix(0.28, 1.0, standing);
+    let up = clamp(refl.y, 0.0, 1.0);
+    // A narrow band of the sky dome, not the whole slope. The old wide lobe
+    // painted the rut blue; this stays a streak along the wall.
+    let band = smoothstep(0.50, 0.64, up) * (1.0 - smoothstep(0.70, 0.84, up));
+    let sky_streak = sky * band * amp * 0.20;
+    let sun_tight = pow(ndoth, 34.0);
+    let glint = clay * sun_tight * amp * 1.6;
+    return body + sky_streak + glint;
 }
 
 fn ripple_height(xz: vec2<f32>, t: f32) -> f32 {
@@ -538,18 +547,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Loose soil on the berm. Lighter than the lane, only where the stamp piled it.
     albedo = mix(albedo, vec3<f32>(0.15, 0.078, 0.034), lip * 0.92);
 
-    // Standing water darkens the bowl. The bank of the same heightfield stays lighter.
+    // The bank of the same heightfield stays lighter. Water colour is applied
+    // after lighting, in the clay of this albedo, so a black bowl cannot
+    // turn the sky sheen into blue plastic.
     let relief = local_relief(xz);
-    let bowl = smoothstep(0.045, 0.14, -relief);
     let bank = smoothstep(0.04, 0.12, relief) * (1.0 - groove);
-    let depth_t = smoothstep(0.004, 0.10, water);
-    albedo = mix(
-        albedo,
-        vec3<f32>(0.012, 0.005, 0.0022),
-        max(bowl, depth_t) * mix(0.4, 0.78, max(wet_face, film)),
-    );
+    let shallow_w = smoothstep(0.004, 0.022, water);
+    let deep_w = smoothstep(0.030, 0.080, water);
     let bank_col = mix(vec3<f32>(0.16, 0.082, 0.036), vec3<f32>(0.062, 0.032, 0.014), wet_face);
-    albedo = mix(albedo, bank_col, bank * mix(0.45, 0.28, wet_face) * (1.0 - depth_t));
+    albedo = mix(albedo, bank_col, bank * mix(0.45, 0.28, wet_face) * (1.0 - deep_w));
 
     // Dry dirt stays rough. Wet mud takes the stored smoothness. A water film
     // is smoother, and the highlight is still the slope lobe, not a mirror fill.
@@ -558,6 +564,16 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let rough_out = mix(dry_r, mix(wet_r, 0.09, film), max(wet_face, film));
 
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+    // Same clay as the dry lane (0.105, 0.052, 0.026), darker in the water.
+    // Shallow water keeps the floor's own light and dark, so the rut stays
+    // readable. Deep water is an opaque brown. The zenith in shade() is blue;
+    // it does not get to be the colour of the slurry.
+    let clay = vec3<f32>(1.0, 0.495, 0.248);
+    let lum = dot(lit, vec3<f32>(0.30, 0.55, 0.15));
+    let shore = clay * max(lum, 0.010) * 1.05;
+    let slurry = clay * max(lum, 0.046) * 0.92;
+    lit = mix(lit, shore, shallow_w);
+    lit = mix(lit, slurry, deep_w);
     // Sheen follows the curved height, not the bilinear kink. Standing
     // water uses the wider sample so the bowl does not stair. A rut keeps
     // the short slope, or the tyre wall disappears. Grit stays off this
