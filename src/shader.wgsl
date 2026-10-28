@@ -12,7 +12,7 @@ struct Frame {
     sky_horizon: vec4<f32>,
     amb: vec4<f32>,
     params: vec4<f32>, // width, height, cell, map res
-    misc: vec4<f32>,   // time, shadow size, _, _
+    misc: vec4<f32>,   // time, shadow size, packed height, pixel hint
 }
 
 struct Model {
@@ -38,6 +38,8 @@ struct Model {
 @group(1) @binding(1) var mat_tex: texture_2d<f32>;
 @group(1) @binding(2) var mat_samp: sampler;
 @group(1) @binding(3) var shadow_tex: texture_2d<f32>;
+@group(1) @binding(4) var clay_tex: texture_2d<f32>;
+@group(1) @binding(5) var clay_samp: sampler;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -356,8 +358,8 @@ fn mat_bilinear(xz: vec2<f32>) -> vec4<f32> {
 
 // Slope of the curved draw height. A finite difference of the bilinear
 // ramp still kinks on the solver-cell edge the tyre lip sits on.
-// `grit_amp` is the dry grain. Wet mud passes a small value so the sheen
-// follows this slope instead of breaking into gravel.
+// Clay grain is a separate normal. Wet mud keeps this slope so the sheen
+// does not break into gravel.
 fn slope_draw(xz: vec2<f32>) -> vec3<f32> {
     let g = draw_grads(xz);
     return normalize(vec3<f32>(-g.x, 1.0, -g.y));
@@ -376,16 +378,52 @@ fn slope_draw_wide(xz: vec2<f32>, step: f32) -> vec3<f32> {
     return normalize(vec3<f32>(h_l - h_r, e * 2.0, h_d - h_u));
 }
 
-fn terrain_normal(xz: vec2<f32>, grit_amp: f32) -> vec3<f32> {
-    // The slope is the curved height difference. Amplifying the stamp on
-    // its own turned a centimetre of noise into a cliff, and the sheen
-    // into rings.
-    var n = slope_draw(xz);
-    let grit = noise(xz * 2.4);
-    let grit_x = noise(xz * 2.4 + vec2<f32>(0.45, 0.0));
-    let grit_z = noise(xz * 2.4 + vec2<f32>(0.0, 0.45));
-    n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * grit_amp);
-    return n;
+// World size of one pixel on the ground. Perspective stores a negative
+// angular size and scales by distance here, so the lod does not jump on
+// triangle edges the way dpdx does.
+fn ground_pixel(world: vec3<f32>) -> f32 {
+    let hint = frame.misc.w;
+    if (hint < 0.0) {
+        let dist = length(frame.cam_pos.xyz - world);
+        let elev = abs(frame.cam_pos.y - world.y) / max(dist, 0.05);
+        return dist * (-hint) / max(elev, 0.22);
+    }
+    return max(hint, 1.0e-4);
+}
+
+fn clay_at(world: vec3<f32>, uv: vec2<f32>, scale: f32) -> vec4<f32> {
+    let texels = ground_pixel(world) * scale * 256.0;
+    let lod = clamp(log2(max(texels, 1.0)), 0.0, 8.0);
+    return textureSampleLevel(clay_tex, clay_samp, uv, lod);
+}
+
+// ~0.6 m tile for crumbs up close, ~2.4 m tile for patches on the oval.
+// Normals stay on the fine tile.
+fn clay_sample(world: vec3<f32>) -> vec4<f32> {
+    let xz = world.xz;
+    let fine = clay_at(world, xz * 1.72, 1.72);
+    let wide = clay_at(world, xz * 0.42 + vec2<f32>(0.17, 0.41), 0.42);
+    return vec4<f32>(
+        fine.rg,
+        fine.b * 0.70 + wide.b * 0.30,
+        fine.a * 0.40 + wide.a * 0.60,
+    );
+}
+
+fn terrain_normal(xz: vec2<f32>, clay: vec4<f32>, grit_amp: f32) -> vec3<f32> {
+    // Geometric slope stays the curved height. The clay normal is a small
+    // tangent tilt, not a second displacement, so a crumb cannot become a cliff.
+    let geo = normalize(slope_draw(xz));
+    let nx = (clay.r * 2.0 - 1.0) * grit_amp;
+    let nz = (clay.g * 2.0 - 1.0) * grit_amp;
+    let ny = sqrt(clamp(1.0 - nx * nx - nz * nz, 0.0, 1.0));
+    var t = vec3<f32>(1.0, 0.0, 0.0) - geo * geo.x;
+    if (dot(t, t) < 1.0e-4) {
+        t = vec3<f32>(0.0, 0.0, 1.0) - geo * geo.z;
+    }
+    t = normalize(t);
+    let b = normalize(cross(t, geo));
+    return normalize(t * nx + b * nz + geo * ny);
 }
 
 // Height minus a wide neighbourhood. Positive on a berm, negative in a bowl.
@@ -512,13 +550,11 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
 
     let film = smoothstep(0.006, 0.035, water);
     let wet_face = smoothstep(0.18, 0.8, wet);
-    // Grain on dry dirt. Wet faces keep the heightfield slope intact.
-    let grit_amp = mix(0.36, mix(0.04, 0.012, film), max(wet_face, film));
-    let n = terrain_normal(xz, grit_amp);
+    let clay = clay_sample(in.world);
 
-    let grit = noise(xz * 1.4) * 0.6 + noise(xz * 4.8) * 0.4;
-    // Dark saturated soil. The noon tan read as flat beige.
-    let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
+    // Dark saturated soil. The noon tan read as flat beige. Clay multiplies
+    // this after the wet mixes so a trough stays the dark colour.
+    let dry = vec3<f32>(0.105, 0.052, 0.026);
     let soaked = vec3<f32>(0.04, 0.022, 0.012);
     var albedo = mix(dry, soaked, smoothstep(0.12, 0.88, wet));
     // Compacted soil is a little darker. This is not the groove.
@@ -550,6 +586,20 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     );
     let bank_col = mix(vec3<f32>(0.16, 0.082, 0.036), vec3<f32>(0.062, 0.032, 0.014), wet_face);
     albedo = mix(albedo, bank_col, bank * mix(0.45, 0.28, wet_face) * (1.0 - depth_t));
+
+    // Dry dirt takes the clay albedo and normal. A wet trough or water film
+    // fades both back to the smooth dark slope the sheen already uses.
+    let wet_gate = max(groove, max(wet_face, film));
+    let grain = 1.0 - wet_gate * 0.94;
+    // The authored amount sits in a narrow band. Stretch it so pores and
+    // crumbs separate, and keep the middle near the old flat colour.
+    let amount = clamp((clay.b - 0.10) * 2.35, 0.0, 1.0);
+    let warm = clamp((clay.a - 0.08) * 2.25, 0.0, 1.0);
+    let lum = mix(0.32, 1.48, amount);
+    let tint = mix(vec3<f32>(0.74, 1.12, 1.06), vec3<f32>(1.26, 0.86, 0.70), warm);
+    albedo *= mix(vec3<f32>(1.0), tint * lum, grain);
+    let grit_amp = mix(1.0, 0.04, wet_gate);
+    let n = terrain_normal(xz, clay, grit_amp);
 
     // Dry dirt stays rough. Wet mud takes the stored smoothness. A water film
     // is smoother, and the highlight is still the slope lobe, not a mirror fill.

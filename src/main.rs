@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod clay;
 mod mesh;
 mod render;
 
@@ -49,6 +50,10 @@ fn main() {
             Some("capture-frame") => {
                 let rest: Vec<String> = args.collect();
                 capture_frame(&rest);
+            }
+            Some("capture-clay") => {
+                let rest: Vec<String> = args.collect();
+                capture_clay(&rest);
             }
             _ => run_window(),
         }
@@ -796,6 +801,115 @@ fn capture_frame(args: &[String]) {
         silt::soil::TRACK_R + 0.74,
         1.6
     );
+}
+
+/// Clay grain on dry dirt, and the same wet rut with the grain faded.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_clay(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut close_path = PathBuf::from(format!("{MEDIA}/mud-texture-close.png"));
+    let mut rut_path = PathBuf::from(format!("{MEDIA}/mud-texture-rut.png"));
+    let mut oval_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--close" => close_path = PathBuf::from(val(&mut i)),
+            "--rut" => rut_path = PathBuf::from(val(&mut i)),
+            "--oval" => oval_path = Some(PathBuf::from(val(&mut i))),
+            other => panic!("unknown capture-clay flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::demo();
+    world.soil = silt::soil::SoilField::demo();
+    let (first, second) = world.soil.cut_east_straight();
+    world.particles.clear();
+    let park = world.soil.sample(-8.0, -6.0).height;
+    world.vehicle.pos = Vec3::new(-8.0, park + 0.62, -6.0);
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.4;
+    world.bike.pos = Vec3::new(-11.0, park + 0.7, -8.5);
+    world.bike.vel = Vec3::ZERO;
+
+    // Down onto dry apron, far enough that a few crumbs cross the frame
+    // and not so grazing that the mip chain flattens them.
+    let close_pose = lift_camera(
+        &world,
+        CameraPose {
+            eye: Vec3::new(12.55, 1.15, -6.55),
+            target: Vec3::new(11.15, 0.06, -5.35),
+            ortho_width: None,
+        },
+    );
+    let rgba = renderer
+        .draw(&world, close_pose, None, true)
+        .expect("close readback");
+    write_png(&close_path, width, height, &rgba).expect("close png");
+    let shoulder = world.soil.sample(11.4, -5.7);
+    let trough = world.soil.sample(silt::soil::TRACK_R + 0.74, 2.4);
+    println!(
+        "close {} passes {:.3}->{:.3} shoulder wet {:.2} water {:.3} trough wet {:.2} water {:.3}",
+        close_path.display(),
+        first,
+        second,
+        shoulder.wetness,
+        shoulder.water,
+        trough.wetness,
+        trough.water
+    );
+
+    let rut_pose = lift_camera(
+        &world,
+        CameraPose {
+            eye: Vec3::new(9.15, 1.55, 1.05),
+            target: Vec3::new(7.05, 0.02, 2.35),
+            ortho_width: None,
+        },
+    );
+    let rgba = renderer
+        .draw(&world, rut_pose, None, true)
+        .expect("rut readback");
+    write_png(&rut_path, width, height, &rgba).expect("rut png");
+    println!(
+        "rut {} depth {:.3} water {:.3}",
+        rut_path.display(),
+        world.soil.rut_near(silt::soil::TRACK_R + 0.74, 2.4),
+        trough.water
+    );
+
+    if let Some(path) = oval_path {
+        let pose = lift_camera(&world, demo_camera(0.0, world.vehicle.pos, world.vehicle.yaw));
+        let rgba = renderer
+            .draw(&world, pose, None, true)
+            .expect("oval readback");
+        write_png(&path, width, height, &rgba).expect("oval png");
+        println!("oval {}", path.display());
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
