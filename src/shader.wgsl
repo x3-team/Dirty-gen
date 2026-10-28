@@ -13,6 +13,9 @@ struct Frame {
     amb: vec4<f32>,
     params: vec4<f32>, // width, height, cell, map res
     misc: vec4<f32>,   // time, shadow size, _, _
+    // Four tires. Even slot: center.xyz, radius.
+    // Odd slot: forward.x, forward.z, sink, active.
+    tires: array<vec4<f32>, 8>,
 }
 
 struct Model {
@@ -46,6 +49,7 @@ struct Model {
 @group(1) @binding(5) var ground_nor: texture_2d_array<f32>;
 @group(1) @binding(6) var ground_pack: texture_2d_array<f32>;
 @group(1) @binding(7) var ground_samp: sampler;
+@group(1) @binding(8) var imprint_tex: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -215,6 +219,112 @@ fn height_at(ij: vec2<i32>) -> f32 {
     return load_height_stamp(ij).x;
 }
 
+fn imprint_at(ij: vec2<i32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(imprint_tex));
+    let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(imprint_tex, c, 0);
+}
+
+fn cell_center(ij: vec2<i32>) -> vec2<f32> {
+    let cell = max(frame.params.z, 1e-4);
+    let half = cell * frame.params.w * 0.5;
+    return vec2<f32>((f32(ij.x) + 0.5) * cell - half, (f32(ij.y) + 0.5) * cell - half);
+}
+
+// Lug blocks pressed into the mud. Grooves stay at the rut floor.
+// This is the stored contact, not a blur across the cell.
+fn tread_delta(xz: vec2<f32>) -> f32 {
+    let ij = vec2<i32>(round(world_to_ij(xz)));
+    let rec = imprint_at(ij);
+    if (rec.a < 0.5) {
+        return 0.0;
+    }
+    let amp = rec.r * 0.06;
+    let ang = rec.g * 6.2831853;
+    let fwd = vec2<f32>(sin(ang), cos(ang));
+    let right = vec2<f32>(fwd.y, -fwd.x);
+    let rel = xz - cell_center(ij);
+    let lat = dot(rel, right) + rec.b * 0.8 - 0.4;
+    let along = dot(xz, fwd);
+    let pitch = 0.19897;
+    let u = fract(along / pitch);
+    let row = select(0.0, 0.5, lat > 0.0);
+    let lug = abs(fract(u + row) - 0.5);
+    let block = 1.0 - smoothstep(0.22, 0.34, lug);
+    let band = smoothstep(0.006, 0.022, abs(lat)) * (1.0 - smoothstep(0.11, 0.16, abs(lat)));
+    return -amp * block * band;
+}
+
+// x = patch weight, y = carcass underside, z = hide the square stamp.
+// The bowl stays on the rubber. A wider shelf was cutting the sidewall.
+fn tire_contact(xz: vec2<f32>, a: vec4<f32>, b: vec4<f32>) -> vec3<f32> {
+    if (b.w < 0.5) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+    let center = a.xyz;
+    let radius = max(a.w, 0.05);
+    let fwd = vec2<f32>(b.x, b.y);
+    let fl = length(fwd);
+    let fwd_n = fwd / max(fl, 1e-4);
+    let rel = xz - center.xz;
+    let along = dot(rel, fwd_n);
+    let lat = length(rel - fwd_n * along);
+    let chord = sqrt(max(2.0 * radius * max(b.z, 0.004) - b.z * b.z, 0.0));
+    let reach = max(chord, 0.06);
+    // Visual crown. The physics lane is wider and reads as a square pit.
+    let half_w = 0.112;
+    let along_n = abs(along) / reach;
+    let lat_n = lat / half_w;
+    var weight = 0.0;
+    var underside = center.y - radius;
+    if (along_n < 1.2 && lat_n < 1.2) {
+        let radial2 = radius * radius - along * along;
+        if (radial2 > 0.01) {
+            underside = center.y - sqrt(radial2) - 0.0015;
+            let rise = underside - (center.y - radius);
+            // The mud stays on the patch. Climbing the circle cut a card
+            // through the sidewall.
+            let crown = 1.0 - smoothstep(0.010, 0.040, rise);
+            weight = (1.0 - smoothstep(0.35, 0.98, along_n))
+                * (1.0 - smoothstep(0.58, 1.02, lat_n))
+                * crown;
+        }
+    }
+    // Tuck the lane rectangle back to the lip while the tire is on it.
+    // Leave the rut behind the contact: that is where the tread negative sits.
+    let ahead = 1.0 - smoothstep(0.30, 0.52, along);
+    let not_behind = 1.0 - smoothstep(0.04, 0.18, -along);
+    let across = 1.0 - smoothstep(0.16, 0.46, lat);
+    let closure = ahead * not_behind * across * (1.0 - smoothstep(0.12, 0.5, weight));
+    return vec3<f32>(clamp(weight, 0.0, 1.0), underside, clamp(closure, 0.0, 1.0));
+}
+
+// x = seated height, y = how fully a tire owns this column, z = stamp closure.
+// Inside the patch the mud is the tread. The square cut around it is filled
+// back to the lip so it is not a pit the carcass floats over.
+fn tire_seat(xz: vec2<f32>, base_h: f32) -> vec3<f32> {
+    var h = base_h;
+    var w = 0.0;
+    var close = 0.0;
+    let c0 = tire_contact(xz, frame.tires[0], frame.tires[1]);
+    h = mix(h, c0.y, c0.x);
+    w = max(w, c0.x);
+    close = max(close, c0.z);
+    let c1 = tire_contact(xz, frame.tires[2], frame.tires[3]);
+    h = mix(h, c1.y, c1.x);
+    w = max(w, c1.x);
+    close = max(close, c1.z);
+    let c2 = tire_contact(xz, frame.tires[4], frame.tires[5]);
+    h = mix(h, c2.y, c2.x);
+    w = max(w, c2.x);
+    close = max(close, c2.z);
+    let c3 = tire_contact(xz, frame.tires[6], frame.tires[7]);
+    h = mix(h, c3.y, c3.x);
+    w = max(w, c3.x);
+    close = max(close, c3.z);
+    return vec3<f32>(h, w, close);
+}
+
 // Metres the stamp added. Negative is soil the tire removed.
 fn stamp_at(ij: vec2<i32>) -> f32 {
     return load_height_stamp(ij).y;
@@ -306,6 +416,17 @@ fn stamp_bilinear(xz: vec2<f32>) -> f32 {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
+// Fill the square lane back to the lip. The bed stamp stays in the field;
+// this is only the mesh under a live tire.
+fn apply_seat(xz: vec2<f32>, base_h: f32) -> vec3<f32> {
+    let seated = tire_seat(xz, base_h);
+    if (seated.z <= 0.001) {
+        return seated;
+    }
+    let pre = base_h - min(stamp_bilinear(xz), 0.0);
+    return vec3<f32>(mix(seated.x, max(seated.x, pre), seated.z), seated.y, seated.z);
+}
+
 // Same samples as height_bilinear, but the step sits in a short wall.
 // A linear blend across a 20 cm cell shades a 10 cm rut as a tint.
 fn height_sharp(xz: vec2<f32>) -> f32 {
@@ -372,6 +493,31 @@ fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
     let grit_z = noise(xz * 2.4 + vec2<f32>(0.0, 0.45));
     let grit_gain = select(0.035, 0.09, torn);
     n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * grit_gain);
+    // The live bowl is a vertex displacement. Shade that slope too, or the
+    // patch stays a flat card under the carcass.
+    let live = frame.tires[1].w + frame.tires[3].w + frame.tires[5].w + frame.tires[7].w;
+    if (live > 0.5) {
+        let se_t = 0.03;
+        let hx1 = apply_seat(xz + vec2<f32>(se_t, 0.0), height_bilinear(xz + vec2<f32>(se_t, 0.0))).x;
+        let hx0 = apply_seat(xz - vec2<f32>(se_t, 0.0), height_bilinear(xz - vec2<f32>(se_t, 0.0))).x;
+        let hz1 = apply_seat(xz + vec2<f32>(0.0, se_t), height_bilinear(xz + vec2<f32>(0.0, se_t))).x;
+        let hz0 = apply_seat(xz - vec2<f32>(0.0, se_t), height_bilinear(xz - vec2<f32>(0.0, se_t))).x;
+        let bx1 = height_bilinear(xz + vec2<f32>(se_t, 0.0));
+        let bx0 = height_bilinear(xz - vec2<f32>(se_t, 0.0));
+        let bz1 = height_bilinear(xz + vec2<f32>(0.0, se_t));
+        let bz0 = height_bilinear(xz - vec2<f32>(0.0, se_t));
+        let extra = vec3<f32>((hx0 - hx1) - (bx0 - bx1), 0.0, (hz0 - hz1) - (bz0 - bz1));
+        if (dot(extra, extra) > 1e-8) {
+            n = normalize(n + extra * (0.65 / se_t));
+        }
+    }
+    let lug = tread_delta(xz);
+    if (lug < -0.001) {
+        let te = 0.025;
+        let dx = tread_delta(xz + vec2<f32>(te, 0.0)) - tread_delta(xz - vec2<f32>(te, 0.0));
+        let dz = tread_delta(xz + vec2<f32>(0.0, te)) - tread_delta(xz - vec2<f32>(0.0, te));
+        n = normalize(n + vec3<f32>(-dx, 0.0, -dz) * (0.5 / te));
+    }
     return n;
 }
 
@@ -426,7 +572,13 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     if (kind == 9u && -stamp_bilinear(in.xz) > 0.012) {
         disp = d0;
     }
-    let h = terrain_height(in.xz) + (disp - 0.5) * disp_scale(kind);
+    let base = terrain_height(in.xz);
+    let seated = apply_seat(in.xz, base);
+    // Under the carcass the cylinder is the surface. The stored lugs show once the tire has left.
+    // Closure is the lip beside the rubber, not another tread.
+    let on_tire = seated.y > 0.35 || seated.z > 0.45;
+    let pattern = select(tread_delta(in.xz), 0.0, on_tire);
+    let h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - seated.y);
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -441,7 +593,13 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     var n = terrain_normal(xz);
-    let kind = kind_nearest(xz);
+    // The square stamp beside a live tire is filled back to the lip. Paint it
+    // as the pad, not as the clay card the stamp kind would leave there.
+    let seat = apply_seat(xz, terrain_height(xz));
+    var kind = kind_nearest(xz);
+    if (seat.z > 0.35 && seat.y < 0.3) {
+        kind = 4u;
+    }
 
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
@@ -551,6 +709,11 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (kind == 3u) { rough_out = max(rough_out, 0.8); }
     if (kind == 10u) { rough_out = max(rough_out, 0.74); }
     if (kind == 11u) { rough_out = mix(rough_out, 0.2, smoothstep(0.35, 0.85, wet)); }
+    let lug_h = tread_delta(xz);
+    if (lug_h < -0.004) {
+        let k = clamp(-lug_h / 0.028, 0.0, 1.0);
+        albedo = mix(albedo, albedo * vec3<f32>(0.38, 0.26, 0.18), 0.42 + 0.4 * k);
+    }
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
     // A wide lobe on the shore is the wet sheen. Inside the cut it stays small
@@ -830,7 +993,7 @@ struct ShadowOut {
 
 @vertex
 fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
-    let h = height_bilinear(in.xz);
+    let h = apply_seat(in.xz, height_bilinear(in.xz)).x;
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     let clip = frame.light_vp * vec4<f32>(world, 1.0);
     var o: ShadowOut;

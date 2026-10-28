@@ -194,6 +194,13 @@ pub struct SoilField {
     pub rest: Vec<f32>,
     /// Distinct lane visits that have cut this cell. Pass 1 is the fresh bite.
     pub passes: Vec<u8>,
+    /// Metres of lug pressed into this cell. Zero means no tread negative.
+    /// The pattern is drawn from this field; it does not move the bed.
+    pub tread_amp: Vec<f32>,
+    /// Heading of the tire that pressed the cell, atan2(forward.x, forward.z).
+    pub tread_ang: Vec<f32>,
+    /// Lateral offset of the cell center from that tire's track, metres.
+    pub tread_lat: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -493,6 +500,9 @@ impl SoilField {
             // The first visit has to count. Rest starts already past the gap.
             rest: vec![PASS_GAP + 1.0; n],
             passes: vec![0; n],
+            tread_amp: vec![0.0; n],
+            tread_ang: vec![0.0; n],
+            tread_lat: vec![0.0; n],
         }
     }
 
@@ -1137,14 +1147,17 @@ impl SoilField {
             rt.normalize()
         };
         let half = self.size * 0.5;
-        let reach = 1.35_f32;
+        // Long enough for a single-cell ridge to hold the coat under the lip.
+        let reach = 4.2_f32;
         let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
         let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
         let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
         let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
         let res = self.res as isize;
-        let mut rut = [(0usize, 0.0f32); 64];
-        let mut n_rut = 0usize;
+        let mut ridge = [(0usize, 0.0f32); 96];
+        let mut n_ridge = 0usize;
+        let mut flank = [(0usize, 0.0f32); 96];
+        let mut n_flank = 0usize;
         let mut shoulder = [0usize; 64];
         let mut n_sh = 0usize;
         for j in j0.max(1)..j1.min(res - 1) {
@@ -1156,36 +1169,46 @@ impl SoilField {
                 let along = rel_x * fwd.x + rel_z * fwd.z;
                 let lat = rel_x * rt.x + rel_z * rt.z;
                 let behind = -along;
-                if !(0.38..=0.95).contains(&behind) {
+                // Far enough that the live stamp does not dig the spoil back
+                // out. The ridge is the center of the rut, not a sheet across it.
+                if !(1.05..=4.2).contains(&behind) {
                     continue;
                 }
                 let idx = j as usize * self.res + i as usize;
                 let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
-                if lat.abs() <= 0.20 && depth > 0.01 {
-                    if n_rut < rut.len() {
-                        rut[n_rut] = (idx, behind);
-                        n_rut += 1;
+                if depth <= 0.01 {
+                    if (0.22..0.48).contains(&lat.abs()) && n_sh < shoulder.len() {
+                        shoulder[n_sh] = idx;
+                        n_sh += 1;
                     }
-                } else if (0.20..0.48).contains(&lat.abs()) && n_sh < shoulder.len() {
-                    shoulder[n_sh] = idx;
-                    n_sh += 1;
+                    continue;
+                }
+                // The cut itself, not the lip. One band, so the coat stacks
+                // into a ridge instead of filming the shoulders.
+                if lat.abs() <= 0.20 && n_ridge < ridge.len() {
+                    ridge[n_ridge] = (idx, behind);
+                    n_ridge += 1;
                 }
             }
         }
-        let into_rut = n_rut > 0;
-        // The nearest cells in the groove. Spreading the same volume over the
-        // whole window leaves a film the still cannot read.
-        if n_rut > 1 {
-            rut[..n_rut].sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let into_rut = n_ridge > 0 || n_flank > 0;
+        if n_ridge > 1 {
+            ridge[..n_ridge]
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         }
-        let n_use = n_rut.min(2);
+        if n_flank > 1 {
+            flank[..n_flank]
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        if into_rut {
+            let wrote = self.lay_ridge(&ridge[..n_ridge], &flank[..n_flank], volume);
+            return CoatLanding {
+                volume: wrote,
+                in_rut: wrote,
+            };
+        }
         let mut chosen = [0usize; 64];
-        let n = if into_rut {
-            for i in 0..n_use {
-                chosen[i] = rut[i].0;
-            }
-            n_use
-        } else if n_sh > 0 {
+        let n = if n_sh > 0 {
             chosen[..n_sh].copy_from_slice(&shoulder[..n_sh]);
             n_sh
         } else if let Some(idx) = self.idx_at(center.x, center.z) {
@@ -1197,52 +1220,115 @@ impl SoilField {
                 in_rut: 0.0,
             };
         };
-        let wrote = self.lay_coat(&chosen[..n], volume, into_rut);
+        let wrote = self.lay_coat(&chosen[..n], volume, false);
         CoatLanding {
             volume: wrote,
-            in_rut: if into_rut { wrote } else { 0.0 },
+            in_rut: 0.0,
         }
+    }
+
+    /// Center of the rut first, under the lip, so the coat is a ridge with
+    /// sides. Flanks only take the overflow, and they stay lower than the ridge.
+    fn lay_ridge(&mut self, ridge: &[(usize, f32)], flank: &[(usize, f32)], volume: f32) -> f32 {
+        let mut ridge_i = [0usize; 96];
+        let mut flank_i = [0usize; 96];
+        for (n, cell) in ridge.iter().enumerate() {
+            ridge_i[n] = cell.0;
+        }
+        for (n, cell) in flank.iter().enumerate() {
+            flank_i[n] = cell.0;
+        }
+        let ridge = &ridge_i[..ridge.len()];
+        let flank = &flank_i[..flank.len()];
+        let mut left = volume;
+        let mut wrote = 0.0_f32;
+        let primary = if ridge.is_empty() { flank } else { ridge };
+        let secondary = if ridge.is_empty() { &[][..] } else { flank };
+        // Under the lip. Filling flush with the ground is a sheet.
+        wrote += self.pour_frac(primary, &mut left, 0.80);
+        if left > 1.0e-8 {
+            wrote += self.pour_frac(secondary, &mut left, 0.80);
+        }
+        if left > 1.0e-8 && !primary.is_empty() {
+            let idx = primary[primary.len() - 1];
+            let add = left / self.cell / self.cell;
+            self.note_coat(idx, add, true);
+            wrote += left;
+        }
+        wrote
+    }
+
+    fn pour_frac(&mut self, cells: &[usize], left: &mut f32, frac: f32) -> f32 {
+        let area = self.cell * self.cell;
+        let mut wrote = 0.0_f32;
+        for &idx in cells {
+            if *left <= 1.0e-8 {
+                break;
+            }
+            let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+            let room = (depth * frac - self.placed[idx]).max(0.0);
+            if room <= 1.0e-5 {
+                continue;
+            }
+            let add = room.min(*left / area);
+            self.note_coat(idx, add, true);
+            let taken = add * area;
+            *left -= taken;
+            wrote += taken;
+        }
+        wrote
     }
 
     /// Spread `volume` across `cells` as placed thickness. A rut cell keeps
     /// its kind. A bare cell becomes spoil. The bed is not cut.
+    ///
+    /// Rut cells fill nearest-first, and only up to a ceiling inside the cut.
+    /// Filling them flush is a flat sheet on the ground.
     fn lay_coat(&mut self, cells: &[usize], volume: f32, into_rut: bool) -> f32 {
         if cells.is_empty() || volume <= 0.0 {
             return 0.0;
         }
-        let area = self.cell * self.cell;
-        let cap = 0.06_f32;
         let mut left = volume;
         let mut wrote = 0.0_f32;
-        for _ in 0..4 {
-            if left <= 1.0e-8 {
-                break;
-            }
-            let open = cells
-                .iter()
-                .filter(|idx| self.placed[**idx] < cap - 1.0e-4)
-                .count();
-            if open == 0 {
-                break;
-            }
-            let share = left / (open as f32 * area);
-            for &idx in cells {
-                let room = (cap - self.placed[idx]).max(0.0);
-                let add = share.min(room);
-                if add <= 0.0 {
-                    continue;
-                }
-                self.note_coat(idx, add, into_rut);
-                left -= add * area;
-                wrote += add * area;
-            }
+        // Two centimetres under the lip, so the pile has a side.
+        wrote += self.pour(cells, &mut left, into_rut, 0.02);
+        if into_rut && left > 1.0e-8 {
+            // Still inside the cut. The in-rut path needs the surface below the lip.
+            wrote += self.pour(cells, &mut left, true, 0.012);
         }
+        // A shallow groove can be shorter than the coat. The last rut cell
+        // keeps the rest so none of it is deleted. The bed is still not cut.
         if left > 1.0e-8 {
-            let add = left / (cells.len() as f32 * area);
-            for &idx in cells {
-                self.note_coat(idx, add, into_rut);
-                wrote += add * area;
+            let idx = cells[cells.len() - 1];
+            let add = left / self.cell / self.cell;
+            self.note_coat(idx, add, into_rut);
+            wrote += left;
+        }
+        wrote
+    }
+
+    fn pour(&mut self, cells: &[usize], left: &mut f32, into_rut: bool, margin: f32) -> f32 {
+        let area = self.cell * self.cell;
+        let mut wrote = 0.0_f32;
+        for &idx in cells {
+            if *left <= 1.0e-8 {
+                break;
             }
+            let room = if into_rut {
+                let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                let ceiling = (depth - margin).max(0.0);
+                (ceiling - self.placed[idx]).max(0.0)
+            } else {
+                (0.06 - self.placed[idx]).max(0.0)
+            };
+            if room <= 1.0e-5 {
+                continue;
+            }
+            let add = room.min(*left / area);
+            self.note_coat(idx, add, into_rut);
+            let taken = add * area;
+            *left -= taken;
+            wrote += taken;
         }
         wrote
     }
@@ -1251,11 +1337,9 @@ impl SoilField {
         self.placed[idx] += add;
         let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
         if into_rut && depth > 0.01 {
-            // The shed coat is the clay that was on the carcass. Packed clay is
-            // the field the ground shader already uses for a pressed tread.
-            self.kind[idx] = SurfaceKind::PackedClay as u8;
-            self.wetness[idx] = self.wetness[idx].max(0.88);
-            self.darken[idx] = self.darken[idx].max(0.82);
+            // Same kind the rut already has. The thickness is placed on the bed.
+            self.wetness[idx] = self.wetness[idx].max(0.74);
+            self.darken[idx] = lerp(self.darken[idx], 0.55, 0.4);
         } else {
             self.kind[idx] = SurfaceKind::Berm as u8;
             self.wetness[idx] = self.wetness[idx].max(0.7);
@@ -1973,6 +2057,10 @@ impl SoilField {
         push_f32s(&mut out, &self.rest);
         out.extend_from_slice(&self.kind);
         out.extend_from_slice(&self.passes);
+        // The tread negative rides with the rut. Older snapshots stop here.
+        push_f32s(&mut out, &self.tread_amp);
+        push_f32s(&mut out, &self.tread_ang);
+        push_f32s(&mut out, &self.tread_lat);
         out
     }
 
@@ -2000,9 +2088,16 @@ impl SoilField {
         let rest = read_f32s(bytes, &mut i, n)?;
         let kind = read_u8s(bytes, &mut i, n)?;
         let passes = read_u8s(bytes, &mut i, n)?;
-        if i != bytes.len() {
+        let (tread_amp, tread_ang, tread_lat) = if i == bytes.len() {
+            (vec![0.0; n], vec![0.0; n], vec![0.0; n])
+        } else if bytes.len() - i == n * 12 {
+            let tread_amp = read_f32s(bytes, &mut i, n)?;
+            let tread_ang = read_f32s(bytes, &mut i, n)?;
+            let tread_lat = read_f32s(bytes, &mut i, n)?;
+            (tread_amp, tread_ang, tread_lat)
+        } else {
             return Err("soil snapshot has trailing bytes".into());
-        }
+        };
         let mut height = vec![0.0; n];
         for idx in 0..n {
             height[idx] = bed[idx] + placed[idx];
@@ -2024,7 +2119,79 @@ impl SoilField {
             kind,
             rest,
             passes,
+            tread_amp,
+            tread_ang,
+            tread_lat,
         })
+    }
+
+    /// Press a negative of the tread into the cells under the contact.
+    /// The bed is not cut. The amplitude stays until a later tire overwrites it.
+    pub fn imprint_tread(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        radius: f32,
+        width: f32,
+        sink: f32,
+    ) {
+        if sink < 0.008 || !sink.is_finite() {
+            return;
+        }
+        let fwd = Vec3::new(forward.x, 0.0, forward.z);
+        let fwd = if fwd.length_squared() < 1.0e-8 {
+            Vec3::Z
+        } else {
+            fwd.normalize()
+        };
+        let rt = Vec3::new(right.x, 0.0, right.z);
+        let rt = if rt.length_squared() < 1.0e-8 {
+            Vec3::new(fwd.z, 0.0, -fwd.x)
+        } else {
+            rt.normalize()
+        };
+        let amp = (sink * 0.9).clamp(0.026, 0.048);
+        let ang = fwd.x.atan2(fwd.z);
+        let chord = contact_length(radius, sink).max(radius * 0.35) * 0.5 + self.cell * 0.45;
+        let half_w = width * 0.5 + self.cell * 0.25;
+        let half = self.size * 0.5;
+        let reach = chord + half_w;
+        let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        for j in j0.max(1)..j1.min(res - 1) {
+            for i in i0.max(1)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - center.x;
+                let rel_z = cz - center.z;
+                let along = rel_x * fwd.x + rel_z * fwd.z;
+                let lat = rel_x * rt.x + rel_z * rt.z;
+                if along.abs() > chord || lat.abs() > half_w {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                self.tread_amp[idx] = amp;
+                self.tread_ang[idx] = ang;
+                self.tread_lat[idx] = lat;
+            }
+        }
+    }
+
+    /// Cells that still carry a tread negative, and the deepest lug.
+    pub fn tread_imprint_stats(&self) -> (u32, f32) {
+        let mut n = 0u32;
+        let mut amp = 0.0_f32;
+        for a in &self.tread_amp {
+            if *a > 0.001 {
+                n += 1;
+                amp = amp.max(*a);
+            }
+        }
+        (n, amp)
     }
 
     pub fn rut_track_span(&self) -> f32 {
@@ -3455,5 +3622,33 @@ mod tests {
             stickiness(cell.kind(), cell.wetness, cell.loose, cell.water) > dry_stick,
             "standing water should make the clay sticky again"
         );
+    }
+
+    #[test]
+    fn tread_negative_persists_with_the_rut() {
+        let mut soil = SoilField::flat(0.72);
+        let before = soil.cut_volume();
+        let center = glam::Vec3::new(0.74, 0.3, 0.2);
+        soil.imprint_tread(center, glam::Vec3::Z, glam::Vec3::X, 0.38, 0.28, 0.04);
+        let idx = soil.idx_at(0.74, 0.2).expect("cell");
+        let amp = soil.tread_amp[idx];
+        assert!(amp > 0.015, "the contact did not press a tread, amp {amp}");
+        let (n, deep) = soil.tread_imprint_stats();
+        assert!(n >= 1 && deep >= amp - 1.0e-6, "imprint missing on a second look");
+        assert!(
+            (soil.cut_volume() - before).abs() < 1.0e-6,
+            "the tread negative cut the bed"
+        );
+        let saved = soil.save_state();
+        let loaded = SoilField::load_state(&saved).expect("reload");
+        assert!(
+            (loaded.tread_amp[idx] - amp).abs() < 1.0e-6,
+            "reload dropped the tread"
+        );
+        assert!((loaded.tread_ang[idx] - soil.tread_ang[idx]).abs() < 1.0e-6);
+        let legacy_len = saved.len() - soil.res * soil.res * 12;
+        let legacy = SoilField::load_state(&saved[..legacy_len]).expect("old snapshot");
+        assert_eq!(legacy.tread_amp[idx], 0.0);
+        assert!((legacy.bed[idx] - soil.bed[idx]).abs() < 1.0e-6);
     }
 }

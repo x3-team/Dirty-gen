@@ -704,7 +704,7 @@ pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
     // The solver stores one height per ~20 cm. A rut is often a single cell,
     // which is one kink and reads as a tint. Draw a finer mesh and sample the
     // same heightfield so the displaced walls have real triangles.
-    let sub = 3usize;
+    let sub = 4usize;
     let n = (res - 1) * sub + 1;
     let mut verts = Vec::with_capacity(n * n);
     let half = size * 0.5;

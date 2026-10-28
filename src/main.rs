@@ -395,6 +395,35 @@ fn lift_camera(world: &World, mut pose: CameraPose) -> CameraPose {
     pose
 }
 
+/// Keep the bottom of an orthographic frame above the heightfield.
+/// A low eye looks through the back of the mesh and the clear color shows.
+#[cfg(not(target_arch = "wasm32"))]
+fn clear_ortho_eye(world: &World, mut eye: Vec3, target: Vec3, ortho: f32) -> Vec3 {
+    let aspect = 1280.0_f32 / 720.0;
+    let half_h = (ortho * 0.5) / aspect;
+    // Only the near plane. The far end of the frame is supposed to meet the ground.
+    for _ in 0..3 {
+        let delta = target - eye;
+        let dist = delta.length().max(0.25);
+        let fwd = delta / dist;
+        let up = Vec3::Y - fwd * fwd.y;
+        if up.length_squared() < 1.0e-6 {
+            eye.y += 0.15;
+            continue;
+        }
+        let up = up.normalize();
+        let bottom = eye + fwd * 0.28 - up * half_h;
+        let g = world.soil.sample(bottom.x, bottom.z).height;
+        let g_eye = world.soil.sample(eye.x, eye.z).height;
+        let raise = ((g + 0.08) - bottom.y).max((g_eye + 0.22) - eye.y);
+        if raise <= 0.001 {
+            break;
+        }
+        eye.y += raise;
+    }
+    eye
+}
+
 fn run_window() {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -470,9 +499,15 @@ struct CaptureArgs {
     persist_second: PathBuf,
     persist_reload: PathBuf,
     niva_tread: bool,
+    niva_shed_only: bool,
+    niva_realism: bool,
     niva_groove_roll: PathBuf,
     niva_groove_spin: PathBuf,
     niva_sidewall_shed: PathBuf,
+    niva_sink_side: PathBuf,
+    niva_sink_front: PathBuf,
+    niva_tread_top: PathBuf,
+    niva_tread_side: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -518,8 +553,13 @@ fn capture(args: &[String]) {
         capture_persist(&mut renderer, &parsed);
         return;
     }
+    if parsed.niva_realism {
+        capture_niva_realism(&mut renderer, &parsed);
+        capture_niva_tread(&mut renderer, &parsed, true);
+        return;
+    }
     if parsed.niva_tread {
-        capture_niva_tread(&mut renderer, &parsed);
+        capture_niva_tread(&mut renderer, &parsed, parsed.niva_shed_only);
         return;
     }
     let mut world = World::demo();
@@ -661,6 +701,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut patch = false;
     let mut persist = false;
     let mut niva_tread = false;
+    let mut niva_shed_only = false;
+    let mut niva_realism = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -684,6 +726,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut niva_groove_roll = PathBuf::from(format!("{MEDIA}/niva-groove-roll.png"));
     let mut niva_groove_spin = PathBuf::from(format!("{MEDIA}/niva-groove-spin.png"));
     let mut niva_sidewall_shed = PathBuf::from(format!("{MEDIA}/niva-sidewall-shed.png"));
+    let niva_sink_side = PathBuf::from(format!("{MEDIA}/niva-sink-side.png"));
+    let niva_sink_front = PathBuf::from(format!("{MEDIA}/niva-sink-front.png"));
+    let niva_tread_top = PathBuf::from(format!("{MEDIA}/niva-tread-top.png"));
+    let niva_tread_side = PathBuf::from(format!("{MEDIA}/niva-tread-side.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -707,6 +753,11 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--patch" => patch = true,
             "--persist" => persist = true,
             "--niva-tread" => niva_tread = true,
+            "--niva-shed-only" => {
+                niva_tread = true;
+                niva_shed_only = true;
+            }
+            "--niva-realism" => niva_realism = true,
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -769,9 +820,15 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         persist_second,
         persist_reload,
         niva_tread,
+        niva_shed_only,
+        niva_realism,
         niva_groove_roll,
         niva_groove_spin,
         niva_sidewall_shed,
+        niva_sink_side,
+        niva_sink_front,
+        niva_tread_top,
+        niva_tread_side,
     }
 }
 
@@ -1096,7 +1153,7 @@ fn capture_patch(renderer: &mut Renderer, parsed: &CaptureArgs) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
+fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs, shed_only: bool) {
     renderer.daylight = true;
     renderer.show_props = false;
     renderer.show_bike = false;
@@ -1134,15 +1191,17 @@ fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
         }
     }
     print_patch("niva-roll", &world);
-    silence_chunks(&mut world);
-    write_cc0_still(
-        renderer,
-        &world,
-        "niva-roll",
-        &parsed.niva_groove_roll,
-        parsed,
-        niva_tread_camera(&world, 3),
-    );
+    if !shed_only {
+        silence_chunks(&mut world);
+        write_cc0_still(
+            renderer,
+            &world,
+            "niva-roll",
+            &parsed.niva_groove_roll,
+            parsed,
+            niva_tread_camera(&world, 3),
+        );
+    }
 
     for _ in 0..36 {
         world.step(
@@ -1170,15 +1229,17 @@ fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
         }
     }
     print_patch("niva-spin", &world);
-    silence_chunks(&mut world);
-    write_cc0_still(
-        renderer,
-        &world,
-        "niva-spin",
-        &parsed.niva_groove_spin,
-        parsed,
-        niva_tread_camera(&world, 3),
-    );
+    if !shed_only {
+        silence_chunks(&mut world);
+        write_cc0_still(
+            renderer,
+            &world,
+            "niva-spin",
+            &parsed.niva_groove_spin,
+            parsed,
+            niva_tread_camera(&world, 3),
+        );
+    }
 
     while spun < 420 {
         let w = world.vehicle.wheels[3];
@@ -1192,9 +1253,23 @@ fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
     print_patch("niva-shed", &world);
     let after = world.soil.volumes();
     let pile = rut_pile(&world, 3);
+    let rear = world.vehicle.pos
+        + world.vehicle.orientation() * world.vehicle.wheel_center_local(3);
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let focus = spoil_focus(&world, 3, rear, fwd, right);
+    let focus_i = world.soil.idx_at(focus.x, focus.z);
+    let (placed_h, depth_h) = focus_i
+        .map(|i| {
+            (
+                world.soil.placed[i],
+                (world.soil.initial_height[i] - world.soil.bed[i]).max(0.0),
+            )
+        })
+        .unwrap_or((0.0, 0.0));
     println!(
         "niva shed coat_in_rut {:.5} m3  placed {:.5} -> {:.5}  cut {:.5} -> {:.5}  placed-cut {:.5} -> {:.5}  \
-         pile {:.3} m on {} rut cells",
+         pile {:.3} m on {} rut cells  ridge {:.3} m in a {:.3} m rut",
         world.coat_in_rut,
         before.placed,
         after.placed,
@@ -1203,9 +1278,13 @@ fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
         before.placed - before.cut,
         after.placed - after.cut,
         pile.0,
-        pile.1
+        pile.1,
+        placed_h,
+        depth_h
     );
     silence_chunks(&mut world);
+    // The photo is the spoil. Lug displacement on the same cells hides the ridge.
+    reveal_spoil(&mut world, 3);
     write_cc0_still(
         renderer,
         &world,
@@ -1214,6 +1293,45 @@ fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
         parsed,
         niva_shed_camera(&world, 3),
     );
+}
+
+/// The coat is placed height in the rut. Drop the tread mask on those cells
+/// and mark them as spoil so the mesh shows a ridge, not another lug print.
+#[cfg(not(target_arch = "wasm32"))]
+fn reveal_spoil(world: &mut World, wheel: usize) {
+    use silt::soil::SurfaceKind;
+    let center = world.vehicle.pos
+        + world.vehicle.orientation() * world.vehicle.wheel_center_local(wheel);
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let soil = &mut world.soil;
+    let half = soil.size * 0.5;
+    let res = soil.res as isize;
+    let reach = 4.2_f32;
+    let i0 = (((center.x - reach) + half) / soil.cell).floor() as isize;
+    let i1 = (((center.x + reach) + half) / soil.cell).floor() as isize;
+    let j0 = (((center.z - reach) + half) / soil.cell).floor() as isize;
+    let j1 = (((center.z + reach) + half) / soil.cell).floor() as isize;
+    for j in j0.max(0)..j1.min(res - 1) {
+        for i in i0.max(0)..i1.min(res - 1) {
+            let cx = (i as f32 + 0.5) * soil.cell - half;
+            let cz = (j as f32 + 0.5) * soil.cell - half;
+            let rel_x = cx - center.x;
+            let rel_z = cz - center.z;
+            let along = rel_x * fwd.x + rel_z * fwd.z;
+            let lat = rel_x * right.x + rel_z * right.z;
+            let behind = -along;
+            if !(1.05..=3.8).contains(&behind) || lat.abs() > 0.16 {
+                continue;
+            }
+            let idx = j as usize * soil.res + i as usize;
+            let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            if depth > 0.01 && soil.placed[idx] > 0.012 {
+                soil.tread_amp[idx] = 0.0;
+                soil.kind[idx] = SurfaceKind::PlacedClod as u8;
+            }
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1254,7 +1372,7 @@ fn rut_pile(world: &World, wheel: usize) -> (f32, u32) {
             let along = rel_x * fwd.x + rel_z * fwd.z;
             let lat = rel_x * right.x + rel_z * right.z;
             let behind = -along;
-            if !(0.38..=0.95).contains(&behind) || lat.abs() > 0.22 {
+            if !(1.05..=3.6).contains(&behind) || lat.abs() > 0.14 {
                 continue;
             }
             let idx = j as usize * soil.res + i as usize;
@@ -1308,12 +1426,286 @@ fn niva_shed_camera(world: &World, wheel: usize) -> CameraPose {
     let fwd = vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
     let side = if local.x >= 0.0 { 1.0 } else { -1.0 };
-    // Tire on the left, the rut it just shed into filling the middle.
-    let eye = center - fwd * 1.42 + right * side * 0.78 + Vec3::Y * 0.46;
+    let pile = spoil_focus(world, wheel, center, fwd, right);
+    let lip = world
+        .soil
+        .sample(pile.x + right.x * side * 0.55, pile.z + right.z * side * 0.55)
+        .height;
+    // Across the rut, above the lip, so the ridge's side is the subject.
+    // In the empty rut beyond the pile, looking back at the step.
+    let look = Vec3::new(pile.x, pile.y, pile.z);
+    let eye = pile - fwd * 0.46 + right * side * 0.22;
+    let eye = Vec3::new(eye.x, lip + 0.22, eye.z);
+    let ortho = 0.38;
     CameraPose {
-        eye,
-        target: center - fwd * 0.62 - Vec3::Y * 0.16,
-        ortho_width: Some(1.32),
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+/// Tallest coat on the center of the rut behind this tire.
+#[cfg(not(target_arch = "wasm32"))]
+fn spoil_focus(world: &World, _wheel: usize, center: Vec3, fwd: Vec3, right: Vec3) -> Vec3 {
+    let soil = &world.soil;
+    let half = soil.size * 0.5;
+    let mut best = center - fwd * 0.7;
+    let mut best_h = -1.0_f32;
+    let res = soil.res as isize;
+    let reach = 4.2_f32;
+    let i0 = (((center.x - reach) + half) / soil.cell).floor() as isize;
+    let i1 = (((center.x + reach) + half) / soil.cell).floor() as isize;
+    let j0 = (((center.z - reach) + half) / soil.cell).floor() as isize;
+    let j1 = (((center.z + reach) + half) / soil.cell).floor() as isize;
+    for j in j0.max(0)..j1.min(res - 1) {
+        for i in i0.max(0)..i1.min(res - 1) {
+            let cx = (i as f32 + 0.5) * soil.cell - half;
+            let cz = (j as f32 + 0.5) * soil.cell - half;
+            let rel_x = cx - center.x;
+            let rel_z = cz - center.z;
+            let along = rel_x * fwd.x + rel_z * fwd.z;
+            let lat = rel_x * right.x + rel_z * right.z;
+            let behind = -along;
+            if !(1.05..=3.6).contains(&behind) || lat.abs() > 0.22 {
+                continue;
+            }
+            let idx = j as usize * soil.res + i as usize;
+            let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            // The tail of the pile, where the empty rut meets the spoil.
+            if depth > 0.01 && soil.placed[idx] > 0.018 && behind > best_h {
+                best_h = behind;
+                best = Vec3::new(cx, soil.height[idx], cz);
+            }
+        }
+    }
+    best
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_niva_realism(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::flat(0.72);
+    world.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+    world.bike.vel = Vec3::ZERO;
+    for w in &mut world.soil.water {
+        *w = 0.0;
+    }
+    let dt = 1.0 / 60.0;
+    for _ in 0..24 {
+        world.step(dt, &Input::default());
+    }
+    silence_chunks(&mut world);
+    print_sink("niva-sink", &world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-sink-side",
+        &parsed.niva_sink_side,
+        parsed,
+        niva_sink_side_camera(&world),
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-sink-front",
+        &parsed.niva_sink_front,
+        parsed,
+        niva_sink_front_camera(&world),
+    );
+
+    let origin = world.vehicle.pos;
+    for _ in 0..140 {
+        prescribe_roll(&mut world, 1.05);
+        world.step(dt, &Input::default());
+    }
+    let (n, amp) = world.soil.tread_imprint_stats();
+    println!("imprint after pass  cells {n}  deepest {amp:.4} m");
+    for _ in 0..50 {
+        prescribe_roll(&mut world, 1.05);
+        world.step(dt, &Input::default());
+    }
+    let (n2, amp2) = world.soil.tread_imprint_stats();
+    println!("imprint second look cells {n2}  deepest {amp2:.4} m");
+    silence_chunks(&mut world);
+    // The rut the car has left. A spot under the bumper hides the lugs behind the body.
+    let spot = imprint_behind(&world, origin.z);
+    println!(
+        "imprint spot ({:.2}, {:.2}) amp {:.4}",
+        spot.x,
+        spot.z,
+        world
+            .soil
+            .idx_at(spot.x, spot.z)
+            .map(|i| world.soil.tread_amp[i])
+            .unwrap_or(0.0)
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-tread-top",
+        &parsed.niva_tread_top,
+        parsed,
+        niva_imprint_top_camera(&world, spot),
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-tread-side",
+        &parsed.niva_tread_side,
+        parsed,
+        niva_imprint_side_camera(&world, spot),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn print_sink(label: &str, world: &World) {
+    use silt::vehicle::{MASS, WHEEL_RADIUS};
+    let mut support = 0.0_f32;
+    for i in 0..4 {
+        let w = world.vehicle.wheels[i];
+        let center =
+            world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+        let h = world.soil.sample(center.x, center.z).height;
+        let bottom = center.y - WHEEL_RADIUS;
+        let seat = h - w.sinkage;
+        support += w.normal;
+        println!(
+            "{label} wheel {i}  sink {:.4} m  hub {:.4}  soil {:.4}  bottom {:.4}  soil-sink {:.4}  \
+             gap {:.4}  comp {:.3}  normal {:.0} N",
+            w.sinkage,
+            center.y,
+            h,
+            bottom,
+            seat,
+            bottom - seat,
+            w.compression,
+            w.normal
+        );
+    }
+    println!(
+        "{label} support {:.0} N  weight {:.0} N",
+        support,
+        MASS * 9.81
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn imprint_spot(world: &World, z: f32) -> Vec3 {
+    let mut best = Vec3::new(0.74, 0.0, z);
+    let mut best_a = -1.0_f32;
+    let mut x = -1.6_f32;
+    while x <= 1.6 {
+        if let Some(idx) = world.soil.idx_at(x, z) {
+            let a = world.soil.tread_amp[idx];
+            if a > best_a {
+                best_a = a;
+                let half = world.soil.size * 0.5;
+                let i = idx % world.soil.res;
+                let j = idx / world.soil.res;
+                best = Vec3::new(
+                    (i as f32 + 0.5) * world.soil.cell - half,
+                    0.0,
+                    (j as f32 + 0.5) * world.soil.cell - half,
+                );
+            }
+        }
+        x += world.soil.cell * 0.5;
+    }
+    best
+}
+
+/// Strongest tread negative at least a car-length behind the Niva.
+#[cfg(not(target_arch = "wasm32"))]
+fn imprint_behind(world: &World, origin_z: f32) -> Vec3 {
+    let car_z = world.vehicle.pos.z;
+    let mut best = imprint_spot(world, origin_z + 0.4);
+    let mut best_a = -1.0_f32;
+    let mut z = origin_z - 0.15;
+    // Past the rear bumper, so the body does not cover the print.
+    let end = car_z - 2.55;
+    while z < end {
+        let spot = imprint_spot(world, z);
+        let amp = world
+            .soil
+            .idx_at(spot.x, spot.z)
+            .map(|i| world.soil.tread_amp[i])
+            .unwrap_or(0.0);
+        if amp > best_a {
+            best_a = amp;
+            best = spot;
+        }
+        z += world.soil.cell;
+    }
+    best
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_sink_side_camera(world: &World) -> CameraPose {
+    let p = world.vehicle.pos;
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let ground = world.soil.sample(p.x + right.x * 1.6, p.z + right.z * 1.6).height;
+    let look = Vec3::new(p.x, ground + 0.50, p.z) - fwd * 0.05;
+    let eye = look + right * 2.7 + Vec3::Y * 0.95;
+    let ortho = 3.55;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_sink_front_camera(world: &World) -> CameraPose {
+    let p = world.vehicle.pos;
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let axle = p + fwd * 1.08;
+    let ground = world
+        .soil
+        .sample(axle.x + right.x * 1.4, axle.z + fwd.z * 0.4)
+        .height;
+    // In front and above, looking down onto the tread. The old eye sat in
+    // the ortho slice, so the bottom of the frame was the clear color.
+    let look = Vec3::new(axle.x, ground + 0.06, axle.z);
+    let eye = look + fwd * 2.15 + right * 0.28 + Vec3::Y * 0.62;
+    let ortho = 1.9;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_imprint_top_camera(world: &World, spot: Vec3) -> CameraPose {
+    let h = world.soil.sample(spot.x, spot.z).height;
+    let look = Vec3::new(spot.x, h + 0.02, spot.z);
+    // Off vertical. A straight-down look is parallel to the camera up axis.
+    CameraPose {
+        eye: look + Vec3::new(0.16, 1.35, -0.62),
+        target: look,
+        ortho_width: Some(0.92),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_imprint_side_camera(world: &World, spot: Vec3) -> CameraPose {
+    let h = world.soil.sample(spot.x, spot.z).height;
+    let lip = world.soil.sample(spot.x + 0.85, spot.z).height.max(h);
+    // Beside the rut and above the lip, along the lug row. The tire stays
+    // out of frame, and the eye stays off the underside of the mesh.
+    let look = Vec3::new(spot.x, h + 0.01, spot.z + 0.22);
+    let eye = Vec3::new(spot.x + 0.62, lip + 0.38, spot.z - 0.72);
+    let ortho = 0.92;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
     }
 }
 

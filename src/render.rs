@@ -33,6 +33,8 @@ struct FrameData {
     amb: [f32; 4],
     params: [f32; 4],
     misc: [f32; 4],
+    /// Four tires, two vec4s each: center.xyz + radius, then forward.xz, sink, active.
+    tires: [[f32; 4]; 8],
 }
 
 #[repr(C)]
@@ -64,6 +66,7 @@ pub struct Renderer {
     tex_bg: wgpu::BindGroup,
     height_bg: wgpu::BindGroup,
     height_tex: wgpu::Texture,
+    imprint_tex: wgpu::Texture,
     mat_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
@@ -110,6 +113,7 @@ pub struct Renderer {
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
+    imprint_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
     height_bytes: Vec<u8>,
     height_packed: bool,
@@ -292,6 +296,16 @@ impl Renderer {
                 filter_array(5, wgpu::ShaderStages::FRAGMENT),
                 filter_array(6, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 filter_samp(7, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -404,6 +418,20 @@ impl Renderer {
         });
         let mat_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("material"),
+            size: wgpu::Extent3d {
+                width: MAP_RES as u32,
+                height: MAP_RES as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let imprint_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imprint"),
             size: wgpu::Extent3d {
                 width: MAP_RES as u32,
                 height: MAP_RES as u32,
@@ -550,6 +578,12 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::Sampler(&ground_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(
+                        &imprint_tex.create_view(&Default::default()),
+                    ),
                 },
             ],
         });
@@ -899,6 +933,7 @@ impl Renderer {
             tex_bg,
             height_bg,
             height_tex,
+            imprint_tex,
             mat_tex,
             color,
             color_view,
@@ -940,6 +975,7 @@ impl Renderer {
             blit_shader,
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
+            imprint_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
             height_packed: formats.height_packed,
@@ -1098,6 +1134,7 @@ impl Renderer {
                 if self.height_packed { 1.0 } else { 0.0 },
                 0.0,
             ],
+            tires: tire_frame(&world.vehicle),
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
@@ -1353,6 +1390,38 @@ impl Renderer {
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
         }
+        for (i, px) in self.imprint_scratch.chunks_exact_mut(4).enumerate() {
+            let amp = soil.tread_amp[i];
+            if amp < 0.001 {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+                px[3] = 0;
+                continue;
+            }
+            let ang = soil.tread_ang[i].rem_euclid(std::f32::consts::TAU)
+                / std::f32::consts::TAU;
+            let lat = ((soil.tread_lat[i] + 0.4) / 0.8).clamp(0.0, 1.0);
+            px[0] = ((amp / 0.06).clamp(0.0, 1.0) * 255.0) as u8;
+            px[1] = (ang.clamp(0.0, 1.0) * 255.0) as u8;
+            px[2] = (lat * 255.0) as u8;
+            px[3] = 255;
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.imprint_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.imprint_scratch,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(res * 4),
+                rows_per_image: Some(res),
+            },
+            extent,
+        );
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.mat_tex,
@@ -1482,6 +1551,27 @@ impl Renderer {
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
+}
+
+fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
+    use glam::Quat;
+    let mut out = [[0.0; 4]; 8];
+    let ori = vehicle.orientation();
+    for i in 0..4 {
+        let center = vehicle.pos + ori * vehicle.wheel_center_local(i);
+        let wheel = vehicle.wheels[i];
+        let mut fwd = ori * (Quat::from_rotation_y(wheel.steer) * Vec3::Z);
+        fwd.y = 0.0;
+        if fwd.length_squared() < 1.0e-6 {
+            fwd = Vec3::Z;
+        } else {
+            fwd = fwd.normalize();
+        }
+        let live = wheel.sinkage > 0.003 && wheel.normal > 1.0;
+        out[i * 2] = [center.x, center.y, center.z, WHEEL_RADIUS];
+        out[i * 2 + 1] = [fwd.x, fwd.z, wheel.sinkage, if live { 1.0 } else { 0.0 }];
+    }
+    out
 }
 
 fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {

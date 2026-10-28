@@ -337,6 +337,15 @@ impl World {
                 dt,
                 false,
             );
+            // The lug negative is a record of this contact. It does not cut.
+            self.soil.imprint_tread(
+                c.wheel_center,
+                c.forward,
+                c.right,
+                WHEEL_RADIUS,
+                crate::vehicle::WHEEL_WIDTH,
+                c.sinkage,
+            );
             // One groove per side of the axle. Front and rear share it, so a
             // turn does not chew a second slot into the berm.
             sides[c.index % 2].add(c.wheel_center, c.forward, c.right, c.sinkage, slip_stamp);
@@ -806,6 +815,46 @@ fn closest_s(pos: Vec3) -> f32 {
         }
     }
     s.rem_euclid(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle::{MASS, WHEEL_RADIUS};
+
+    #[test]
+    fn hubs_sit_on_the_solver_sink() {
+        let world = World::flat(0.72);
+        let mut support = 0.0_f32;
+        for i in 0..4 {
+            let w = world.vehicle.wheels[i];
+            let center =
+                world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+            let h = world.soil.sample(center.x, center.z).height;
+            let bottom = center.y - WHEEL_RADIUS;
+            let seat = h - w.sinkage;
+            assert!(w.normal > 200.0, "wheel {i} is not supporting the body");
+            assert!(w.sinkage > 0.005 && w.sinkage < 0.16, "wheel {i} sink {}", w.sinkage);
+            assert!(
+                (bottom - seat).abs() < 0.012,
+                "wheel {i} bottom {bottom:.4} soil-sink {seat:.4} sink {:.4}",
+                w.sinkage
+            );
+            support += w.normal;
+        }
+        let weight = MASS * 9.81;
+        assert!(
+            support > weight * 0.65 && support < weight * 1.45,
+            "tires are not carrying the body, support {support:.0} weight {weight:.0}"
+        );
+        let (n, amp) = world.soil.tread_imprint_stats();
+        assert!(n > 0 && amp > 0.01, "settle did not leave a tread negative");
+        let saved = world.soil.save_state();
+        let loaded = crate::soil::SoilField::load_state(&saved).expect("reload");
+        let (n2, amp2) = loaded.tread_imprint_stats();
+        assert_eq!(n2, n);
+        assert!((amp2 - amp).abs() < 1.0e-5, "the imprint did not survive reload");
+    }
 }
 
 fn wrap_pi(mut a: f32) -> f32 {
