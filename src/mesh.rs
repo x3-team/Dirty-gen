@@ -1121,7 +1121,8 @@ fn add_torn_clay(
     let sink = if grounded {
         let heavy = (stones_n as f32 - 1.0) * 0.05;
         let tall = if chunky { 0.14 } else { 0.0 };
-        Vec3::Y * radius * (0.36 + h(12) * 0.1 + tall - heavy)
+        // Sit in the soil, like the torn shoulder of the rut. Volume is unchanged.
+        Vec3::Y * radius * (0.12 + h(12) * 0.06 + tall * 0.4 - heavy)
     } else {
         Vec3::ZERO
     };
