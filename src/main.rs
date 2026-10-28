@@ -46,6 +46,10 @@ fn main() {
                 let rest: Vec<String> = args.collect();
                 capture_rut(&rest);
             }
+            Some("capture-frame") => {
+                let rest: Vec<String> = args.collect();
+                capture_frame(&rest);
+            }
             _ => run_window(),
         }
     }
@@ -695,6 +699,102 @@ fn capture_rut(args: &[String]) {
         water_path.display(),
         world.soil.rut_near(0.2, 0.74),
         world.soil.sample(2.6, 0.0).water
+    );
+}
+
+/// Oval after two tyre passes. Water sits in the east-straight ruts.
+/// One frame is the groove, one is the water on that same cut.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_frame(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut rut_path = PathBuf::from(format!("{MEDIA}/mud-frame-rut.png"));
+    let mut water_path = PathBuf::from(format!("{MEDIA}/mud-frame-water.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--rut" => rut_path = PathBuf::from(val(&mut i)),
+            "--water" => water_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-frame flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::demo();
+    // Fresh oval, then the same two passes the soil test measures.
+    world.soil = silt::soil::SoilField::demo();
+    let (first, second) = world.soil.cut_east_straight();
+    world.particles.clear();
+    let park = world.soil.sample(-8.0, -6.0).height;
+    world.vehicle.pos = Vec3::new(-8.0, park + 0.62, -6.0);
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.4;
+    world.bike.pos = Vec3::new(-11.0, park + 0.7, -8.5);
+    world.bike.vel = Vec3::ZERO;
+    let lip = world.soil.sample(silt::soil::TRACK_R + 0.74, 1.6);
+    // Along the grooves, low, from the infield. The outer wall faces this way.
+    let rut_pose = lift_camera(
+        &world,
+        CameraPose {
+            eye: Vec3::new(4.05, 1.22, -0.05),
+            target: Vec3::new(6.95, -0.06, 2.15),
+            ortho_width: None,
+        },
+    );
+    let rgba = renderer
+        .draw(&world, rut_pose, None, true)
+        .expect("rut readback");
+    write_png(&rut_path, width, height, &rgba).expect("rut png");
+    println!(
+        "rut {} passes {:.3}->{:.3} lip water {:.3} height {:.3}",
+        rut_path.display(),
+        first,
+        second,
+        lip.water,
+        lip.height
+    );
+    // Same cut, higher, so the water in the groove is the subject.
+    let water_pose = lift_camera(
+        &world,
+        CameraPose {
+            eye: Vec3::new(3.4, 2.7, 0.35),
+            target: Vec3::new(6.75, -0.1, 2.05),
+            ortho_width: None,
+        },
+    );
+    let rgba = renderer
+        .draw(&world, water_pose, None, true)
+        .expect("water readback");
+    write_png(&water_path, width, height, &rgba).expect("water png");
+    println!(
+        "water {} depth {:.3} at ({:.2},{:.2})",
+        water_path.display(),
+        lip.water,
+        silt::soil::TRACK_R + 0.74,
+        1.6
     );
 }
 

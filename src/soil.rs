@@ -593,6 +593,27 @@ impl SoilField {
         self.rut_near(mid.x, mid.z)
     }
 
+    /// Two southbound tyre lanes on the east straight of the oval, through
+    /// the puddle and out onto the track. The gap between passes is long
+    /// enough to count as a second visit. Returns the rut depth after each
+    /// pass. Water is then given time to sit in the cut.
+    pub fn cut_east_straight(&mut self) -> (f32, f32) {
+        let dir = Vec3::new(0.0, 0.0, -1.0);
+        let mut first = 0.0_f32;
+        for lane in [-0.74_f32, 0.74] {
+            let origin = Vec3::new(TRACK_R + lane, 0.0, 4.6);
+            first = first.max(self.roll_pass(origin, dir, 6.2, 0.09, 0.0));
+        }
+        self.age_water(0.55);
+        let mut second = 0.0_f32;
+        for lane in [-0.74_f32, 0.74] {
+            let origin = Vec3::new(TRACK_R + lane, 0.0, 4.6);
+            second = second.max(self.roll_pass(origin, dir, 6.2, 0.09, 0.0));
+        }
+        self.age_water(6.0);
+        (first, second)
+    }
+
     /// Deepest rut in a small window. A sample that lands on a shoulder
     /// would under-report the floor.
     pub fn rut_near(&self, x: f32, z: f32) -> f32 {
@@ -1294,6 +1315,42 @@ mod tests {
         assert!(
             slip_wet > slip_dry + 0.2,
             "wet rut slip {slip_wet:.3} is not above dry {slip_dry:.3}"
+        );
+    }
+
+    /// East straight of the oval. Two tyre lanes, southbound, through the
+    /// puddle and out onto the track. The second pass has to open a groove
+    /// the puddle can sit in.
+    #[test]
+    fn oval_two_passes_hold_water_in_the_rut() {
+        let mut soil = SoilField::demo();
+        let before: f32 = soil.water.iter().sum();
+        let (first, second) = soil.cut_east_straight();
+        // On the south lip of the east puddle. The groove is still full.
+        // The berm beside that groove is the shoulder.
+        let in_rut = soil.sample(TRACK_R + 0.74, 1.6).water;
+        let shoulder = soil.sample(TRACK_R + 0.74 + 0.42, 1.6).water;
+        let floor = soil.sample(TRACK_R + 0.74, 1.6);
+        let after: f32 = soil.water.iter().sum();
+        eprintln!(
+            "oval passes {first:.4} -> {second:.4}  rut water {in_rut:.4} shoulder {shoulder:.4} height {:.4} rut {:.4} volume {before:.2} -> {after:.2}",
+            floor.height, floor.rut
+        );
+        assert!(
+            second > first + 0.012,
+            "second pass did not deepen the oval rut: {first:.4} -> {second:.4}"
+        );
+        assert!(
+            in_rut > 0.02,
+            "water is not sitting in the oval rut, depth {in_rut:.4}"
+        );
+        assert!(
+            shoulder < in_rut * 0.5,
+            "water left the rut onto the shoulder: rut {in_rut:.4} shoulder {shoulder:.4}"
+        );
+        assert!(
+            after > before * 0.92,
+            "water was deleted on the oval: {before:.2} -> {after:.2}"
         );
     }
 }
