@@ -4,6 +4,7 @@
 
 mod cc0;
 mod mesh;
+mod niva;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -133,6 +134,7 @@ impl ApplicationHandler for App {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
                         PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
+                        PhysicalKey::Code(KeyCode::Backspace) => self.world.reset_vehicle(),
                         _ => {}
                     }
                 }
@@ -463,6 +465,10 @@ struct CaptureArgs {
     patch: bool,
     patch_roll: PathBuf,
     patch_spin: PathBuf,
+    persist: bool,
+    persist_first: PathBuf,
+    persist_second: PathBuf,
+    persist_reload: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -502,6 +508,10 @@ fn capture(args: &[String]) {
     }
     if parsed.patch {
         capture_patch(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.persist {
+        capture_persist(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -641,6 +651,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut volume = false;
     let mut moisture = false;
     let mut patch = false;
+    let mut persist = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -658,6 +669,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut moisture_dry = PathBuf::from(format!("{MEDIA}/moisture-dry.png"));
     let mut patch_roll = PathBuf::from(format!("{MEDIA}/patch-roll.png"));
     let mut patch_spin = PathBuf::from(format!("{MEDIA}/patch-spin.png"));
+    let mut persist_first = PathBuf::from(format!("{MEDIA}/persist-first.png"));
+    let mut persist_second = PathBuf::from(format!("{MEDIA}/persist-second.png"));
+    let mut persist_reload = PathBuf::from(format!("{MEDIA}/persist-reload.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -679,6 +693,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--volume" => volume = true,
             "--moisture" => moisture = true,
             "--patch" => patch = true,
+            "--persist" => persist = true,
+            "--persist-first" => persist_first = PathBuf::from(val(&mut i)),
+            "--persist-second" => persist_second = PathBuf::from(val(&mut i)),
+            "--persist-reload" => persist_reload = PathBuf::from(val(&mut i)),
             "--patch-roll" => patch_roll = PathBuf::from(val(&mut i)),
             "--patch-spin" => patch_spin = PathBuf::from(val(&mut i)),
             "--moisture-wet" => moisture_wet = PathBuf::from(val(&mut i)),
@@ -730,6 +748,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         moisture_dry,
         patch_roll,
         patch_spin,
+        persist,
+        persist_first,
+        persist_second,
+        persist_reload,
     }
 }
 
@@ -858,6 +880,103 @@ fn capture_volume(renderer: &mut Renderer, parsed: &CaptureArgs) {
         parsed,
         volume_slope_camera(),
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_persist(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::SoilField;
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::flat(0.45);
+    world.soil = SoilField::mud_pad();
+    let from = Vec3::new(0.0, 0.0, -1.15);
+    let to = Vec3::new(0.0, 0.0, 1.15);
+    world.soil.roll_lane(from, to, 0.09, 0.0);
+    let saved = world.soil.save_state();
+    park_beside(&mut world);
+    print_persist("pass1", &world.soil);
+    write_cc0_still(
+        renderer,
+        &world,
+        "persist-first",
+        &parsed.persist_first,
+        parsed,
+        persist_camera(),
+    );
+
+    world.soil.age_passes(0.55);
+    world.soil.roll_lane(from, to, 0.09, 0.0);
+    park_beside(&mut world);
+    print_persist("pass2", &world.soil);
+    write_cc0_still(
+        renderer,
+        &world,
+        "persist-second",
+        &parsed.persist_second,
+        parsed,
+        persist_camera(),
+    );
+
+    // Fresh world, then the pass-1 snapshot. Reset restores the spawn pose
+    // and leaves the cut. The Niva is parked beside that surviving rut.
+    let mut reloaded = World::flat(0.45);
+    reloaded.soil = SoilField::load_state(&saved).expect("soil snapshot");
+    reloaded.reset_vehicle();
+    park_beside(&mut reloaded);
+    print_persist("reload", &reloaded.soil);
+    write_cc0_still(
+        renderer,
+        &reloaded,
+        "persist-reload",
+        &parsed.persist_reload,
+        parsed,
+        persist_camera(),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn print_persist(label: &str, soil: &silt::soil::SoilField) {
+    let v = soil.volumes();
+    let depth = soil.rut_near(0.0, 0.0);
+    println!(
+        "{label} depth {:.4} m  cut {:.4} m3  placed {:.4} m3  berm {:.4} m3  clods {:.4} m3  \
+         max rut {:.4} m  berm height {:.4} m",
+        depth, v.cut, v.placed, v.berm, v.clods, v.max_rut, v.max_berm
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_camera() -> CameraPose {
+    // Same three-quarter for every still, so the second groove reads as deeper.
+    // Low enough to see the torn lip, high enough to keep the Niva in frame.
+    CameraPose {
+        eye: Vec3::new(-3.15, 1.78, 2.55),
+        target: Vec3::new(0.05, 0.72, -0.05),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn park_beside(world: &mut World) {
+    // Off the lane. The tires are not in the cut, so the picture does not
+    // restamp the rut the solver just wrote.
+    world.bike.pos = Vec3::new(18.0, 0.4, 18.0);
+    world.bike.vel = Vec3::ZERO;
+    let x = 2.15;
+    let z = -0.2;
+    let h = world.soil.sample(x, z).height;
+    world.vehicle.pos = Vec3::new(x, h + 0.66, z);
+    world.vehicle.yaw = -0.55;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.pitch_rate = 0.0;
+    world.vehicle.roll_rate = 0.0;
 }
 
 #[cfg(not(target_arch = "wasm32"))]

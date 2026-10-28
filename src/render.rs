@@ -114,6 +114,15 @@ pub struct Renderer {
     height_bytes: Vec<u8>,
     height_packed: bool,
     depth_format: wgpu::TextureFormat,
+    /// Midday sun and sky. The window keeps the low sun unless a still asks.
+    pub daylight: bool,
+    pub show_props: bool,
+    pub show_bike: bool,
+    /// Draw the fitted Lada Niva instead of the dune buggy mesh.
+    pub niva_picture: bool,
+    niva_body: GpuMesh,
+    niva_glass: GpuMesh,
+    niva_wheels: [GpuMesh; 4],
 }
 
 pub struct GpuFormats {
@@ -295,6 +304,9 @@ impl Renderer {
                 filter_tex(4, wgpu::ShaderStages::FRAGMENT),
                 filter_tex(5, wgpu::ShaderStages::FRAGMENT),
                 filter_samp(6, wgpu::ShaderStages::FRAGMENT),
+                array_tex(7),
+                array_tex(8),
+                array_tex(9),
             ],
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -476,6 +488,15 @@ impl Renderer {
         let (tire_base, tire_base_view) = upload_rgba(&device, &queue, "tire-base", &cc0.tire_base);
         let (tire_nor, tire_nor_view) = upload_rgba(&device, &queue, "tire-nor", &cc0.tire_nor);
         let (prop_tex, prop_view) = upload_rgba(&device, &queue, "prop", &cc0.prop_tex);
+        eprintln!("loading Lada Niva");
+        let mut niva = crate::niva::load();
+        let (niva_base, niva_base_view) =
+            upload_rgba_array(&device, &queue, "niva-base", &niva.base);
+        niva.base = Vec::new();
+        let (niva_nor, niva_nor_view) = upload_rgba_array(&device, &queue, "niva-nor", &niva.nor);
+        niva.nor = Vec::new();
+        let (niva_mr, niva_mr_view) = upload_rgba_array(&device, &queue, "niva-mr", &niva.mr);
+        niva.mr = Vec::new();
         let resident = vec![
             ground_diff,
             ground_nor,
@@ -486,6 +507,9 @@ impl Renderer {
             tire_base,
             tire_nor,
             prop_tex,
+            niva_base,
+            niva_nor,
+            niva_mr,
         ];
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tex-bg"),
@@ -560,6 +584,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&paint_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&niva_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&niva_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&niva_mr_view),
                 },
             ],
         });
@@ -810,6 +846,14 @@ impl Renderer {
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
         let props = upload_cpu(&device, &cc0.props, "props");
+        let niva_body = upload_cpu(&device, &niva.body, "niva-body");
+        let niva_glass = upload_cpu(&device, &niva.glass, "niva-glass");
+        let niva_wheels = [
+            upload_cpu(&device, &niva.wheels[0], "niva-fl"),
+            upload_cpu(&device, &niva.wheels[1], "niva-fr"),
+            upload_cpu(&device, &niva.wheels[2], "niva-rl"),
+            upload_cpu(&device, &niva.wheels[3], "niva-rr"),
+        ];
         let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-v"),
             size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -900,6 +944,13 @@ impl Renderer {
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
             height_packed: formats.height_packed,
             depth_format: formats.depth,
+            daylight: false,
+            show_props: true,
+            show_bike: true,
+            niva_picture: false,
+            niva_body,
+            niva_glass,
+            niva_wheels,
         }
     }
 
@@ -995,22 +1046,46 @@ impl Renderer {
             Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
         };
         let view_proj = proj * view;
-        // Low sun so rut walls and the buggy contact shadow separate from the ground.
-        let sun = Vec3::new(0.88, 0.32, 0.24).normalize();
-        let light_target = Vec3::new(0.0, 0.0, 2.0);
+        // The window keeps the low sun. Persist stills ask for daylight.
+        let sun = if self.daylight {
+            Vec3::new(0.38, 0.88, 0.18).normalize()
+        } else {
+            Vec3::new(0.88, 0.32, 0.24).normalize()
+        };
+        let light_target = if self.daylight {
+            Vec3::new(0.4, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 0.0, 2.0)
+        };
+        let extent = if self.daylight { 14.0 } else { 36.0 };
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
-        let light_proj = Mat4::orthographic_rh(-36.0, 36.0, -36.0, 36.0, 1.0, 130.0);
+        let light_proj = Mat4::orthographic_rh(-extent, extent, -extent, extent, 1.0, 130.0);
         let light_vp = light_proj * light_view;
+        let (sun_color, sky_zenith, sky_horizon, amb) = if self.daylight {
+            (
+                [1.70, 1.78, 1.90, 1.0],
+                [0.42, 0.64, 0.98, 1.0],
+                [0.76, 0.84, 0.96, 1.0],
+                [0.18, 0.20, 0.22, 1.0],
+            )
+        } else {
+            (
+                [1.15, 0.74, 0.42, 1.0],
+                [0.13, 0.26, 0.52, 1.0],
+                [0.50, 0.28, 0.18, 1.0],
+                [0.10, 0.062, 0.038, 1.0],
+            )
+        };
         let frame = FrameData {
             view_proj: view_proj.to_cols_array_2d(),
             light_vp: light_vp.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
             sun_dir: vec4(sun, 0.0),
-            sun_color: [1.15, 0.74, 0.42, 1.0],
-            sky_zenith: [0.13, 0.26, 0.52, 1.0],
-            sky_horizon: [0.50, 0.28, 0.18, 1.0],
-            amb: [0.10, 0.062, 0.038, 1.0],
+            sun_color,
+            sky_zenith,
+            sky_horizon,
+            amb,
             params: [
                 self.width as f32,
                 self.height as f32,
@@ -1075,9 +1150,13 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            draw_indexed(&mut pass, &self.props);
+            if self.show_props {
+                draw_indexed(&mut pass, &self.props);
+            }
             self.draw_vehicle(&mut pass);
-            self.draw_bike(&mut pass, bike_susp_count);
+            if self.show_bike {
+                self.draw_bike(&mut pass, bike_susp_count);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
@@ -1117,12 +1196,16 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
             self.draw_vehicle(&mut pass);
-            self.draw_bike(&mut pass, bike_susp_count);
+            if self.show_bike {
+                self.draw_bike(&mut pass, bike_susp_count);
+            }
 
             pass.set_pipeline(&self.pipe_mesh_double);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
-            draw_indexed(&mut pass, &self.props);
+            if self.show_props {
+                draw_indexed(&mut pass, &self.props);
+            }
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
@@ -1289,7 +1372,12 @@ impl Renderer {
 
     fn write_models(&self, vehicle: &Vehicle) {
         let chassis = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
-        let body = chassis * buggy_fit();
+        // The Niva is already fitted onto the hardpoints. The buggy mesh is not.
+        let body = if self.niva_picture {
+            chassis
+        } else {
+            chassis * buggy_fit()
+        };
         let mut mud = [[0.0; 4]; PANEL_COUNT];
         for (i, panel) in vehicle.panels.iter().enumerate() {
             mud[i] = [
@@ -1299,12 +1387,13 @@ impl Renderer {
                 panel.wet,
             ];
         }
+        let niva = self.niva_picture;
         let slots = [
             model(body, mud, [0.0, 0.0, 0.0, 0.0]),
-            wheel_model(vehicle, chassis, mud, 0),
-            wheel_model(vehicle, chassis, mud, 1),
-            wheel_model(vehicle, chassis, mud, 2),
-            wheel_model(vehicle, chassis, mud, 3),
+            wheel_model(vehicle, chassis, mud, 0, niva),
+            wheel_model(vehicle, chassis, mud, 1, niva),
+            wheel_model(vehicle, chassis, mud, 2, niva),
+            wheel_model(vehicle, chassis, mud, 3, niva),
             model(Mat4::IDENTITY, [[0.0; 4]; 12], [0.0, 0.0, 0.0, 0.0]),
             model(body, mud, [0.0, 0.0, 0.0, 0.0]),
         ];
@@ -1318,20 +1407,30 @@ impl Renderer {
     }
 
     fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let (body, wheels) = if self.niva_picture {
+            (&self.niva_body, &self.niva_wheels)
+        } else {
+            (&self.body, &self.wheels)
+        };
         pass.set_bind_group(2, &self.model_bg, &[0]);
-        draw_indexed(pass, &self.body);
+        draw_indexed(pass, body);
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
-            draw_indexed(pass, &self.wheels[i]);
+            draw_indexed(pass, &wheels[i]);
         }
     }
 
     fn draw_glass(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.glass.count == 0 {
+        let glass = if self.niva_picture {
+            &self.niva_glass
+        } else {
+            &self.glass
+        };
+        if glass.count == 0 {
             return;
         }
         pass.set_bind_group(2, &self.model_bg, &[0]);
-        draw_indexed(pass, &self.glass);
+        draw_indexed(pass, glass);
     }
 
     fn write_bike_models(&self, bike: &Bike) {
@@ -1406,28 +1505,41 @@ fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) 
     )
 }
 
-fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
+fn wheel_model(
+    vehicle: &Vehicle,
+    body: Mat4,
+    mud: [[f32; 4]; 12],
+    index: usize,
+    niva: bool,
+) -> ModelData {
     let local = vehicle.wheel_center_local(index);
     let wheel = vehicle.wheels[index];
-    // Authored front radius is 0.30 and rear is 0.36. Scale onto the physics
-    // radius so the tread meets the soil at the same hub the fender was fit to.
-    let authored = if index < 2 { 0.30 } else { 0.36 };
-    let fit = WHEEL_RADIUS / authored;
-    let world = body
-        * Mat4::from_translation(local)
-        * Mat4::from_rotation_y(wheel.steer)
-        * Mat4::from_rotation_x(wheel.spin)
-        * Mat4::from_scale(Vec3::splat(fit));
-    model(
-        world,
-        mud,
+    // The Niva tire is already the physics radius. The buggy mesh is not:
+    // authored front radius is 0.30 and rear is 0.36.
+    let world = if niva {
+        body * Mat4::from_translation(local)
+            * Mat4::from_rotation_y(wheel.steer)
+            * Mat4::from_rotation_x(wheel.spin)
+    } else {
+        let authored = if index < 2 { 0.30 } else { 0.36 };
+        let fit = WHEEL_RADIUS / authored;
+        body * Mat4::from_translation(local)
+            * Mat4::from_rotation_y(wheel.steer)
+            * Mat4::from_rotation_x(wheel.spin)
+            * Mat4::from_scale(Vec3::splat(fit))
+    };
+    let mud_n = (wheel.mud / 1.5).clamp(0.0, 1.4);
+    let extra = if niva {
+        [0.0, mud_n, 0.0, 0.0]
+    } else {
         [
             1.0,
-            (wheel.mud / 1.5).clamp(0.0, 1.4),
+            mud_n,
             wheel.groove.clamp(0.0, 1.0),
             wheel.smear.clamp(0.0, 1.0),
-        ],
-    )
+        ]
+    };
+    model(world, mud, extra)
 }
 
 fn model(world: Mat4, mud: [[f32; 4]; 12], extra: [f32; 4]) -> ModelData {
@@ -1468,6 +1580,19 @@ fn filter_tex(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLa
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn array_tex(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         },
         count: None,
@@ -1554,6 +1679,129 @@ fn upload_array(
         ..Default::default()
     });
     (texture, view)
+}
+
+fn upload_rgba_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    layers: &[RgbaTex],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let width = layers[0].width;
+    let height = layers[0].height;
+    for layer in layers {
+        assert_eq!(layer.width, width);
+        assert_eq!(layer.height, height);
+    }
+    let mips = mip_count(width.max(height));
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: layers.len() as u32,
+        },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (i, layer) in layers.iter().enumerate() {
+        let mut rgba = layer.rgba.clone();
+        let mut mw = width;
+        let mut mh = height;
+        for level in 0..mips {
+            let (padded, stride) = pad_rows(&rgba, mw, mh);
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &padded,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(mh),
+                },
+                wgpu::Extent3d {
+                    width: mw,
+                    height: mh,
+                    depth_or_array_layers: 1,
+                },
+            );
+            if level + 1 == mips {
+                break;
+            }
+            rgba = box_down(&rgba, mw, mh);
+            mw = (mw / 2).max(1);
+            mh = (mh / 2).max(1);
+        }
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some(label),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+fn mip_count(size: u32) -> u32 {
+    let mut n = 1u32;
+    let mut s = size.max(1);
+    while s > 1 {
+        s /= 2;
+        n += 1;
+    }
+    n
+}
+
+fn box_down(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let nw = (w / 2).max(1);
+    let nh = (h / 2).max(1);
+    let mut dst = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut acc = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let sx = (x * 2 + dx).min(w - 1);
+                    let sy = (y * 2 + dy).min(h - 1);
+                    let i = ((sy * w + sx) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += src[i + c] as u32;
+                    }
+                }
+            }
+            let o = ((y * nw + x) * 4) as usize;
+            for c in 0..4 {
+                dst[o + c] = (acc[c] / 4) as u8;
+            }
+        }
+    }
+    dst
+}
+
+fn pad_rows(src: &[u8], w: u32, h: u32) -> (Vec<u8>, u32) {
+    let tight = w * 4;
+    let stride = tight.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    if stride == tight {
+        return (src.to_vec(), stride);
+    }
+    let mut dst = vec![0u8; (stride * h) as usize];
+    for y in 0..h as usize {
+        let from = y * tight as usize;
+        let to = y * stride as usize;
+        dst[to..to + tight as usize].copy_from_slice(&src[from..from + tight as usize]);
+    }
+    (dst, stride)
 }
 
 fn upload_rgba(

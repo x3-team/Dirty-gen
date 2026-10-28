@@ -1,0 +1,7 @@
+Lada Niva by Greg McKechnie
+https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2
+License: CC BY 4.0
+https://creativecommons.org/licenses/by/4.0/
+
+lada_niva-hq.glb is that published mesh and its textures. The loader copies
+those texels. It does not recompress or recolor them. sRGB decode is in the shader.

@@ -52,6 +52,11 @@ pub const SURFACE_STATE_COUNT: usize = 14;
 /// Crest chunks stay lumps. Later passes put the rest of the cut on the berm.
 const CREST_CLOD_CAP: f32 = 0.04;
 
+/// A tire that leaves a cell and comes back after this many seconds cuts
+/// another pass. Overlapping stamps from the same visit do not count, and
+/// they do not fill the groove back in.
+const PASS_GAP: f32 = 0.40;
+
 impl SurfaceKind {
     pub fn from_u8(v: u8) -> Self {
         match v {
@@ -185,6 +190,10 @@ pub struct SoilField {
     /// Soil put down after it was cut: berm, crest clods, impact ring.
     pub placed: Vec<f32>,
     pub kind: Vec<u8>,
+    /// Seconds since a lane tire last claimed this cell. A gap starts a new pass.
+    pub rest: Vec<f32>,
+    /// Distinct lane visits that have cut this cell. Pass 1 is the fresh bite.
+    pub passes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -481,6 +490,9 @@ impl SoilField {
             bed: vec![0.0; n],
             placed: vec![0.0; n],
             kind: vec![SurfaceKind::Undisturbed as u8; n],
+            // The first visit has to count. Rest starts already past the gap.
+            rest: vec![PASS_GAP + 1.0; n],
+            passes: vec![0; n],
         }
     }
 
@@ -1041,18 +1053,13 @@ impl SoilField {
         }
         let len = contact_length(radius, sinkage).max(radius * 0.35);
         let slip_n = slip.abs().min(1.2);
-        // The groove is the Bekker bite. A fast straight used to leave only a few
-        // millimetres: the plastic rate was tuned for a spun puddle, and the tire
-        // was gone before that cut arrived, so the lane behind the vehicle stayed
-        // smooth. The first several centimetres now stay in the heightfield after
-        // one pass. Slip still digs deeper than that, on the slow rate, so a driver
-        // can back out of a hole they are spinning.
-        let groove = (sinkage * 0.82).min(0.055);
+        // One visit bites this deep. A later visit of the same lane, after the
+        // tire has left, raises the pass count and cuts deeper into that slot.
+        // The bed is only lowered. A second stamp never fills the first cut
+        // back up to a fresh shallow groove. Slip still digs past the rolling
+        // bite, on the slow rate, so a driver can back out of a hole they spin.
+        let one_pass = (sinkage * 0.82).min(0.055);
         let spun = sinkage * (0.48 + 0.90 * slip_n);
-        let want = spun.max(groove).min(0.40);
-        // A rolling per-tire stamp stops at a scuff the shader does not darken.
-        // The visible pair is the `lane` call. Spinning still reaches `want`.
-        let fast = if lane { groove } else { groove.min(0.008) };
         let sigma = (width * 0.42).max(self.cell * 0.34);
         // Flat floor, then a broken step. A ramped shoulder smeared the cut
         // lip and the placed berm into one slope.
@@ -1135,10 +1142,24 @@ impl SoilField {
                 };
 
                 if across > 0.2 {
+                    // Scuffs do not claim a pass and do not reset the gap, or
+                    // the lane stamp in the same step would stay on pass 1.
+                    let passes = if lane {
+                        self.note_pass(idx)
+                    } else {
+                        self.passes[idx].max(1)
+                    };
+                    let groove = if lane {
+                        pass_groove(one_pass, passes)
+                    } else {
+                        one_pass
+                    };
+                    let want = spun.max(groove).min(0.40);
+                    let fast = if lane { groove } else { groove.min(0.008) };
                     let already = (self.initial_height[idx] - self.bed[idx]).max(0.0);
                     let local_want = if lane {
                         want * across
-                    } else if spun > groove {
+                    } else if spun > one_pass {
                         want * across
                     } else {
                         fast * across
@@ -1200,7 +1221,7 @@ impl SoilField {
                     self.roughness[idx] = lerp(self.roughness[idx], 0.84, 0.35);
                     // A notch in the crest. The step is broken, not a ramp.
                     if h < 0.42 {
-                        let bite = (0.55 + h) * groove.min(0.055);
+                        let bite = (0.55 + h) * one_pass;
                         let already = (self.initial_height[idx] - self.bed[idx]).max(0.0);
                         let drop = (bite - already).max(0.0).min(0.06) * along;
                         if drop > 0.001 {
@@ -1235,6 +1256,16 @@ impl SoilField {
             self.pile_spoil(&mut berms, &mut n_berm, &cuts[..n_cut]);
         }
         self.deposit_spoil(vol, &clods[..n_clod], &berms[..n_berm]);
+    }
+
+    /// Count a later visit. Overlapping stamps from the tire still on the
+    /// cell keep the same pass and do not raise the bed.
+    fn note_pass(&mut self, idx: usize) -> u8 {
+        if self.rest[idx] > PASS_GAP {
+            self.passes[idx] = self.passes[idx].saturating_add(1);
+        }
+        self.rest[idx] = 0.0;
+        self.passes[idx].max(1)
     }
 
     /// Lateral neighbours of the cut, in world XZ, used when the shoulder
@@ -1379,6 +1410,8 @@ impl SoilField {
     /// [`step_moisture`](Self::step_moisture) dries clay toward a crust and
     /// wets that crust again when rain or a pond is on it.
     pub fn step_surface(&mut self, dt: f32, rain: f32) {
+        // Time away from a cell is what makes the next visit a new pass.
+        self.age_passes(dt);
         self.infiltrate(dt);
         let res = self.res;
         let dx = self.cell;
@@ -1646,6 +1679,102 @@ impl SoilField {
             m = m.max(h0 - bed);
         }
         m
+    }
+
+    /// Deepest cut in a small window. A sample that lands on the berm
+    /// would under-report the floor.
+    pub fn rut_near(&self, x: f32, z: f32) -> f32 {
+        let mut m = 0.0_f32;
+        for dz in [-1, 0, 1] {
+            for dx in [-1, 0, 1] {
+                let s = self.cell * 0.45;
+                m = m.max(self.sample(x + dx as f32 * s, z + dz as f32 * s).rut);
+            }
+        }
+        m
+    }
+
+    /// Advance the pass clock without moving water, the bed, or the berm.
+    pub fn age_passes(&mut self, seconds: f32) {
+        if seconds <= 0.0 {
+            return;
+        }
+        for rest in &mut self.rest {
+            *rest = (*rest + seconds).min(30.0);
+        }
+    }
+
+    /// Bytes for the cut, the berm, and the pass clock. Height is rebuilt
+    /// from the bed and the placed pile on load.
+    pub fn save_state(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.bed.len() * 46);
+        out.extend_from_slice(b"RUT1");
+        out.extend_from_slice(&(self.res as u32).to_le_bytes());
+        out.extend_from_slice(&self.size.to_le_bytes());
+        push_f32s(&mut out, &self.initial_height);
+        push_f32s(&mut out, &self.bed);
+        push_f32s(&mut out, &self.placed);
+        push_f32s(&mut out, &self.loose);
+        push_f32s(&mut out, &self.wetness);
+        push_f32s(&mut out, &self.base_wetness);
+        push_f32s(&mut out, &self.water);
+        push_f32s(&mut out, &self.darken);
+        push_f32s(&mut out, &self.roughness);
+        push_f32s(&mut out, &self.rest);
+        out.extend_from_slice(&self.kind);
+        out.extend_from_slice(&self.passes);
+        out
+    }
+
+    /// Restore a field written by [`save_state`](Self::save_state).
+    pub fn load_state(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 12 || &bytes[0..4] != b"RUT1" {
+            return Err("not a soil snapshot".into());
+        }
+        let res = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let size = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if res == 0 || res > 1024 || !size.is_finite() || size <= 0.0 {
+            return Err("soil snapshot has a bad grid".into());
+        }
+        let n = res * res;
+        let mut i = 12usize;
+        let initial_height = read_f32s(bytes, &mut i, n)?;
+        let bed = read_f32s(bytes, &mut i, n)?;
+        let placed = read_f32s(bytes, &mut i, n)?;
+        let loose = read_f32s(bytes, &mut i, n)?;
+        let wetness = read_f32s(bytes, &mut i, n)?;
+        let base_wetness = read_f32s(bytes, &mut i, n)?;
+        let water = read_f32s(bytes, &mut i, n)?;
+        let darken = read_f32s(bytes, &mut i, n)?;
+        let roughness = read_f32s(bytes, &mut i, n)?;
+        let rest = read_f32s(bytes, &mut i, n)?;
+        let kind = read_u8s(bytes, &mut i, n)?;
+        let passes = read_u8s(bytes, &mut i, n)?;
+        if i != bytes.len() {
+            return Err("soil snapshot has trailing bytes".into());
+        }
+        let mut height = vec![0.0; n];
+        for idx in 0..n {
+            height[idx] = bed[idx] + placed[idx];
+        }
+        Ok(Self {
+            res,
+            size,
+            cell: size / res as f32,
+            height,
+            initial_height,
+            loose,
+            wetness,
+            base_wetness,
+            water,
+            darken,
+            roughness,
+            bed,
+            placed,
+            kind,
+            rest,
+            passes,
+        })
     }
 
     pub fn rut_track_span(&self) -> f32 {
@@ -2082,6 +2211,43 @@ fn bilerp(a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32) -> f32 {
     let ab = a + (b - a) * tx;
     let cd = c + (d - c) * tx;
     ab + (cd - ab) * ty
+}
+
+/// Rolling depth after `passes` visits. Pass 1 is the fresh bite. Each later
+/// visit of the same slot is deeper, capped so the chassis is not swallowed.
+fn pass_groove(one_pass: f32, passes: u8) -> f32 {
+    let n = (passes as f32).max(1.0);
+    (one_pass * n.powf(1.25)).min(0.30)
+}
+
+fn push_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn read_f32s(bytes: &[u8], i: &mut usize, n: usize) -> Result<Vec<f32>, String> {
+    let need = n * 4;
+    if *i + need > bytes.len() {
+        return Err("truncated soil snapshot".into());
+    }
+    let mut values = Vec::with_capacity(n);
+    for _ in 0..n {
+        let end = *i + 4;
+        let raw: [u8; 4] = bytes[*i..end].try_into().unwrap();
+        values.push(f32::from_le_bytes(raw));
+        *i = end;
+    }
+    Ok(values)
+}
+
+fn read_u8s(bytes: &[u8], i: &mut usize, n: usize) -> Result<Vec<u8>, String> {
+    if *i + n > bytes.len() {
+        return Err("truncated soil snapshot".into());
+    }
+    let values = bytes[*i..*i + n].to_vec();
+    *i += n;
+    Ok(values)
 }
 
 /// Signed metres outside the stadium centerline. Negative is the infield.
@@ -2593,6 +2759,129 @@ mod tests {
         );
         assert!(second.cut > first.cut, "cut volume did not grow");
         assert!(second.berm > first.berm, "berm volume did not grow");
+    }
+
+    fn straight_lane(soil: &mut SoilField) {
+        soil.roll_lane(
+            Vec3::new(0.0, 0.0, -1.15),
+            Vec3::new(0.0, 0.0, 1.15),
+            0.09,
+            0.0,
+        );
+    }
+
+    #[test]
+    fn rut_persists_across_a_second_pass_and_a_reload() {
+        use crate::world::World;
+
+        let mut soil = SoilField::mud_pad();
+        straight_lane(&mut soil);
+        let idx = soil.idx_at(0.0, 0.0).expect("lane cell");
+        let pass1 = soil.rut_near(0.0, 0.0);
+        let bed1 = soil.bed[idx];
+        let v1 = volumes_match(&soil, "pass1");
+        assert!(
+            (0.04..0.07).contains(&pass1),
+            "pass 1 should be the fresh bite, depth {pass1}"
+        );
+        assert_eq!(soil.passes[idx], 1, "the first visit should count as one pass");
+        let saved = soil.save_state();
+
+        // The tire is still in the slot. That must not refill it, and it
+        // must not pretend the overlap is a second pass.
+        straight_lane(&mut soil);
+        let replay = soil.rut_near(0.0, 0.0);
+        assert!(
+            soil.bed[idx] <= bed1 + 1.0e-5,
+            "same visit filled the cut back, bed {bed1} -> {}",
+            soil.bed[idx]
+        );
+        assert!(
+            replay + 1.0e-4 >= pass1,
+            "same visit wiped the rut {pass1} -> {replay}"
+        );
+        assert!(
+            replay < pass1 + 0.02,
+            "same visit counted as another pass {pass1} -> {replay}"
+        );
+
+        soil.age_passes(0.55);
+        straight_lane(&mut soil);
+        let pass2 = soil.rut_near(0.0, 0.0);
+        let bed2 = soil.bed[idx];
+        let v2 = volumes_match(&soil, "pass2");
+        assert!(
+            pass2 > pass1 + 0.04,
+            "second pass did not deepen the rut: {pass1} -> {pass2}"
+        );
+        assert!(v2.cut > v1.cut + 1.0e-4, "second pass added no spoil");
+        assert!(v2.berm > v1.berm, "berm did not take the extra cut");
+        assert!(v2.max_berm + 1.0e-5 >= v1.max_berm, "berm height fell");
+        assert_eq!(soil.passes[idx], 2);
+
+        // A shallow stamp after the deep cut must leave the deep cut.
+        straight_lane(&mut soil);
+        assert!(
+            soil.bed[idx] <= bed2 + 1.0e-5,
+            "a later stamp filled the deep rut back to a shallow groove"
+        );
+        assert!(
+            soil.rut_near(0.0, 0.0) + 1.0e-4 >= pass2,
+            "deep rut was wiped"
+        );
+
+        let loaded = SoilField::load_state(&saved).expect("reload");
+        let reload_depth = loaded.rut_near(0.0, 0.0);
+        let reload = volumes_match(&loaded, "reload");
+        assert!(
+            (reload_depth - pass1).abs() < 1.0e-4,
+            "reload lost pass 1: {pass1} -> {reload_depth}"
+        );
+        assert!(
+            (reload.cut - v1.cut).abs() < 1.0e-5 && (reload.berm - v1.berm).abs() < 1.0e-5,
+            "reload volumes drifted"
+        );
+        assert_eq!(loaded.passes[idx], 1);
+        assert!(
+            (loaded.bed[idx] - bed1).abs() < 1.0e-5,
+            "reload bed moved"
+        );
+        assert!(reload_depth + 0.03 < pass2, "reload kept the second pass");
+
+        let mut world = World::flat(0.45);
+        let home = world.vehicle.pos;
+        world.soil = SoilField::load_state(&saved).expect("re-init");
+        world.vehicle.pos = Vec3::new(8.0, 1.0, 8.0);
+        world.vehicle.yaw = 1.2;
+        world.reset_vehicle();
+        let kept = world.soil.rut_near(0.0, 0.0);
+        let kept_v = world.soil.volumes();
+        assert!(
+            (kept - pass1).abs() < 1.0e-4,
+            "reset cleared the rut: {pass1} -> {kept}"
+        );
+        assert!((kept_v.cut - v1.cut).abs() < 1.0e-5);
+        assert!((kept_v.berm - v1.berm).abs() < 1.0e-5);
+        assert!(
+            (world.vehicle.pos.x - home.x).abs() < 0.05
+                && (world.vehicle.pos.z - home.z).abs() < 0.05,
+            "vehicle did not return home, pos {:?}",
+            world.vehicle.pos
+        );
+        eprintln!(
+            "persist pass1 depth {pass1:.4} m  cut {c1:.4}  berm {b1:.4}  clods {k1:.4}  \
+             pass2 depth {pass2:.4} m  cut {c2:.4}  berm {b2:.4}  clods {k2:.4}  \
+             reload depth {reload_depth:.4} m  cut {c3:.4}  berm {b3:.4}  clods {k3:.4}",
+            c1 = v1.cut,
+            b1 = v1.berm,
+            k1 = v1.clods,
+            c2 = v2.cut,
+            b2 = v2.berm,
+            k2 = v2.clods,
+            c3 = reload.cut,
+            b3 = reload.berm,
+            k3 = reload.clods,
+        );
     }
 
     #[test]

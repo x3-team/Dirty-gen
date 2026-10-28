@@ -66,6 +66,10 @@ pub struct World {
     air_time: f32,
     impact_latched: bool,
     did_launch: bool,
+    spawn_pos: Vec3,
+    spawn_yaw: f32,
+    bike_spawn: Vec3,
+    bike_spawn_yaw: f32,
 }
 
 /// Wheels on one side of the axle, averaged into a single groove.
@@ -139,6 +143,10 @@ impl World {
             air_time: 0.0,
             impact_latched: false,
             did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::ZERO,
+            bike_spawn_yaw: 0.0,
         };
         world.place_on_soil();
         for _ in 0..120 {
@@ -153,6 +161,7 @@ impl World {
         };
         world.drip_acc = 0.0;
         world.bike.place_on(&world.soil);
+        world.remember_spawn();
         world
     }
 
@@ -173,6 +182,10 @@ impl World {
             air_time: 0.0,
             impact_latched: false,
             did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::ZERO,
+            bike_spawn_yaw: 0.0,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -187,7 +200,34 @@ impl World {
             min_speed_in_soft: 99.0,
             ..Telemetry::default()
         };
+        world.remember_spawn();
         world
+    }
+
+    fn remember_spawn(&mut self) {
+        self.spawn_pos = self.vehicle.pos;
+        self.spawn_yaw = self.vehicle.yaw;
+        self.bike_spawn = self.bike.pos;
+        self.bike_spawn_yaw = self.bike.yaw;
+    }
+
+    /// Put both vehicles back on their start poses. The heightfield, the
+    /// berm, and any mud still in the air stay where they are.
+    pub fn reset_vehicle(&mut self) {
+        self.vehicle = Vehicle::new();
+        self.vehicle.pos = self.spawn_pos;
+        self.vehicle.yaw = self.spawn_yaw;
+        self.place_on_soil();
+        self.bike = Bike::new();
+        self.bike.pos.x = self.bike_spawn.x;
+        self.bike.pos.z = self.bike_spawn.z;
+        self.bike.yaw = self.bike_spawn_yaw;
+        self.bike.place_on(&self.soil);
+        self.crest_armed = false;
+        self.air_time = 0.0;
+        self.impact_latched = false;
+        self.did_launch = false;
+        self.drip_acc = 0.0;
     }
 
     fn place_on_soil(&mut self) {
