@@ -201,6 +201,9 @@ pub struct SoilField {
     pub tread_ang: Vec<f32>,
     /// Lateral offset of the cell center from that tire's track, metres.
     pub tread_lat: Vec<f32>,
+    /// Cubic metres that left a contact and have not been placed yet.
+    /// A snapshot does not carry this. Land it before saving.
+    pub airborne: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -541,6 +544,7 @@ impl SoilField {
             tread_amp: vec![0.0; n],
             tread_ang: vec![0.0; n],
             tread_lat: vec![0.0; n],
+            airborne: 0.0,
         }
     }
 
@@ -1555,25 +1559,10 @@ impl SoilField {
                     let target_r = lerp(0.62, 0.16, wet);
                     let blend = (5.0 * dt * across * along).min(0.45);
                     self.roughness[idx] = lerp(self.roughness[idx], target_r, blend);
-                    let prev = SurfaceKind::from_u8(self.kind[idx]);
                     // Firm covers stay themselves. A dry crust does not become mud
                     // because a tire crossed it. Standing water keeps the cut slick.
-                    self.kind[idx] = if matches!(
-                        prev,
-                        SurfaceKind::Gravel
-                            | SurfaceKind::Grass
-                            | SurfaceKind::DryCrust
-                            | SurfaceKind::Sand
-                            | SurfaceKind::Silt
-                    ) {
-                        prev as u8
-                    } else if self.water[idx] > 0.03 {
-                        SurfaceKind::FreshCut as u8
-                    } else if self.darken[idx] > 0.72 {
-                        SurfaceKind::PackedClay as u8
-                    } else {
-                        SurfaceKind::FreshCut as u8
-                    };
+                    self.kind[idx] =
+                        opened_kind(self.kind[idx], self.water[idx], self.darken[idx]);
                 } else if lane && ax > half_w && ax <= half_w + lip_band && along > 0.35 {
                     let piled = SurfaceKind::from_u8(self.kind[idx]);
                     if matches!(piled, SurfaceKind::Berm) && self.placed[idx] > 0.012 {
@@ -1742,6 +1731,240 @@ impl SoilField {
                 self.sync(*idx);
             }
         }
+    }
+
+    /// Lower every column the patch covers down to `floor_y`. The removed
+    /// volume is split between the berm beside the patch and `airborne`.
+    /// Firm covers keep their kind. Nothing is dropped on the floor.
+    pub fn plow_contact(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        length: f32,
+        width: f32,
+        floor_y: f32,
+        throw_dir: Vec3,
+        throw_frac: f32,
+    ) -> PlowCut {
+        if !floor_y.is_finite() || length <= 1.0e-4 || width <= 1.0e-4 {
+            return PlowCut::default();
+        }
+        let fwd = horizontal(forward);
+        let mut rt = horizontal(right);
+        if rt.length_squared() < 1.0e-8 {
+            rt = Vec3::new(fwd.z, 0.0, -fwd.x);
+        }
+        let half_l = length * 0.5;
+        let half_w = width * 0.5;
+        let reach = half_l + half_w + self.cell * 2.2;
+        let half = self.size * 0.5;
+        let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        let area = self.cell * self.cell;
+        let throw_h = horizontal(throw_dir);
+        let throw_s = throw_h.x * rt.x + throw_h.z * rt.z;
+        let band = self.cell * 1.35;
+
+        let mut bed = 0.0_f32;
+        let mut moved = 0.0_f32;
+        let mut cuts: Vec<usize> = Vec::new();
+        let mut soft: Vec<usize> = Vec::new();
+        let mut shoulders: Vec<usize> = Vec::new();
+
+        for j in j0.max(1)..j1.min(res - 1) {
+            for i in i0.max(1)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - center.x;
+                let rel_z = cz - center.z;
+                let lx = rel_x * rt.x + rel_z * rt.z;
+                let lz = rel_x * fwd.x + rel_z * fwd.z;
+                let idx = j as usize * self.res + i as usize;
+                let inside = lx.abs() <= half_w && lz.abs() <= half_l;
+                if inside {
+                    let pen = self.height[idx] - floor_y;
+                    if pen < 0.004 {
+                        continue;
+                    }
+                    let drop = pen.min(0.22);
+                    let before_bed = self.bed[idx];
+                    let before_placed = self.placed[idx];
+                    let removed = self.excavate(idx, drop);
+                    if removed <= 0.0 {
+                        continue;
+                    }
+                    let bed_drop = (before_bed - self.bed[idx]).max(0.0);
+                    let placed_drop = (before_placed - self.placed[idx]).max(0.0);
+                    bed += bed_drop * area;
+                    moved += placed_drop * area;
+                    if bed_drop > 1.0e-5 {
+                        self.kind[idx] =
+                            opened_kind(self.kind[idx], self.water[idx], self.darken[idx]);
+                        self.darken[idx] = (self.darken[idx] + 0.42).min(1.0);
+                        self.loose[idx] = (self.loose[idx] + bed_drop * 0.45).min(0.16);
+                        self.roughness[idx] = lerp(self.roughness[idx], 0.22, 0.35);
+                    }
+                    cuts.push(idx);
+                } else if lz.abs() <= half_l + self.cell * 0.35 {
+                    let outward = if throw_s.abs() < 0.15 {
+                        lx.abs()
+                    } else {
+                        lx * throw_s.signum()
+                    };
+                    if outward > half_w && outward <= half_w + band {
+                        shoulders.push(idx);
+                        if !firm_cover(SurfaceKind::from_u8(self.kind[idx])) {
+                            soft.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        let vol = bed + moved;
+        if vol <= 1.0e-8 {
+            return PlowCut::default();
+        }
+        let frac = throw_frac.clamp(0.0, 0.72);
+        let mut thrown = vol * frac;
+        let mut berm = vol - thrown;
+        if thrown < 1.0e-6 {
+            berm += thrown;
+            thrown = 0.0;
+        }
+        if berm > 1.0e-8 {
+            if soft.is_empty() {
+                let mut extra = [0usize; 192];
+                let mut n = 0usize;
+                self.pile_spoil(&mut extra, &mut n, &cuts);
+                for idx in extra.iter().take(n) {
+                    if cuts.contains(idx) {
+                        continue;
+                    }
+                    if firm_cover(SurfaceKind::from_u8(self.kind[*idx])) {
+                        if !shoulders.contains(idx) {
+                            shoulders.push(*idx);
+                        }
+                    } else if !soft.contains(idx) {
+                        soft.push(*idx);
+                    }
+                }
+            }
+            soft.retain(|idx| !cuts.contains(idx));
+            shoulders.retain(|idx| !cuts.contains(idx));
+            if !soft.is_empty() {
+                self.deposit_spoil(berm, &[], &soft);
+            } else if !shoulders.is_empty() {
+                self.lay_kept(&shoulders, berm);
+            } else if !cuts.is_empty() {
+                // No shoulder on the field. Keep the mass on the lip cells
+                // that were cut rather than dropping it.
+                thrown += berm;
+                berm = 0.0;
+            } else {
+                thrown += berm;
+                berm = 0.0;
+            }
+        }
+        self.airborne += thrown;
+        PlowCut {
+            bed,
+            moved,
+            berm,
+            thrown,
+        }
+    }
+
+    /// Put thrown soil down. Firm ground keeps its kind. The landing walks
+    /// off a fresh cut so the furrow stays open. Returns the surface point.
+    pub fn receive_thrown(&mut self, x: f32, z: f32, volume: f32) -> Option<Vec3> {
+        let take = volume.min(self.airborne).max(0.0);
+        if take <= 1.0e-8 || !take.is_finite() {
+            return None;
+        }
+        let (x, z) = self.outside_rut(x, z);
+        let idx = self.idx_at(x, z)?;
+        self.airborne -= take;
+        let dh = take / (self.cell * self.cell);
+        self.placed[idx] += dh;
+        if !firm_cover(SurfaceKind::from_u8(self.kind[idx]))
+            && self.kind[idx] != SurfaceKind::Berm as u8
+        {
+            self.kind[idx] = SurfaceKind::PlacedClod as u8;
+        }
+        self.loose[idx] = (self.loose[idx] + dh * 0.35).min(0.18);
+        self.roughness[idx] = lerp(self.roughness[idx], 0.9, 0.3);
+        self.sync(idx);
+        let half = self.size * 0.5;
+        let i = idx % self.res;
+        let j = idx / self.res;
+        Some(Vec3::new(
+            (i as f32 + 0.5) * self.cell - half,
+            self.height[idx],
+            (j as f32 + 0.5) * self.cell - half,
+        ))
+    }
+
+    fn lay_kept(&mut self, cells: &[usize], volume: f32) {
+        if cells.is_empty() || volume <= 0.0 {
+            return;
+        }
+        let area = self.cell * self.cell;
+        let dh = volume / (cells.len() as f32 * area);
+        for idx in cells {
+            self.placed[*idx] += dh;
+            if !firm_cover(SurfaceKind::from_u8(self.kind[*idx])) {
+                self.kind[*idx] = SurfaceKind::Berm as u8;
+            }
+            self.sync(*idx);
+        }
+    }
+
+    fn outside_rut(&self, mut x: f32, mut z: f32) -> (f32, f32) {
+        for _ in 0..16 {
+            let Some(idx) = self.idx_at(x, z) else {
+                break;
+            };
+            let rut = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+            let opened = matches!(
+                SurfaceKind::from_u8(self.kind[idx]),
+                SurfaceKind::FreshCut | SurfaceKind::CutLip | SurfaceKind::PackedClay
+            );
+            if rut < 0.02 && !opened {
+                break;
+            }
+            let mut best = (x, z);
+            let mut best_rut = rut;
+            let step = self.cell;
+            for (dx, dz) in [(step, 0.0), (-step, 0.0), (0.0, step), (0.0, -step)] {
+                let (nx, nz) = (x + dx, z + dz);
+                let Some(nidx) = self.idx_at(nx, nz) else {
+                    continue;
+                };
+                let nr = (self.initial_height[nidx] - self.bed[nidx]).max(0.0);
+                if nr < best_rut - 0.004 {
+                    best_rut = nr;
+                    best = (nx, nz);
+                }
+            }
+            if (best.0 - x).abs() < 1.0e-6 && (best.1 - z).abs() < 1.0e-6 {
+                let push = Vec3::new(x, 0.0, z).normalize_or_zero() * step;
+                if push.length_squared() < 1.0e-8 {
+                    x += step;
+                } else {
+                    x += push.x;
+                    z += push.z;
+                }
+            } else {
+                x = best.0;
+                z = best.1;
+            }
+        }
+        (x, z)
     }
 
     /// Displace puddle water out of a wheel footprint. Returns displaced depth scale.
@@ -2162,6 +2385,7 @@ impl SoilField {
             tread_amp,
             tread_ang,
             tread_lat,
+            airborne: 0.0,
         })
     }
 
@@ -2538,6 +2762,16 @@ pub struct CoatLanding {
     pub in_rut: f32,
 }
 
+/// What one rigid patch took out of the field. Volumes are cubic metres.
+/// `bed + moved == berm + thrown`. Thrown mass is added to [`SoilField::airborne`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlowCut {
+    pub bed: f32,
+    pub moved: f32,
+    pub berm: f32,
+    pub thrown: f32,
+}
+
 /// Cut soil against the pile that received it.
 #[derive(Clone, Copy, Debug)]
 pub struct SoilVolumes {
@@ -2547,6 +2781,39 @@ pub struct SoilVolumes {
     pub clods: f32,
     pub max_rut: f32,
     pub max_berm: f32,
+}
+
+fn firm_cover(kind: SurfaceKind) -> bool {
+    matches!(
+        kind,
+        SurfaceKind::Gravel
+            | SurfaceKind::Grass
+            | SurfaceKind::DryCrust
+            | SurfaceKind::Sand
+            | SurfaceKind::Silt
+    )
+}
+
+fn opened_kind(prev: u8, water: f32, darken: f32) -> u8 {
+    let prev = SurfaceKind::from_u8(prev);
+    if firm_cover(prev) {
+        prev as u8
+    } else if water > 0.03 {
+        SurfaceKind::FreshCut as u8
+    } else if darken > 0.72 {
+        SurfaceKind::PackedClay as u8
+    } else {
+        SurfaceKind::FreshCut as u8
+    }
+}
+
+fn horizontal(v: Vec3) -> Vec3 {
+    let v = Vec3::new(v.x, 0.0, v.z);
+    if v.length_squared() < 1.0e-8 {
+        Vec3::Z
+    } else {
+        v.normalize()
+    }
 }
 
 fn transfer(
@@ -2888,6 +3155,96 @@ pub fn sinkage_for_load(load: f32, softness: f32, radius: f32, width: f32) -> f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plow_keeps_firm_ground_and_the_clay_volume() {
+        for kind in [
+            SurfaceKind::Gravel,
+            SurfaceKind::Sand,
+            SurfaceKind::Silt,
+            SurfaceKind::DryCrust,
+            SurfaceKind::Grass,
+        ] {
+            let mut soil = SoilField::flat(0.16);
+            for cell in &mut soil.kind {
+                *cell = kind as u8;
+            }
+            let cut = soil.plow_contact(
+                Vec3::new(0.0, -0.08, 0.0),
+                Vec3::Z,
+                Vec3::X,
+                0.9,
+                0.45,
+                -0.08,
+                Vec3::X,
+                0.35,
+            );
+            assert!(cut.bed > 1.0e-3, "{kind:?} bed {}", cut.bed);
+            assert!(
+                (cut.bed + cut.moved - cut.berm - cut.thrown).abs() < 1.0e-4,
+                "{kind:?} split bed {} moved {} berm {} thrown {}",
+                cut.bed,
+                cut.moved,
+                cut.berm,
+                cut.thrown
+            );
+            let v = soil.volumes();
+            let gap = (v.cut - v.placed - soil.airborne).abs();
+            assert!(
+                gap < 1.0e-4,
+                "{kind:?} deleted volume cut {} placed {} air {gap}",
+                v.cut,
+                v.placed
+            );
+            assert_eq!(soil.sample(0.0, 0.0).kind(), kind, "{kind:?} was retagged");
+            let shoulder = soil.sample(0.36, 0.0);
+            assert_eq!(shoulder.kind(), kind, "{kind:?} shoulder changed");
+            assert!(
+                shoulder.placed > 0.0 || soil.airborne > 0.0,
+                "{kind:?} spoil vanished"
+            );
+        }
+
+        let mut clay = SoilField::mud_pad();
+        let cut = clay.plow_contact(
+            Vec3::new(0.0, -0.1, 0.0),
+            Vec3::Z,
+            Vec3::X,
+            1.1,
+            0.5,
+            -0.1,
+            Vec3::X,
+            0.4,
+        );
+        assert!(cut.bed > 0.01, "clay bed {}", cut.bed);
+        assert!(cut.thrown > 1.0e-3, "clay threw {}", cut.thrown);
+        assert!(cut.berm > 1.0e-3, "clay berm {}", cut.berm);
+        assert_eq!(clay.sample(0.0, 0.0).kind(), SurfaceKind::FreshCut);
+        let v = clay.volumes();
+        let gap = (v.cut - v.placed - clay.airborne).abs();
+        assert!(
+            gap < v.cut * 0.02 + 1.0e-5,
+            "clay volume cut {} placed {} air {} gap {gap}",
+            v.cut,
+            v.placed,
+            clay.airborne
+        );
+        let landed = clay.airborne;
+        let spot = clay.receive_thrown(0.9, 0.2, landed).expect("landing");
+        assert!(clay.airborne < 1.0e-6, "airborne left {}", clay.airborne);
+        assert!(
+            (spot.x - 0.0).hypot(spot.z - 0.0) > 0.25,
+            "thrown mass landed in the cut at {spot:?}"
+        );
+        let v = clay.volumes();
+        let gap = (v.cut - v.placed - clay.airborne).abs();
+        assert!(gap < v.cut * 0.02 + 1.0e-5, "landing deleted volume {gap}");
+        assert!(
+            clay.sample(0.0, 0.0).rut > 0.06,
+            "the cut filled, rut {}",
+            clay.sample(0.0, 0.0).rut
+        );
+    }
 
     #[test]
     fn bekker_grows_with_sinkage() {

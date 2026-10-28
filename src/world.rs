@@ -589,6 +589,350 @@ impl World {
             self.step(dt, &input);
         }
     }
+
+    /// Wet clay pad with the Niva sitting on the surface. No settle rut.
+    pub fn wet_clay() -> Self {
+        let mut world = Self {
+            soil: SoilField::mud_pad(),
+            vehicle: Vehicle::new(),
+            bike: Bike::new(),
+            particles: Particles::new(),
+            time: 0.0,
+            telemetry: Telemetry {
+                min_speed_in_soft: 99.0,
+                ..Telemetry::default()
+            },
+            drip_acc: 0.0,
+            crest_armed: false,
+            air_time: 0.0,
+            impact_latched: false,
+            did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::new(14.0, 0.5, 14.0),
+            bike_spawn_yaw: 0.0,
+            coat_in_rut: 0.0,
+        };
+        world.bike.pos = world.bike_spawn;
+        world.vehicle.pos = Vec3::new(0.0, 0.7, 0.0);
+        world.vehicle.yaw = 0.0;
+        world.vehicle.roll = 0.0;
+        world
+    }
+
+    /// Roll the Niva onto its side while it yaws in the clay, then settle it
+    /// in a second pose beside the furrow. Cut, berm, and thrown mass come
+    /// from the body and the tires. The bed under the roll is not filled.
+    pub fn roll_in_clay(&mut self) -> RollCut {
+        let before = self.soil.volumes();
+        let mut body = 0.0_f32;
+        let mut tires = 0.0_f32;
+        let mut berm = 0.0_f32;
+        let mut thrown = 0.0_f32;
+        let steps = 32;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let s = t * t * (3.0 - 2.0 * t);
+            let moving = (s * (1.0 - s) * 4.0).clamp(0.0, 1.0);
+            let roll = s * 1.48;
+            let yaw = s * 1.22;
+            let embed = 0.035 + 0.12 * s;
+            let frac = 0.16 + 0.46 * moving;
+            let frame = self.plow_pose(roll, yaw, embed, Vec3::ZERO, frac);
+            body += frame.body;
+            tires += frame.tires;
+            berm += frame.berm;
+            thrown += frame.thrown;
+        }
+        let mut scar: Vec<(usize, f32)> = Vec::new();
+        for idx in 0..self.soil.bed.len() {
+            let depth = self.soil.initial_height[idx] - self.soil.bed[idx];
+            if depth > 0.03 {
+                scar.push((idx, self.soil.bed[idx]));
+            }
+        }
+        let bed = scar
+            .iter()
+            .map(|(idx, _)| self.soil.initial_height[*idx] - self.soil.bed[*idx])
+            .fold(0.0_f32, f32::max);
+        let yaw2 = 1.70_f32;
+        let fwd = Vec3::new(yaw2.sin(), 0.0, yaw2.cos());
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let shift = right * 1.9 + fwd * 0.25;
+        let frame = self.plow_pose(1.22, yaw2, 0.055, shift, 0.22);
+        body += frame.body;
+        tires += frame.tires;
+        berm += frame.berm;
+        thrown += frame.thrown;
+        for _ in 0..48 {
+            self.particles.update(&mut self.soil, 1.0 / 30.0);
+        }
+        self.particles.land_ledger(&mut self.soil);
+        let mut bed_after = 0.0_f32;
+        let mut raised = false;
+        for (idx, was) in &scar {
+            if self.soil.bed[*idx] > was + 1.0e-4 {
+                raised = true;
+            }
+            bed_after = bed_after.max(self.soil.initial_height[*idx] - self.soil.bed[*idx]);
+        }
+        let after = self.soil.volumes();
+        RollCut {
+            displaced: after.cut - before.cut,
+            berm,
+            thrown,
+            body,
+            tires,
+            bed,
+            bed_after,
+            raised,
+            airborne: self.soil.airborne,
+            placed: after.placed - before.placed,
+        }
+    }
+
+    fn plow_pose(
+        &mut self,
+        roll: f32,
+        yaw: f32,
+        embed: f32,
+        shift: Vec3,
+        throw_frac: f32,
+    ) -> PoseCut {
+        self.seat_skin(roll, yaw, embed, shift);
+        let ori = self.vehicle.orientation();
+        let yaw_dir = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let fwd = yaw_dir;
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let mut pose = PoseCut::default();
+        let mut origin = Vec3::ZERO;
+        let mut dir_acc = Vec3::ZERO;
+        let mut fling = 0.0_f32;
+        for i in 0..4 {
+            let center = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
+            let bottom = tire_bottom(&self.vehicle, i);
+            let h = self.soil.sample(bottom.x, bottom.z).height;
+            let pen = h - bottom.y;
+            if pen < 0.012 {
+                continue;
+            }
+            let throw_dir = throw_dir(&self.vehicle, bottom);
+            let cut = self.soil.plow_contact(
+                bottom,
+                fwd,
+                right,
+                0.46,
+                WHEEL_WIDTH,
+                bottom.y,
+                throw_dir,
+                throw_frac,
+            );
+            credit_bed(cut, false, &mut pose);
+            if pen > 0.008 {
+                self.soil.imprint_tread(
+                    center,
+                    fwd,
+                    right,
+                    WHEEL_RADIUS,
+                    WHEEL_WIDTH,
+                    pen.min(0.09),
+                );
+            }
+            if cut.thrown > 1.0e-6 {
+                origin += bottom * cut.thrown;
+                dir_acc += throw_dir * cut.thrown;
+                fling += cut.thrown;
+            }
+        }
+        for p in body_skin() {
+            let w = self.vehicle.pos + ori * p;
+            if wheel_owns(&self.vehicle, w) {
+                continue;
+            }
+            let h = self.soil.sample(w.x, w.z).height;
+            if h - w.y < 0.012 {
+                continue;
+            }
+            let throw_dir = throw_dir(&self.vehicle, w);
+            let cut = self.soil.plow_contact(
+                w,
+                fwd,
+                right,
+                0.50,
+                0.40,
+                w.y,
+                throw_dir,
+                throw_frac,
+            );
+            credit_bed(cut, true, &mut pose);
+            if cut.thrown > 1.0e-6 {
+                origin += w * cut.thrown;
+                dir_acc += throw_dir * cut.thrown;
+                fling += cut.thrown;
+            }
+        }
+        if fling > 1.0e-6 {
+            let origin = origin / fling + Vec3::Y * 0.16;
+            let dir = if dir_acc.length_squared() < 1.0e-8 {
+                right
+            } else {
+                dir_acc.normalize()
+            };
+            self.fling_mass(origin, dir, fling);
+        }
+        pose
+    }
+
+    fn fling_mass(&mut self, origin: Vec3, dir: Vec3, volume: f32) {
+        let piece = 0.0032_f32;
+        let n = ((volume / piece).round() as i32).clamp(1, 3);
+        let each = volume / n as f32;
+        let mut left = volume;
+        for k in 0..n {
+            let side = (k as f32 - (n as f32 - 1.0) * 0.5) * 0.35;
+            let spread = Vec3::new(-dir.z, 0.0, dir.x) * side;
+            let vel = dir * 2.4 + spread + Vec3::Y * (2.1 + k as f32 * 0.25);
+            let took = self.particles.throw_soil(origin + spread * 0.2, vel, each);
+            left -= took;
+        }
+        if left > 1.0e-6 {
+            let land = origin + dir * 0.85;
+            let _ = self.soil.receive_thrown(land.x, land.z, left);
+        }
+    }
+
+    fn seat_skin(&mut self, roll: f32, yaw: f32, embed: f32, shift: Vec3) {
+        self.vehicle.roll = roll;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.yaw = yaw;
+        self.vehicle.roll_rate = 0.0;
+        self.vehicle.yaw_rate = 0.0;
+        self.vehicle.pitch_rate = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        self.vehicle.pos.x = -0.50 * (1.0 - yaw.cos()) + shift.x;
+        self.vehicle.pos.z = 0.90 * yaw.sin() + shift.z;
+        self.vehicle.pos.y = 0.0;
+        let ori = self.vehicle.orientation();
+        let mut low_y = f32::MAX;
+        let mut low_x = 0.0_f32;
+        let mut low_z = 0.0_f32;
+        for p in body_skin() {
+            let w = self.vehicle.pos + ori * p;
+            if w.y < low_y {
+                low_y = w.y;
+                low_x = w.x;
+                low_z = w.z;
+            }
+        }
+        for i in 0..4 {
+            let w = tire_bottom(&self.vehicle, i);
+            if w.y < low_y {
+                low_y = w.y;
+                low_x = w.x;
+                low_z = w.z;
+            }
+        }
+        let ground = match self.soil.idx_at(low_x, low_z) {
+            Some(idx) => self.soil.initial_height[idx],
+            None => 0.0,
+        };
+        self.vehicle.pos.y += (ground - embed) - low_y;
+    }
+}
+
+/// Volumes from a roll. Cubic metres, except `bed`, which is metres of cut
+/// left under the first pose after the body has settled in the second.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RollCut {
+    pub displaced: f32,
+    pub berm: f32,
+    pub thrown: f32,
+    pub body: f32,
+    pub tires: f32,
+    pub bed: f32,
+    pub bed_after: f32,
+    pub raised: bool,
+    pub airborne: f32,
+    pub placed: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PoseCut {
+    body: f32,
+    tires: f32,
+    berm: f32,
+    thrown: f32,
+}
+
+fn body_skin() -> Vec<Vec3> {
+    let mut pts = Vec::with_capacity(84);
+    let mut z = -1.55_f32;
+    while z <= 1.56 {
+        for y in [0.0_f32, 0.30, 0.60, 0.92] {
+            pts.push(Vec3::new(-0.90, y, z));
+            pts.push(Vec3::new(0.90, y, z));
+        }
+        z += 0.42;
+    }
+    for z in [-1.15_f32, -0.35, 0.45, 1.25] {
+        for x in [-0.42_f32, 0.0, 0.42] {
+            pts.push(Vec3::new(x, -0.24, z));
+        }
+    }
+    pts
+}
+
+fn tire_bottom(vehicle: &Vehicle, index: usize) -> Vec3 {
+    let ori = vehicle.orientation();
+    let center = vehicle.pos + ori * vehicle.wheel_center_local(index);
+    let axle_y = (ori * Vec3::X).y.clamp(-1.0, 1.0);
+    let radial = WHEEL_RADIUS * (1.0 - axle_y * axle_y).max(0.0).sqrt();
+    let flank = WHEEL_WIDTH * 0.5 * axle_y.abs();
+    Vec3::new(center.x, center.y - radial - flank, center.z)
+}
+
+fn wheel_owns(vehicle: &Vehicle, point: Vec3) -> bool {
+    let ori = vehicle.orientation();
+    for i in 0..4 {
+        let center = vehicle.pos + ori * vehicle.wheel_center_local(i);
+        if (center - point).length() < WHEEL_RADIUS * 0.92 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Berm and thrown figures count only the bed that was cut, so they add up
+/// to the displaced soil. Spoil that was picked up and put down again is not
+/// a second cut.
+fn credit_bed(cut: crate::soil::PlowCut, body: bool, pose: &mut PoseCut) {
+    let vol = cut.bed + cut.moved;
+    let share = if vol > 1.0e-8 { cut.bed / vol } else { 0.0 };
+    if body {
+        pose.body += cut.bed;
+    } else {
+        pose.tires += cut.bed;
+    }
+    pose.berm += cut.berm * share;
+    pose.thrown += cut.thrown * share;
+}
+
+fn throw_dir(vehicle: &Vehicle, at: Vec3) -> Vec3 {
+    let yaw = vehicle.yaw;
+    let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let tangent = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let out = Vec3::new(at.x - vehicle.pos.x, 0.0, at.z - vehicle.pos.z);
+    let out = if out.length_squared() < 1.0e-6 {
+        tangent
+    } else {
+        out.normalize()
+    };
+    let dir = out * 0.55 + tangent * 0.85;
+    if dir.length_squared() < 1.0e-8 {
+        tangent
+    } else {
+        dir.normalize()
+    }
 }
 
 fn stick_impact_mud(vehicle: &mut Vehicle, soil: &SoilField) {
@@ -927,6 +1271,78 @@ mod tests {
         );
         let (n, amp) = world.soil.tread_imprint_stats();
         assert!(n > 0 && amp > 0.01, "the clay contact left no tread height");
+    }
+
+    #[test]
+    fn roll_in_wet_clay_cuts_throws_and_keeps_the_bed() {
+        use crate::soil::SurfaceKind;
+
+        let mut world = World::wet_clay();
+        assert!(
+            world.soil.volumes().cut < 1.0e-6,
+            "the pad was already cut"
+        );
+        let roll = world.roll_in_clay();
+        eprintln!(
+            "roll displaced {:.4} m3  thrown {:.4} m3  berm {:.4} m3  body {:.4} m3  tires {:.4} m3  \
+             bed {:.4} m  bed_after {:.4} m  placed {:.4} m3  airborne {:.4} m3",
+            roll.displaced,
+            roll.thrown,
+            roll.berm,
+            roll.body,
+            roll.tires,
+            roll.bed,
+            roll.bed_after,
+            roll.placed,
+            roll.airborne
+        );
+        assert!(
+            roll.displaced > 0.02,
+            "soil displaced {:.4} m3",
+            roll.displaced
+        );
+        assert!(roll.thrown > 0.004, "mass thrown {:.4} m3", roll.thrown);
+        assert!(roll.berm > 0.008, "berm {:.4} m3", roll.berm);
+        assert!(
+            roll.body > 0.004,
+            "the body did not cut, {:.4} m3",
+            roll.body
+        );
+        assert!(
+            roll.tires > 0.004,
+            "the tires did not cut, {:.4} m3",
+            roll.tires
+        );
+        assert!(roll.bed > 0.06, "the roll did not cut a bed, {:.4} m", roll.bed);
+        assert!(
+            !roll.raised,
+            "the second pose filled the bed"
+        );
+        assert!(
+            roll.bed_after > 0.06,
+            "bed after the body settled {:.4} m",
+            roll.bed_after
+        );
+        let gap = (roll.displaced - roll.placed - roll.airborne).abs();
+        assert!(
+            gap < roll.displaced * 0.02 + 1.0e-4,
+            "volume deleted displaced {:.4} placed {:.4} airborne {:.4}",
+            roll.displaced,
+            roll.placed,
+            roll.airborne
+        );
+        assert_eq!(
+            world.soil.sample(8.0, 8.0).kind(),
+            SurfaceKind::WetMud,
+            "the roll retagged clay that it never touched"
+        );
+        let (n, amp) = world.soil.tread_imprint_stats();
+        assert!(n > 0 && amp > 0.01, "the tires left no tread imprint");
+        assert!(
+            world.vehicle.roll.abs() > 1.0,
+            "the settled pose is not on its side, roll {}",
+            world.vehicle.roll
+        );
     }
 }
 

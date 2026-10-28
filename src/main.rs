@@ -510,6 +510,8 @@ struct CaptureArgs {
     niva_tread_side: PathBuf,
     surfaces: bool,
     surfaces_proof: PathBuf,
+    roll: bool,
+    roll_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -566,6 +568,10 @@ fn capture(args: &[String]) {
     }
     if parsed.surfaces {
         capture_surfaces(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.roll {
+        capture_roll(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -710,6 +716,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut niva_shed_only = false;
     let mut niva_realism = false;
     let mut surfaces = false;
+    let mut roll = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -738,6 +745,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let niva_tread_top = PathBuf::from(format!("{MEDIA}/niva-tread-top.png"));
     let niva_tread_side = PathBuf::from(format!("{MEDIA}/niva-tread-side.png"));
     let mut surfaces_proof = PathBuf::from(format!("{MEDIA}/surfaces-proof.png"));
+    let mut roll_proof = PathBuf::from(format!("{MEDIA}/roll-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -768,6 +776,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--niva-realism" => niva_realism = true,
             "--surfaces" => surfaces = true,
             "--surfaces-proof" => surfaces_proof = PathBuf::from(val(&mut i)),
+            "--roll-proof" => {
+                roll = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    roll_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -841,6 +855,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         niva_tread_side,
         surfaces,
         surfaces_proof,
+        roll,
+        roll_proof,
     }
 }
 
@@ -1506,6 +1522,56 @@ fn spoil_focus(world: &World, _wheel: usize, center: Vec3, fwd: Vec3, right: Vec
         }
     }
     best
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let roll = world.roll_in_clay();
+    println!(
+        "roll displaced {:.4} m3  thrown {:.4} m3  berm {:.4} m3  body {:.4} m3  tires {:.4} m3  \
+         bed {:.4} m  bed_after {:.4} m  placed {:.4} m3  airborne {:.4} m3  pose roll {:.2} yaw {:.2}",
+        roll.displaced,
+        roll.thrown,
+        roll.berm,
+        roll.body,
+        roll.tires,
+        roll.bed,
+        roll.bed_after,
+        roll.placed,
+        roll.airborne,
+        world.vehicle.roll,
+        world.vehicle.yaw
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "roll",
+        &parsed.roll_proof,
+        parsed,
+        roll_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn roll_camera(world: &World) -> CameraPose {
+    let yaw = world.vehicle.yaw;
+    let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let p = world.vehicle.pos;
+    let look = Vec3::new(p.x * 0.42, 0.2, p.z * 0.42);
+    let eye = look + fwd * 4.6 - right * 1.1 + Vec3::Y * 2.15;
+    let ortho = 7.2;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
