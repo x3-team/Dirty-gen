@@ -50,6 +50,10 @@ fn main() {
                 let rest: Vec<String> = args.collect();
                 capture_frame(&rest);
             }
+            Some("capture-water") => {
+                let rest: Vec<String> = args.collect();
+                capture_water(&rest);
+            }
             _ => run_window(),
         }
     }
@@ -700,6 +704,100 @@ fn capture_rut(args: &[String]) {
         world.soil.rut_near(0.2, 0.74),
         world.soil.sample(2.6, 0.0).water
     );
+}
+
+/// Shallow film over clay, and the opaque slurry where the column is deep.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_water(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut shallow_path = PathBuf::from(format!("{MEDIA}/water-real-shallow.png"));
+    let mut deep_path = PathBuf::from(format!("{MEDIA}/water-real-deep.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--shallow" => shallow_path = PathBuf::from(val(&mut i)),
+            "--deep" => deep_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-water flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::demo();
+    world.soil = silt::soil::SoilField::demo();
+    let (first, second) = world.soil.cut_east_straight();
+    world.particles.clear();
+    world.time = 1.7;
+    let park = world.soil.sample(-14.0, -12.0).height;
+    world.vehicle.pos = Vec3::new(-14.0, park + 0.62, -12.0);
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.2;
+    world.bike.pos = Vec3::new(-12.0, park + 0.7, -14.0);
+    world.bike.vel = Vec3::ZERO;
+    let rut_x = silt::soil::TRACK_R + 0.74;
+    let lip = world.soil.sample(rut_x, 1.05);
+    let bowl = world.soil.sample(rut_x, 2.2);
+    println!(
+        "film water {:.3} height {:.3}  slurry water {:.3} height {:.3}",
+        lip.water, lip.height, bowl.water, bowl.height
+    );
+    // Above the thin end of the outer groove, so the clay floor is the subject.
+    let shallow_pose = lift_camera(
+        &world,
+        CameraPose {
+            eye: Vec3::new(3.7, 2.25, -0.05),
+            target: Vec3::new(rut_x - 0.05, -0.04, 1.12),
+            ortho_width: None,
+        },
+    );
+    let rgba = renderer
+        .draw(&world, shallow_pose, None, true)
+        .expect("shallow readback");
+    write_png(&shallow_path, width, height, &rgba).expect("shallow png");
+    println!(
+        "shallow {} passes {:.3}->{:.3}",
+        shallow_path.display(),
+        first,
+        second
+    );
+    // Same grooves where the east puddle fills them. The column is deep enough
+    // that the slurry covers the clay.
+    let deep_pose = lift_camera(
+        &world,
+        CameraPose {
+            eye: Vec3::new(3.45, 2.65, 0.45),
+            target: Vec3::new(rut_x - 0.1, -0.14, 2.25),
+            ortho_width: None,
+        },
+    );
+    let rgba = renderer
+        .draw(&world, deep_pose, None, true)
+        .expect("deep readback");
+    write_png(&deep_path, width, height, &rgba).expect("deep png");
+    println!("deep {}", deep_path.display());
 }
 
 /// Oval after two tyre passes. Water sits in the east-straight ruts.
