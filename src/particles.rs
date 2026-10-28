@@ -21,6 +21,10 @@ pub struct Particle {
     /// Sitting on the soil after the arc. The mesh stays until `life` ends.
     pub grounded: bool,
     pub deposited: bool,
+    /// Cubic metres this piece is carrying for the soil ledger.
+    pub volume: f32,
+    /// The volume came out of a contact. Landing places it; it is not minted.
+    pub ledger: bool,
 }
 
 impl Default for Particle {
@@ -38,6 +42,8 @@ impl Default for Particle {
             rot: Quat::IDENTITY,
             grounded: false,
             deposited: false,
+            volume: 0.0,
+            ledger: false,
         }
     }
 }
@@ -100,14 +106,86 @@ impl Particles {
             rot,
             grounded: false,
             deposited: false,
+            volume: 0.0,
+            ledger: false,
         };
+        let _ = self.insert(piece);
+    }
+
+    /// One clod whose volume is already on the soil ledger. Returns the
+    /// cubic metres the particle actually took. Zero means the caller still
+    /// holds that mass in `airborne` and must place it.
+    pub fn throw_soil(&mut self, origin: Vec3, vel: Vec3, volume: f32) -> f32 {
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return 0.0;
+        }
+        let seed = self.rng;
+        let _ = self.rnd();
+        let size = (volume / 0.35).cbrt().clamp(0.10, 0.28);
+        let spin = Vec3::new(
+            (self.rnd() - 0.5) * 4.0,
+            (self.rnd() - 0.5) * 4.0,
+            (self.rnd() - 0.5) * 4.0,
+        );
+        let rot = Quat::from_euler(
+            EulerRot::YXZ,
+            self.rnd() * std::f32::consts::TAU,
+            (self.rnd() - 0.5) * 1.4,
+            (self.rnd() - 0.5) * 1.4,
+        );
+        let piece = Particle {
+            pos: origin,
+            vel,
+            life: 4.0,
+            max_life: 4.0,
+            size,
+            kind: 1,
+            alive: true,
+            seed,
+            spin,
+            rot,
+            grounded: false,
+            deposited: false,
+            volume,
+            ledger: true,
+        };
+        if self.insert(piece) {
+            volume
+        } else {
+            0.0
+        }
+    }
+
+    fn insert(&mut self, piece: Particle) -> bool {
         if self.items.len() > 900 {
             if let Some(slot) = self.items.iter_mut().find(|p| !p.alive || p.life <= 0.0) {
                 *slot = piece;
+                return true;
             }
-            return;
+            return false;
         }
         self.items.push(piece);
+        true
+    }
+
+    /// Drop any ledger mass that is still in the air so a settled pose cannot
+    /// lose it. Grounded pieces stay visible.
+    pub fn land_ledger(&mut self, soil: &mut SoilField) {
+        for p in &mut self.items {
+            if !p.ledger || p.volume <= 1.0e-8 {
+                continue;
+            }
+            if let Some(rest) = soil.receive_thrown(p.pos.x, p.pos.z, p.volume) {
+                p.pos = rest + Vec3::Y * p.size * 0.22;
+                p.volume = 0.0;
+                p.deposited = true;
+                p.grounded = true;
+                p.vel = Vec3::ZERO;
+                p.spin = Vec3::ZERO;
+                p.alive = true;
+                p.life = p.life.max(2.0);
+            }
+        }
     }
 
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
@@ -194,6 +272,12 @@ impl Particles {
             }
             p.life -= dt;
             if p.life <= 0.0 {
+                if p.ledger && p.volume > 1.0e-8 {
+                    if let Some(rest) = soil.receive_thrown(p.pos.x, p.pos.z, p.volume) {
+                        p.pos = rest + Vec3::Y * p.size * 0.22;
+                        p.volume = 0.0;
+                    }
+                }
                 p.alive = false;
                 continue;
             }
@@ -221,26 +305,42 @@ impl Particles {
             let sit = h + p.size * belly;
             if p.pos.y <= sit {
                 if !p.deposited {
-                    if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
+                    if p.ledger {
+                        if let Some(rest) = soil.receive_thrown(p.pos.x, p.pos.z, p.volume) {
+                            p.pos.x = rest.x;
+                            p.pos.z = rest.z;
+                            p.volume = 0.0;
+                            p.deposited = true;
+                        }
+                    } else if let Some(idx) = soil.idx_at(p.pos.x, p.pos.z) {
                         match p.kind {
                             0 | 4 => {
                                 soil.wetness[idx] = (soil.wetness[idx] + 0.03).min(1.0);
                                 soil.darken[idx] = (soil.darken[idx] + 0.02).min(1.0);
                             }
-                            1 | 2 | 3 => {
+                            1 | 3 => {
+                                let volume = p.size * p.size * p.size * 0.35;
+                                soil.land_clod(p.pos.x, p.pos.z, volume);
+                            }
+                            2 => {
                                 soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
-                                soil.loose[idx] = (soil.loose[idx] + 0.008).min(0.16);
                                 soil.wetness[idx] = (soil.wetness[idx] + 0.1).min(1.0);
                             }
                             _ => {}
                         }
+                        p.deposited = true;
+                    } else {
+                        p.deposited = true;
                     }
-                    p.deposited = true;
                 }
-                p.grounded = true;
-                p.pos.y = sit;
-                p.vel = Vec3::ZERO;
-                p.spin = Vec3::ZERO;
+                if p.deposited {
+                    let h = soil.sample(p.pos.x, p.pos.z).height;
+                    let sit = h + p.size * belly;
+                    p.grounded = true;
+                    p.pos.y = sit;
+                    p.vel = Vec3::ZERO;
+                    p.spin = Vec3::ZERO;
+                }
             }
         }
     }
