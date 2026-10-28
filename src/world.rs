@@ -288,6 +288,10 @@ impl World {
             side.stamp(&mut self.soil, WHEEL_RADIUS, width, dt);
         }
 
+        // Wet sink keeps a film of the cut on the tread. Spin and bumps
+        // put that volume back on the heightfield, in the groove behind.
+        self.vehicle.exchange_clay(&mut self.soil, &contacts, dt);
+
         let planted = contacts.iter().filter(|c| c.active).count();
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);

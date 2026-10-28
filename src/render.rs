@@ -1251,7 +1251,7 @@ fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize)
     model(
         world,
         mud,
-        [1.0, (wheel.mud / 1.5).clamp(0.0, 1.4), 0.0, 0.0],
+        [1.0, wheel.clay_coat(), wheel.clay_thickness(), 0.0],
     )
 }
 

@@ -29,7 +29,7 @@ struct Model {
     mud9: vec4<f32>,
     mud10: vec4<f32>,
     mud11: vec4<f32>,
-    extra: vec4<f32>, // is_wheel, wheel mud 0..1, _, _
+    extra: vec4<f32>, // is_wheel, tread coat 0..1, clay thickness m, _
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -521,9 +521,32 @@ struct MeshOut {
     @location(3) panel: f32,
 }
 
+// Clay film on the tread. Grooves pack first; the sidewall only takes a smear.
+fn clay_local(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if (model.extra.x < 0.5) {
+        return pos;
+    }
+    let thick = max(model.extra.z, 0.0);
+    if (thick <= 1.0e-5) {
+        return pos;
+    }
+    if (uv.y > 1.5) {
+        let side = select(-1.0, 1.0, pos.x >= 0.0);
+        return pos + vec3<f32>(side * thick * 0.35, 0.0, 0.0);
+    }
+    let radial = pos.yz;
+    let r = max(length(radial), 1.0e-4);
+    // Crown of the mesh sits near 0.37. The cut rings dip toward 0.33.
+    let groove = 1.0 - smoothstep(0.332, 0.372, r);
+    let fill = mix(0.55, 3.4, groove);
+    let dir = normalize(vec3<f32>(nrm.x * 0.2, radial.x / r, radial.y / r));
+    return pos + dir * thick * fill;
+}
+
 @vertex
 fn vs_mesh(in: MeshIn) -> MeshOut {
-    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let pos = clay_local(in.pos, in.nrm, in.uv);
+    let world = model.world * vec4<f32>(pos, 1.0);
     var o: MeshOut;
     o.clip = frame.view_proj * world;
     o.world = world.xyz;
@@ -551,7 +574,8 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
 
 @vertex
 fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
-    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let pos = clay_local(in.pos, in.nrm, in.uv);
+    let world = model.world * vec4<f32>(pos, 1.0);
     let clip = frame.light_vp * world;
     var o: ShadowOut;
     o.clip = clip;
@@ -640,7 +664,8 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
         let sidewall = select(0.0, 1.0, in.uv.y > 1.5);
         let mud = clamp(model.extra.y, 0.0, 1.2);
-        // Existing adhesion. ~0.4 of the cap already cakes the tread.
+        // A thin film already covers the tread. Thickness is the clay coat;
+        // adhesion on the bike stays the darker tint.
         let load = smoothstep(0.04, 0.28, mud);
         let wp = in.world;
         let n = noise(wp.xy * 9.0 + vec2<f32>(wp.z * 4.0, ang));
@@ -649,8 +674,12 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         var mask = load * (0.88 + 0.12 * clump);
         mask = mask * mix(0.94 + 0.06 * groove, 0.7 + 0.25 * clump, sidewall);
         mask = clamp(mask, 0.0, 1.0);
-        albedo = mix(vec3<f32>(0.02, 0.018, 0.016), vec3<f32>(0.12, 0.058, 0.028), mask);
-        rough = mix(0.92, mix(0.28, 0.07, groove * (1.0 - sidewall)), mask);
+        let film = model.extra.z > 0.001;
+        // Clay on the buggy tread is light enough to read against the rubber.
+        let mud_col = select(vec3<f32>(0.12, 0.058, 0.028), vec3<f32>(0.38, 0.18, 0.065), film);
+        albedo = mix(vec3<f32>(0.018, 0.016, 0.015), mud_col, mask);
+        let mud_rough = select(mix(0.28, 0.07, groove * (1.0 - sidewall)), 0.40, film);
+        rough = mix(0.92, mud_rough, mask);
         nrm = mud_normal(in.nrm, in.world, mask);
     } else if (panel >= 0 && panel < 12) {
         let m = mud_of(panel);

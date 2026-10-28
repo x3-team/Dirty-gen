@@ -567,6 +567,133 @@ impl SoilField {
         }
     }
 
+    /// Cubic metres of solid height. Water is not included.
+    pub fn solid_volume(&self) -> f32 {
+        let area = self.cell * self.cell;
+        self.height.iter().sum::<f32>() * area
+    }
+
+    /// Scrape `vol` cubic metres of wet clay out of the tread patch.
+    /// Returns the volume actually removed.
+    pub fn lift_clay(&mut self, center: Vec3, forward: Vec3, right: Vec3, vol: f32) -> f32 {
+        if vol <= 1.0e-8 {
+            return 0.0;
+        }
+        (-self.move_height(center, forward, right, 0.24, 0.15, -vol, true)).max(0.0)
+    }
+
+    /// Lay `vol` cubic metres back into the groove just behind the tire.
+    /// Returns the volume actually added to the heightfield.
+    pub fn deposit_clay(&mut self, center: Vec3, forward: Vec3, right: Vec3, vol: f32) -> f32 {
+        if vol <= 1.0e-8 {
+            return 0.0;
+        }
+        let fwd = forward.normalize_or_zero();
+        if fwd.length_squared() < 0.5 {
+            return 0.0;
+        }
+        let origin = center - fwd * 0.72;
+        // A short patch, so the film piles in the groove instead of smearing away.
+        self.move_height(origin, fwd, right, 0.20, 0.13, vol, false)
+            .max(0.0)
+    }
+
+    /// Add `vol` cubic metres to the patch (`vol` negative removes it).
+    /// The return value has the same sign as `vol`.
+    fn move_height(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        half_l: f32,
+        half_w: f32,
+        vol: f32,
+        wet_only: bool,
+    ) -> f32 {
+        if vol.abs() <= 1.0e-8 || !vol.is_finite() {
+            return 0.0;
+        }
+        let forward = forward.normalize_or_zero();
+        let right = right.normalize_or_zero();
+        if forward.length_squared() < 0.5 || right.length_squared() < 0.5 {
+            return 0.0;
+        }
+        let removing = vol < 0.0;
+        let want = vol.abs();
+        let reach = half_l + half_w + self.cell;
+        let half = self.size * 0.5;
+        let i0 = (((origin.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((origin.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((origin.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((origin.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        let area = self.cell * self.cell;
+        // idx, weight, max volume this cell will give up when removing.
+        let mut cells: Vec<(usize, f32, f32)> = Vec::new();
+        let mut wsum = 0.0_f32;
+        for j in j0.max(1)..j1.min(res - 1) {
+            for i in i0.max(1)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - origin.x;
+                let rel_z = cz - origin.z;
+                let lx = rel_x * right.x + rel_z * right.z;
+                let lz = rel_x * forward.x + rel_z * forward.z;
+                let along = 1.0 - (lz.abs() / half_l.max(0.05)).clamp(0.0, 1.0);
+                let across = 1.0 - (lx.abs() / half_w.max(0.05)).clamp(0.0, 1.0);
+                let mut w = along * across;
+                if w <= 0.0 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if wet_only && self.wetness[idx] < 0.28 && self.water[idx] < 0.008 {
+                    continue;
+                }
+                let cap_v = if removing {
+                    let floor = self.initial_height[idx] - 0.20;
+                    let room = (self.height[idx] - floor).max(0.0).min(0.03);
+                    room * area
+                } else {
+                    let rut = (self.initial_height[idx] - self.height[idx]).max(0.0);
+                    w *= 0.50 + 0.50 * (rut / 0.05).clamp(0.0, 1.0);
+                    f32::MAX
+                };
+                if w <= 0.0 || cap_v <= 1.0e-8 {
+                    continue;
+                }
+                cells.push((idx, w, cap_v));
+                wsum += w;
+            }
+        }
+        if wsum <= 1.0e-8 || cells.is_empty() {
+            return 0.0;
+        }
+        let mut moved = 0.0_f32;
+        for (idx, w, cap_v) in cells {
+            let mut share = want * w / wsum;
+            if removing {
+                share = share.min(cap_v);
+            }
+            if share <= 0.0 {
+                continue;
+            }
+            let delta = share / area;
+            if removing {
+                self.height[idx] -= delta;
+            } else {
+                self.height[idx] += delta;
+                self.roughness[idx] = lerp(self.roughness[idx], 0.96, 0.30);
+                self.darken[idx] = lerp(self.darken[idx], 0.18, 0.35);
+            }
+            moved += share;
+        }
+        if removing {
+            -moved
+        } else {
+            moved
+        }
+    }
+
     /// One rolling pass of a lane-width tire. `dir` is the travel direction.
     /// Returns the rut depth halfway along the pass.
     pub fn roll_pass(
@@ -1295,5 +1422,36 @@ mod tests {
             slip_wet > slip_dry + 0.2,
             "wet rut slip {slip_wet:.3} is not above dry {slip_dry:.3}"
         );
+    }
+
+    #[test]
+    fn clay_scraped_from_wet_ground_can_be_put_back() {
+        let mut soil = SoilField::flat(0.8);
+        let before = soil.solid_volume();
+        let got = soil.lift_clay(Vec3::new(0.2, 0.0, 0.4), Vec3::Z, Vec3::X, 0.004);
+        let mid = soil.solid_volume();
+        eprintln!("lifted {got:.6}  solid {before:.6} -> {mid:.6}");
+        assert!(got > 0.003, "wet pad did not give up clay, got {got:.6}");
+        assert!(
+            (before - mid - got).abs() < 1.0e-5,
+            "lift deleted volume: {before:.6} -> {mid:.6} plus {got:.6}"
+        );
+        let put = soil.deposit_clay(Vec3::new(0.2, 0.0, 0.4), Vec3::Z, Vec3::X, got);
+        let after = soil.solid_volume();
+        eprintln!("returned {put:.6}  solid {after:.6}");
+        assert!(
+            (put - got).abs() < 1.0e-5,
+            "deposit dropped volume: asked {got:.6} put {put:.6}"
+        );
+        assert!(
+            (after - before).abs() < 1.0e-4,
+            "clay round trip changed the field: {before:.6} -> {after:.6}"
+        );
+        let dry = SoilField::flat(0.05);
+        let refused = {
+            let mut dry = dry;
+            dry.lift_clay(Vec3::ZERO, Vec3::Z, Vec3::X, 0.004)
+        };
+        assert!(refused < 1.0e-8, "dry ground gave up clay, {refused:.6}");
     }
 }

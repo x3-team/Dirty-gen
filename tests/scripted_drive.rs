@@ -417,3 +417,158 @@ fn impact_chunks_land_on_the_heightfield() {
         "large clumps should be sitting on the soil, grounded {grounded} airborne {airborne}"
     );
 }
+
+fn budget(world: &World) -> f32 {
+    world.soil.solid_volume() + world.vehicle.clay_volume()
+}
+
+#[test]
+fn driving_on_wet_ground_coats_the_tires() {
+    let mut world = World::flat(0.55);
+    let v0 = budget(&world);
+    world.run_seconds(2.5, |_| Input {
+        throttle: 0.5,
+        brake: 0.0,
+        steer: 0.0,
+    });
+    let clay = world.vehicle.clay_volume();
+    let mut slip = 0.0_f32;
+    let mut n = 0.0_f32;
+    for w in &world.vehicle.wheels {
+        if w.normal > 1.0 {
+            slip += w.slip.abs();
+            n += 1.0;
+        }
+    }
+    eprintln!(
+        "wet drive clay {clay:.5} slip {:.3} speed {:.2} budget {:+.6}",
+        if n > 0.0 { slip / n } else { 0.0 },
+        world.vehicle.speed(),
+        budget(&world) - v0
+    );
+    assert!(
+        (v0).abs() < 2.0e-3,
+        "settle did not conserve volume, budget {v0:.6}"
+    );
+    assert!(clay > 0.001, "wet drive left the tread clean, clay {clay:.5}");
+    assert!(
+        (budget(&world) - v0).abs() < 2.0e-3,
+        "drive did not conserve volume"
+    );
+}
+
+#[test]
+fn wet_sink_coats_the_tread_spin_and_bumps_return_it() {
+    use glam::Vec3;
+    use silt::soil::SoilField;
+    use silt::vehicle::{Contact, Vehicle};
+
+    let mut soil = SoilField::flat(0.82);
+    let mut vehicle = Vehicle::new();
+    let before = soil.solid_volume() + vehicle.clay_volume();
+    let mut contact = Contact::default();
+    contact.active = true;
+    contact.index = 0;
+    contact.sinkage = 0.06;
+    contact.normal = 4200.0;
+    contact.compression = vehicle.wheels[0].compression;
+    contact.slip = 0.04;
+    contact.forward = Vec3::Z;
+    contact.right = Vec3::X;
+    contact.wheel_center = Vec3::new(0.2, 0.4, 0.6);
+    contact.sample.wetness = 0.9;
+    contact.sample.water = 0.04;
+    contact.speed = 1.6;
+    vehicle.wheels[0].normal = 2000.0;
+    let contacts = [contact, Contact::default(), Contact::default(), Contact::default()];
+    let dt = 1.0 / 60.0;
+    for _ in 0..(3.0 * 60.0) as u32 {
+        vehicle.exchange_clay(&mut soil, &contacts, dt);
+    }
+    let coated = vehicle.clay_volume();
+    let mid = soil.solid_volume() + coated;
+    eprintln!("coated {coated:.5}  budget {:+.6}", mid - before);
+    assert!(coated > 0.004, "wet sink did not coat the tread, clay {coated:.5}");
+    assert!(
+        (mid - before).abs() < 1.0e-4,
+        "coating did not conserve volume: {before:.6} -> {mid:.6}"
+    );
+
+    let mut spinning = contacts;
+    spinning[0].slip = 1.05;
+    spinning[0].speed = 0.15;
+    let held = vehicle.clay_volume();
+    let solid_held = soil.solid_volume();
+    for _ in 0..(1.4 * 60.0) as u32 {
+        vehicle.exchange_clay(&mut soil, &spinning, dt);
+    }
+    let after_spin = vehicle.clay_volume();
+    eprintln!(
+        "spin {held:.5} -> {after_spin:.5}  solid {:+.5}",
+        soil.solid_volume() - solid_held
+    );
+    assert!(
+        after_spin < held * 0.35,
+        "spin left the clay on the tread: {held:.5} -> {after_spin:.5}"
+    );
+    assert!(
+        (soil.solid_volume() + after_spin - before).abs() < 1.0e-4,
+        "spin did not conserve volume"
+    );
+
+    // Put the leftover film back, then load a full coat for the landing.
+    let leftover = vehicle.wheels[0].clay;
+    if leftover > 0.0 {
+        let put = soil.deposit_clay(contact.wheel_center, Vec3::Z, Vec3::X, leftover);
+        vehicle.wheels[0].clay = leftover - put;
+    }
+    let reloaded = soil.lift_clay(contact.wheel_center, Vec3::Z, Vec3::X, 0.005);
+    vehicle.wheels[0].clay += reloaded;
+    let loaded = vehicle.clay_volume();
+    vehicle.vel.y = -3.4;
+    vehicle.wheels[0].compression = 0.04;
+    vehicle.wheels[0].normal = 2500.0;
+    let mut hit = contacts;
+    hit[0].slip = 0.02;
+    hit[0].compression = 0.24;
+    hit[0].normal = 7000.0;
+    hit[0].speed = 0.4;
+    vehicle.exchange_clay(&mut soil, &hit, dt);
+    let after_bump = vehicle.clay_volume();
+    eprintln!("bump {loaded:.5} -> {after_bump:.5}");
+    assert!(
+        after_bump < loaded * 0.45,
+        "bump left the clay on the tread: {loaded:.5} -> {after_bump:.5}"
+    );
+    assert!(
+        (soil.solid_volume() + vehicle.clay_volume() - before).abs() < 2.0e-4,
+        "bump did not conserve volume"
+    );
+
+    let mut dry_soil = SoilField::flat(0.06);
+    let dry_before = dry_soil.solid_volume();
+    let mut dry = Vehicle::new();
+    let mut bare = Contact::default();
+    bare.active = true;
+    bare.index = 0;
+    bare.sinkage = 0.04;
+    bare.normal = 3000.0;
+    bare.compression = dry.wheels[0].compression;
+    bare.slip = 0.02;
+    bare.forward = Vec3::Z;
+    bare.right = Vec3::X;
+    bare.wheel_center = Vec3::new(-0.4, 0.4, -0.2);
+    bare.sample.wetness = 0.06;
+    bare.speed = 2.0;
+    dry.wheels[0].normal = 2000.0;
+    let bare_contacts = [bare, Contact::default(), Contact::default(), Contact::default()];
+    for _ in 0..180 {
+        dry.exchange_clay(&mut dry_soil, &bare_contacts, dt);
+    }
+    assert!(
+        dry.clay_volume() < 1.0e-6,
+        "dry sink coated the tread, clay {:.6}",
+        dry.clay_volume()
+    );
+    assert!((dry_soil.solid_volume() - dry_before).abs() < 1.0e-6);
+}

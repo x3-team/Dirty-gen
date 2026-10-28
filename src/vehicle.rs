@@ -40,6 +40,17 @@ const ENGINE_TORQUE: f32 = 500.0;
 const MAX_OMEGA: f32 = 34.0;
 const WHEEL_MUD_CAP: f32 = 1.5;
 pub const PANEL_MUD_CAP: f32 = 0.85;
+/// Thickest clay film the tread will hold. A coat, not a clod.
+pub const CLAY_THICK_MAX: f32 = 0.010;
+
+/// Tread shell area. Clay volume divided by this is the film thickness.
+pub fn tread_area() -> f32 {
+    std::f32::consts::TAU * WHEEL_RADIUS * WHEEL_WIDTH
+}
+
+pub fn clay_cap() -> f32 {
+    tread_area() * CLAY_THICK_MAX
+}
 
 /// Hardpoints: FL, FR, RL, RR. Local space, Y up, Z forward.
 pub fn hardpoints() -> [Vec3; 4] {
@@ -58,6 +69,8 @@ pub struct Wheel {
     pub steer: f32,
     pub compression: f32,
     pub mud: f32,
+    /// Clay volume stuck to the tread, in cubic metres. It came off the heightfield.
+    pub clay: f32,
     pub slip: f32,
     pub sinkage: f32,
     pub normal: f32,
@@ -73,11 +86,33 @@ impl Default for Wheel {
             steer: 0.0,
             compression: 0.08,
             mud: 0.0,
+            clay: 0.0,
             slip: 0.0,
             sinkage: 0.0,
             normal: 0.0,
             in_water: false,
             drive_force: 0.0,
+        }
+    }
+}
+
+impl Wheel {
+    /// Metres of clay measured out from the rubber.
+    pub fn clay_thickness(&self) -> f32 {
+        let area = tread_area();
+        if self.clay <= 0.0 || area <= 0.0 {
+            0.0
+        } else {
+            (self.clay / area).min(CLAY_THICK_MAX)
+        }
+    }
+
+    /// 0 is bare rubber, 1 is the full film.
+    pub fn clay_coat(&self) -> f32 {
+        if CLAY_THICK_MAX <= 0.0 {
+            0.0
+        } else {
+            (self.clay_thickness() / CLAY_THICK_MAX).clamp(0.0, 1.0)
         }
     }
 }
@@ -176,6 +211,11 @@ impl Vehicle {
         self.wheels.iter().map(|w| w.mud).sum()
     }
 
+    /// Clay carried on the four treads, in cubic metres.
+    pub fn clay_volume(&self) -> f32 {
+        self.wheels.iter().map(|w| w.clay).sum()
+    }
+
     pub fn clear_loose_mud(&mut self) {
         for w in &mut self.wheels {
             w.mud = 0.0;
@@ -219,7 +259,10 @@ impl Vehicle {
             let up = ori * Vec3::Y;
             let up_y = up.y.max(0.4);
             let sample = soil.sample(wc0.x, wc0.z);
-            let z0 = sample.height - wc0.y + WHEEL_RADIUS;
+            // The clay film rides outside the rubber, so the tread meets the ground early.
+            let thick = self.wheels[i].clay_thickness();
+            let radius = WHEEL_RADIUS + thick;
+            let z0 = sample.height - wc0.y + radius;
 
             let (compression, sinkage, normal) = if z0 <= 0.004 {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
@@ -232,6 +275,7 @@ impl Vehicle {
                     sample.softness,
                     sample.rut,
                     sample.water,
+                    radius,
                 )
             };
 
@@ -254,8 +298,8 @@ impl Vehicle {
             let v_long = v_point.x * fwd.x + v_point.z * fwd.z;
             let v_lat = v_point.x * right.x + v_point.z * right.z;
             let omega = self.wheels[i].omega;
-            let slip_vel = omega * WHEEL_RADIUS - v_long;
-            let denom = v_long.abs().max((omega * WHEEL_RADIUS).abs()).max(0.25);
+            let slip_vel = omega * radius - v_long;
+            let denom = v_long.abs().max((omega * radius).abs()).max(0.25);
             let slip = if v_long.abs() < 0.12 && (omega * WHEEL_RADIUS).abs() < 0.12 {
                 0.0
             } else {
@@ -271,8 +315,15 @@ impl Vehicle {
             let mut fling = 0.0;
 
             if active {
-                let tm = terramech_at(sample.softness, sample.rut, sample.water);
-                let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
+                let mut tm = terramech_at(sample.softness, sample.rut, sample.water);
+                // Clay on the tread shears before the soil does. The ground still
+                // carries the weight; only the friction of the contact drops.
+                let coat = (thick / CLAY_THICK_MAX).clamp(0.0, 1.0);
+                if coat > 0.0 {
+                    tm.phi *= 1.0 - 0.12 * coat;
+                    tm.cohesion *= 1.0 - 0.08 * coat;
+                }
+                let length = contact_length(radius, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
                 let j_long = slip.abs() * length;
@@ -348,9 +399,9 @@ impl Vehicle {
                 }
 
                 // Shear reacts on the wheel even if Bingham holds the chassis still.
-                wheel_torque -= blended_long * WHEEL_RADIUS;
+                wheel_torque -= blended_long * radius;
 
-                let peripheral = omega.abs() * WHEEL_RADIUS;
+                let peripheral = omega.abs() * radius;
                 fling = 0.62
                     * self.wheels[i].mud
                     * (peripheral / 5.5).clamp(0.0, 2.5)
@@ -625,6 +676,62 @@ impl Vehicle {
             p.drip = (p.mass / PANEL_MUD_CAP).clamp(0.0, 1.0);
         }
     }
+
+    /// Move clay between the tread and the heightfield.
+    ///
+    /// A wet sink scrapes a film onto the tire. The same volume leaves the
+    /// contact patch, so the rut gets it back when the tire spins or hits.
+    pub fn exchange_clay(&mut self, soil: &mut SoilField, contacts: &[Contact; 4], dt: f32) {
+        let dt = dt.max(0.0);
+        let drop_v = (-self.vel.y - 0.8).max(0.0);
+        let cap = clay_cap().max(1.0e-6);
+        for c in contacts.iter() {
+            let idx = c.index;
+            if c.active {
+                let wet = smoothstep(0.30, 0.58, c.sample.wetness).max(
+                    smoothstep(0.01, 0.045, c.sample.water)
+                        * smoothstep(0.22, 0.50, c.sample.wetness),
+                );
+                let sink_w = smoothstep(0.01, 0.05, c.sinkage);
+                // A spinning tread throws the film off instead of taking more.
+                let hold = 1.0 - smoothstep(0.28, 0.70, c.slip.abs());
+                let room = (1.0 - self.wheels[idx].clay / cap).clamp(0.0, 1.0);
+                let travel = c.speed.clamp(0.0, 5.0);
+                let rate = (0.00040 + 0.00125 * travel) * wet * sink_w * room * hold;
+                let want = rate * dt;
+                if want > 1.0e-8 {
+                    let got = soil.lift_clay(c.wheel_center, c.forward, c.right, want);
+                    self.wheels[idx].clay = (self.wheels[idx].clay + got).min(cap);
+                }
+            }
+
+            let clay = self.wheels[idx].clay;
+            if clay <= 1.0e-8 || !c.active {
+                continue;
+            }
+            let spin = smoothstep(0.32, 0.80, c.slip.abs());
+            let spin_loss = clay * (1.0 - (-dt * 2.6 * spin).exp());
+            let crush = if self.wheels[idx].normal > 1.0 {
+                ((c.compression - self.wheels[idx].compression) / dt.max(1.0e-4)).max(0.0)
+            } else {
+                0.0
+            };
+            let bump = smoothstep(0.45, 1.7, crush);
+            let impact = if c.normal > 1600.0 {
+                smoothstep(0.5, 2.4, drop_v)
+            } else {
+                0.0
+            };
+            let knock = (0.50 * bump + 0.72 * impact).min(0.85);
+            let shed = (spin_loss + clay * knock).min(clay);
+            if shed <= 1.0e-8 {
+                continue;
+            }
+            self.wheels[idx].clay -= shed;
+            let put = soil.deposit_clay(c.wheel_center, c.forward, c.right, shed);
+            self.wheels[idx].clay += shed - put;
+        }
+    }
 }
 
 impl Default for Contact {
@@ -678,13 +785,14 @@ fn solve_suspension(
     softness: f32,
     rut: f32,
     water: f32,
+    radius: f32,
 ) -> (f32, f32, f32) {
     let tm = terramech_at(softness, rut, water);
     // Slip-sinkage: a spinning tire sees a softer modulus and sinks further.
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;
     let z_of = |c: f32| (z0 - up_y * c).max(0.0);
-    let soil_n = |c: f32| bekker_load(z_of(c), WHEEL_RADIUS, WHEEL_WIDTH, k_eq, tm.n);
+    let soil_n = |c: f32| bekker_load(z_of(c), radius, WHEEL_WIDTH, k_eq, tm.n);
 
     let at_droop = soil_n(0.0);
     if at_droop <= 1.0 {

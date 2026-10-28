@@ -46,6 +46,10 @@ fn main() {
                 let rest: Vec<String> = args.collect();
                 capture_rut(&rest);
             }
+            Some("capture-tire") => {
+                let rest: Vec<String> = args.collect();
+                capture_tire(&rest);
+            }
             _ => run_window(),
         }
     }
@@ -696,6 +700,148 @@ fn capture_rut(args: &[String]) {
         world.soil.rut_near(0.2, 0.74),
         world.soil.sample(2.6, 0.0).water
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_tire(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut on_path = PathBuf::from(format!("{MEDIA}/tire-mud-on.png"));
+    let mut shed_path = PathBuf::from(format!("{MEDIA}/tire-mud-shed.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--on" => on_path = PathBuf::from(val(&mut i)),
+            "--shed" => shed_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-tire flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    // Damp clay, no standing water. The tire can roll without spinning the film off.
+    let mut world = World::flat(0.52);
+    world.bike.pos = Vec3::new(16.0, 4.0, 16.0);
+    world.particles.clear();
+    let roll = Input {
+        throttle: 0.42,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    for _ in 0..(3.6 * 60.0) as u32 {
+        world.step(1.0 / 60.0, &roll);
+    }
+    world.particles.clear();
+    let behind = tire_behind(&world);
+    println!(
+        "tire on  clay {:.5}  thick {:.4}  speed {:.2}  pos ({:.2},{:.2})  rut {:.3}  behind h {:.4} rut {:.4}",
+        world.vehicle.clay_volume(),
+        world.vehicle.wheels[3].clay_thickness(),
+        world.vehicle.speed(),
+        world.vehicle.pos.x,
+        world.vehicle.pos.z,
+        world.soil.max_rut_depth(),
+        world.soil.sample(behind.x, behind.z).height,
+        world.soil.rut_near(behind.x, behind.z)
+    );
+    let pose_on = tire_pose(&world);
+    let rgba = renderer.draw(&world, pose_on, None, true).expect("on readback");
+    write_png(&on_path, width, height, &rgba).expect("on png");
+    println!("on {}", on_path.display());
+
+    let hold = Input {
+        throttle: 0.0,
+        brake: 1.0,
+        steer: 0.0,
+    };
+    // Hold the chassis and spin the treads, so the film drops into the groove
+    // just behind the tire instead of smearing down the straight.
+    world.vehicle.vel = Vec3::ZERO;
+    for _ in 0..80 {
+        for w in &mut world.vehicle.wheels {
+            w.omega = 24.0;
+        }
+        world.vehicle.vel.x = 0.0;
+        world.vehicle.vel.z = 0.0;
+        world.step(1.0 / 60.0, &hold);
+    }
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.pos.y += 0.42;
+    world.vehicle.vel.y = -3.3;
+    for _ in 0..36 {
+        world.vehicle.vel.x = 0.0;
+        world.vehicle.vel.z = 0.0;
+        world.step(1.0 / 60.0, &hold);
+    }
+    world.particles.clear();
+    let behind = tire_behind(&world);
+    println!(
+        "tire shed clay {:.5}  thick {:.4}  speed {:.2}  pos ({:.2},{:.2})  rut {:.3}  behind h {:.4} rut {:.4}",
+        world.vehicle.clay_volume(),
+        world.vehicle.wheels[3].clay_thickness(),
+        world.vehicle.speed(),
+        world.vehicle.pos.x,
+        world.vehicle.pos.z,
+        world.soil.max_rut_depth(),
+        world.soil.sample(behind.x, behind.z).height,
+        world.soil.rut_near(behind.x, behind.z)
+    );
+    let pose_shed = tire_pose(&world);
+    let rgba = renderer
+        .draw(&world, pose_shed, None, true)
+        .expect("shed readback");
+    write_png(&shed_path, width, height, &rgba).expect("shed png");
+    println!("shed {}", shed_path.display());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tire_hub(world: &World) -> Vec3 {
+    let ori = world.vehicle.orientation();
+    world.vehicle.pos + ori * world.vehicle.wheel_center_local(3)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tire_behind(world: &World) -> Vec3 {
+    let hub = tire_hub(world);
+    let fwd = world.vehicle.forward();
+    hub - fwd * 0.72
+}
+
+/// Sun-side view of the front-right tread and the groove it just left.
+#[cfg(not(target_arch = "wasm32"))]
+fn tire_pose(world: &World) -> CameraPose {
+    let hub = tire_hub(world);
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let eye = hub + right * 1.85 - fwd * 1.55 + Vec3::Y * 1.15;
+    let target = hub - fwd * 0.55 + Vec3::Y * -0.06;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: Some(2.35),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
