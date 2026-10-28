@@ -174,8 +174,17 @@ impl World {
 
     /// Uniform flat pad. `wetness` 0 is firm, 1 is deep mud. No puddle.
     pub fn flat(wetness: f32) -> Self {
+        Self::rest(SoilField::flat(wetness))
+    }
+
+    /// Niva settled across wet clay and gravel. The bed starts flat.
+    pub fn surface_split() -> Self {
+        Self::rest(SoilField::surface_split())
+    }
+
+    fn rest(soil: SoilField) -> Self {
         let mut world = Self {
-            soil: SoilField::flat(wetness),
+            soil,
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
@@ -860,6 +869,64 @@ mod tests {
         let (n2, amp2) = loaded.tread_imprint_stats();
         assert_eq!(n2, n);
         assert!((amp2 - amp).abs() < 1.0e-5, "the imprint did not survive reload");
+    }
+
+    #[test]
+    fn niva_sinks_on_two_surfaces() {
+        use crate::soil::SurfaceKind;
+
+        let world = World::surface_split();
+        let mut clay_sink = 0.0_f32;
+        let mut clay_n = 0.0_f32;
+        let mut gravel_sink = 0.0_f32;
+        let mut gravel_n = 0.0_f32;
+        for i in 0..4 {
+            let w = world.vehicle.wheels[i];
+            let center = world.vehicle.pos
+                + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+            let sample = world.soil.sample(center.x, center.z);
+            let bottom = center.y - WHEEL_RADIUS;
+            let seat = sample.height - w.sinkage;
+            assert!(w.normal > 200.0, "wheel {i} is not supporting the body");
+            assert!(
+                (bottom - seat).abs() < 0.002,
+                "wheel {i} hub is not on soil-sink, bottom {bottom:.4} soil-sink {seat:.4}"
+            );
+            match sample.kind() {
+                SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay => {
+                    clay_sink += w.sinkage;
+                    clay_n += 1.0;
+                }
+                SurfaceKind::Gravel => {
+                    gravel_sink += w.sinkage;
+                    gravel_n += 1.0;
+                }
+                other => panic!("wheel {i} left its surface, kind {other:?} at {center:?}"),
+            }
+            eprintln!(
+                "split wheel {i} kind {:?} sink {:.4} m x {:.2}",
+                sample.kind(),
+                w.sinkage,
+                center.x
+            );
+        }
+        assert_eq!(clay_n, 2.0, "the clay side lost a tire");
+        assert_eq!(gravel_n, 2.0, "the gravel side lost a tire");
+        let clay = clay_sink / clay_n;
+        let gravel = gravel_sink / gravel_n;
+        assert!(
+            clay > gravel + 0.015,
+            "the two surfaces sank the same, clay {clay:.4} gravel {gravel:.4}"
+        );
+        let v = world.soil.volumes();
+        assert!(
+            (v.cut - v.placed).abs() < v.cut * 0.02 + 1.0e-5,
+            "split settle broke cut = placed, cut {} placed {}",
+            v.cut,
+            v.placed
+        );
+        let (n, amp) = world.soil.tread_imprint_stats();
+        assert!(n > 0 && amp > 0.01, "the clay contact left no tread height");
     }
 }
 

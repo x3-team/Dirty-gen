@@ -508,6 +508,8 @@ struct CaptureArgs {
     niva_sink_front: PathBuf,
     niva_tread_top: PathBuf,
     niva_tread_side: PathBuf,
+    surfaces: bool,
+    surfaces_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -560,6 +562,10 @@ fn capture(args: &[String]) {
     }
     if parsed.niva_tread {
         capture_niva_tread(&mut renderer, &parsed, parsed.niva_shed_only);
+        return;
+    }
+    if parsed.surfaces {
+        capture_surfaces(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -703,6 +709,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut niva_tread = false;
     let mut niva_shed_only = false;
     let mut niva_realism = false;
+    let mut surfaces = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -730,6 +737,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let niva_sink_front = PathBuf::from(format!("{MEDIA}/niva-sink-front.png"));
     let niva_tread_top = PathBuf::from(format!("{MEDIA}/niva-tread-top.png"));
     let niva_tread_side = PathBuf::from(format!("{MEDIA}/niva-tread-side.png"));
+    let mut surfaces_proof = PathBuf::from(format!("{MEDIA}/surfaces-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -758,6 +766,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 niva_shed_only = true;
             }
             "--niva-realism" => niva_realism = true,
+            "--surfaces" => surfaces = true,
+            "--surfaces-proof" => surfaces_proof = PathBuf::from(val(&mut i)),
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -829,6 +839,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         niva_sink_front,
         niva_tread_top,
         niva_tread_side,
+        surfaces,
+        surfaces_proof,
     }
 }
 
@@ -1494,6 +1506,60 @@ fn spoil_focus(world: &World, _wheel: usize, center: Vec3, fwd: Vec3, right: Vec
         }
     }
     best
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_surfaces(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{surface_grip_sink, SurfaceKind};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let pairs = [
+        ("gravel", SurfaceKind::Gravel),
+        ("dry clay", SurfaceKind::DryCrust),
+        ("wet clay", SurfaceKind::WetMud),
+        ("sand", SurfaceKind::Sand),
+        ("silt", SurfaceKind::Silt),
+    ];
+    for (name, kind) in pairs {
+        let (grip, sink) = surface_grip_sink(kind);
+        println!("surface {name}  grip {grip:.3}  sink {sink:.4} m");
+    }
+
+    let mut world = World::surface_split();
+    world.bike.pos = Vec3::new(16.0, 0.5, 16.0);
+    world.bike.vel = Vec3::ZERO;
+    silence_chunks(&mut world);
+    print_sink("surfaces", &world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "surfaces",
+        &parsed.surfaces_proof,
+        parsed,
+        surfaces_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn surfaces_camera(world: &World) -> CameraPose {
+    let p = world.vehicle.pos;
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let axle = p + fwd * 0.72;
+    let ground = world.soil.sample(axle.x, axle.z).height;
+    // Down the nose, close enough that the clay hubs sit lower than the gravel.
+    let look = Vec3::new(axle.x, ground + 0.46, axle.z);
+    let eye = look + fwd * 3.3 + right * 0.08 + Vec3::Y * 2.35;
+    let ortho = 3.55;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

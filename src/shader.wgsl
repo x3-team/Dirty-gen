@@ -657,11 +657,12 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     var n = terrain_normal(xz);
-    // The square stamp beside a live tire is filled back to the lip. Paint it
-    // as the pad, not as the clay card the stamp kind would leave there.
+    // The square stamp beside a live tire is filled back to the lip. Paint a
+    // clay card as the pad. Gravel is not a stamp product, so it stays gravel
+    // under the tire instead of being covered with the mud map.
     let seat = apply_seat(xz, terrain_height(xz));
     var kind = kind_nearest(xz);
-    if (seat.z > 0.22) {
+    if (seat.z > 0.22 && kind != 2u) {
         kind = 4u;
     }
 
