@@ -12,7 +12,7 @@ use crate::mesh::{CpuMesh, MeshVertex};
 
 const GLB: &[u8] = include_bytes!("../assets/vehicle/lada_niva-slim.glb");
 const LAYERS: usize = 8;
-const TEX: u32 = 512;
+const TEX: u32 = 2048;
 
 pub struct NivaScene {
     pub body: CpuMesh,
@@ -261,6 +261,159 @@ fn bake_wheel(mesh: &mut CpuMesh, hub: Vec3) {
     let s = WHEEL_RADIUS / radius;
     for v in &mut mesh.vertices {
         v.pos = (Vec3::from(v.pos) * s).to_array();
+    }
+    // The authored rim is a coarse n-gon. At the tire camera that reads as a gear.
+    round_wheel(mesh);
+}
+
+/// Split chords of the metal disc and push them back out to the circle.
+/// Tread blocks sit outside the disc island and keep their shape.
+fn round_wheel(mesh: &mut CpuMesh) {
+    let cy = disc_uv_y(mesh);
+    let mut projected = 0u32;
+    for _ in 0..3 {
+        projected += subdivide_disc(mesh, cy);
+    }
+    eprintln!(
+        "niva wheel rim {} tris, {} disc chords projected",
+        mesh.indices.len() / 3,
+        projected
+    );
+    smooth_normals(mesh);
+}
+
+fn disc_uv_y(mesh: &CpuMesh) -> f32 {
+    let top = disc_hits(mesh, 508.9);
+    let bottom = disc_hits(mesh, 2048.0 - 508.9);
+    eprintln!("niva disc uv hits top {top} bottom {bottom}");
+    if bottom > top {
+        2048.0 - 508.9
+    } else {
+        508.9
+    }
+}
+
+fn disc_hits(mesh: &CpuMesh, cy: f32) -> usize {
+    mesh.vertices
+        .iter()
+        .filter(|v| on_disc(v.uv, cy))
+        .count()
+}
+
+fn on_disc(uv: [f32; 2], cy: f32) -> bool {
+    let dx = uv[0] * 2048.0 - 1343.1;
+    let dy = uv[1] * 2048.0 - cy;
+    // A little past the painted circle so the lip, not the tread, is included.
+    dx * dx + dy * dy <= 170.0 * 170.0
+}
+
+fn subdivide_disc(mesh: &mut CpuMesh, cy: f32) -> u32 {
+    let mut mid: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut projected = 0u32;
+    let old = std::mem::take(&mut mesh.indices);
+    let mut next = Vec::with_capacity(old.len() * 4);
+    for tri in old.chunks_exact(3) {
+        let (m01, p01) = disc_midpoint(mesh, &mut mid, tri[0], tri[1], cy);
+        let (m12, p12) = disc_midpoint(mesh, &mut mid, tri[1], tri[2], cy);
+        let (m20, p20) = disc_midpoint(mesh, &mut mid, tri[2], tri[0], cy);
+        projected += u32::from(p01) + u32::from(p12) + u32::from(p20);
+        let i0 = tri[0];
+        let i1 = tri[1];
+        let i2 = tri[2];
+        next.extend_from_slice(&[
+            i0, m01, m20, m01, i1, m12, m20, m12, i2, m01, m12, m20,
+        ]);
+    }
+    mesh.indices = next;
+    projected
+}
+
+fn disc_midpoint(
+    mesh: &mut CpuMesh,
+    mid: &mut HashMap<(u32, u32), u32>,
+    a: u32,
+    b: u32,
+    cy: f32,
+) -> (u32, bool) {
+    let key = if a < b { (a, b) } else { (b, a) };
+    if let Some(&i) = mid.get(&key) {
+        return (i, false);
+    }
+    let va = mesh.vertices[a as usize];
+    let vb = mesh.vertices[b as usize];
+    let pa = Vec3::from(va.pos);
+    let pb = Vec3::from(vb.pos);
+    let mut p = (pa + pb) * 0.5;
+    let mut projected = false;
+    // Axle is +X after bake. A chord of the disc is two texels on that island
+    // at nearly the same radius; the tread atlas is outside it.
+    if on_disc(va.uv, cy) && on_disc(vb.uv, cy) {
+        let ra = (pa.y * pa.y + pa.z * pa.z).sqrt();
+        let rb = (pb.y * pb.y + pb.z * pb.z).sqrt();
+        let r = (ra + rb) * 0.5;
+        let len = (p.y * p.y + p.z * p.z).sqrt();
+        let inset = r - len;
+        let cos_ang = if ra > 1.0e-4 && rb > 1.0e-4 {
+            (pa.y * pb.y + pa.z * pb.z) / (ra * rb)
+        } else {
+            1.0
+        };
+        if r > 0.04 && (ra - rb).abs() < 0.012 && inset > -0.002 && inset < 0.03 && cos_ang > 0.70
+        {
+            let scale = r / len.max(1.0e-5);
+            p.y *= scale;
+            p.z *= scale;
+            projected = true;
+        }
+    }
+    let n = (Vec3::from(va.nrm) + Vec3::from(vb.nrm)).normalize_or_zero();
+    let i = mesh.vertices.len() as u32;
+    mesh.vertices.push(MeshVertex {
+        pos: p.to_array(),
+        nrm: if n.length_squared() > 0.0 {
+            n.to_array()
+        } else {
+            va.nrm
+        },
+        uv: lerp_uv(va.uv, vb.uv),
+        panel: va.panel,
+    });
+    mid.insert(key, i);
+    (i, projected)
+}
+
+fn lerp_uv(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    let wrap = |a: f32, b: f32| -> f32 {
+        let mut b = b;
+        if a - b > 0.5 {
+            b += 1.0;
+        } else if b - a > 0.5 {
+            b -= 1.0;
+        }
+        ((a + b) * 0.5).rem_euclid(1.0)
+    };
+    [wrap(a[0], b[0]), wrap(a[1], b[1])]
+}
+
+fn smooth_normals(mesh: &mut CpuMesh) {
+    let mut acc = vec![Vec3::ZERO; mesh.vertices.len()];
+    for tri in mesh.indices.chunks_exact(3) {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+        let p0 = Vec3::from(mesh.vertices[i0].pos);
+        let p1 = Vec3::from(mesh.vertices[i1].pos);
+        let p2 = Vec3::from(mesh.vertices[i2].pos);
+        let n = (p1 - p0).cross(p2 - p0);
+        acc[i0] += n;
+        acc[i1] += n;
+        acc[i2] += n;
+    }
+    for (v, n) in mesh.vertices.iter_mut().zip(acc) {
+        let nn = n.normalize_or_zero();
+        if nn.length_squared() > 0.0 {
+            v.nrm = nn.to_array();
+        }
     }
 }
 
@@ -537,23 +690,33 @@ fn textures(doc: &gltf::Gltf, bin: &[u8]) -> (Vec<RgbaTex>, Vec<RgbaTex>, Vec<Rg
             &images,
             &tex_image,
             pbr.base_color_texture().map(|t| t.texture().index()),
-            true,
             flat(180, 180, 180, 255),
         );
         nor[idx] = take(
             &images,
             &tex_image,
             mat.normal_texture().map(|t| t.texture().index()),
-            false,
             flat(128, 128, 255, 255),
         );
         mr[idx] = take(
             &images,
             &tex_image,
             pbr.metallic_roughness_texture().map(|t| t.texture().index()),
-            false,
             flat(0, 255, 0, 255),
         );
+    }
+    // The slim WebP is soft, so keep the 2K and then repair the two maps
+    // that read badly: one paint on the shell, a clean disc on the wheel.
+    if base.len() > 5 {
+        unify_body_paint(&mut base[0]);
+        // The shipped WebP is the soft slim bake. Stay at 2K and pull the
+        // body, tread, and sidewall type back. The disc is replaced after.
+        sharpen(&mut base[0], 0.45);
+        sharpen(&mut base[5], 0.9);
+        clean_wheel_disc(&mut base[5], &mut nor[5], &mut mr[5]);
+    }
+    for tex in &mut base {
+        linearize(tex);
     }
     (base, nor, mr)
 }
@@ -562,7 +725,6 @@ fn take(
     images: &HashMap<usize, Vec<u8>>,
     tex_image: &HashMap<usize, usize>,
     texture: Option<usize>,
-    srgb: bool,
     fallback: RgbaTex,
 ) -> RgbaTex {
     let Some(texture) = texture else {
@@ -571,25 +733,206 @@ fn take(
     let Some(image) = tex_image.get(&texture).and_then(|i| images.get(i)) else {
         return fallback;
     };
-    decode_tex(image, srgb).unwrap_or(fallback)
+    decode_tex(image).unwrap_or(fallback)
 }
 
-fn decode_tex(bytes: &[u8], srgb: bool) -> Option<RgbaTex> {
+fn decode_tex(bytes: &[u8]) -> Option<RgbaTex> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let img = image::imageops::resize(&img, TEX, TEX, FilterType::Triangle);
-    let mut rgba = img.into_raw();
-    if srgb {
-        for px in rgba.chunks_exact_mut(4) {
-            for c in &mut px[..3] {
-                *c = linear_u8(*c);
-            }
-        }
-    }
+    let img = if img.width() == TEX && img.height() == TEX {
+        img
+    } else {
+        image::imageops::resize(&img, TEX, TEX, FilterType::Lanczos3)
+    };
     Some(RgbaTex {
         width: TEX,
         height: TEX,
-        rgba,
+        rgba: img.into_raw(),
     })
+}
+
+fn linearize(tex: &mut RgbaTex) {
+    for px in tex.rgba.chunks_exact_mut(4) {
+        for c in &mut px[..3] {
+            *c = linear_u8(*c);
+        }
+    }
+}
+
+fn is_body_paint(r: u8, g: u8, b: u8) -> bool {
+    let r = r as i32;
+    let g = g as i32;
+    let b = b as i32;
+    if !(70..220).contains(&r) {
+        return false;
+    }
+    if (r - g).abs() < 14 && (g - b).abs() < 14 {
+        return false;
+    }
+    if b > r {
+        return false;
+    }
+    r + 8 >= g && g + 8 >= b && (r - b) > 16
+}
+
+fn unify_body_paint(tex: &mut RgbaTex) {
+    let mut sum = [0u64; 3];
+    let mut n = 0u64;
+    for px in tex.rgba.chunks_exact(4) {
+        if is_body_paint(px[0], px[1], px[2]) {
+            sum[0] += px[0] as u64;
+            sum[1] += px[1] as u64;
+            sum[2] += px[2] as u64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return;
+    }
+    let mean = [
+        (sum[0] / n) as u8,
+        (sum[1] / n) as u8,
+        (sum[2] / n) as u8,
+    ];
+    let mean_l = luma(mean[0], mean[1], mean[2]).max(1.0);
+    eprintln!(
+        "niva paint mean srgb ({},{},{}) from {n} texels",
+        mean[0], mean[1], mean[2]
+    );
+    for px in tex.rgba.chunks_exact_mut(4) {
+        if !is_body_paint(px[0], px[1], px[2]) {
+            continue;
+        }
+        let scale = (luma(px[0], px[1], px[2]) / mean_l).clamp(0.88, 1.10);
+        for c in 0..3 {
+            let target = (mean[c] as f32 * scale).clamp(0.0, 255.0);
+            let mixed = px[c] as f32 * 0.12 + target * 0.88;
+            px[c] = mixed.round() as u8;
+        }
+    }
+}
+
+fn luma(r: u8, g: u8, b: u8) -> f32 {
+    0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+}
+
+fn sharpen(tex: &mut RgbaTex, amount: f32) {
+    let w = tex.width as i32;
+    let h = tex.height as i32;
+    let src = tex.rgba.clone();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            for c in 0..3 {
+                let i = ((y * w + x) * 4 + c) as usize;
+                let center = src[i] as f32;
+                let mut acc = 0.0;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let j = (((y + dy) * w + (x + dx)) * 4 + c) as usize;
+                        acc += src[j] as f32;
+                    }
+                }
+                let v = center + (center - acc / 8.0) * amount;
+                tex.rgba[i] = v.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+}
+
+fn clean_wheel_disc(base: &mut RgbaTex, nor: &mut RgbaTex, mr: &mut RgbaTex) {
+    let w = base.width as usize;
+    let h = base.height as usize;
+    let mut bright = vec![false; w * h];
+    for (i, px) in base.rgba.chunks_exact(4).enumerate() {
+        if px[0] > 165 && px[1] > 165 && px[2] > 155 && (px[0] as i32 - px[2] as i32).abs() < 45 {
+            bright[i] = true;
+        }
+    }
+    let mut seen = vec![false; w * h];
+    let mut best: Vec<usize> = Vec::new();
+    let mut stack = Vec::new();
+    for start in 0..w * h {
+        if !bright[start] || seen[start] {
+            continue;
+        }
+        stack.clear();
+        stack.push(start);
+        seen[start] = true;
+        let mut comp = Vec::new();
+        while let Some(i) = stack.pop() {
+            comp.push(i);
+            let x = i % w;
+            let y = i / w;
+            let neigh = [
+                (x.wrapping_sub(1), y, x > 0),
+                (x + 1, y, x + 1 < w),
+                (x, y.wrapping_sub(1), y > 0),
+                (x, y + 1, y + 1 < h),
+            ];
+            for (nx, ny, ok) in neigh {
+                if !ok {
+                    continue;
+                }
+                let j = ny * w + nx;
+                if bright[j] && !seen[j] {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        if comp.len() > best.len() {
+            best = comp;
+        }
+    }
+    if best.len() < 64 {
+        return;
+    }
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    for &i in &best {
+        sx += (i % w) as f64;
+        sy += (i / w) as f64;
+    }
+    sx /= best.len() as f64;
+    sy /= best.len() as f64;
+    let mut rmax = 0.0f32;
+    for &i in &best {
+        let dx = (i % w) as f32 - sx as f32;
+        let dy = (i / w) as f32 - sy as f32;
+        rmax = rmax.max(dx * dx + dy * dy);
+    }
+    let radius = rmax.sqrt() + 1.5;
+    eprintln!(
+        "niva disc center ({sx:.1},{sy:.1}) r={radius:.1} px {}",
+        best.len()
+    );
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - sx as f32;
+            let dy = y as f32 - sy as f32;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d > radius {
+                continue;
+            }
+            let i = (y * w + x) * 4;
+            let t = (d / radius).clamp(0.0, 1.0);
+            let shade = 198.0 - 16.0 * t * t;
+            base.rgba[i] = shade.round() as u8;
+            base.rgba[i + 1] = (shade + 2.0).round() as u8;
+            base.rgba[i + 2] = (shade + 6.0).round() as u8;
+            base.rgba[i + 3] = 255;
+            nor.rgba[i] = 128;
+            nor.rgba[i + 1] = 128;
+            nor.rgba[i + 2] = 255;
+            nor.rgba[i + 3] = 255;
+            mr.rgba[i] = 255;
+            mr.rgba[i + 1] = 72;
+            mr.rgba[i + 2] = 255;
+            mr.rgba[i + 3] = 255;
+        }
+    }
 }
 
 fn flat(r: u8, g: u8, b: u8, a: u8) -> RgbaTex {

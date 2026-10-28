@@ -16,7 +16,8 @@ use crate::mesh::{
     MeshVertex, ParticleVertex, TerrainVertex,
 };
 
-const SHADOW: u32 = 2048;
+const SHADOW: u32 = 4096;
+const COLOR_SAMPLES: u32 = 4;
 const MODEL_SLOTS: u64 = 12;
 
 #[repr(C)]
@@ -67,6 +68,11 @@ pub struct Renderer {
     mat_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    msaa_color: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    fxaa: wgpu::Texture,
+    fxaa_view: wgpu::TextureView,
+    fxaa_bg: wgpu::BindGroup,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     #[allow(dead_code)]
@@ -113,6 +119,7 @@ pub struct Renderer {
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
+    pipe_fxaa: wgpu::RenderPipeline,
     credit_bg: wgpu::BindGroup,
     pipe_credit: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
@@ -472,7 +479,7 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let (ground_diff, ground_diff_view) = upload_rgba(&device, &queue, "ground-diff", &cc0.ground_diff);
@@ -601,22 +608,22 @@ impl Renderer {
             }],
         });
 
-        let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&device, width, height, formats.depth);
-        let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit-bg"),
-            layout: &blit_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
-                },
-            ],
-        });
+        let (
+            color,
+            color_view,
+            msaa_color,
+            msaa_view,
+            fxaa,
+            fxaa_view,
+            depth,
+            depth_view,
+            readback,
+            padded_row,
+        ) = make_targets(&device, width, height, formats.depth);
+        // Resolve is 8-bit. FXAA runs before the credit so the glyph stays sharp
+        // and the readback matches the window.
+        let fxaa_bg = view_bind(&device, &blit_bgl, &color_view, &nearest, "fxaa-bg");
+        let blit_bg = view_bind(&device, &blit_bgl, &fxaa_view, &nearest, "blit-bg");
 
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain-layout"),
@@ -809,6 +816,18 @@ impl Renderer {
             false,
             None,
         );
+        let pipe_fxaa = pipeline(
+            &device,
+            &blit_shader,
+            &blit_layout,
+            "vs_blit",
+            Some("fs_fxaa"),
+            &[],
+            color_format,
+            None,
+            false,
+            None,
+        );
         let (credit_w, credit_h, credit_px) = credit_banner();
         let credit_tex = upload_rgba(
             &device,
@@ -936,6 +955,11 @@ impl Renderer {
             mat_tex,
             color,
             color_view,
+            msaa_color,
+            msaa_view,
+            fxaa,
+            fxaa_view,
+            fxaa_bg,
             depth,
             depth_view,
             shadow,
@@ -974,6 +998,7 @@ impl Renderer {
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
+            pipe_fxaa,
             credit_bg,
             pipe_credit,
             blit_shader,
@@ -1021,10 +1046,24 @@ impl Renderer {
         }
         self.width = width;
         self.height = height;
-        let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&self.device, width, height, self.depth_format);
+        let (
+            color,
+            color_view,
+            msaa_color,
+            msaa_view,
+            fxaa,
+            fxaa_view,
+            depth,
+            depth_view,
+            readback,
+            padded_row,
+        ) = make_targets(&self.device, width, height, self.depth_format);
         self.color = color;
         self.color_view = color_view;
+        self.msaa_color = msaa_color;
+        self.msaa_view = msaa_view;
+        self.fxaa = fxaa;
+        self.fxaa_view = fxaa_view;
         self.depth = depth;
         self.depth_view = depth_view;
         self.readback = readback;
@@ -1033,24 +1072,27 @@ impl Renderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
+        // Rebuild the resolve bind groups against the new views.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
-        self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit-bg"),
-            layout: &blit_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
-                },
-            ],
-        });
+        self.fxaa_bg = view_bind(
+            &self.device,
+            &blit_bgl,
+            &self.color_view,
+            &nearest,
+            "fxaa-bg",
+        );
+        self.blit_bg = view_bind(
+            &self.device,
+            &blit_bgl,
+            &self.fxaa_view,
+            &nearest,
+            "blit-bg",
+        );
     }
 
     pub fn draw(
@@ -1172,11 +1214,11 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    resolve_target: None,
+                    view: &self.msaa_view,
+                    resolve_target: Some(&self.color_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1228,9 +1270,29 @@ impl Renderer {
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fxaa"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.fxaa_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipe_fxaa);
+            pass.set_bind_group(0, &self.fxaa_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("credits"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
+                    view: &self.fxaa_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -1273,7 +1335,7 @@ impl Renderer {
         if readback {
             encoder.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture {
-                    texture: &self.color,
+                    texture: &self.fxaa,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -1580,6 +1642,7 @@ fn upload_array(
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let width = layers[0].width;
     let height = layers[0].height;
+    let mips = mip_count(width.max(height));
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -1587,7 +1650,7 @@ fn upload_array(
             height,
             depth_or_array_layers: layers.len() as u32,
         },
-        mip_level_count: 1,
+        mip_level_count: mips,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
@@ -1595,29 +1658,41 @@ fn upload_array(
         view_formats: &[],
     });
     for (i, layer) in layers.iter().enumerate() {
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: i as u32,
+        let mut rgba = layer.rgba.clone();
+        let mut mw = width;
+        let mut mh = height;
+        for level in 0..mips {
+            let (padded, stride) = pad_rows(&rgba, mw, mh);
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &layer.rgba,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+                &padded,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(mh),
+                },
+                wgpu::Extent3d {
+                    width: mw,
+                    height: mh,
+                    depth_or_array_layers: 1,
+                },
+            );
+            if level + 1 == mips {
+                break;
+            }
+            rgba = box_down(&rgba, mw, mh);
+            mw = (mw / 2).max(1);
+            mh = (mh / 2).max(1);
+        }
     }
     let view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some(label),
@@ -1625,6 +1700,57 @@ fn upload_array(
         ..Default::default()
     });
     (texture, view)
+}
+
+fn mip_count(size: u32) -> u32 {
+    let mut n = 1u32;
+    let mut s = size.max(1);
+    while s > 1 {
+        s /= 2;
+        n += 1;
+    }
+    n
+}
+
+fn box_down(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let nw = (w / 2).max(1);
+    let nh = (h / 2).max(1);
+    let mut dst = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut acc = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let sx = (x * 2 + dx).min(w - 1);
+                    let sy = (y * 2 + dy).min(h - 1);
+                    let i = ((sy * w + sx) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += src[i + c] as u32;
+                    }
+                }
+            }
+            let o = ((y * nw + x) * 4) as usize;
+            for c in 0..4 {
+                dst[o + c] = (acc[c] / 4) as u8;
+            }
+        }
+    }
+    dst
+}
+
+fn pad_rows(src: &[u8], w: u32, h: u32) -> (Vec<u8>, u32) {
+    let tight = w * 4;
+    let stride = tight.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    if stride == tight {
+        return (src.to_vec(), stride);
+    }
+    let mut dst = vec![0u8; (stride * h) as usize];
+    for y in 0..h as usize {
+        let s = y * tight as usize;
+        let d = y * stride as usize;
+        dst[d..d + tight as usize].copy_from_slice(&src[s..s + tight as usize]);
+    }
+    (dst, stride)
 }
 
 fn filter_samp(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -1731,6 +1857,10 @@ fn make_targets(
     wgpu::TextureView,
     wgpu::Texture,
     wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
     wgpu::Buffer,
     u32,
 ) {
@@ -1751,6 +1881,38 @@ fn make_targets(
         view_formats: &[],
     });
     let color_view = color.create_view(&Default::default());
+    let fxaa = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fxaa"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let fxaa_view = fxaa.create_view(&Default::default());
+    let msaa_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("color-msaa"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: COLOR_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let msaa_view = msaa_color.create_view(&Default::default());
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
         size: wgpu::Extent3d {
@@ -1759,7 +1921,7 @@ fn make_targets(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: COLOR_SAMPLES,
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1774,7 +1936,41 @@ fn make_targets(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    (color, color_view, depth, depth_view, readback, padded_row)
+    (
+        color,
+        color_view,
+        msaa_color,
+        msaa_view,
+        fxaa,
+        fxaa_view,
+        depth,
+        depth_view,
+        readback,
+        padded_row,
+    )
+}
+
+fn view_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    samp: &wgpu::Sampler,
+    label: &'static str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+        ],
+    })
 }
 
 fn uniform_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {
@@ -1937,7 +2133,18 @@ fn pipeline(
             conservative: false,
         },
         depth_stencil: depth,
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: if matches!(
+                vs,
+                "vs_shadow_terrain" | "vs_shadow_mesh" | "vs_blit" | "vs_credit"
+            ) {
+                1
+            } else {
+                COLOR_SAMPLES
+            },
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         fragment: fs.map(|entry| wgpu::FragmentState {
             module: shader,
             entry_point: Some(entry),
@@ -2092,5 +2299,41 @@ fn fs_blit(in: V) -> @location(0) vec4<f32> {
 fn fs_blit_tosrgb(in: V) -> @location(0) vec4<f32> {
     let c = textureSample(blit_tex, blit_samp, in.uv);
     return vec4<f32>(pow(c.rgb, vec3<f32>(2.2)), c.a);
+}
+
+fn fxaa_luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.299, 0.587, 0.114));
+}
+
+@fragment
+fn fs_fxaa(in: V) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(blit_tex));
+    let px = 1.0 / dims;
+    let c = textureSampleLevel(blit_tex, blit_samp, in.uv, 0.0);
+    let l = fxaa_luma(c.rgb);
+    let n = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(0.0, -px.y), 0.0).rgb);
+    let s = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(0.0, px.y), 0.0).rgb);
+    let e = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(px.x, 0.0), 0.0).rgb);
+    let w = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(-px.x, 0.0), 0.0).rgb);
+    let lne = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(px.x, -px.y), 0.0).rgb);
+    let lnw = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(-px.x, -px.y), 0.0).rgb);
+    let lse = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(px.x, px.y), 0.0).rgb);
+    let lsw = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(-px.x, px.y), 0.0).rgb);
+    let edge_h = abs(lnw + 2.0 * n + lne - (lsw + 2.0 * s + lse));
+    let edge_v = abs(lnw + 2.0 * w + lsw - (lne + 2.0 * e + lse));
+    let contrast = max(edge_h, edge_v);
+    // Dithered gradients stay put. A hard glyph is left alone. A rim stair
+    // sits between those, and a short blend across the edge knocks it down.
+    let thresh = max(0.08, l * 0.15);
+    if (contrast < thresh || contrast > 1.2) {
+        return c;
+    }
+    let horizontal = edge_h >= edge_v;
+    let step = select(vec2<f32>(px.x, 0.0), vec2<f32>(0.0, px.y), horizontal);
+    let a = textureSampleLevel(blit_tex, blit_samp, in.uv - step, 0.0);
+    let b = textureSampleLevel(blit_tex, blit_samp, in.uv + step, 0.0);
+    let span = clamp((contrast - thresh) / max(contrast, 1e-3), 0.0, 1.0);
+    let cap = mix(0.4, 0.12, smoothstep(0.35, 0.9, contrast));
+    return vec4<f32>(mix(c.rgb, (a.rgb + b.rgb) * 0.5, span * cap), c.a);
 }
 "#;
