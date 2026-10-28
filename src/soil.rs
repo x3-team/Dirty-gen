@@ -1909,6 +1909,365 @@ impl SoilField {
         ))
     }
 
+    /// Lay the spoil from a roll as a trench and a berm.
+    ///
+    /// One column was holding more than a metre, and the cells around it were
+    /// painted as separate tablets. The cut stays the trench that was dug,
+    /// with the steps blurred out. The spoil becomes one ridge on the flank
+    /// it was thrown, then a lower tongue. Cut volume and the sum of
+    /// `placed` stay put. The berm is height, not a second colour.
+    pub fn lay_debris_field(&mut self) {
+        let placed_total: f32 = self.placed.iter().copied().sum();
+        let res = self.res;
+        let cell = self.cell;
+        let n = res * res;
+        let half = self.size * 0.5;
+        let mut dug = vec![false; n];
+        let mut cut_sum = 0.0_f32;
+        let mut cwx = 0.0_f32;
+        let mut cwz = 0.0_f32;
+        let mut cw = 0.0_f32;
+        let mut pwx = 0.0_f32;
+        let mut pwz = 0.0_f32;
+        let mut pw = 0.0_f32;
+        for idx in 0..n {
+            let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+            cut_sum += depth;
+            let i = idx % res;
+            let j = idx / res;
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            if depth > 0.01 {
+                dug[idx] = true;
+                cwx += x * depth;
+                cwz += z * depth;
+                cw += depth;
+            }
+            let placed = self.placed[idx];
+            if placed > 0.0 {
+                pwx += x * placed;
+                pwz += z * placed;
+                pw += placed;
+            }
+        }
+        if cut_sum <= 1.0e-6 || placed_total <= 1.0e-6 || cw <= 1.0e-6 {
+            return;
+        }
+        let ccx = cwx / cw;
+        let ccz = cwz / cw;
+        let (tx, tz) = if pw > 1.0e-6 {
+            let mut dx = pwx / pw - ccx;
+            let mut dz = pwz / pw - ccz;
+            let len = dx.hypot(dz);
+            if len < 0.15 {
+                (1.0, 0.0)
+            } else {
+                dx /= len;
+                dz /= len;
+                (dx, dz)
+            }
+        } else {
+            (1.0, 0.0)
+        };
+
+        // The scar stays the trench the roll cut. A filled bowl of the same
+        // volume is only a few centimetres deep, and this view cannot see it.
+        let mut mask = vec![false; n];
+        let mut seen = vec![false; n];
+        let mut best_comp: Vec<usize> = Vec::new();
+        for start in 0..n {
+            if !dug[start] || seen[start] {
+                continue;
+            }
+            let mut comp = Vec::new();
+            let mut stack = vec![start];
+            seen[start] = true;
+            while let Some(idx) = stack.pop() {
+                comp.push(idx);
+                let i = (idx % res) as isize;
+                let j = (idx / res) as isize;
+                for dj in -1isize..=1 {
+                    for di in -1isize..=1 {
+                        if di == 0 && dj == 0 {
+                            continue;
+                        }
+                        let ii = i + di;
+                        let jj = j + dj;
+                        if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                            continue;
+                        }
+                        let nidx = jj as usize * res + ii as usize;
+                        if dug[nidx] && !seen[nidx] {
+                            seen[nidx] = true;
+                            stack.push(nidx);
+                        }
+                    }
+                }
+            }
+            if comp.len() > best_comp.len() {
+                best_comp = comp;
+            }
+        }
+        for idx in &best_comp {
+            mask[*idx] = true;
+        }
+        // One-cell holes in that trench only. A wider fill became a pond.
+        for _ in 0..2 {
+            let prev = mask.clone();
+            for j in 1..res - 1 {
+                for i in 1..res - 1 {
+                    let idx = j * res + i;
+                    if prev[idx] {
+                        continue;
+                    }
+                    let mut nbr = 0;
+                    for dj in -1isize..=1 {
+                        for di in -1isize..=1 {
+                            if di == 0 && dj == 0 {
+                                continue;
+                            }
+                            if prev[(j as isize + dj) as usize * res + (i as isize + di) as usize] {
+                                nbr += 1;
+                            }
+                        }
+                    }
+                    if nbr >= 6 {
+                        mask[idx] = true;
+                    }
+                }
+            }
+        }
+
+        let orig: Vec<f32> = (0..n)
+            .map(|idx| (self.initial_height[idx] - self.bed[idx]).max(0.0))
+            .collect();
+        let mut depth = vec![0.0_f32; n];
+        for idx in 0..n {
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            let mut near = mask[idx];
+            if !near {
+                for dj in -1isize..=1 {
+                    for di in -1isize..=1 {
+                        let ii = i + di;
+                        let jj = j + dj;
+                        if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                            continue;
+                        }
+                        if mask[jj as usize * res + ii as usize] {
+                            near = true;
+                        }
+                    }
+                }
+            }
+            if !near {
+                continue;
+            }
+            let mut acc = 0.0_f32;
+            let mut wacc = 0.0_f32;
+            for dj in -1isize..=1 {
+                for di in -1isize..=1 {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    let w = match di.abs() + dj.abs() {
+                        0 => 0.52,
+                        1 => 0.09,
+                        _ => 0.02,
+                    };
+                    let nidx = jj as usize * res + ii as usize;
+                    let src = if mask[nidx] { orig[nidx] } else { 0.0 };
+                    acc += src * w;
+                    wacc += w;
+                }
+            }
+            if wacc > 0.0 {
+                depth[idx] = acc / wacc;
+            }
+        }
+        let dw_sum: f32 = depth.iter().copied().sum();
+        if dw_sum <= 1.0e-6 {
+            return;
+        }
+        let depth_scale = cut_sum / dw_sum;
+        for d in &mut depth {
+            *d *= depth_scale;
+        }
+        for idx in 0..n {
+            self.bed[idx] = self.initial_height[idx] - depth[idx];
+            let prev = SurfaceKind::from_u8(self.kind[idx]);
+            if firm_cover(prev) {
+                continue;
+            }
+            // Same mud on the lip and the berm. A second colour was a tile.
+            if depth[idx] > 0.05 {
+                self.kind[idx] = SurfaceKind::FreshCut as u8;
+            } else if matches!(
+                prev,
+                SurfaceKind::FreshCut
+                    | SurfaceKind::PackedClay
+                    | SurfaceKind::CutLip
+                    | SurfaceKind::Berm
+                    | SurfaceKind::PlacedClod
+            ) {
+                self.kind[idx] = if self.wetness[idx] > 0.45 {
+                    SurfaceKind::WetMud as u8
+                } else {
+                    SurfaceKind::Undisturbed as u8
+                };
+            }
+        }
+
+        // Distance from the trench floor, and which floor cell is nearest,
+        // so the berm follows the flank instead of piling at the centroid.
+        let mut lip = vec![f32::MAX; n];
+        let mut nearest = vec![usize::MAX; n];
+        let mut queue: Vec<usize> = Vec::new();
+        for idx in 0..n {
+            if depth[idx] <= 0.03 {
+                continue;
+            }
+            lip[idx] = 0.0;
+            nearest[idx] = idx;
+            queue.push(idx);
+        }
+        let diag = cell * std::f32::consts::SQRT_2;
+        let mut qh = 0usize;
+        while qh < queue.len() {
+            let idx = queue[qh];
+            qh += 1;
+            if lip[idx] > 1.15 {
+                continue;
+            }
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            for (di, dj, step) in [
+                (1isize, 0, cell),
+                (-1, 0, cell),
+                (0, 1, cell),
+                (0, -1, cell),
+                (1, 1, diag),
+                (1, -1, diag),
+                (-1, 1, diag),
+                (-1, -1, diag),
+            ] {
+                let ii = i + di;
+                let jj = j + dj;
+                if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                    continue;
+                }
+                let nidx = jj as usize * res + ii as usize;
+                let nd = lip[idx] + step;
+                if nd + 1.0e-5 < lip[nidx] && nd < 1.3 {
+                    lip[nidx] = nd;
+                    nearest[nidx] = nearest[idx];
+                    queue.push(nidx);
+                }
+            }
+        }
+        let mut weight = vec![0.0_f32; n];
+        for idx in 0..n {
+            if depth[idx] > 0.02 || lip[idx] > 1.15 || nearest[idx] == usize::MAX {
+                continue;
+            }
+            let i = idx % res;
+            let j = idx / res;
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let ni = nearest[idx] % res;
+            let nj = nearest[idx] / res;
+            let nx = (ni as f32 + 0.5) * cell - half;
+            let nz = (nj as f32 + 0.5) * cell - half;
+            let ox = x - nx;
+            let oz = z - nz;
+            let olen = ox.hypot(oz).max(1.0e-4);
+            let flank = (ox / olen) * tx + (oz / olen) * tz;
+            let best = lip[idx];
+            // Steep ridge on the throw flank, then a lower tongue of the
+            // thrown mass. One piece of spoil, not a ring of cells.
+            let ridge = (-0.5 * ((best - 0.16) / 0.07).powi(2)).exp();
+            let tongue = 0.42 * (-0.5 * ((best - 0.48) / 0.16).powi(2)).exp();
+            let flank_t = ((flank + 0.05) / 0.85).clamp(0.0, 1.0);
+            let aim = 0.12 + 0.88 * flank_t * flank_t * (3.0 - 2.0 * flank_t);
+            let tongue_t = ((flank - 0.15) / 0.7).clamp(0.0, 1.0);
+            let tongue_aim = tongue_t * tongue_t * (3.0 - 2.0 * tongue_t);
+            let wobble = 0.98 + 0.02 * noise2(x * 0.15, z * 0.15);
+            let w = (ridge * aim + tongue * tongue_aim) * wobble;
+            if w > 0.04 {
+                weight[idx] = w;
+            }
+        }
+        for _ in 0..4 {
+            let wsum: f32 = weight.iter().copied().sum();
+            if wsum <= 1.0e-6 {
+                break;
+            }
+            let scale = placed_total / wsum;
+            let max_h = weight.iter().copied().fold(0.0_f32, f32::max) * scale;
+            if (0.16..=0.24).contains(&max_h) {
+                break;
+            }
+            if max_h > 0.24 {
+                let src = weight.clone();
+                for idx in 0..n {
+                    if depth[idx] > 0.02 {
+                        weight[idx] = 0.0;
+                        continue;
+                    }
+                    let i = (idx % res) as isize;
+                    let j = (idx / res) as isize;
+                    let mut acc = src[idx] * 0.40;
+                    let mut wacc = 0.40_f32;
+                    let mut near = src[idx] > 0.0;
+                    for (di, dj) in [(1isize, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let ii = i + di;
+                        let jj = j + dj;
+                        if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                            continue;
+                        }
+                        let nidx = jj as usize * res + ii as usize;
+                        if depth[nidx] > 0.02 {
+                            continue;
+                        }
+                        acc += src[nidx] * 0.15;
+                        wacc += 0.15;
+                        near = near || src[nidx] > 0.0;
+                    }
+                    weight[idx] = if near { acc / wacc } else { 0.0 };
+                }
+            } else {
+                for w in &mut weight {
+                    if *w > 0.0 {
+                        *w = w.powf(1.4);
+                    }
+                }
+            }
+        }
+        let wsum: f32 = weight.iter().copied().sum();
+        if wsum <= 1.0e-6 {
+            for idx in 0..n {
+                self.sync(idx);
+            }
+            return;
+        }
+        let scale = placed_total / wsum;
+        for idx in 0..n {
+            let on_floor = depth[idx] > 0.02;
+            self.placed[idx] = if on_floor { 0.0 } else { weight[idx] * scale };
+            self.sync(idx);
+        }
+        let now: f32 = self.placed.iter().copied().sum();
+        if now > 1.0e-8 && (now - placed_total).abs() > 1.0e-5 {
+            let fix = placed_total / now;
+            for idx in 0..n {
+                self.placed[idx] *= fix;
+                self.sync(idx);
+            }
+        }
+    }
+
     fn lay_kept(&mut self, cells: &[usize], volume: f32) {
         if cells.is_empty() || volume <= 0.0 {
             return;

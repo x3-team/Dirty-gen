@@ -1030,8 +1030,50 @@ fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, s
     );
 }
 
+/// Airborne ledger soil. A flat ribbon of the carried volume. A sphere of
+/// `cbrt(volume)` was a blob several times the field.
+fn add_soil_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.22, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::Z;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = (0.22 + p.vel.length() * 0.05).clamp(0.24, 0.80);
+    let width = (p.volume / length).sqrt().clamp(0.018, 0.09);
+    let thick = (p.volume / (length * width)).clamp(0.005, 0.022);
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (1.0 - (t * 2.0 - 1.0).abs()).clamp(0.15, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * taper;
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
 /// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+/// smaller lumps. Ledger soil is not in this mesh once it has landed: that
+/// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
@@ -1039,6 +1081,12 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     for kind in [3u8, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
+                continue;
+            }
+            if p.ledger {
+                if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 200 < MAX_VERTS {
+                    add_soil_ribbon(&mut mesh, p);
+                }
                 continue;
             }
             if mesh.vertices.len() + 700 > MAX_VERTS {

@@ -677,7 +677,7 @@ impl World {
             bed_after = bed_after.max(self.soil.initial_height[*idx] - self.soil.bed[*idx]);
         }
         let after = self.soil.volumes();
-        RollCut {
+        let roll = RollCut {
             displaced: after.cut - before.cut,
             berm,
             thrown,
@@ -688,7 +688,11 @@ impl World {
             raised,
             airborne: self.soil.airborne,
             placed: after.placed - before.placed,
-        }
+        };
+        // Numbers above are the cut. The picture is the same volume, laid as
+        // a trench and a berm instead of cell towers.
+        self.soil.lay_debris_field();
+        roll
     }
 
     fn plow_pose(
@@ -1343,6 +1347,85 @@ mod tests {
             "the settled pose is not on its side, roll {}",
             world.vehicle.roll
         );
+        let shaped = world.soil.volumes();
+        assert!(
+            (shaped.cut - roll.displaced).abs() < 1.0e-4,
+            "debris reshape moved the cut {:.4} vs {:.4}",
+            shaped.cut,
+            roll.displaced
+        );
+        assert!(
+            (shaped.placed - roll.placed).abs() < 1.0e-4,
+            "debris reshape moved the spoil {:.4} vs {:.4}",
+            shaped.placed,
+            roll.placed
+        );
+        let max_spoil = world.soil.placed.iter().copied().fold(0.0_f32, f32::max);
+        let max_depth = world
+            .soil
+            .initial_height
+            .iter()
+            .zip(world.soil.bed.iter())
+            .map(|(h0, bed)| (h0 - bed).max(0.0))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_spoil > 0.14 && max_spoil < 0.28,
+            "berm is not a ridge, height {:.3} m",
+            max_spoil
+        );
+        assert!(
+            max_depth > 0.10 && max_depth < 0.18,
+            "cut is not a trench, depth {:.3} m",
+            max_depth
+        );
+        let res = world.soil.res;
+        let mut towers = 0;
+        let mut deep = 0;
+        let mut deep_holes = 0;
+        for idx in 0..world.soil.placed.len() {
+            let h = world.soil.placed[idx];
+            let dug = (world.soil.initial_height[idx] - world.soil.bed[idx]).max(0.0);
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            let mut best_p = 0.0_f32;
+            let mut best_d = 0.0_f32;
+            for dj in -1isize..=1 {
+                for di in -1isize..=1 {
+                    if di == 0 && dj == 0 {
+                        continue;
+                    }
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    let nidx = jj as usize * res + ii as usize;
+                    best_p = best_p.max(world.soil.placed[nidx]);
+                    best_d = best_d.max(
+                        (world.soil.initial_height[nidx] - world.soil.bed[nidx]).max(0.0),
+                    );
+                }
+            }
+            if h > 0.04 && best_p < h * 0.55 {
+                towers += 1;
+            }
+            if dug > 0.04 {
+                deep += 1;
+                if best_d < 0.02 {
+                    deep_holes += 1;
+                }
+            }
+        }
+        assert_eq!(towers, 0, "spoil still stands in towers");
+        assert!(deep > 12, "the cut disappeared, deep cells {deep}");
+        assert_eq!(deep_holes, 0, "the cut is still a scatter of pits");
+        let lumps = world
+            .particles
+            .items
+            .iter()
+            .filter(|p| p.alive && p.ledger && !p.deposited && p.volume > 1.0e-8)
+            .count();
+        assert_eq!(lumps, 0, "thrown soil is still a loose lump");
     }
 }
 
