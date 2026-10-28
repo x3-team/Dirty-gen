@@ -975,95 +975,138 @@ fn world_of(p: &silt::particles::Particle, local: Vec3) -> Vec3 {
 }
 
 fn add_torn_clod(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let radii = p.span.max(Vec3::splat(0.004));
-    let mut v = [Vec3::ZERO; 6];
-    let dirs = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
-    for (i, d) in dirs.iter().enumerate() {
-        let j = 0.68 + chunk_hash(p.seed, i as u32) * 0.58;
-        let tear = if i == 0 {
-            1.48
-        } else if i == 5 {
-            0.58
-        } else if i == 3 {
-            0.72
-        } else {
-            1.0
-        };
-        v[i] = Vec3::new(d.x * radii.x, d.y * radii.y, d.z * radii.z) * j * tear;
-        v[i].x += v[i].y * (0.28 + chunk_hash(p.seed, 8) * 0.2);
-        v[i].z += v[i].x * (0.12 + chunk_hash(p.seed, 9) * 0.22);
+    // Span is ellipsoid radii. Corners sit on that bulk, one of them bitten
+    // in, so the chunk has thickness from every side.
+    let rx = p.span.x.max(0.012);
+    let ry = p.span.y.max(0.01);
+    let rz = p.span.z.max(0.01);
+    let mut corner = [Vec3::ZERO; 8];
+    let mut n = 0u32;
+    for sx in [-1.0_f32, 1.0] {
+        for sy in [-1.0_f32, 1.0] {
+            for sz in [-1.0_f32, 1.0] {
+                let jag = 0.82 + chunk_hash(p.seed, n) * 0.32;
+                let bite = if n == 5 { 0.52 } else { 1.0 };
+                let mut c = Vec3::new(sx * rx, sy * ry, sz * rz) * jag * bite;
+                c.x += sy * rx * 0.12;
+                c.z += sx * rz * 0.1;
+                corner[n as usize] = c;
+                n += 1;
+            }
+        }
     }
-    // A bite out of one face, so the silhouette is a torn slab.
-    v[4] *= 0.48 + chunk_hash(p.seed, 11) * 0.28;
-    let faces = [
-        (0usize, 4, 2),
-        (4, 1, 2),
-        (1, 5, 2),
-        (5, 0, 2),
-        (4, 0, 3),
-        (1, 4, 3),
-        (5, 1, 3),
-        (0, 5, 3),
+    // sz fastest, then sy, then sx. See the loop above.
+    let quads = [
+        [0usize, 1, 3, 2],
+        [4, 6, 7, 5],
+        [0, 2, 6, 4],
+        [1, 5, 7, 3],
+        [0, 4, 5, 1],
+        [2, 3, 7, 6],
     ];
     let panel = soil_panel(p);
     let uv = soil_uv(p);
-    for (k, (ia, ib, ic)) in faces.iter().enumerate() {
-        let a = v[*ia];
-        let b = v[*ib];
-        let c = v[*ic];
-        let mid = (a + b + c) / 3.0;
-        let n = (b - a).cross(c - a).normalize_or_zero();
-        let kick = (chunk_hash(p.seed, 20 + k as u32) - 0.42) * radii.y * 0.95;
-        let m = mid + n * kick;
+    let origin = world_of(p, Vec3::ZERO);
+    for (f, q) in quads.iter().enumerate() {
+        let a = corner[q[0]];
+        let b = corner[q[1]];
+        let c = corner[q[2]];
+        let d = corner[q[3]];
+        let mid0 = (a + b + c + d) * 0.25;
+        let out = mid0.normalize_or_zero();
+        let bulge = (0.16 + chunk_hash(p.seed, 30 + f as u32) * 0.2) * (rx + ry + rz) / 3.0;
+        // One face is the tear.
+        let bulge = if f == 1 { -bulge * 0.85 } else { bulge };
+        let mid = mid0 + out * bulge;
         let aw = world_of(p, a);
         let bw = world_of(p, b);
         let cw = world_of(p, c);
-        let mw = world_of(p, m);
-        add_tri_tint(mesh, aw, bw, mw, panel, uv, p.pos);
-        add_tri_tint(mesh, bw, cw, mw, panel, uv, p.pos);
-        add_tri_tint(mesh, cw, aw, mw, panel, uv, p.pos);
+        let dw = world_of(p, d);
+        let mw = world_of(p, mid);
+        add_tri_tint(mesh, aw, bw, mw, panel, uv, origin);
+        add_tri_tint(mesh, bw, cw, mw, panel, uv, origin);
+        add_tri_tint(mesh, cw, dw, mw, panel, uv, origin);
+        add_tri_tint(mesh, dw, aw, mw, panel, uv, origin);
     }
 }
 
 fn add_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let length = p.span.x.max(0.02);
-    let width = p.span.y.max(0.008);
-    let thick = p.span.z.max(0.003);
-    let segs = 6usize;
+    // Full box extents. The cross section stays fat on both axes so a side
+    // view cannot collapse the piece into a card.
+    let length = p.span.x.max(0.03);
+    let half_w = p.span.y.max(0.02) * 0.5;
+    let half_t = p.span.z.max(0.016) * 0.5;
+    let segs = 4usize;
     let panel = soil_panel(p);
     let uv = soil_uv(p);
-    let mut ring = Vec::with_capacity(segs + 1);
+    // Torn quad, not a lathe. One corner is the bite.
+    let profile = [
+        (1.05_f32, 0.35_f32),
+        (0.25, 1.05),
+        (-0.95, 0.2),
+        (-0.15, -1.0),
+        (0.72, -0.55),
+    ];
+    let mut rings: Vec<[Vec3; 5]> = Vec::with_capacity(segs + 1);
     for i in 0..=segs {
         let t = i as f32 / segs as f32;
-        let edge = if i == 0 || i == segs { 0.18 } else { 1.0 };
-        let belly = (t * (1.0 - t) * 4.0).powf(0.6).max(0.32);
-        let tear = 0.62 + chunk_hash(p.seed, i as u32) * 0.55;
-        let w = width * 0.5 * belly * tear * edge;
-        let th = thick * 0.5 * (0.55 + 0.45 * belly) * edge;
+        let edge = if i == 0 || i == segs { 0.55 } else { 1.0 };
+        let belly = (0.78 + 0.22 * (t * (1.0 - t) * 4.0).sqrt()) * edge;
         let x = (t - 0.5) * length;
-        let curl = ((t - 0.32) * 2.1).sin() * thick * 0.85;
-        let jag = (chunk_hash(p.seed, 24 + i as u32) - 0.5) * width * 0.16;
-        let twist = (t - 0.5) * 0.45 + (chunk_hash(p.seed, 6) - 0.5) * 0.2;
+        let bow = ((t - 0.42) * std::f32::consts::PI).sin() * half_w * 0.35;
+        let twist = (t - 0.5) * 0.55 + (chunk_hash(p.seed, 6) - 0.5) * 0.3;
         let (s, c) = twist.sin_cos();
-        let rot = |y: f32, z: f32| Vec3::new(x, y * c - z * s + curl, y * s + z * c);
-        let top = w * (0.85 + chunk_hash(p.seed, 40 + i as u32) * 0.4);
-        let bot = w * (0.6 + chunk_hash(p.seed, 50 + i as u32) * 0.55);
-        ring.push([
-            rot(top + jag, th * 0.15),
-            rot(jag * 0.25, th),
-            rot(-bot + jag * 0.35, -th * 0.1),
-            rot(jag * 0.1, -th * 0.85),
-        ]);
+        let mut ring = [Vec3::ZERO; 5];
+        for k in 0..5 {
+            let bite = if k == 2 {
+                0.62 + chunk_hash(p.seed, 4) * 0.15
+            } else {
+                1.0
+            };
+            let jag = 0.84 + chunk_hash(p.seed, (i * 5 + k) as u32) * 0.28;
+            let (py, pz) = profile[k];
+            let y = py * half_w * belly * bite * jag;
+            let z = pz * half_t * belly * jag;
+            ring[k] = Vec3::new(x, y * c - z * s + bow, y * s + z * c);
+        }
+        rings.push(ring);
     }
-    let pairs = [(0usize, 1usize), (1, 2), (2, 3), (3, 0)];
     for i in 0..segs {
-        for (u, v) in pairs {
-            let a = world_of(p, ring[i][u]);
-            let b = world_of(p, ring[i + 1][u]);
-            let c = world_of(p, ring[i + 1][v]);
-            let d = world_of(p, ring[i][v]);
-            add_tri_double(mesh, a, b, c, panel, uv);
-            add_tri_double(mesh, a, c, d, panel, uv);
+        let mut axis = Vec3::ZERO;
+        for k in 0..5 {
+            axis += rings[i][k] + rings[i + 1][k];
+        }
+        axis /= 10.0;
+        let axis_w = world_of(p, axis);
+        for k in 0..5 {
+            let k2 = (k + 1) % 5;
+            let a = world_of(p, rings[i][k]);
+            let b = world_of(p, rings[i][k2]);
+            let c = world_of(p, rings[i + 1][k2]);
+            let d = world_of(p, rings[i + 1][k]);
+            add_tri_tint(mesh, a, b, c, panel, uv, axis_w);
+            add_tri_tint(mesh, a, c, d, panel, uv, axis_w);
+        }
+    }
+    let hub = world_of(p, Vec3::ZERO);
+    for ring in [rings[0], rings[segs]] {
+        let mut cap = Vec3::ZERO;
+        for k in 0..5 {
+            cap += ring[k];
+        }
+        cap /= 5.0;
+        let cap_w = world_of(p, cap);
+        for k in 0..5 {
+            let k2 = (k + 1) % 5;
+            add_tri_tint(
+                mesh,
+                cap_w,
+                world_of(p, ring[k]),
+                world_of(p, ring[k2]),
+                panel,
+                uv,
+                hub,
+            );
         }
     }
 }

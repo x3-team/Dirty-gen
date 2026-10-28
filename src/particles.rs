@@ -423,7 +423,7 @@ impl Particles {
         let _ = self.rnd();
         let span = span_for(shape, volume.max(1.0e-9), slip, speed, wet);
         let roll = match shape {
-            SHAPE_RIBBON => (self.rnd() - 0.5) * 0.35,
+            SHAPE_RIBBON => (self.rnd() - 0.5) * 0.85,
             SHAPE_DUST => (self.rnd() - 0.5) * 0.7,
             _ => (self.rnd() - 0.5) * 1.1,
         };
@@ -526,13 +526,14 @@ impl Particles {
     }
 }
 
-/// Wet slurry leaves as drops and ribbons. Dry ground leaves as dust and clods.
+/// Wet ground throws thick clods and ribbons, plus a few drops.
+/// Dry ground stays dust and clods.
 fn shape_budget(face: u8, moisture: f32) -> [f32; 4] {
     // clod, ribbon, drop, dust
     if face == FACE_MUD && moisture > 0.42 {
-        [0.0, 0.62, 0.38, 0.0]
+        [0.48, 0.36, 0.16, 0.0]
     } else if face == FACE_MUD {
-        [0.28, 0.42, 0.30, 0.0]
+        [0.40, 0.40, 0.20, 0.0]
     } else if face == FACE_GRAVEL || moisture < 0.28 {
         [0.64, 0.0, 0.0, 0.36]
     } else if moisture > 0.55 {
@@ -545,10 +546,10 @@ fn shape_budget(face: u8, moisture: f32) -> [f32; 4] {
 /// A piece stops taking new cut once it is large enough to read as one chunk.
 fn absorb_cap(shape: u8) -> f32 {
     match shape {
-        SHAPE_RIBBON => 2.4e-3,
-        SHAPE_DROP => 7.5e-4,
+        SHAPE_RIBBON => 3.2e-3,
+        SHAPE_DROP => 1.1e-3,
         SHAPE_DUST => 4.2e-4,
-        _ => 2.8e-3,
+        _ => 4.5e-3,
     }
 }
 
@@ -579,15 +580,16 @@ fn span_for(shape: u8, volume: f32, slip: f32, speed: f32, moisture: f32) -> Vec
     let speed_n = (speed / 6.0).clamp(0.0, 1.0);
     match shape {
         SHAPE_RIBBON => {
-            // Length along the throw, width vertical, thickness across.
-            let elong = (3.4 + speed_n * 1.6 + moisture * 0.6).clamp(3.2, 5.6);
-            let wide = (2.15 + slip_n * 0.35 + moisture * 0.45).clamp(2.1, 3.2);
-            let thick = (0.42 + (1.0 - moisture) * 0.12).clamp(0.36, 0.58);
-            fit_box(volume, Vec3::new(elong, wide, thick), 0.46)
+            // A thick strap. The short axis stays large enough to read as
+            // volume from the side, not a card.
+            let elong = (2.55 + speed_n * 0.7 + moisture * 0.25).clamp(2.45, 3.5);
+            let wide = (1.45 + slip_n * 0.2).clamp(1.4, 1.85);
+            let thick = (1.05 + (1.0 - moisture) * 0.08).clamp(1.0, 1.2);
+            fit_box(volume, Vec3::new(elong, wide, thick), 0.62)
         }
         SHAPE_DROP => {
-            let elong = (2.4 + moisture * 0.7 + speed_n * 0.4).clamp(2.3, 3.8);
-            fit_ellipsoid(volume, Vec3::new(elong, 0.72, 0.48), 0.42)
+            let elong = (2.15 + moisture * 0.35 + speed_n * 0.2).clamp(2.1, 2.8);
+            fit_ellipsoid(volume, Vec3::new(elong, 1.05, 0.82), 0.5)
         }
         SHAPE_DUST => {
             let wide = 2.1 + speed_n * 0.9 + (1.0 - moisture) * 0.4;
@@ -595,10 +597,10 @@ fn span_for(shape: u8, volume: f32, slip: f32, speed: f32, moisture: f32) -> Vec
             fit_box(volume, Vec3::new(wide, tall, 1.05), 0.85)
         }
         _ => {
-            let long = 1.65 + slip_n * 0.55;
-            let tall = 0.95 + moisture * 0.12;
-            let thick = 0.52;
-            fit_ellipsoid(volume, Vec3::new(long, tall, thick), 0.55)
+            let long = 2.05 + slip_n * 0.35;
+            let tall = 1.35 + moisture * 0.08;
+            let thick = 1.05;
+            fit_ellipsoid(volume, Vec3::new(long, tall, thick), 0.62)
         }
     }
 }
@@ -695,9 +697,37 @@ mod tests {
                 p.shape,
                 p.span
             );
-            assert!(p.shape == SHAPE_RIBBON || p.shape == SHAPE_DROP);
+            assert!(
+                p.shape == SHAPE_CLOD || p.shape == SHAPE_RIBBON || p.shape == SHAPE_DROP,
+                "wet piece shape {}",
+                p.shape
+            );
+            if p.shape == SHAPE_RIBBON {
+                assert!(
+                    p.span.z > p.span.x * 0.24,
+                    "ribbon is a card {:?}",
+                    p.span
+                );
+            }
+            if p.shape == SHAPE_CLOD {
+                assert!(
+                    e[0] > e[2] * 0.4,
+                    "clod is a card {:?}",
+                    p.span
+                );
+            }
             assert_eq!(p.face, FACE_MUD);
         }
+        let shapes: Vec<u8> = particles
+            .items
+            .iter()
+            .filter(|p| p.alive)
+            .map(|p| p.shape)
+            .collect();
+        assert!(
+            shapes.contains(&SHAPE_CLOD) && shapes.contains(&SHAPE_RIBBON),
+            "wet throw needs a clod and a ribbon, got {shapes:?}"
+        );
     }
 
     #[test]
