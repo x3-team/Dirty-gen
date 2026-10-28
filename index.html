@@ -25,6 +25,7 @@
         display: block;
         outline: none;
         touch-action: none;
+        cursor: grab;
         background: #24180f;
       }
       #hud {
@@ -39,14 +40,26 @@
   <body>
     <canvas id="silt" tabindex="0"></canvas>
     <div id="hud">
-      Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C камера.
+      Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C изометрия. Тяните мышь — орбита вокруг выбранной машины, колесо — ближе и дальше. Q / E и R / F крутят ту же камеру.
       <span id="backend">загрузка…</span>
     </div>
     <script>
       const canvas = document.getElementById("silt");
       const focus = () => canvas.focus();
       window.addEventListener("load", focus);
-      canvas.addEventListener("pointerdown", focus);
+      canvas.addEventListener("pointerdown", (event) => {
+        focus();
+        if (event.button === 0) {
+          canvas.setPointerCapture(event.pointerId);
+        }
+      });
+      canvas.addEventListener(
+        "wheel",
+        (event) => {
+          event.preventDefault();
+        },
+        { passive: false }
+      );
       window.addEventListener(
         "keydown",
         (event) => {
