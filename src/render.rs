@@ -10,9 +10,10 @@ use silt::bike::{Bike, BIKE_RADIUS};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
+use crate::cc0::{buggy_fit, RgbaTex};
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bike_body, bike_suspension, environment_mesh, mud_chunks, terrain_mesh, wheel_mesh, CpuMesh,
+    MeshVertex, ParticleVertex, TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
@@ -78,11 +79,15 @@ pub struct Renderer {
     padded_row: u32,
     terrain: GpuMesh,
     body: GpuMesh,
+    glass: GpuMesh,
+    wheels: [GpuMesh; 4],
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
-    susp_v: wgpu::Buffer,
-    susp_i: wgpu::Buffer,
+    props: GpuMesh,
+    #[allow(dead_code)]
+    resident: Vec<wgpu::Texture>,
+    paint_bg: wgpu::BindGroup,
     bike_susp_v: wgpu::Buffer,
     bike_susp_i: wgpu::Buffer,
     #[allow(dead_code)]
@@ -93,6 +98,8 @@ pub struct Renderer {
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
+    pipe_mesh_blend: wgpu::RenderPipeline,
+    pipe_mesh_double: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
@@ -214,6 +221,7 @@ impl Renderer {
         width: u32,
         height: u32,
         formats: GpuFormats,
+        cc0: crate::cc0::Cc0Scene,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
@@ -271,6 +279,22 @@ impl Renderer {
                     },
                     count: None,
                 },
+                filter_array(4, wgpu::ShaderStages::FRAGMENT),
+                filter_array(5, wgpu::ShaderStages::FRAGMENT),
+                filter_array(6, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                filter_samp(7, wgpu::ShaderStages::VERTEX_FRAGMENT),
+            ],
+        });
+        let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paint"),
+            entries: &[
+                filter_tex(0, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(1, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(2, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(3, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(4, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(5, wgpu::ShaderStages::FRAGMENT),
+                filter_samp(6, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -420,6 +444,49 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let ground_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ground"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let paint_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("paint"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let (ground_diff, ground_diff_view) =
+            upload_array(&device, &queue, "ground-diff", &cc0.ground_diff);
+        let (ground_nor, ground_nor_view) =
+            upload_array(&device, &queue, "ground-nor", &cc0.ground_nor);
+        let (ground_pack, ground_pack_view) =
+            upload_array(&device, &queue, "ground-pack", &cc0.ground_pack);
+        let (buggy_base, buggy_base_view) = upload_rgba(&device, &queue, "buggy-base", &cc0.buggy_base);
+        let (buggy_nor, buggy_nor_view) = upload_rgba(&device, &queue, "buggy-nor", &cc0.buggy_nor);
+        let (buggy_mr, buggy_mr_view) = upload_rgba(&device, &queue, "buggy-mr", &cc0.buggy_mr);
+        let (tire_base, tire_base_view) = upload_rgba(&device, &queue, "tire-base", &cc0.tire_base);
+        let (tire_nor, tire_nor_view) = upload_rgba(&device, &queue, "tire-nor", &cc0.tire_nor);
+        let (prop_tex, prop_view) = upload_rgba(&device, &queue, "prop", &cc0.prop_tex);
+        let resident = vec![
+            ground_diff,
+            ground_nor,
+            ground_pack,
+            buggy_base,
+            buggy_nor,
+            buggy_mr,
+            tire_base,
+            tire_nor,
+            prop_tex,
+        ];
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tex-bg"),
             layout: &tex_bgl,
@@ -443,6 +510,56 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&ground_diff_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&ground_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&ground_pack_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&ground_samp),
+                },
+            ],
+        });
+        let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint-bg"),
+            layout: &paint_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&buggy_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&buggy_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&buggy_mr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&tire_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&tire_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&prop_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&paint_samp),
                 },
             ],
         });
@@ -481,7 +598,7 @@ impl Renderer {
         });
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
-            bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl],
+            bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl],
             push_constant_ranges: &[],
         });
         let solo_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -552,6 +669,38 @@ impl Renderer {
             )),
             false,
             Some(wgpu::Face::Back),
+        );
+        let pipe_mesh_blend = pipeline(
+            &device,
+            &shader,
+            mesh_layout_ref,
+            "vs_mesh",
+            Some("fs_mesh"),
+            mesh_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
+        let pipe_mesh_double = pipeline(
+            &device,
+            &shader,
+            mesh_layout_ref,
+            "vs_mesh",
+            Some("fs_mesh"),
+            mesh_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            false,
+            None,
         );
         let pipe_sky = pipeline(
             &device,
@@ -649,23 +798,18 @@ impl Renderer {
 
         let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
         let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
-        let body_cpu = buggy_body();
-        let body = upload_cpu(&device, &body_cpu, "body");
+        let body = upload_cpu(&device, &cc0.body, "body");
+        let glass = upload_cpu(&device, &cc0.glass, "glass");
+        let wheels = [
+            upload_cpu(&device, &cc0.wheels[0], "wheel-fl"),
+            upload_cpu(&device, &cc0.wheels[1], "wheel-fr"),
+            upload_cpu(&device, &cc0.wheels[2], "wheel-rl"),
+            upload_cpu(&device, &cc0.wheels[3], "wheel-rr"),
+        ];
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
-        let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("susp-v"),
-            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("susp-i"),
-            size: (32768 * 4) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let props = upload_cpu(&device, &cc0.props, "props");
         let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-v"),
             size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -724,11 +868,14 @@ impl Renderer {
             padded_row,
             terrain,
             body,
+            glass,
+            wheels,
             wheel,
             bike_body,
             env,
-            susp_v,
-            susp_i,
+            props,
+            resident,
+            paint_bg,
             bike_susp_v,
             bike_susp_i,
             particles,
@@ -738,6 +885,8 @@ impl Renderer {
             pipe_terrain,
             pipe_water,
             pipe_mesh,
+            pipe_mesh_blend,
+            pipe_mesh_double,
             pipe_particle,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
@@ -829,12 +978,6 @@ impl Renderer {
         readback: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
-        let susp = suspension_mesh(&world.vehicle);
-        let susp_index_count = susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.susp_v, 0, bytemuck::cast_slice(&susp.vertices));
-        self.queue
-            .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
         self.queue
@@ -932,7 +1075,8 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
+            draw_indexed(&mut pass, &self.props);
+            self.draw_vehicle(&mut pass);
             self.draw_bike(&mut pass, bike_susp_count);
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
@@ -969,16 +1113,27 @@ impl Renderer {
             draw_indexed(&mut pass, &self.terrain);
 
             pass.set_pipeline(&self.pipe_mesh);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
+            self.draw_vehicle(&mut pass);
             self.draw_bike(&mut pass, bike_susp_count);
+
+            pass.set_pipeline(&self.pipe_mesh_double);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            draw_indexed(&mut pass, &self.props);
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
             pass.set_pipeline(&self.pipe_mesh);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_chunks(&mut pass, chunk_count);
+
+            pass.set_pipeline(&self.pipe_mesh_blend);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            self.draw_glass(&mut pass);
         }
 
         if let Some((view, srgb)) = present {
@@ -1113,7 +1268,7 @@ impl Renderer {
             px[0] = (soil.wetness[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[1] = ((soil.water[i] / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
-            px[3] = (soil.roughness[i].clamp(0.0, 1.0) * 255.0) as u8;
+            px[3] = soil.kind[i];
         }
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -1133,7 +1288,8 @@ impl Renderer {
     }
 
     fn write_models(&self, vehicle: &Vehicle) {
-        let body = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
+        let chassis = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
+        let body = chassis * buggy_fit();
         let mut mud = [[0.0; 4]; PANEL_COUNT];
         for (i, panel) in vehicle.panels.iter().enumerate() {
             mud[i] = [
@@ -1145,10 +1301,10 @@ impl Renderer {
         }
         let slots = [
             model(body, mud, [0.0, 0.0, 0.0, 0.0]),
-            wheel_model(vehicle, body, mud, 0),
-            wheel_model(vehicle, body, mud, 1),
-            wheel_model(vehicle, body, mud, 2),
-            wheel_model(vehicle, body, mud, 3),
+            wheel_model(vehicle, chassis, mud, 0),
+            wheel_model(vehicle, chassis, mud, 1),
+            wheel_model(vehicle, chassis, mud, 2),
+            wheel_model(vehicle, chassis, mud, 3),
             model(Mat4::IDENTITY, [[0.0; 4]; 12], [0.0, 0.0, 0.0, 0.0]),
             model(body, mud, [0.0, 0.0, 0.0, 0.0]),
         ];
@@ -1161,17 +1317,21 @@ impl Renderer {
         }
     }
 
-    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
+    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(2, &self.model_bg, &[0]);
         draw_indexed(pass, &self.body);
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
-            draw_indexed(pass, &self.wheel);
+            draw_indexed(pass, &self.wheels[i]);
         }
-        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 6]);
-        pass.set_vertex_buffer(0, self.susp_v.slice(..));
-        pass.set_index_buffer(self.susp_i.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..susp_indices, 0, 0..1);
+    }
+
+    fn draw_glass(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.glass.count == 0 {
+            return;
+        }
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        draw_indexed(pass, &self.glass);
     }
 
     fn write_bike_models(&self, bike: &Bike) {
@@ -1244,14 +1404,19 @@ fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) 
 fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
     let local = vehicle.wheel_center_local(index);
     let wheel = vehicle.wheels[index];
+    // Authored front radius is 0.30 and rear is 0.36. Scale onto the physics
+    // radius so the tread meets the soil at the same hub the fender was fit to.
+    let authored = if index < 2 { 0.30 } else { 0.36 };
+    let fit = WHEEL_RADIUS / authored;
     let world = body
         * Mat4::from_translation(local)
         * Mat4::from_rotation_y(wheel.steer)
-        * Mat4::from_rotation_x(wheel.spin);
+        * Mat4::from_rotation_x(wheel.spin)
+        * Mat4::from_scale(Vec3::splat(fit));
     model(
         world,
         mud,
-        [1.0, (wheel.mud / 1.5).clamp(0.0, 1.4), 0.0, 0.0],
+        [1.0, (wheel.mud / 1.5).clamp(0.0, 1.4), 1.0, 0.0],
     )
 }
 
@@ -1271,6 +1436,171 @@ fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.count, 0, 0..1);
+}
+
+fn filter_array(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn filter_tex(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn filter_samp(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn upload_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    layers: &[crate::cc0::RgbaTex; 5],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let width = layers[0].width;
+    let height = layers[0].height;
+    for layer in layers {
+        assert_eq!(layer.width, width);
+        assert_eq!(layer.height, height);
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 5,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = stride.div_ceil(align) * align;
+    for (i, layer) in layers.iter().enumerate() {
+        let data: Vec<u8> = if padded == stride {
+            layer.rgba.clone()
+        } else {
+            let mut out = vec![0u8; (padded * height) as usize];
+            for y in 0..height as usize {
+                let src = y * stride as usize;
+                let dst = y * padded as usize;
+                out[dst..dst + stride as usize]
+                    .copy_from_slice(&layer.rgba[src..src + stride as usize]);
+            }
+            out
+        };
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: i as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+fn upload_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    tex: &RgbaTex,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: tex.width,
+            height: tex.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = tex.width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = stride.div_ceil(align) * align;
+    let data: Vec<u8> = if padded == stride {
+        tex.rgba.clone()
+    } else {
+        let mut out = vec![0u8; (padded * tex.height) as usize];
+        for y in 0..tex.height as usize {
+            let src = y * stride as usize;
+            let dst = y * padded as usize;
+            out[dst..dst + stride as usize].copy_from_slice(&tex.rgba[src..src + stride as usize]);
+        }
+        out
+    };
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(padded),
+            rows_per_image: Some(tex.height),
+        },
+        wgpu::Extent3d {
+            width: tex.width,
+            height: tex.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 fn upload_cpu(device: &wgpu::Device, mesh: &CpuMesh, label: &str) -> GpuMesh {
