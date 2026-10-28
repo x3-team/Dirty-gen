@@ -1037,52 +1037,68 @@ fn ang_dist(i: usize, j: usize, sides: usize) -> usize {
     d.min(sides - d)
 }
 
-fn add_chip(mesh: &mut CpuMesh, center: Vec3, rot: Quat, radius: f32, seed: u32, panel: f32) {
+fn add_pebble(mesh: &mut CpuMesh, center: Vec3, rot: Quat, radius: f32, seed: u32) {
     let h = |n: u32| chunk_hash(seed, n);
-    let n = 5usize;
-    let mut ring = Vec::with_capacity(n);
-    for i in 0..n {
-        let ang = i as f32 / n as f32 * std::f32::consts::TAU + (h(10 + i as u32) - 0.5) * 0.45;
-        let rr = radius * (0.55 + h(20 + i as u32) * 0.75);
-        let y = (h(30 + i as u32) - 0.5) * radius * 0.4;
-        ring.push(center + rot * Vec3::new(rr * ang.cos(), y, rr * ang.sin()));
+    let axis = Vec3::new(0.7 + h(1) * 0.55, 0.45 + h(2) * 0.4, 0.65 + h(3) * 0.6);
+    let slices = 5usize;
+    let place = |dir: Vec3, rad: f32| {
+        let y_scale = if dir.y < -0.2 {
+            axis.y * (0.62 + h(4) * 0.2)
+        } else {
+            axis.y
+        };
+        let shaped = Vec3::new(dir.x * axis.x, dir.y * y_scale, dir.z * axis.z) * rad;
+        let n = Vec3::new(dir.x / axis.x, dir.y / y_scale.max(0.2), dir.z / axis.z);
+        (center + rot * shaped, (rot * n).normalize_or_zero())
+    };
+    let mut pts = Vec::new();
+    let mut nrm = Vec::new();
+    let (p, n) = place(Vec3::Y, radius * (0.75 + h(5) * 0.3));
+    pts.push(p);
+    nrm.push(n);
+    let phi = std::f32::consts::PI * 0.5;
+    for i in 0..slices {
+        let th = i as f32 / slices as f32 * std::f32::consts::TAU + h(6);
+        let wob = 0.82 + h(20 + i as u32) * 0.3;
+        let dir = Vec3::new(th.cos() * phi.sin(), phi.cos() * 0.15, th.sin() * phi.sin());
+        let (p, n) = place(dir.normalize_or_zero(), radius * wob);
+        pts.push(p);
+        nrm.push(n);
     }
-    let top = center
-        + rot
-            * Vec3::new(
-                (h(1) - 0.5) * radius * 0.45,
-                radius * (0.32 + h(2) * 0.5),
-                (h(3) - 0.5) * radius * 0.4,
-            );
-    let bot = center
-        + rot
-            * Vec3::new(
-                (h(4) - 0.5) * radius * 0.3,
-                -radius * (0.25 + h(5) * 0.4),
-                (h(6) - 0.5) * radius * 0.3,
-            );
-    let up = rot * Vec3::Y;
-    for i in 0..n {
-        let j = (i + 1) % n;
-        add_outward(mesh, top, ring[i], ring[j], panel, up);
-        add_outward(mesh, bot, ring[j], ring[i], panel, -up);
+    let (p, n) = place(-Vec3::Y, radius * (0.55 + h(7) * 0.25));
+    pts.push(p);
+    nrm.push(n);
+    for i in 0..slices {
+        let a = 1 + i;
+        let b = 1 + (i + 1) % slices;
+        add_tri_smooth(
+            mesh,
+            pts[0],
+            nrm[0],
+            pts[a],
+            nrm[a],
+            pts[b],
+            nrm[b],
+            PANEL_STONE,
+            center,
+        );
+        let bot = pts.len() - 1;
+        add_tri_smooth(
+            mesh,
+            pts[bot],
+            nrm[bot],
+            pts[b],
+            nrm[b],
+            pts[a],
+            nrm[a],
+            PANEL_STONE,
+            center,
+        );
     }
 }
 
-fn add_outward(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32, outward: Vec3) {
-    let n = (b - a).cross(c - a);
-    if n.length_squared() < 1.0e-12 {
-        return;
-    }
-    if n.dot(outward) >= 0.0 {
-        add_tri(mesh, a, b, c, panel);
-    } else {
-        add_tri(mesh, a, c, b, panel);
-    }
-}
-
-/// Wet sheet, torn plate, or thicker chunk. Stones sit in the piece.
-/// Landed pieces keep that shape; only the mesh lies on the soil.
+/// Thick wet soil plate. Soft skin, a torn outline, crust on the dry side,
+/// stones sunk in. Landed pieces keep that shape; only the mesh sits up.
 fn add_torn_clay(
     mesh: &mut CpuMesh,
     center: Vec3,
@@ -1092,223 +1108,181 @@ fn add_torn_clay(
     grounded: bool,
 ) {
     let h = |n: u32| chunk_hash(seed, n);
-    // 0 wet sheet, 1 torn plate, 2 thicker chunk. Stones ride in all three.
-    let shape = (h(4) * 3.0) as u32;
-    let sheet = shape == 0;
-    let chunky = shape == 2;
-    let scale = if sheet {
-        Vec3::new(1.45 + h(1) * 0.85, 0.9 + h(2) * 0.12, 1.2 + h(3) * 0.9)
-    } else if chunky {
-        Vec3::new(0.68 + h(1) * 0.5, 0.86 + h(2) * 0.28, 0.62 + h(3) * 0.55)
-    } else {
-        Vec3::new(0.78 + h(1) * 0.72, 0.9 + h(2) * 0.18, 0.68 + h(3) * 0.8)
-    };
-    let bulk = if sheet {
-        0.95 + h(11) * 0.5
-    } else {
-        0.82 + h(11) * 0.4
-    };
-    let stones_n = if sheet {
-        2 + (h(36) * 2.0) as u32
-    } else {
-        1 + (h(36) * 2.2) as u32
-    };
-    // Mesh only. Stonier pieces sit lower. The soil volume is unchanged.
-    let sink = if grounded {
-        let heavy = (stones_n as f32 - 1.0) * 0.04;
-        let tall = if chunky {
-            0.2
-        } else if sheet {
-            0.02
+    let chunky = h(4) > 0.62;
+    let thick = radius
+        * if chunky {
+            0.55 + h(5) * 0.18
         } else {
-            0.06
+            0.34 + h(5) * 0.12
         };
-        Vec3::Y * radius * (0.3 + h(12) * 0.12 + tall - heavy)
+    let scale = Vec3::new(0.78 + h(1) * 0.55, 0.94 + h(2) * 0.16, 0.72 + h(3) * 0.6);
+    let bulk = 0.88 + h(11) * 0.32;
+    let stones_n = 1 + (h(36) * 1.6) as u32;
+    let sink = if grounded {
+        let heavy = (stones_n as f32 - 1.0) * 0.05;
+        let tall = if chunky { 0.14 } else { 0.0 };
+        Vec3::Y * radius * (0.36 + h(12) * 0.1 + tall - heavy)
     } else {
         Vec3::ZERO
     };
     let laid = if grounded {
         let fwd = rot * Vec3::Z;
         let yaw = fwd.x.atan2(fwd.z);
-        let tilt = (h(6) - 0.5) * if sheet { 0.65 } else { 0.4 };
-        let roll = (h(8) - 0.5) * if sheet { 0.55 } else { 0.42 };
-        let flip = if !sheet && h(7) > 0.8 {
-            std::f32::consts::PI
-        } else {
-            0.0
-        };
-        Quat::from_rotation_y(yaw)
-            * Quat::from_rotation_x(tilt + flip)
-            * Quat::from_rotation_z(roll)
+        let tilt = (h(6) - 0.5) * 0.28;
+        let roll = (h(8) - 0.5) * 0.32;
+        Quat::from_rotation_y(yaw) * Quat::from_rotation_x(tilt) * Quat::from_rotation_z(roll)
     } else {
         rot
     };
-    let up = laid * Vec3::Y;
     let xform = |p: Vec3| {
         center + laid * Vec3::new(p.x * scale.x, p.y * scale.y, p.z * scale.z) * bulk + sink
     };
-    let sides = if sheet {
-        10 + (h(9) * 3.0) as usize
-    } else {
-        7 + (h(9) * 2.0) as usize
-    };
+    let interior = xform(Vec3::ZERO);
+    let up = laid * Vec3::Y;
+    let sides = 14 + (h(9) * 3.0) as usize;
     let bite = (h(13) * sides as f32) as usize % sides;
-    let spur = (bite + sides / 2) % sides;
-    let sand_i = (bite + sides / 3) % sides;
-    let thick = radius
-        * if sheet {
-            0.14 + h(5) * 0.08
-        } else if chunky {
-            0.58 + h(5) * 0.38
-        } else {
-            0.22 + h(5) * 0.14
-        };
-    let curl = if sheet {
-        radius * (0.06 + h(22) * 0.1)
-    } else if chunky {
-        radius * 0.05
-    } else {
-        radius * (0.05 + h(22) * 0.08)
-    };
-    let step = std::f32::consts::TAU / sides as f32;
+    let lump = (bite + sides / 2) % sides;
+    let sand_i = (lump + 1) % sides;
     let phase = h(14) * std::f32::consts::TAU;
-
-    let mut top = Vec::with_capacity(sides);
-    let mut bot = Vec::with_capacity(sides);
-    let mut ang_of = Vec::with_capacity(sides);
-    for i in 0..sides {
-        let wobble = (h(40 + i as u32) - 0.5) * step * 0.36;
-        let ang = i as f32 * step + wobble;
-        ang_of.push(ang);
-        let mut rr = radius * (0.48 + h(50 + i as u32) * 0.72);
-        if i == bite {
-            rr *= if sheet { 0.24 } else { 0.38 + h(17) * 0.08 };
-        } else if ang_dist(i, bite, sides) == 1 {
-            rr *= 0.62 + h(18) * 0.1;
+    let phase2 = h(15) * std::f32::consts::TAU;
+    let step = std::f32::consts::TAU / sides as f32;
+    // A thick plate: wide, with a soft rim rather than an egg.
+    let profile = [
+        (-0.46_f32, 0.86_f32),
+        (-0.2, 1.0),
+        (0.0, 1.02),
+        (0.2, 1.0),
+        (0.44, 0.84),
+    ];
+    let mut rings: Vec<Vec<Vec3>> = Vec::new();
+    let mut norms: Vec<Vec<Vec3>> = Vec::new();
+    for (band, (y, rad)) in profile.iter().enumerate() {
+        let mut pts = Vec::with_capacity(sides);
+        let mut nrm = Vec::with_capacity(sides);
+        for i in 0..sides {
+            let wobble = (h(40 + band as u32 * 20 + i as u32) - 0.5) * step * 0.28;
+            let ang = i as f32 * step + wobble;
+            let lobe = 1.0 + 0.2 * (ang * 2.0 + phase).cos() + 0.1 * (ang * 3.0 + phase2).sin();
+            let mut rr = radius * rad * lobe * (0.82 + h(70 + band as u32 * 20 + i as u32) * 0.32);
+            if i == bite {
+                rr *= 0.52 + h(17) * 0.08;
+            } else if ang_dist(i, bite, sides) == 1 {
+                rr *= 0.74;
+            }
+            if i == lump {
+                rr *= 1.22 + h(18) * 0.12;
+            }
+            let yy = y * thick + (h(90 + band as u32 * 20 + i as u32) - 0.5) * thick * 0.05;
+            let world = xform(Vec3::new(rr * ang.cos(), yy, rr * ang.sin()));
+            let radial = (world - interior).normalize_or_zero();
+            let n = if band == 4 {
+                (up + radial * 0.28).normalize_or_zero()
+            } else if band == 0 {
+                (-up + radial * 0.28).normalize_or_zero()
+            } else if band == 3 {
+                (radial + up * 0.55).normalize_or_zero()
+            } else if band == 1 {
+                (radial - up * 0.55).normalize_or_zero()
+            } else {
+                radial
+            };
+            nrm.push(n);
+            pts.push(world);
         }
-        if i == spur {
-            rr *= 1.12 + h(19) * 0.18;
-        }
-        let wave = (ang + phase).sin() * curl + (ang * 2.0 + phase).cos() * curl * 0.35;
-        let mut half = thick * (0.42 + h(60 + i as u32) * 0.28);
-        if ang_dist(i, bite, sides) <= 1 {
-            half *= 0.65;
-        }
-        if i == spur && !sheet {
-            half += thick * (0.3 + h(21) * 0.3);
-        }
-        top.push(xform(Vec3::new(
-            rr * ang.cos(),
-            wave + half,
-            rr * ang.sin(),
-        )));
-        bot.push(xform(Vec3::new(
-            rr * ang.cos(),
-            wave - half,
-            rr * ang.sin(),
-        )));
+        rings.push(pts);
+        norms.push(nrm);
     }
 
-    let crown = xform(Vec3::new(0.0, curl * 0.12, 0.0));
-    let floor = xform(Vec3::new(0.0, -thick * 0.2, 0.0));
-    let face = |i: usize| -> f32 {
-        let j = (i + 1) % sides;
-        if sheet {
-            if i == sand_i || j == sand_i {
-                PANEL_SAND
-            } else if i == spur || j == spur {
-                PANEL_CRUST
-            } else {
-                PANEL_CLOD
-            }
+    let skin = |band: usize, i: usize| -> f32 {
+        if band < 3 {
+            return PANEL_CLOD;
+        }
+        // One drier patch and a sandy streak on the top. The torn side stays wet.
+        if ang_dist(i, sand_i, sides) <= 1 {
+            PANEL_SAND
+        } else if ang_dist(i, lump, sides) <= sides / 5 {
+            PANEL_CRUST
         } else {
-            let wet = |k: usize| ang_dist(k, bite, sides) <= 1;
-            let sand = |k: usize| ang_dist(k, sand_i, sides) <= 1;
-            if wet(i) && wet(j) {
-                PANEL_CLOD
-            } else if sand(i) && sand(j) {
-                PANEL_SAND
-            } else if wet(i) || wet(j) {
-                PANEL_CLOD
-            } else if sand(i) || sand(j) {
-                PANEL_SAND
-            } else {
-                PANEL_CRUST
-            }
+            PANEL_CLOD
         }
     };
 
+    let floor = xform(Vec3::new(0.0, profile[0].0 * thick * 0.45, 0.0));
+    let floor_n = (laid * -Vec3::Y).normalize();
+    let crown = xform(Vec3::new(0.0, profile[4].0 * thick * 0.62, 0.0));
     for i in 0..sides {
         let j = (i + 1) % sides;
-        let panel = face(i);
-        add_tri_smooth(mesh, crown, up, top[i], up, top[j], up, panel, crown - up);
         add_tri_smooth(
             mesh,
+            rings[0][i],
+            norms[0][i],
+            rings[0][j],
+            norms[0][j],
             floor,
-            -up,
-            bot[j],
-            -up,
-            bot[i],
-            -up,
+            floor_n,
             PANEL_CLOD,
-            floor + up,
+            interior,
         );
-        let dir = Vec3::new(ang_of[i].cos(), 0.0, ang_of[i].sin());
-        let outward = (laid * Vec3::new(dir.x * scale.x, 0.0, dir.z * scale.z)).normalize_or_zero();
-        add_outward(mesh, top[i], bot[i], top[j], panel, outward);
-        add_outward(mesh, top[j], bot[i], bot[j], panel, outward);
+        add_tri_smooth(
+            mesh,
+            rings[4][i],
+            norms[4][i],
+            crown,
+            up,
+            rings[4][j],
+            norms[4][j],
+            skin(4, i),
+            interior,
+        );
     }
-
-    if !sheet {
-        let mut grains = 0u32;
-        let grain_budget = 3 + (h(35) * 3.0) as u32;
+    for band in 0..4 {
         for i in 0..sides {
-            if grains >= grain_budget {
-                break;
-            }
-            if ang_dist(i, sand_i, sides) > 1 {
-                continue;
-            }
-            let grain_r = radius * (0.07 + h(120 + grains) * 0.06);
-            let at = top[i].lerp(crown, 0.4) - up * grain_r * 0.2;
-            let spin = Quat::from_rotation_y(h(140 + grains) * std::f32::consts::TAU);
-            add_chip(
+            let j = (i + 1) % sides;
+            let panel = skin(band, i);
+            add_tri_smooth(
                 mesh,
-                at,
-                laid * spin,
-                grain_r,
-                seed ^ grains.wrapping_mul(0x9E37_u32),
-                PANEL_SAND,
+                rings[band][i],
+                norms[band][i],
+                rings[band + 1][i],
+                norms[band + 1][i],
+                rings[band][j],
+                norms[band][j],
+                panel,
+                interior,
             );
-            grains += 1;
+            add_tri_smooth(
+                mesh,
+                rings[band][j],
+                norms[band][j],
+                rings[band + 1][i],
+                norms[band + 1][i],
+                rings[band + 1][j],
+                norms[band + 1][j],
+                panel,
+                interior,
+            );
         }
     }
 
-    let mut cursor = spur;
+    let mut cursor = (lump + 2) % sides;
     for s in 0..stones_n {
-        cursor = (cursor + 2 + (s as usize % 3)) % sides;
-        if cursor == bite {
-            cursor = (cursor + 1) % sides;
+        if ang_dist(cursor, sand_i, sides) <= 1 {
+            cursor = (cursor + 2) % sides;
         }
-        let stone_r = radius
-            * if s == 0 {
-                0.28 + h(220) * 0.16
-            } else if sheet {
-                0.16 + h(220 + s) * 0.08
-            } else {
-                0.22 + h(220 + s) * 0.1
-            };
-        let at = top[cursor].lerp(crown, 0.34) + up * stone_r * 0.15;
+        let host = rings[3][cursor];
+        let n = norms[3][cursor];
+        let stone_r = radius * (0.2 + h(220 + s) * 0.12);
+        let at = host + n * stone_r * 0.05;
         let spin =
-            Quat::from_rotation_z(h(240 + s) * 3.0) * Quat::from_rotation_y(h(250 + s) * 2.2);
-        add_chip(
+            Quat::from_rotation_y(h(240 + s) * 4.0) * Quat::from_rotation_z(h(250 + s) * 2.0);
+        add_pebble(
             mesh,
             at,
             laid * spin,
             stone_r,
             seed ^ 0x51C0_u32.wrapping_mul(s + 1),
-            PANEL_STONE,
         );
+        cursor = (cursor + sides / 2) % sides;
     }
 }
 

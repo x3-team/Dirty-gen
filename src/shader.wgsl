@@ -706,7 +706,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let shadow = shadow_factor(in.world + n * 0.02, n);
         // Darker than the berm. A crown in the soil's own brown reads as a dry stone.
         let tone = clamp((albedo.r - 0.016) / 0.018, 0.0, 1.0);
-        let body = mix(vec3<f32>(0.020, 0.009, 0.0035), vec3<f32>(0.038, 0.016, 0.006), tone);
+        let body = mix(vec3<f32>(0.012, 0.0052, 0.0020), vec3<f32>(0.022, 0.0090, 0.0034), tone);
         let wrap = ndl * 0.28 + 0.72;
         lit = body * (0.85 + wrap * shadow * 0.22);
         // The flat top has almost one normal from this camera, so a Phong lobe
@@ -730,7 +730,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let stony = in.panel >= 48.5;
         let e = 0.04;
         let freq = select(6.5, 18.0, sandy);
-        let amp = select(select(0.14, 0.42, sandy), 0.04, stony);
+        let amp = select(select(0.08, 0.22, sandy), 0.03, stony);
         let h0 = noise(in.world.xz * freq + vec2<f32>(in.world.y * 2.4, in.panel));
         let hx = noise((in.world.xz + vec2<f32>(e, 0.0)) * freq + vec2<f32>(in.world.y * 2.4, in.panel));
         let hz = noise((in.world.xz + vec2<f32>(0.0, e)) * freq + vec2<f32>(in.world.y * 2.4, in.panel));
@@ -747,18 +747,18 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         var spec_pow = 12.0;
         if (in.panel < 47.5) {
             // Drier crust: lighter grey-brown than the wet break.
-            body = mix(vec3<f32>(0.075, 0.062, 0.048), vec3<f32>(0.13, 0.11, 0.086), g);
-            gloss = 0.03;
-            spec_pow = 14.0;
+            body = mix(vec3<f32>(0.046, 0.028, 0.013), vec3<f32>(0.078, 0.048, 0.022), g);
+            gloss = 0.012;
+            spec_pow = 16.0;
         } else if (in.panel < 48.5) {
             let grain = noise(in.world.xz * 26.0 + vec2<f32>(in.world.y * 11.0, 1.7));
-            body = mix(vec3<f32>(0.11, 0.082, 0.038), vec3<f32>(0.17, 0.125, 0.055), grain);
-            gloss = 0.012;
-            spec_pow = 8.0;
+            body = mix(vec3<f32>(0.052, 0.036, 0.016), vec3<f32>(0.082, 0.056, 0.024), grain);
+            gloss = 0.008;
+            spec_pow = 10.0;
         } else {
-            body = mix(vec3<f32>(0.055, 0.048, 0.040), vec3<f32>(0.095, 0.084, 0.070), g);
-            gloss = 0.035;
-            spec_pow = 22.0;
+            body = mix(vec3<f32>(0.030, 0.028, 0.024), vec3<f32>(0.050, 0.046, 0.040), g);
+            gloss = 0.02;
+            spec_pow = 24.0;
         }
         lit = body * (0.7 + wrap * shadow * 0.62);
         let spec = pow(clamp(dot(n, halfv), 0.0, 1.0), spec_pow) * gloss * shadow;
