@@ -52,6 +52,9 @@ struct Model {
 @group(3) @binding(3) var tire_base: texture_2d<f32>;
 @group(3) @binding(4) var tire_nor: texture_2d<f32>;
 @group(3) @binding(5) var prop_tex: texture_2d<f32>;
+@group(3) @binding(7) var niva_base: texture_2d_array<f32>;
+@group(3) @binding(8) var niva_nor: texture_2d_array<f32>;
+@group(3) @binding(9) var niva_mr: texture_2d_array<f32>;
 @group(3) @binding(6) var paint_samp: sampler;
 
 fn hash12(p: vec2<f32>) -> f32 {
@@ -666,7 +669,29 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
 
     var nrm = in.nrm;
     var alpha = 1.0;
-    if (in.panel > 69.5 && in.panel < 70.5) {
+    if (in.panel > 79.5 && in.panel < 88.5) {
+        let layer = i32(in.panel + 0.5) - 80;
+        let base = textureSampleLevel(niva_base, paint_samp, in.uv, layer, 0.0);
+        let mr = textureSampleLevel(niva_mr, paint_samp, in.uv, layer, 0.0);
+        let nm = textureSampleLevel(niva_nor, paint_samp, in.uv, layer, 0.0).rgb;
+        if (layer == 7 && base.a < 0.35) {
+            discard;
+        }
+        albedo = base.rgb;
+        rough = clamp(mr.g, 0.045, 1.0);
+        nrm = tbn_normal(in.nrm, nm);
+        if (layer == 3) {
+            alpha = clamp(max(base.a, 0.22), 0.22, 0.62);
+            albedo = mix(base.rgb, vec3<f32>(0.62, 0.78, 0.84), 0.35);
+            rough = 0.05;
+        }
+        let mud = clamp(model.extra.y, 0.0, 1.2);
+        let cover = max(mud, max(model.mud5.x, max(model.mud1.x, max(model.mud4.x, max(model.mud2.x, model.mud3.x)))));
+        let down = smoothstep(0.55, -0.2, nrm.y);
+        let mask = smoothstep(0.04, 0.42, cover) * (0.28 + 0.72 * down);
+        albedo = mix(albedo, vec3<f32>(0.045, 0.022, 0.011), mask * 0.9);
+        rough = mix(rough, mix(0.32, 0.08, cover), mask);
+    } else if (in.panel > 69.5 && in.panel < 70.5) {
         let c = textureSampleLevel(prop_tex, paint_samp, in.uv, 0.0);
         if (c.a < 0.2) {
             discard;

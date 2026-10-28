@@ -10,7 +10,7 @@ use silt::bike::{Bike, BIKE_RADIUS};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
-use crate::cc0::{buggy_fit, RgbaTex};
+use crate::cc0::RgbaTex;
 use crate::mesh::{
     bike_body, bike_suspension, environment_mesh, mud_chunks, terrain_mesh, wheel_mesh, CpuMesh,
     MeshVertex, ParticleVertex, TerrainVertex,
@@ -81,6 +81,12 @@ pub struct Renderer {
     body: GpuMesh,
     glass: GpuMesh,
     wheels: [GpuMesh; 4],
+    #[allow(dead_code)]
+    buggy_body: GpuMesh,
+    #[allow(dead_code)]
+    buggy_glass: GpuMesh,
+    #[allow(dead_code)]
+    buggy_wheels: [GpuMesh; 4],
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
@@ -107,6 +113,8 @@ pub struct Renderer {
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
+    credit_bg: wgpu::BindGroup,
+    pipe_credit: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
@@ -295,6 +303,9 @@ impl Renderer {
                 filter_tex(4, wgpu::ShaderStages::FRAGMENT),
                 filter_tex(5, wgpu::ShaderStages::FRAGMENT),
                 filter_samp(6, wgpu::ShaderStages::FRAGMENT),
+                array_tex(7),
+                array_tex(8),
+                array_tex(9),
             ],
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -473,7 +484,11 @@ impl Renderer {
         let (tire_base, tire_base_view) = upload_rgba(&device, &queue, "tire-base", &cc0.tire_base);
         let (tire_nor, tire_nor_view) = upload_rgba(&device, &queue, "tire-nor", &cc0.tire_nor);
         let (prop_tex, prop_view) = upload_rgba(&device, &queue, "prop", &cc0.prop_tex);
-        let resident = vec![
+        let niva = crate::niva::load();
+        let (niva_base, niva_base_view) = upload_array(&device, &queue, "niva-base", &niva.base);
+        let (niva_nor, niva_nor_view) = upload_array(&device, &queue, "niva-nor", &niva.nor);
+        let (niva_mr, niva_mr_view) = upload_array(&device, &queue, "niva-mr", &niva.mr);
+        let mut resident = vec![
             ground_diff,
             ground_nor,
             ground_pack,
@@ -483,6 +498,9 @@ impl Renderer {
             tire_base,
             tire_nor,
             prop_tex,
+            niva_base,
+            niva_nor,
+            niva_mr,
         ];
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tex-bg"),
@@ -557,6 +575,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&paint_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&niva_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&niva_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&niva_mr_view),
                 },
             ],
         });
@@ -779,6 +809,48 @@ impl Renderer {
             false,
             None,
         );
+        let (credit_w, credit_h, credit_px) = credit_banner();
+        let credit_tex = upload_rgba(
+            &device,
+            &queue,
+            "credits",
+            &RgbaTex {
+                width: credit_w,
+                height: credit_h,
+                rgba: credit_px,
+            },
+        );
+        let credit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("credit-bg"),
+            layout: &blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&credit_tex.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&paint_samp),
+                },
+            ],
+        });
+        let credit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("credits"),
+            source: wgpu::ShaderSource::Wgsl(CREDIT_WGSL.into()),
+        });
+        let pipe_credit = pipeline(
+            &device,
+            &credit_shader,
+            &blit_layout,
+            "vs_credit",
+            Some("fs_credit"),
+            &[],
+            color_format,
+            None,
+            true,
+            None,
+        );
+        resident.push(credit_tex.0);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -795,13 +867,22 @@ impl Renderer {
 
         let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
         let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
-        let body = upload_cpu(&device, &cc0.body, "body");
-        let glass = upload_cpu(&device, &cc0.glass, "glass");
+        let body = upload_cpu(&device, &niva.body, "niva-body");
+        let glass = upload_cpu(&device, &niva.glass, "niva-glass");
         let wheels = [
-            upload_cpu(&device, &cc0.wheels[0], "wheel-fl"),
-            upload_cpu(&device, &cc0.wheels[1], "wheel-fr"),
-            upload_cpu(&device, &cc0.wheels[2], "wheel-rl"),
-            upload_cpu(&device, &cc0.wheels[3], "wheel-rr"),
+            upload_cpu(&device, &niva.wheels[0], "niva-fl"),
+            upload_cpu(&device, &niva.wheels[1], "niva-fr"),
+            upload_cpu(&device, &niva.wheels[2], "niva-rl"),
+            upload_cpu(&device, &niva.wheels[3], "niva-rr"),
+        ];
+        // The Grab3D buggy stays loaded. The demo draws the Niva instead.
+        let buggy_body = upload_cpu(&device, &cc0.body, "buggy-body");
+        let buggy_glass = upload_cpu(&device, &cc0.glass, "buggy-glass");
+        let buggy_wheels = [
+            upload_cpu(&device, &cc0.wheels[0], "buggy-fl"),
+            upload_cpu(&device, &cc0.wheels[1], "buggy-fr"),
+            upload_cpu(&device, &cc0.wheels[2], "buggy-rl"),
+            upload_cpu(&device, &cc0.wheels[3], "buggy-rr"),
         ];
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
@@ -867,6 +948,9 @@ impl Renderer {
             body,
             glass,
             wheels,
+            buggy_body,
+            buggy_glass,
+            buggy_wheels,
             wheel,
             bike_body,
             env,
@@ -890,6 +974,8 @@ impl Renderer {
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
+            credit_bg,
+            pipe_credit,
             blit_shader,
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
@@ -973,6 +1059,7 @@ impl Renderer {
         cam: CameraPose,
         present: Option<(&wgpu::TextureView, bool)>,
         readback: bool,
+        show_bike: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
         let bike_susp = bike_suspension(&world.bike);
@@ -1074,7 +1161,9 @@ impl Renderer {
             draw_indexed(&mut pass, &self.env);
             draw_indexed(&mut pass, &self.props);
             self.draw_vehicle(&mut pass);
-            self.draw_bike(&mut pass, bike_susp_count);
+            if show_bike {
+                self.draw_bike(&mut pass, bike_susp_count);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
@@ -1113,8 +1202,12 @@ impl Renderer {
             pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
+            pass.set_pipeline(&self.pipe_mesh_double);
             self.draw_vehicle(&mut pass);
-            self.draw_bike(&mut pass, bike_susp_count);
+            pass.set_pipeline(&self.pipe_mesh);
+            if show_bike {
+                self.draw_bike(&mut pass, bike_susp_count);
+            }
 
             pass.set_pipeline(&self.pipe_mesh_double);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -1131,6 +1224,26 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("credits"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipe_credit);
+            pass.set_bind_group(0, &self.credit_bg, &[]);
+            pass.draw(0..6, 0..1);
         }
 
         if let Some((view, srgb)) = present {
@@ -1286,7 +1399,8 @@ impl Renderer {
 
     fn write_models(&self, vehicle: &Vehicle) {
         let chassis = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
-        let body = chassis * buggy_fit();
+        // The Niva mesh is already fitted onto the hardpoints.
+        let body = chassis;
         let mut mud = [[0.0; 4]; PANEL_COUNT];
         for (i, panel) in vehicle.panels.iter().enumerate() {
             mud[i] = [
@@ -1403,13 +1517,10 @@ fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize)
     let wheel = vehicle.wheels[index];
     // Authored front radius is 0.30 and rear is 0.36. Scale onto the physics
     // radius so the tread meets the soil at the same hub the fender was fit to.
-    let authored = if index < 2 { 0.30 } else { 0.36 };
-    let fit = WHEEL_RADIUS / authored;
     let world = body
         * Mat4::from_translation(local)
         * Mat4::from_rotation_y(wheel.steer)
-        * Mat4::from_rotation_x(wheel.spin)
-        * Mat4::from_scale(Vec3::splat(fit));
+        * Mat4::from_rotation_x(wheel.spin);
     model(
         world,
         mud,
@@ -1446,6 +1557,74 @@ fn filter_tex(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLa
         },
         count: None,
     }
+}
+
+fn array_tex(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn upload_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    layers: &[RgbaTex],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let width = layers[0].width;
+    let height = layers[0].height;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: layers.len() as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (i, layer) in layers.iter().enumerate() {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: i as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &layer.rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some(label),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
 }
 
 fn filter_samp(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -1785,6 +1964,105 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::
         .write_image_data(rgba)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
 }
+
+const CREDIT: &str =
+    "Lada Niva by Greg McKechnie (https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2) — CC BY 4.0";
+
+fn credit_banner() -> (u32, u32, Vec<u8>) {
+    let line1 = "Lada Niva by Greg McKechnie";
+    let line2 = "(https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2) — CC BY 4.0";
+    let _ = CREDIT;
+    let w = 1024u32;
+    let h = 48u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = 16;
+        px[1] = 10;
+        px[2] = 7;
+        px[3] = 196;
+    }
+    stamp_text(&mut rgba, w, 12, 4, line1, 2);
+    stamp_text(&mut rgba, w, 12, 24, line2, 1);
+    (w, h, rgba)
+}
+
+fn stamp_text(rgba: &mut [u8], width: u32, x0: u32, y0: u32, text: &str, scale: u32) {
+    let mut x = x0;
+    for ch in text.chars() {
+        let bits = glyph(ch);
+        for row in 0..8u32 {
+            let bits = bits[row as usize];
+            for col in 0..8u32 {
+                if (bits >> col) & 1 == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = x + col * scale + sx;
+                        let py = y0 + row * scale + sy;
+                        if px >= width {
+                            continue;
+                        }
+                        let i = ((py * width + px) * 4) as usize;
+                        if i + 3 >= rgba.len() {
+                            continue;
+                        }
+                        rgba[i] = 244;
+                        rgba[i + 1] = 232;
+                        rgba[i + 2] = 214;
+                        rgba[i + 3] = 255;
+                    }
+                }
+            }
+        }
+        x += 8 * scale + scale;
+    }
+}
+
+fn glyph(ch: char) -> [u8; 8] {
+    use font8x8::UnicodeFonts;
+    if ch == '\u{2014}' || ch == '\u{2013}' {
+        return [0x00, 0x00, 0x00, 0x7E, 0x7E, 0x00, 0x00, 0x00];
+    }
+    font8x8::BASIC_FONTS
+        .get(ch)
+        .or_else(|| font8x8::LATIN_FONTS.get(ch))
+        .unwrap_or([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+}
+
+const CREDIT_WGSL: &str = r#"
+struct V {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@group(0) @binding(0) var credit_tex: texture_2d<f32>;
+@group(0) @binding(1) var credit_samp: sampler;
+
+@vertex
+fn vs_credit(@builtin(vertex_index) vid: u32) -> V {
+    var p = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(-1.0, -0.84),
+        vec2<f32>(-1.0, -0.84),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, -0.84),
+    );
+    let xy = p[vid];
+    var o: V;
+    o.clip = vec4<f32>(xy, 0.0, 1.0);
+    let u = xy.x * 0.5 + 0.5;
+    let v = (xy.y - (-1.0)) / 0.16;
+    o.uv = vec2<f32>(u, 1.0 - v);
+    return o;
+}
+
+@fragment
+fn fs_credit(in: V) -> @location(0) vec4<f32> {
+    return textureSample(credit_tex, credit_samp, in.uv);
+}
+"#;
 
 const BLIT_WGSL: &str = r#"
 struct V {

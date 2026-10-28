@@ -4,6 +4,7 @@
 
 mod cc0;
 mod mesh;
+mod niva;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -320,7 +321,13 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
+        renderer.draw(
+            &self.world,
+            pose,
+            Some((&view, self.srgb)),
+            false,
+            self.drive_bike,
+        );
         frame.present();
     }
 
@@ -442,6 +449,7 @@ struct CaptureArgs {
     seconds: f32,
     stills_only: bool,
     cc0: bool,
+    niva: bool,
     video: PathBuf,
     still_start: PathBuf,
     still_puddle: PathBuf,
@@ -449,6 +457,9 @@ struct CaptureArgs {
     cc0_iso: PathBuf,
     cc0_tire: PathBuf,
     cc0_puddle: PathBuf,
+    niva_iso: PathBuf,
+    niva_tire: PathBuf,
+    niva_puddle: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -470,6 +481,10 @@ fn capture(args: &[String]) {
         formats,
         scene,
     );
+    if parsed.niva {
+        capture_niva(&mut renderer, &parsed);
+        return;
+    }
     if parsed.cc0 {
         capture_cc0(&mut renderer, &parsed);
         return;
@@ -500,7 +515,7 @@ fn capture(args: &[String]) {
                     &world,
                     demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
                 );
-                let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+                let rgba = renderer.draw(&world, pose, None, true, false).expect("readback");
                 write_png(dest, parsed.width, parsed.height, &rgba).expect("still");
                 println!(
                     "still {} at t={:.2} pos=({:.1},{:.1}) mud={:.2} rut={:.3}",
@@ -532,7 +547,7 @@ fn capture(args: &[String]) {
             &world,
             demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
         );
-        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        let rgba = renderer.draw(&world, pose, None, true, false).expect("readback");
         let path = dir.join(format!("frame_{frame:04}.png"));
         write_png(&path, parsed.width, parsed.height, &rgba).expect("png");
         for (i, (when, dest)) in stills.iter().enumerate() {
@@ -607,6 +622,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut seconds = 12.0f32;
     let mut stills_only = false;
     let mut cc0 = false;
+    let mut niva = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -614,6 +630,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut cc0_iso = PathBuf::from(format!("{MEDIA}/cc0-iso.png"));
     let mut cc0_tire = PathBuf::from(format!("{MEDIA}/cc0-tire.png"));
     let mut cc0_puddle = PathBuf::from(format!("{MEDIA}/cc0-puddle.png"));
+    let mut niva_iso = PathBuf::from(format!("{MEDIA}/niva-iso.png"));
+    let mut niva_tire = PathBuf::from(format!("{MEDIA}/niva-tire.png"));
+    let mut niva_puddle = PathBuf::from(format!("{MEDIA}/niva-puddle.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -631,6 +650,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--seconds" => seconds = val(&mut i).parse().expect("seconds"),
             "--stills-only" => stills_only = true,
             "--cc0" => cc0 = true,
+            "--niva" => niva = true,
+            "--niva-iso" => niva_iso = PathBuf::from(val(&mut i)),
+            "--niva-tire" => niva_tire = PathBuf::from(val(&mut i)),
+            "--niva-puddle" => niva_puddle = PathBuf::from(val(&mut i)),
             "--cc0-iso" => cc0_iso = PathBuf::from(val(&mut i)),
             "--cc0-tire" => cc0_tire = PathBuf::from(val(&mut i)),
             "--cc0-puddle" => cc0_puddle = PathBuf::from(val(&mut i)),
@@ -651,6 +674,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         seconds,
         stills_only,
         cc0,
+        niva,
         video,
         still_start,
         still_puddle,
@@ -658,6 +682,130 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         cc0_iso,
         cc0_tire,
         cc0_puddle,
+        niva_iso,
+        niva_tire,
+        niva_puddle,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_niva(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    let mut world = World::demo();
+    let dt = 1.0 / 60.0;
+    let steps = (11.0f32 / dt).round() as u32;
+    println!("niva drive {steps} steps");
+    let mut shot = false;
+    for _ in 0..steps {
+        let bike = demo_drive_bike(&world);
+        world.step_bike(dt, &bike);
+        let input = demo_drive(&world);
+        world.step(dt, &input);
+        if !shot && world.time >= 3.2 {
+            write_cc0_still(
+                renderer,
+                &world,
+                "iso",
+                &parsed.niva_iso,
+                parsed,
+                niva_iso_camera(&world),
+            );
+            write_cc0_still(
+                renderer,
+                &world,
+                "tire",
+                &parsed.niva_tire,
+                parsed,
+                cc0_tire_camera(&world),
+            );
+            shot = true;
+        }
+    }
+    if !shot {
+        write_cc0_still(
+            renderer,
+            &world,
+            "iso",
+            &parsed.niva_iso,
+            parsed,
+            niva_iso_camera(&world),
+        );
+        write_cc0_still(
+            renderer,
+            &world,
+            "tire",
+            &parsed.niva_tire,
+            parsed,
+            cc0_tire_camera(&world),
+        );
+    }
+    println!(
+        "niva t={:.2} pos=({:.2},{:.2},{:.2}) yaw={:.2}",
+        world.time,
+        world.vehicle.pos.x,
+        world.vehicle.pos.y,
+        world.vehicle.pos.z,
+        world.vehicle.yaw
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "puddle",
+        &parsed.niva_puddle,
+        parsed,
+        niva_puddle_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_iso_camera(world: &World) -> CameraPose {
+    let p = world.vehicle.pos;
+    let target = Vec3::new(p.x, p.y + 0.35, p.z);
+    let eye = target + Vec3::new(-8.4, 6.2, -7.0);
+    CameraPose {
+        eye,
+        target,
+        ortho_width: Some(11.0),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_puddle_camera(world: &World) -> CameraPose {
+    let v = &world.vehicle;
+    let mut best_x = v.pos.x;
+    let mut best_z = v.pos.z;
+    let mut best = -1.0f32;
+    for j in -16..=16 {
+        for i in -16..=16 {
+            let x = v.pos.x + i as f32 * 0.35;
+            let z = v.pos.z + j as f32 * 0.35;
+            let s = world.soil.sample(x, z);
+            let d = (x - v.pos.x).hypot(z - v.pos.z);
+            if d < 1.1 || d > 5.5 {
+                continue;
+            }
+            let score = s.water * 5.0 + s.rut * 3.0 + s.wetness * 0.2;
+            if score > best {
+                best = score;
+                best_x = x;
+                best_z = z;
+            }
+        }
+    }
+    let ground = world.soil.sample(best_x, best_z);
+    let target = Vec3::new(
+        v.pos.x * 0.62 + best_x * 0.38,
+        v.pos.y * 0.35 + ground.height * 0.65,
+        v.pos.z * 0.62 + best_z * 0.38,
+    );
+    let span = (v.pos.x - best_x).hypot(v.pos.z - best_z).max(2.8);
+    println!(
+        "niva puddle score={best:.3} at ({best_x:.2},{best_z:.2}) water={:.3} rut={:.3}",
+        ground.water, ground.rut
+    );
+    CameraPose {
+        eye: target + Vec3::new(-span * 0.85, span * 0.62, -span * 0.7),
+        target,
+        ortho_width: Some((span * 2.15).clamp(6.5, 12.0)),
     }
 }
 
@@ -726,7 +874,7 @@ fn write_cc0_still(
     pose: CameraPose,
 ) {
     let pose = lift_camera(world, pose);
-    let rgba = renderer.draw(world, pose, None, true).expect("readback");
+    let rgba = renderer.draw(world, pose, None, true, false).expect("readback");
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).ok();
     }
