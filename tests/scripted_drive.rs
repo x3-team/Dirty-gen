@@ -290,6 +290,109 @@ fn rolling_tires_leave_a_pair_of_grooves() {
 }
 
 #[test]
+fn slow_tire_sinks_and_slips_more_in_the_wet_rut() {
+    let input = Input {
+        throttle: 0.42,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    let mut dry = World::flat(0.08);
+    park(&mut dry);
+    let (dry_sink, dry_slip, dry_speed) = slow_roll(&mut dry, input);
+
+    let mut wet = World::flat(0.08);
+    lay_wet_rut(&mut wet.soil);
+    park(&mut wet);
+    let (wet_sink, wet_slip, wet_speed) = slow_roll(&mut wet, input);
+    eprintln!(
+        "dry sink {dry_sink:.4} slip {dry_slip:.3} speed {dry_speed:.2}   wet rut sink {wet_sink:.4} slip {wet_slip:.3} speed {wet_speed:.2}"
+    );
+    assert!(
+        wet_sink > dry_sink * 1.25,
+        "slow tire did not sink more in the wet rut: dry {dry_sink:.4} wet {wet_sink:.4}"
+    );
+    assert!(
+        wet_slip > dry_slip + 0.15,
+        "slow tire did not slip more in the wet rut: dry {dry_slip:.3} wet {wet_slip:.3}"
+    );
+    assert!(
+        wet_speed < dry_speed * 0.75,
+        "wet rut did not slow the tire: dry {dry_speed:.2} wet {wet_speed:.2}"
+    );
+}
+
+fn park(world: &mut World) {
+    use glam::Vec3;
+    let h = world.soil.sample(0.0, 0.5).height;
+    world.vehicle.pos = Vec3::new(0.0, h + 0.62, 0.5);
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.pitch_rate = 0.0;
+    world.vehicle.roll_rate = 0.0;
+    world.vehicle.jump_hold = 0.0;
+    for w in &mut world.vehicle.wheels {
+        w.omega = 0.0;
+        w.slip = 0.0;
+        w.sinkage = 0.0;
+    }
+}
+
+/// A trench under the whole buggy, cut below the surrounding pad and filled
+/// so the water stays in the rut.
+fn lay_wet_rut(soil: &mut silt::soil::SoilField) {
+    let res = soil.res;
+    let half = soil.size * 0.5;
+    let cell = soil.cell;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            if x.abs() < 1.2 && (-2.0..18.0).contains(&z) {
+                let idx = j * res + i;
+                soil.height[idx] = -0.07;
+                soil.water[idx] = 0.06;
+                soil.wetness[idx] = 1.0;
+                soil.base_wetness[idx] = 1.0;
+                soil.loose[idx] = (soil.loose[idx]).max(0.08);
+            }
+        }
+    }
+}
+
+fn slow_roll(world: &mut World, input: Input) -> (f32, f32, f32) {
+    let mut sink = 0.0_f32;
+    let mut slip = 0.0_f32;
+    let mut speed = 0.0_f32;
+    let mut n = 0.0_f32;
+    for frame in 0..(3.0 * 60.0) as u32 {
+        world.step(1.0 / 60.0, &input);
+        if frame > 100 {
+            let mut s = 0.0_f32;
+            let mut sl = 0.0_f32;
+            let mut c = 0.0_f32;
+            for w in &world.vehicle.wheels {
+                if w.normal > 1.0 {
+                    s += w.sinkage;
+                    sl += w.slip.abs();
+                    c += 1.0;
+                }
+            }
+            if c > 0.0 {
+                sink += s / c;
+                slip += sl / c;
+                speed += world.vehicle.speed();
+                n += 1.0;
+            }
+        }
+    }
+    assert!(n > 10.0, "the slow tire never loaded the ground");
+    (sink / n, slip / n, speed / n)
+}
+
+#[test]
 fn impact_chunks_land_on_the_heightfield() {
     let mut world = World::demo();
     world.run_seconds_with(6.4, silt::demo_drive);
