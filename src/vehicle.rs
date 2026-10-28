@@ -5,8 +5,9 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::patch::{contact_patch, step_tread, TreadCoat, TreadStep};
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
-    terramech_for, wheel_buoyancy, SoilField, SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
+    slurry_motion_drag, slurry_suction_force, stick_scale, terramech_for, wheel_buoyancy, SoilField,
+    SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -70,6 +71,10 @@ pub struct Wheel {
     pub normal: f32,
     pub in_water: bool,
     pub drive_force: f32,
+    /// Metres this tire has already risen through a slurry seal.
+    pub slurry_lift: f32,
+    /// Armed once the tire has sat in deep slurry. Cleared on breakaway.
+    pub slurry_sealed: bool,
 }
 
 impl Default for Wheel {
@@ -88,6 +93,8 @@ impl Default for Wheel {
             normal: 0.0,
             in_water: false,
             drive_force: 0.0,
+            slurry_lift: 0.0,
+            slurry_sealed: false,
         }
     }
 }
@@ -156,6 +163,10 @@ pub struct Contact {
     /// Horizontal force the tire puts into the soil, newtons. Shear, not the
     /// net force left on the chassis after the soil pushes back.
     pub push: f32,
+    /// Downward suction from a slurry seal, newtons.
+    pub suction: f32,
+    /// Vertical speed of the contact, metres per second. Positive is up.
+    pub v_up: f32,
 }
 
 impl Vehicle {
@@ -275,6 +286,7 @@ impl Vehicle {
             let v_point = self.vel + ang_world.cross(r);
             let v_long = v_point.x * fwd.x + v_point.z * fwd.z;
             let v_lat = v_point.x * right.x + v_point.z * right.z;
+            let v_up = v_point.y;
             let omega = self.wheels[i].omega;
             let slip_vel = omega * WHEEL_RADIUS - v_long;
             let denom = v_long.abs().max((omega * WHEEL_RADIUS).abs()).max(0.25);
@@ -416,6 +428,24 @@ impl Vehicle {
                 // Shear reacts on the wheel even if Bingham holds the chassis still.
                 wheel_torque -= blended_long * WHEEL_RADIUS;
 
+                // Deep slurry. Viscosity is the mix under the tire. Translation
+                // and spin are resisted separately, including when only one is moving.
+                if sample.slurry > 0.012 {
+                    let drag = slurry_motion_drag(
+                        sample.kind(),
+                        sample.wetness,
+                        sample.slurry,
+                        WHEEL_RADIUS,
+                        WHEEL_WIDTH,
+                        v_long,
+                        omega,
+                    );
+                    wheel_torque += drag.torque;
+                    if !stuck {
+                        chassis_long += drag.force;
+                    }
+                }
+
                 let peripheral = omega.abs() * WHEEL_RADIUS;
                 fling = 0.62
                     * self.wheels[i].mud
@@ -424,6 +454,20 @@ impl Vehicle {
                 // A share of what the tread pulled out. The existing clods throw it.
                 fling += (tread_fling * 0.06).min(0.40);
             }
+
+            let suction = if self.wheels[i].slurry_sealed && sample.slurry > 0.03 && v_up > 0.05 {
+                slurry_suction_force(
+                    sample.kind(),
+                    sample.wetness,
+                    sample.slurry,
+                    WHEEL_RADIUS,
+                    WHEEL_WIDTH,
+                    v_up,
+                    self.wheels[i].slurry_lift,
+                )
+            } else {
+                0.0
+            };
 
             out[i] = Contact {
                 active,
@@ -448,6 +492,8 @@ impl Vehicle {
                 pull,
                 patch_length,
                 push: soil_push,
+                suction,
+                v_up,
             };
         }
         out
@@ -463,9 +509,13 @@ impl Vehicle {
         }
 
         for c in contacts.iter() {
+            // Suction pulls down through the seal. It can exceed the spring
+            // by a little, which is the tire sticking, and then it is capped
+            // so one wheel cannot throw the chassis through the bed.
+            let support = (c.normal - c.suction).max(-1_600.0);
             let f_world = Vec3::new(
                 c.forward.x * c.chassis_long + c.right.x * c.chassis_lat,
-                c.normal,
+                support,
                 c.forward.z * c.chassis_long + c.right.z * c.chassis_lat,
             );
             // The crest already set the flight. Contact springs would glue the car back down.
@@ -753,6 +803,8 @@ impl Default for Contact {
             pull: 0.0,
             patch_length: 0.0,
             push: 0.0,
+            suction: 0.0,
+            v_up: 0.0,
         }
     }
 }

@@ -6,10 +6,10 @@ use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
 use crate::patch::SIDEWALL_VOLUME;
 use crate::soil::{
-    on_launch_crest, stick_scale, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
+    on_launch_crest, stick_scale, track_offset, SlurrySeal, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
-    hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
+    hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
     PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
     WHEEL_WIDTH,
 };
@@ -341,6 +341,55 @@ impl World {
         }
     }
 
+    /// A tire that has sat in deep slurry picks up a seal. Rising through it
+    /// holds the suction already applied on the contact, then the break throws
+    /// ribbons and drops taken from the slurry column.
+    fn pull_slurry_seals(&mut self, contacts: &[Contact; 4], dt: f32) {
+        for c in contacts.iter() {
+            let i = c.index;
+            let depth = c.sample.slurry;
+            let v_up = c.v_up;
+            let lift = self.vehicle.wheels[i].slurry_lift;
+            let sealed = self.vehicle.wheels[i].slurry_sealed;
+            if depth > 0.045 && v_up < 0.10 {
+                let w = &mut self.vehicle.wheels[i];
+                w.slurry_lift = (lift - dt * 0.15).max(0.0);
+                if w.slurry_lift < 0.008 {
+                    w.slurry_sealed = true;
+                }
+                continue;
+            }
+            if !sealed || v_up < 0.22 || depth < 0.03 {
+                continue;
+            }
+            let mut seal = SlurrySeal {
+                lift,
+                impulse: 0.0,
+                broken: false,
+            };
+            let out = self.soil.pull_from_slurry(
+                c.wheel_center.x,
+                c.wheel_center.z,
+                c.forward,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                v_up,
+                dt,
+                &mut seal,
+            );
+            self.vehicle.wheels[i].slurry_lift = seal.lift;
+            if seal.broken {
+                self.vehicle.wheels[i].slurry_sealed = false;
+            }
+            if out.thrown > 1.0e-8 {
+                let origin = c.contact_point + Vec3::Y * 0.08;
+                let _took = self
+                    .particles
+                    .throw_slurry(origin, c.forward, c.right, out.thrown);
+            }
+        }
+    }
+
     fn substep(&mut self, dt: f32, input: &Input) {
         self.vehicle.update_steer(input.steer, dt);
         let contacts = self
@@ -410,6 +459,7 @@ impl World {
                 );
             }
         }
+        self.pull_slurry_seals(&contacts, dt);
         let width = crate::vehicle::WHEEL_WIDTH;
         for side in &sides {
             side.stamp(&mut self.soil, WHEEL_RADIUS, width, dt);

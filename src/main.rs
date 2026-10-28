@@ -518,6 +518,10 @@ struct CaptureArgs {
     slurry_proof: PathBuf,
     slurry_flow: bool,
     slurry_flow_proof: PathBuf,
+    slurry_drag: bool,
+    slurry_drag_proof: PathBuf,
+    slurry_suction: bool,
+    slurry_suction_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -590,6 +594,14 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_flow {
         capture_slurry_flow(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_drag {
+        capture_slurry_drag(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_suction {
+        capture_slurry_suction(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -770,6 +782,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_proof = PathBuf::from(format!("{MEDIA}/slurry-mix-proof.png"));
     let mut slurry_flow = false;
     let mut slurry_flow_proof = PathBuf::from(format!("{MEDIA}/slurry-flow-proof.png"));
+    let mut slurry_drag = false;
+    let mut slurry_drag_proof = PathBuf::from(format!("{MEDIA}/slurry-drag-proof.png"));
+    let mut slurry_suction = false;
+    let mut slurry_suction_proof = PathBuf::from(format!("{MEDIA}/slurry-suction-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -822,6 +838,18 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_flow = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_flow_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-drag-proof" => {
+                slurry_drag = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_drag_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-suction-proof" => {
+                slurry_suction = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_suction_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -905,6 +933,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_proof,
         slurry_flow,
         slurry_flow_proof,
+        slurry_drag,
+        slurry_drag_proof,
+        slurry_suction,
+        slurry_suction_proof,
     }
 }
 
@@ -1896,6 +1928,248 @@ fn slurry_flow_camera(world: &World) -> CameraPose {
     // Low, beside the wave, so the mound in front of the tread and the low bed read together.
     let eye = wheel + right * 1.05 + fwd * 0.85 + Vec3::Y * 0.28;
     let ortho = 1.35;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+/// Niva sunk in a deep clay slurry. The bow in front of the tread is the
+/// slurry the tire is shoving, and the mix viscosity is what resists the roll.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_drag(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{slurry_motion_drag, SurfaceKind, SLURRY_COMPARE_MOISTURE};
+    use silt::vehicle::{WHEEL_RADIUS, WHEEL_WIDTH};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let moisture = SLURRY_COMPARE_MOISTURE;
+    let depth = 0.16_f32;
+    let mut world = World::wet_clay();
+    let poured = world.soil.fill_slurry_pool(
+        -2.4,
+        2.4,
+        -2.6,
+        2.4,
+        depth,
+        SurfaceKind::WetMud,
+        moisture,
+    );
+    println!("slurry pool {poured:.4} m3  depth {depth:.3} m");
+    for (name, kind) in [
+        ("clay", SurfaceKind::WetMud),
+        ("silt", SurfaceKind::Silt),
+        ("sand", SurfaceKind::Sand),
+    ] {
+        let drag = slurry_motion_drag(kind, moisture, depth, WHEEL_RADIUS, WHEEL_WIDTH, 1.15, 3.2);
+        println!(
+            "slurry drag {name}  force {:.1} N  torque {:.1} N·m  visc {:.2} Pa·s",
+            drag.force.abs(),
+            drag.torque.abs(),
+            drag.viscosity
+        );
+    }
+
+    world.vehicle.pos = Vec3::new(0.0, 0.55, -0.15);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.vel = Vec3::new(0.0, 0.0, 0.85);
+    for w in &mut world.vehicle.wheels {
+        w.compression = 0.22;
+        w.omega = 4.2;
+        w.slurry_sealed = true;
+    }
+    seat_axle(&mut world, 0, 0.18);
+    let ori = world.vehicle.orientation();
+    let mut bow_max = 0.0_f32;
+    for i in 0..4 {
+        let local = ori * world.vehicle.wheel_center_local(i);
+        let x = world.vehicle.pos.x + local.x;
+        let z = world.vehicle.pos.z + local.z;
+        let sample = world.soil.sample(x, z);
+        let bow = world
+            .soil
+            .raise_bow_wave(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH);
+        bow_max = bow_max.max(bow);
+        println!(
+            "wheel {i} slurry {:.4} m  bow {bow:.4} m  at ({x:.2}, {z:.2})",
+            sample.slurry
+        );
+    }
+    println!("bow wave height {bow_max:.4} m");
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "slurry-drag",
+        &parsed.slurry_drag_proof,
+        parsed,
+        slurry_drag_camera(&world),
+    );
+}
+
+/// The front tire has just broken a slurry seal. Ribbons and drops in the air
+/// are the volume taken out of the pool.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_suction(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{SlurrySeal, SurfaceKind, SLURRY_COMPARE_MOISTURE};
+    use silt::vehicle::{WHEEL_RADIUS, WHEEL_WIDTH};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let moisture = SLURRY_COMPARE_MOISTURE;
+    let depth = 0.16_f32;
+    let mut world = World::wet_clay();
+    let poured = world.soil.fill_slurry_pool(
+        -2.4,
+        2.4,
+        -2.8,
+        2.6,
+        depth,
+        SurfaceKind::WetMud,
+        moisture,
+    );
+    let before = world.soil.mix_volumes();
+    println!(
+        "suction pool {poured:.4} m3  volume before {:.4} m3",
+        before.total()
+    );
+
+    world.vehicle.pos = Vec3::new(0.0, 0.7, -0.05);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.10;
+    world.vehicle.roll = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    for (i, w) in world.vehicle.wheels.iter_mut().enumerate() {
+        w.compression = if i < 2 { 0.05 } else { 0.22 };
+        w.omega = if i < 2 { 1.4 } else { 0.4 };
+        w.slurry_sealed = false;
+        w.slurry_lift = 0.05;
+    }
+    // Nose up, front tread just clear of the seal it broke.
+    seat_axle(&mut world, 0, -0.04);
+
+    let ori = world.vehicle.orientation();
+    let mut thrown = 0.0_f32;
+    let mut impulse = 0.0_f32;
+    // The camera is outside the right front tire. That is the seal that breaks.
+    for i in [1_usize] {
+        let local = ori * world.vehicle.wheel_center_local(i);
+        let x = world.vehicle.pos.x + local.x;
+        let z = world.vehicle.pos.z + local.z;
+        let mut seal = SlurrySeal::seated();
+        let dt = 0.02_f32;
+        let lift_speed = 0.40_f32;
+        for _ in 0..24 {
+            let out = world.soil.pull_from_slurry(
+                x,
+                z,
+                Vec3::Z,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                lift_speed,
+                dt,
+                &mut seal,
+            );
+            impulse += out.impulse;
+            if out.thrown > 1.0e-8 {
+                let right = Vec3::X;
+                let origin = Vec3::new(x, world.soil.sample(x, z).height + 0.04, z);
+                let took = world.particles.throw_slurry(origin, Vec3::Z, right, out.thrown);
+                thrown += out.thrown;
+                println!(
+                    "wheel {i} breakaway thrown {:.4} m3  ribbons {:.4}  drops {:.4}  impulse {:.2} N·s  pieces {}",
+                    out.thrown,
+                    took.ribbons,
+                    took.drops,
+                    seal.impulse,
+                    world.particles.alive_count()
+                );
+                break;
+            }
+        }
+    }
+    let after = world.soil.mix_volumes();
+    println!(
+        "suction impulse {impulse:.2} N·s  thrown {thrown:.4} m3  volume before {:.4} m3  after {:.4} m3  airborne {:.4} m3",
+        before.total(),
+        after.total(),
+        world.soil.airborne
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "slurry-suction",
+        &parsed.slurry_suction_proof,
+        parsed,
+        slurry_suction_camera(&world),
+    );
+}
+
+/// Put one axle's tire bottoms `sink` metres under the slurry surface.
+/// Negative sink lifts the tread clear.
+#[cfg(not(target_arch = "wasm32"))]
+fn seat_axle(world: &mut World, wheel: usize, sink: f32) {
+    use silt::vehicle::{hardpoints, WHEEL_RADIUS};
+    let hps = hardpoints();
+    let ori = world.vehicle.orientation();
+    let local = ori * world.vehicle.wheel_center_local(wheel);
+    let x = world.vehicle.pos.x + hps[wheel].x;
+    let z = world.vehicle.pos.z + hps[wheel].z;
+    // Pitch moves the contact off the hardpoint. Sample where the tire is.
+    let wx = world.vehicle.pos.x + local.x;
+    let wz = world.vehicle.pos.z + local.z;
+    let ground = world.soil.sample(wx, wz).height;
+    world.vehicle.pos.y = ground - sink - local.y + WHEEL_RADIUS;
+    let bottom = world.vehicle.pos.y + local.y - WHEEL_RADIUS;
+    println!(
+        "seat wheel {wheel}  ground {ground:.4} m  bottom {bottom:.4} m  sink {:.3} m  hardpoint ({x:.2},{z:.2})",
+        ground - bottom
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_drag_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let p = world.vehicle.pos;
+    let wheel = p + fwd * 1.05 + right * 0.78;
+    let bow = wheel + fwd * 0.42;
+    let floor = world.soil.sample(wheel.x, wheel.z).height;
+    let look = Vec3::new(
+        wheel.x * 0.72 + p.x * 0.28,
+        floor - 0.04,
+        wheel.z * 0.62 + bow.z * 0.38,
+    );
+    let eye = wheel + right * 1.72 - fwd * 0.05 + Vec3::Y * 0.34;
+    let ortho = 1.85;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_suction_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let ori = world.vehicle.orientation();
+    let local = ori * world.vehicle.wheel_center_local(1);
+    let wheel = world.vehicle.pos + local;
+    let floor = world.soil.sample(wheel.x, wheel.z).height;
+    // Beside the tread, where the ribbons and drops leave the broken seal.
+    let look = Vec3::new(wheel.x + right.x * 0.38, floor + 0.36, wheel.z + fwd.z * 0.06);
+    let eye = wheel + right * 1.85 + fwd * 0.22 + Vec3::Y * 0.58;
+    let ortho = 1.65;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,

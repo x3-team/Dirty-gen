@@ -6,8 +6,12 @@
 //! wet soil into one slurry. That slurry then flows downhill into the low rut
 //! and into holes. A berm beside it slowly creeps into the slurry. A tire in
 //! the slurry pushes a bow wave and leaves its track in the slurry thickness.
-//! The visible height is bed + placed + that slurry, so the picture is not a
-//! solid floor under a separate water column.
+//! Deep slurry also drags. The viscosity is the mix — clay, silt, or sand —
+//! and it resists both the roll of the tread and the forward motion of the
+//! tire. Pulling the tire out holds a short suction, then the seal breaks and
+//! throws ribbons and drops taken from the slurry. That thrown part leaves
+//! the slurry column and stays in the airborne or placed account. The visible
+//! height is bed + placed + the slurry that is still on the ground.
 //!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
@@ -205,6 +209,137 @@ fn paste_kind(kind: SurfaceKind) -> SurfaceKind {
     match kind {
         SurfaceKind::Berm | SurfaceKind::PlacedClod | SurfaceKind::CutLip => SurfaceKind::WetMud,
         other => other,
+    }
+}
+
+/// Metres of upward travel that snap a slurry seal. The suction lives inside
+/// this stretch. Past it the tire is free and the mud leaves with the break.
+pub const SLURRY_BREAK_LIFT: f32 = 0.050;
+
+/// Force and torque of deep slurry on one tire.
+///
+/// `force` is newtons along the tire forward axis and opposes `v_long`.
+/// `torque` is newton-metres on the wheel and opposes `omega`. Either is zero
+/// when the motion it resists is zero, so a shove and a spin are separate.
+#[derive(Clone, Copy, Debug)]
+pub struct SlurryDrag {
+    pub force: f32,
+    pub torque: f32,
+    pub viscosity: f32,
+}
+
+/// Viscous drag of one slurry on a tire that is moving, spinning, or both.
+///
+/// `depth` is the slurry the tire is in, metres. Clay, silt, and sand use
+/// [`slurry_viscosity`] at the same moisture, so the mix is what sets the
+/// resistance. A deeper body resists more because the patch and the plowed
+/// section are larger, not because the shear gap grows.
+pub fn slurry_motion_drag(
+    kind: SurfaceKind,
+    moisture: f32,
+    depth: f32,
+    radius: f32,
+    width: f32,
+    v_long: f32,
+    omega: f32,
+) -> SlurryDrag {
+    let viscosity = slurry_viscosity(paste_kind(kind), moisture);
+    let depth = depth.max(0.0);
+    if depth < 0.008 || !viscosity.is_finite() {
+        return SlurryDrag {
+            force: 0.0,
+            torque: 0.0,
+            viscosity,
+        };
+    }
+    let radius = radius.max(0.05);
+    let width = width.max(0.02);
+    let sink = depth.min(radius * 0.92);
+    let chord = contact_length(radius, sink).max(sink);
+    let patch = chord * width;
+    let plow = depth * width;
+    // Fixed shear gap. Depth enters through the wetted patch and the section
+    // the tire has to shove aside.
+    let gap = 0.016_f32;
+    let shear = viscosity / gap;
+    let force_mag = (shear * (patch * 0.42 + plow * 1.15) * v_long.abs()).min(5_500.0);
+    let torque_mag = (shear * patch * omega.abs() * radius * radius).min(850.0);
+    SlurryDrag {
+        force: oppose(v_long) * force_mag,
+        torque: oppose(omega) * torque_mag,
+        viscosity,
+    }
+}
+
+/// Downward suction, newtons, while a tire is still sealed to the slurry.
+/// Zero once `lift` reaches [`SLURRY_BREAK_LIFT`], and zero when the tire is
+/// not actually rising. The pressure follows the same mix viscosity as the drag.
+pub fn slurry_suction_force(
+    kind: SurfaceKind,
+    moisture: f32,
+    depth: f32,
+    radius: f32,
+    width: f32,
+    lift_speed: f32,
+    lift: f32,
+) -> f32 {
+    if lift >= SLURRY_BREAK_LIFT - 1.0e-6 || depth < 0.025 || lift_speed <= 1.0e-4 {
+        return 0.0;
+    }
+    let viscosity = slurry_viscosity(paste_kind(kind), moisture).max(0.05);
+    let radius = radius.max(0.05);
+    let width = width.max(0.02);
+    let sink = depth.min(radius * 0.92);
+    let chord = contact_length(radius, sink).max(0.05);
+    let area = chord * width;
+    let stretch = (lift / SLURRY_BREAK_LIFT).clamp(0.0, 1.0);
+    let seal = (1.0 - stretch).powf(0.55);
+    let gap = 0.005 + lift.max(0.0);
+    let pressure = viscosity * (lift_speed / gap + 22.0);
+    (pressure * area * seal).clamp(0.0, 7_000.0)
+}
+
+/// Seal under one tire. `lift` is how far it has already risen through the slurry.
+#[derive(Clone, Copy, Debug)]
+pub struct SlurrySeal {
+    pub lift: f32,
+    pub impulse: f32,
+    pub broken: bool,
+}
+
+impl SlurrySeal {
+    pub fn seated() -> Self {
+        Self {
+            lift: 0.0,
+            impulse: 0.0,
+            broken: false,
+        }
+    }
+}
+
+impl Default for SlurrySeal {
+    fn default() -> Self {
+        Self::seated()
+    }
+}
+
+/// One pull step. `force` is the downward suction. `thrown` is slurry volume
+/// that left the column on the breakaway, now carried in `airborne`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PullOut {
+    pub force: f32,
+    pub impulse: f32,
+    pub broken: bool,
+    pub thrown: f32,
+}
+
+fn oppose(v: f32) -> f32 {
+    if v > 1.0e-4 {
+        -1.0
+    } else if v < -1.0e-4 {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -2856,6 +2991,161 @@ impl SoilField {
             self.sync(*idx);
         }
         bow
+    }
+
+    /// Dig a bowl and fill it with one slurry. The free surface sits below the rim.
+    /// Returns the cubic metres of slurry in the bowl.
+    pub fn fill_slurry_pool(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        depth: f32,
+        kind: SurfaceKind,
+        moisture: f32,
+    ) -> f32 {
+        let depth = depth.max(0.0);
+        if depth <= 1.0e-5 {
+            return 0.0;
+        }
+        let moisture = moisture.clamp(0.08, 0.92);
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let mut vol = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                self.bed[idx] -= depth + 0.045;
+                self.slurry[idx] = depth;
+                self.water[idx] = 0.0;
+                self.wetness[idx] = moisture;
+                self.kind[idx] = kind as u8;
+                self.darken[idx] = (self.darken[idx] + 0.42).min(1.0);
+                self.loose[idx] = (self.loose[idx] + 0.02).min(0.12);
+                self.sync(idx);
+                vol += depth * area;
+            }
+        }
+        vol
+    }
+
+    /// Lift a tire through slurry. While the seal holds, the step adds a
+    /// downward suction impulse. At [`SLURRY_BREAK_LIFT`] the seal snaps and
+    /// a share of the slurry under the tread is thrown. That volume leaves
+    /// the slurry column and is added to [`SoilField::airborne`].
+    pub fn pull_from_slurry(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        radius: f32,
+        width: f32,
+        lift_speed: f32,
+        dt: f32,
+        seal: &mut SlurrySeal,
+    ) -> PullOut {
+        if seal.broken || dt <= 0.0 || lift_speed <= 1.0e-4 {
+            return PullOut {
+                broken: seal.broken,
+                ..PullOut::default()
+            };
+        }
+        let sample = self.sample(x, z);
+        if sample.slurry < 0.025 && seal.lift <= 1.0e-4 {
+            return PullOut::default();
+        }
+        if seal.lift >= SLURRY_BREAK_LIFT - 1.0e-5 {
+            let thrown = self.release_slurry(x, z, forward, radius, width);
+            seal.broken = true;
+            return PullOut {
+                force: 0.0,
+                impulse: 0.0,
+                broken: true,
+                thrown,
+            };
+        }
+        let room = SLURRY_BREAK_LIFT - seal.lift;
+        let step = (lift_speed * dt).min(room.max(0.0));
+        let dt_used = step / lift_speed;
+        let force = slurry_suction_force(
+            sample.kind(),
+            sample.wetness,
+            sample.slurry,
+            radius,
+            width,
+            lift_speed,
+            seal.lift,
+        );
+        let impulse = force * dt_used;
+        seal.lift += step;
+        seal.impulse += impulse;
+        let mut thrown = 0.0;
+        let mut broken = false;
+        if seal.lift >= SLURRY_BREAK_LIFT - 1.0e-5 {
+            thrown = self.release_slurry(x, z, forward, radius, width);
+            seal.broken = true;
+            broken = true;
+        }
+        PullOut {
+            force,
+            impulse,
+            broken,
+            thrown,
+        }
+    }
+
+    /// Take a share of the slurry under a tire and move it to the thrown account.
+    /// The bed is not cut. Returns the cubic metres removed.
+    fn release_slurry(&mut self, x: f32, z: f32, forward: Vec3, radius: f32, width: f32) -> f32 {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let radius = radius.max(0.15);
+        let half_w = width * 0.72 + self.cell * 0.35;
+        let back = -radius * 0.20;
+        let front = radius * 0.95;
+        let reach = radius + half_w + self.cell;
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let mut taken: Vec<(usize, f32)> = Vec::new();
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                if !(back..=front).contains(&along) || lat.abs() > half_w {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let take = self.slurry[idx] * 0.55;
+                if take > 1.0e-6 {
+                    taken.push((idx, take));
+                }
+            }
+        }
+        let area = self.cell * self.cell;
+        let mut vol = 0.0_f32;
+        for (idx, take) in &taken {
+            self.slurry[*idx] -= *take;
+            vol += *take * area;
+            self.sync(*idx);
+        }
+        if vol > 0.0 {
+            self.airborne += vol;
+        }
+        vol
     }
 
     /// A tire rut is a bed below the surface it started at. A hole is a
@@ -6124,5 +6414,252 @@ mod tests {
         }
         let (idx, x, z, _) = best.expect("low rut should hold slurry under a tire");
         (idx, x, z)
+    }
+
+    /// Deep slurry resists translation and spin. Clay, silt, and sand use the
+    /// same moisture, so the gap between them is the mix viscosity.
+    #[test]
+    fn deep_slurry_drag_resists_translation_and_spin() {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let depth = 0.16_f32;
+        let film = 0.02_f32;
+        let v = 1.15_f32;
+        let omega = 3.2_f32;
+        let radius = 0.38_f32;
+        let width = 0.28_f32;
+        let clay = slurry_motion_drag(SurfaceKind::WetMud, moisture, depth, radius, width, v, omega);
+        let silt = slurry_motion_drag(SurfaceKind::Silt, moisture, depth, radius, width, v, omega);
+        let sand = slurry_motion_drag(SurfaceKind::Sand, moisture, depth, radius, width, v, omega);
+        let shallow = slurry_motion_drag(SurfaceKind::WetMud, moisture, film, radius, width, v, omega);
+        let coast = slurry_motion_drag(SurfaceKind::WetMud, moisture, depth, radius, width, v, 0.0);
+        let spin = slurry_motion_drag(SurfaceKind::WetMud, moisture, depth, radius, width, 0.0, omega);
+        let reverse = slurry_motion_drag(
+            SurfaceKind::WetMud,
+            moisture,
+            depth,
+            radius,
+            width,
+            -v,
+            -omega,
+        );
+        eprintln!(
+            "deep slurry drag  clay force {:.1} N  torque {:.1} N·m  visc {:.2} Pa·s",
+            clay.force.abs(),
+            clay.torque.abs(),
+            clay.viscosity
+        );
+        eprintln!(
+            "deep slurry drag  silt force {:.1} N  torque {:.1} N·m  visc {:.2} Pa·s",
+            silt.force.abs(),
+            silt.torque.abs(),
+            silt.viscosity
+        );
+        eprintln!(
+            "deep slurry drag  sand force {:.1} N  torque {:.1} N·m  visc {:.2} Pa·s",
+            sand.force.abs(),
+            sand.torque.abs(),
+            sand.viscosity
+        );
+        eprintln!(
+            "film drag         clay force {:.1} N  torque {:.1} N·m",
+            shallow.force.abs(),
+            shallow.torque.abs()
+        );
+        assert!(
+            (clay.viscosity - slurry_viscosity(SurfaceKind::WetMud, moisture)).abs() < 1.0e-3,
+            "drag viscosity is not the clay mix"
+        );
+        assert!(
+            (silt.viscosity - slurry_viscosity(SurfaceKind::Silt, moisture)).abs() < 1.0e-3
+        );
+        assert!(
+            (sand.viscosity - slurry_viscosity(SurfaceKind::Sand, moisture)).abs() < 1.0e-3
+        );
+        assert!(
+            clay.viscosity > silt.viscosity * 1.5 && silt.viscosity > sand.viscosity * 1.5,
+            "mix viscosities did not separate, clay {} silt {} sand {}",
+            clay.viscosity,
+            silt.viscosity,
+            sand.viscosity
+        );
+        assert!(
+            clay.force.abs() > silt.force.abs() * 1.8,
+            "clay should resist translation more than silt, {:.1} vs {:.1}",
+            clay.force.abs(),
+            silt.force.abs()
+        );
+        assert!(
+            silt.force.abs() > sand.force.abs() * 1.8,
+            "silt should resist translation more than sand, {:.1} vs {:.1}",
+            silt.force.abs(),
+            sand.force.abs()
+        );
+        assert!(
+            clay.torque.abs() > silt.torque.abs() * 1.8
+                && silt.torque.abs() > sand.torque.abs() * 1.8,
+            "spin resistance should follow the mix"
+        );
+        assert!(
+            clay.force.abs() > shallow.force.abs() * 2.0,
+            "deep slurry force {:.1} N is not above the film {:.1} N",
+            clay.force.abs(),
+            shallow.force.abs()
+        );
+        assert!(
+            clay.torque.abs() > shallow.torque.abs() * 2.0,
+            "deep slurry torque {:.1} N·m is not above the film {:.1} N·m",
+            clay.torque.abs(),
+            shallow.torque.abs()
+        );
+        assert!(
+            clay.force < -200.0 && clay.torque < -40.0,
+            "drag should oppose +v and +omega, force {} torque {}",
+            clay.force,
+            clay.torque
+        );
+        assert!(
+            reverse.force > 200.0 && reverse.torque > 40.0,
+            "drag should oppose reverse motion"
+        );
+        assert!(
+            coast.force.abs() > 200.0 && coast.torque.abs() < 1.0,
+            "forward motion should resist without a spin torque, force {} torque {}",
+            coast.force,
+            coast.torque
+        );
+        assert!(
+            spin.torque.abs() > 40.0 && spin.force.abs() < 1.0,
+            "spin should resist without a shove, force {} torque {}",
+            spin.force,
+            spin.torque
+        );
+        let dry = slurry_motion_drag(SurfaceKind::WetMud, moisture, 0.0, radius, width, v, omega);
+        assert!(dry.force.abs() < 1.0 && dry.torque.abs() < 1.0);
+    }
+
+    /// A rising tire holds a short suction, then the break throws slurry.
+    /// The thrown cubic metres leave the slurry and stay in the airborne
+    /// account until they are placed.
+    #[test]
+    fn pull_out_suction_then_breakaway_keeps_volume() {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let mut soil = SoilField::mud_pad();
+        let depth = 0.16_f32;
+        let poured = soil.fill_slurry_pool(
+            -1.3,
+            1.3,
+            -1.3,
+            1.3,
+            depth,
+            SurfaceKind::WetMud,
+            moisture,
+        );
+        assert!(poured > 0.2, "the pool did not fill, {poured}");
+        let idx = soil.idx_at(0.05, 0.12).expect("pool cell");
+        let half = soil.size * 0.5;
+        let i = idx % soil.res;
+        let j = idx / soil.res;
+        let x = (i as f32 + 0.5) * soil.cell - half;
+        let z = (j as f32 + 0.5) * soil.cell - half;
+        assert!(soil.slurry[idx] > 0.12, "the tire is not in deep slurry");
+        let bed0 = soil.bed[idx];
+        let before = soil.mix_volumes();
+        let air0 = soil.airborne;
+        let mut seal = SlurrySeal::seated();
+        let mut impulse = 0.0_f32;
+        let mut thrown = 0.0_f32;
+        let mut held = false;
+        let dt = 0.02_f32;
+        let lift_speed = 0.40_f32;
+        for _ in 0..24 {
+            let out = soil.pull_from_slurry(x, z, Vec3::Z, 0.38, 0.28, lift_speed, dt, &mut seal);
+            impulse += out.impulse;
+            if out.thrown <= 1.0e-8 {
+                assert!(
+                    out.force > 80.0,
+                    "suction lapsed before the break, force {:.1} N lift {:.3} m",
+                    out.force,
+                    seal.lift
+                );
+                held = true;
+            } else {
+                thrown = out.thrown;
+                assert!(out.broken, "the throw happened before the seal broke");
+                break;
+            }
+        }
+        assert!(held, "the pull never held a suction");
+        assert!(seal.broken, "the seal did not break");
+        assert!(
+            (seal.impulse - impulse).abs() < 1.0e-3,
+            "impulse was not accumulated on the seal"
+        );
+        assert!(
+            impulse > 40.0,
+            "suction impulse {impulse:.2} N·s is too small for a sealed pull"
+        );
+        assert!(thrown > 0.002, "breakaway threw {thrown:.4} m3");
+        let after = soil.mix_volumes();
+        eprintln!(
+            "pull-out suction impulse {impulse:.2} N·s  force held  thrown {thrown:.4} m3"
+        );
+        eprintln!(
+            "volume before {:.4} m3  after {:.4} m3  airborne {:.4} m3  slurry {:.4} -> {:.4} m3",
+            before.total(),
+            after.total(),
+            soil.airborne,
+            before.slurry,
+            after.slurry
+        );
+        let gap = (before.total() + air0 - (after.total() + soil.airborne)).abs();
+        assert!(
+            gap < 1.0e-3,
+            "volume deleted, before {:.4} after {:.4} airborne {:.4}",
+            before.total(),
+            after.total(),
+            soil.airborne
+        );
+        assert!(
+            (soil.airborne - air0 - thrown).abs() < 1.0e-4,
+            "thrown {:.4} m3 is not the airborne account {:.4}",
+            thrown,
+            soil.airborne - air0
+        );
+        assert!(
+            before.slurry - after.slurry > thrown * 0.99,
+            "thrown mud was not taken from the slurry"
+        );
+        assert!(
+            (soil.bed[idx] - bed0).abs() < 1.0e-6,
+            "the breakaway cut the bed"
+        );
+        let quiet = soil.pull_from_slurry(x, z, Vec3::Z, 0.38, 0.28, lift_speed, dt, &mut seal);
+        assert!(
+            quiet.force.abs() < 1.0 && quiet.thrown < 1.0e-8,
+            "the seal pulled again after the break"
+        );
+        let placed0 = soil.placed_volume();
+        let spot = soil.receive_thrown(x + 2.4, z, thrown).expect("place thrown slurry");
+        assert!(soil.airborne < 1.0e-5, "airborne left {}", soil.airborne);
+        let placed = soil.placed_volume() - placed0;
+        let landed = soil.mix_volumes();
+        eprintln!(
+            "placed thrown {placed:.4} m3 at ({:.2}, {:.2})  total {:.4} m3",
+            spot.x,
+            spot.z,
+            landed.total()
+        );
+        assert!(
+            (placed - thrown).abs() < 1.0e-4,
+            "placed {:.4} is not the thrown {:.4}",
+            placed,
+            thrown
+        );
+        assert!(
+            (landed.total() - before.total()).abs() < 1.0e-3,
+            "landing did not restore the volume, before {:.4} after {:.4}",
+            before.total(),
+            landed.total()
+        );
     }
 }

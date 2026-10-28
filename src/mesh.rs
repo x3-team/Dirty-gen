@@ -1071,6 +1071,192 @@ fn add_soil_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
+/// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
+/// is a ribbon rather than a box, a tablet, or a cube.
+fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.35, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::Z;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let speed = p.vel.length();
+    let length = (0.34 + speed * 0.04).clamp(0.42, 0.78);
+    let width = (p.volume / length).sqrt().clamp(0.022, 0.10);
+    let thick = (p.volume / (length * width * 0.55)).clamp(0.004, 0.014);
+    let segs = 8usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        // Pinched ends. A constant width would be a tablet.
+        let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0);
+        let arc = (t * std::f32::consts::PI).sin();
+        let twist = (t - 0.5) * 0.7;
+        let side_t = side * twist.cos() + up * twist.sin();
+        let up_t = -side * twist.sin() + up * twist.cos();
+        let c = p.pos
+            + dir * (length * (t - 0.5))
+            + up * (arc - 0.55) * length * 0.16
+            + side * (t - 0.5) * width * 0.35;
+        let w = side_t * width * 0.5 * taper;
+        let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
+/// A liquid drop: pointed tail, round belly, hemispherical nose. The long
+/// axis follows the velocity, so it is not a sphere, a cube, or a tablet.
+fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut axis = p.vel;
+    if axis.length_squared() < 1.0e-6 {
+        axis = Vec3::Y;
+    }
+    axis = axis.normalize();
+    let mut side = axis.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = axis.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let bin = side.cross(axis).normalize();
+    let radius = (p.volume / 1.6).cbrt().clamp(0.014, 0.048);
+    let body = radius * 3.4;
+    let stacks = 8usize;
+    let slices = 8usize;
+    let mut pts = Vec::with_capacity((stacks + 1) * slices);
+    let mut nrm = Vec::with_capacity(pts.capacity());
+    for s in 0..=stacks {
+        let t = s as f32 / stacks as f32;
+        let (y, rad, n_axis) = if t < 0.70 {
+            let u = t / 0.70;
+            let rad = radius * u.powf(0.62);
+            let y = u * body - body * 0.55;
+            // The tail narrows toward -axis.
+            (y, rad, -0.55 + u * 0.9)
+        } else {
+            let u = ((t - 0.70) / 0.30).clamp(0.0, 1.0);
+            let rad = radius * (1.0 - u * u).sqrt();
+            let y = body * 0.45 + u * radius;
+            (y, rad, 0.35 + u * 0.9)
+        };
+        for i in 0..slices {
+            let th = i as f32 / slices as f32 * std::f32::consts::TAU;
+            let radial = side * th.cos() + bin * th.sin();
+            let pos = p.pos + axis * y + radial * rad;
+            let n = (radial * rad.max(radius * 0.15) + axis * n_axis * radius).normalize_or_zero();
+            pts.push(pos);
+            nrm.push(if n.length_squared() < 1.0e-8 { axis } else { n });
+        }
+    }
+    let center = p.pos;
+    for s in 0..stacks {
+        for i in 0..slices {
+            let a = s * slices + i;
+            let b = s * slices + (i + 1) % slices;
+            let c = (s + 1) * slices + i;
+            let d = (s + 1) * slices + (i + 1) % slices;
+            add_tri_smooth(mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center);
+            add_tri_smooth(mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center);
+        }
+    }
+}
+
+#[cfg(test)]
+mod slurry_shapes {
+    use super::*;
+    use silt::particles::Particle;
+
+    fn piece(kind: u8, volume: f32, vel: Vec3) -> Particle {
+        Particle {
+            pos: Vec3::new(0.0, 0.5, 0.0),
+            vel,
+            life: 2.0,
+            max_life: 2.0,
+            size: 0.05,
+            kind,
+            alive: true,
+            volume,
+            ledger: true,
+            ..Particle::default()
+        }
+    }
+
+    fn extents(mesh: &CpuMesh) -> [f32; 3] {
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(-f32::MAX);
+        for v in &mesh.vertices {
+            let p = Vec3::from_array(v.pos);
+            min = min.min(p);
+            max = max.max(p);
+        }
+        let mut e = (max - min).to_array();
+        e.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        e
+    }
+
+    #[test]
+    fn breakaway_mud_is_a_ribbon_and_a_drop() {
+        let mut ribbon = CpuMesh::new();
+        add_slurry_ribbon(
+            &mut ribbon,
+            &piece(5, 0.004, Vec3::new(0.0, 0.15, 5.0)),
+        );
+        let mut drop = CpuMesh::new();
+        add_mud_drop(&mut drop, &piece(6, 0.0008, Vec3::new(0.05, 3.4, 0.0)));
+        assert!(ribbon.vertices.len() > 24, "ribbon mesh missing");
+        assert!(drop.vertices.len() > 24, "drop mesh missing");
+        let r = extents(&ribbon);
+        let d = extents(&drop);
+        assert!(
+            r[0] > r[1] * 2.4 && r[0] > r[2] * 3.0,
+            "ribbon is not a long sheet {r:?}"
+        );
+        assert!(
+            r[1] / r[0] < 0.42,
+            "ribbon reads as a tablet {r:?}"
+        );
+        assert!(
+            d[0] > d[1] * 1.65,
+            "drop is round like a sphere {d:?}"
+        );
+        assert!(
+            d[1] / d[2] < 1.45,
+            "drop cross-section is a block {d:?}"
+        );
+        assert!(d[0] / d[1] < 6.0, "drop is a needle {d:?}");
+    }
+
+    #[test]
+    fn mud_chunks_includes_the_breakaway() {
+        use silt::particles::Particles;
+        let mut particles = Particles::new();
+        let threw = particles.throw_slurry(Vec3::new(0.4, 0.2, 0.6), Vec3::Z, Vec3::X, 0.012);
+        assert!(threw.ribbons > 0.0 && threw.drops > 0.0);
+        let mesh = mud_chunks(&particles.items);
+        assert!(
+            mesh.vertices.len() > 80,
+            "breakaway pieces were not meshed, verts {}",
+            mesh.vertices.len()
+        );
+    }
+}
+
 /// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
 /// smaller lumps. Ledger soil is not in this mesh once it has landed: that
 /// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
@@ -1078,14 +1264,21 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    for kind in [3u8, 1, 4, 0, 2] {
+    // 5 and 6 are the slurry breakaway: ribbons, then drops.
+    for kind in [5u8, 6, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
             if p.ledger {
-                if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 200 < MAX_VERTS {
-                    add_soil_ribbon(&mut mesh, p);
+                if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
+                    if p.kind == silt::particles::KIND_SLURRY_DROP {
+                        add_mud_drop(&mut mesh, p);
+                    } else if p.kind == silt::particles::KIND_SLURRY_RIBBON {
+                        add_slurry_ribbon(&mut mesh, p);
+                    } else {
+                        add_soil_ribbon(&mut mesh, p);
+                    }
                 }
                 continue;
             }
