@@ -8,8 +8,10 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::particles::Particles;
+use crate::patch::{contact_patch, step_tread, TreadCoat};
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
+    terramech_for, wheel_buoyancy, SoilField, Terramech,
 };
 use crate::vehicle::{
     PanelMud, Wheel, PANEL_BELLY, PANEL_COUNT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_SEAT,
@@ -138,7 +140,13 @@ impl Bike {
             let (compression, sinkage, normal) = if z0 <= 0.004 {
                 ((self.wheels[i].compression - dt * 3.4).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
+                solve_suspension(
+                    z0,
+                    up_y,
+                    self.wheels[i].slip,
+                    terramech_for(sample.kind(), sample.softness, sample.water),
+                    sample.water,
+                )
             };
             let wheel_center = wc0 + up * compression;
             let mut fwd = ori * (Quat::from_rotation_y(self.wheels[i].steer) * Vec3::Z);
@@ -175,7 +183,7 @@ impl Bike {
             let mut long_f = 0.0;
             let mut lat_f = 0.0;
             if active {
-                let tm = terramech(sample.softness);
+                let tm = terramech_for(sample.kind(), sample.softness, sample.water);
                 let length = contact_length(BIKE_RADIUS, sinkage).max(0.05);
                 let area = (BIKE_WIDTH * length).max(0.008);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -196,7 +204,37 @@ impl Bike {
                     * (1.0 - (-slip_angle.abs() / 0.14).exp());
                 long_f = lerp(pace_long, prop_long, soil_w);
                 lat_f = lerp(pace_lat, prop_lat, soil_w);
+                let patch_len = length;
+                let foot = soil.sample_patch(wheel_center, fwd, right, patch_len, BIKE_WIDTH);
+                let coat = TreadCoat {
+                    groove: self.wheels[i].groove,
+                    smear: self.wheels[i].smear,
+                };
+                let patch = contact_patch(
+                    BIKE_RADIUS,
+                    BIKE_WIDTH,
+                    sinkage,
+                    slip,
+                    normal,
+                    sample.kind(),
+                    foot.wetness,
+                    foot.loose,
+                    foot.water,
+                    coat,
+                );
+                let spun = ((slip.abs() - 0.75) / 0.20).clamp(0.0, 1.0);
+                let coated = ((coat.smear - 0.72) / 0.20).clamp(0.0, 1.0);
+                let patch_scale = lerp(1.0, patch.scale, spun.max(coated) * soil_w);
+                long_f *= patch_scale;
+                lat_f *= patch_scale;
+                if v_long.abs() > 0.12 {
+                    long_f -= v_long.signum() * rolling_resistance(normal, sample.water);
+                }
                 drive -= long_f * BIKE_RADIUS;
+                let mut next = coat;
+                let _thrown = step_tread(&mut next, slip, patch.squeeze, patch.pull, dt);
+                self.wheels[i].groove = next.groove;
+                self.wheels[i].smear = next.smear;
                 let _ = tm;
             }
             let held = self.jump_hold > 0.0;
@@ -412,7 +450,7 @@ fn stick_mud(bike: &mut Bike, soil: &SoilField) {
     for panel in spots {
         let sample = soil.sample(bike.pos.x, bike.pos.z);
         let p = &mut bike.panels[panel];
-        let add = 0.2 + 0.16 * sample.wetness;
+        let add = (0.2 + 0.16 * sample.wetness) * stick_scale(sample.kind(), sample.wetness);
         p.mass = (p.mass + add).min(PANEL_MUD_CAP);
         p.wet = (p.wet + 0.7).min(1.0);
         p.streak = (p.streak + 0.4).min(1.0);
@@ -420,27 +458,28 @@ fn stick_mud(bike: &mut Bike, soil: &SoilField) {
     }
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {
-    let tm = terramech(softness);
+fn solve_suspension(z0: f32, up_y: f32, slip: f32, tm: Terramech, water: f32) -> (f32, f32, f32) {
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;
     let z_of = |c: f32| (z0 - up_y * c).max(0.0);
     let soil_n = |c: f32| bekker_load(z_of(c), BIKE_RADIUS, BIKE_WIDTH, k_eq, tm.n);
+    let buoy = wheel_buoyancy(water, BIKE_RADIUS, BIKE_WIDTH);
+    let support = |c: f32| soil_n(c) + buoy;
     let at_droop = soil_n(0.0);
-    if at_droop <= 1.0 {
+    if at_droop <= 1.0 && buoy <= 1.0 {
         return (0.0, 0.0, 0.0);
     }
-    if at_droop < spring(0.0) {
-        return (0.0, z_of(0.0), at_droop.min(8_000.0));
+    if support(0.0) < spring(0.0) {
+        return (0.0, z_of(0.0), support(0.0).min(8_000.0));
     }
-    if soil_n(TRAVEL) > spring(TRAVEL) {
-        return (TRAVEL, z_of(TRAVEL), soil_n(TRAVEL).min(8_000.0));
+    if support(TRAVEL) > spring(TRAVEL) {
+        return (TRAVEL, z_of(TRAVEL), support(TRAVEL).min(8_000.0));
     }
     let mut lo = 0.0;
     let mut hi = TRAVEL;
     for _ in 0..12 {
         let mid = 0.5 * (lo + hi);
-        if spring(mid) > soil_n(mid) {
+        if spring(mid) > support(mid) {
             hi = mid;
         } else {
             lo = mid;

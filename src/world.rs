@@ -4,7 +4,9 @@ use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
-use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
+use crate::soil::{
+    on_launch_crest, stick_scale, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
+};
 use crate::vehicle::{
     hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
     PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
@@ -64,6 +66,10 @@ pub struct World {
     air_time: f32,
     impact_latched: bool,
     did_launch: bool,
+    spawn_pos: Vec3,
+    spawn_yaw: f32,
+    bike_spawn: Vec3,
+    bike_spawn_yaw: f32,
 }
 
 /// Wheels on one side of the axle, averaged into a single groove.
@@ -137,6 +143,10 @@ impl World {
             air_time: 0.0,
             impact_latched: false,
             did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::ZERO,
+            bike_spawn_yaw: 0.0,
         };
         world.place_on_soil();
         for _ in 0..120 {
@@ -151,6 +161,7 @@ impl World {
         };
         world.drip_acc = 0.0;
         world.bike.place_on(&world.soil);
+        world.remember_spawn();
         world
     }
 
@@ -171,6 +182,10 @@ impl World {
             air_time: 0.0,
             impact_latched: false,
             did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::ZERO,
+            bike_spawn_yaw: 0.0,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -185,7 +200,34 @@ impl World {
             min_speed_in_soft: 99.0,
             ..Telemetry::default()
         };
+        world.remember_spawn();
         world
+    }
+
+    fn remember_spawn(&mut self) {
+        self.spawn_pos = self.vehicle.pos;
+        self.spawn_yaw = self.vehicle.yaw;
+        self.bike_spawn = self.bike.pos;
+        self.bike_spawn_yaw = self.bike.yaw;
+    }
+
+    /// Put both vehicles back on their start poses. The heightfield, the
+    /// berm, and any mud still in the air stay where they are.
+    pub fn reset_vehicle(&mut self) {
+        self.vehicle = Vehicle::new();
+        self.vehicle.pos = self.spawn_pos;
+        self.vehicle.yaw = self.spawn_yaw;
+        self.place_on_soil();
+        self.bike = Bike::new();
+        self.bike.pos.x = self.bike_spawn.x;
+        self.bike.pos.z = self.bike_spawn.z;
+        self.bike.yaw = self.bike_spawn_yaw;
+        self.bike.place_on(&self.soil);
+        self.crest_armed = false;
+        self.air_time = 0.0;
+        self.impact_latched = false;
+        self.did_launch = false;
+        self.drip_acc = 0.0;
     }
 
     fn place_on_soil(&mut self) {
@@ -292,6 +334,19 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
+        for c in &contacts {
+            if c.active && c.squeeze > 0.02 {
+                // Loose smear only. The cut still lands on the berm.
+                self.soil.skim_loose(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    c.patch_length.max(0.08),
+                    crate::vehicle::WHEEL_WIDTH,
+                    c.squeeze * 0.0025 * dt,
+                );
+            }
+        }
 
         let speed = self.vehicle.speed();
         for c in &contacts {
@@ -483,7 +538,8 @@ fn stick_impact_mud(vehicle: &mut Vehicle, soil: &SoilField) {
         let world = vehicle.pos + ori * local;
         let sample = soil.sample(world.x, world.z);
         if world.y < vehicle.pos.y + 0.05 || world.y < sample.height + 0.55 {
-            let add = 0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0);
+            let add = (0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0))
+                * stick_scale(sample.kind(), sample.wetness);
             let p = &mut vehicle.panels[panel];
             p.mass = (p.mass + add).min(PANEL_MUD_CAP);
             p.wet = (p.wet + 0.7).min(1.0);
