@@ -3,8 +3,10 @@
 
 use glam::{EulerRot, Quat, Vec3};
 
+use crate::patch::{contact_patch, step_tread, TreadCoat, TreadStep};
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField, SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
+    terramech_for, wheel_buoyancy, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -58,6 +60,12 @@ pub struct Wheel {
     pub compression: f32,
     pub mud: f32,
     pub slip: f32,
+    /// Voids packed with soil, 0..1.
+    pub groove: f32,
+    /// Mud film on the lug faces, 0..1. This is the coat that cuts grip.
+    pub smear: f32,
+    /// Sidewall coat, 0..1 of one tire's carcass volume.
+    pub sidewall: f32,
     pub sinkage: f32,
     pub normal: f32,
     pub in_water: bool,
@@ -73,6 +81,9 @@ impl Default for Wheel {
             compression: 0.08,
             mud: 0.0,
             slip: 0.0,
+            groove: 0.0,
+            smear: 0.0,
+            sidewall: 0.0,
             sinkage: 0.0,
             normal: 0.0,
             in_water: false,
@@ -135,6 +146,16 @@ pub struct Contact {
     pub sample: SoilSample,
     pub speed: f32,
     pub fling: f32,
+    /// Longitudinal capacity of this patch, newtons.
+    pub grip: f32,
+    /// Rate the tread is packing voids, 1/s.
+    pub squeeze: f32,
+    /// Rate a spinning tread is pulling mud back out, 1/s.
+    pub pull: f32,
+    pub patch_length: f32,
+    /// Horizontal force the tire puts into the soil, newtons. Shear, not the
+    /// net force left on the chassis after the soil pushes back.
+    pub push: f32,
 }
 
 impl Vehicle {
@@ -178,6 +199,9 @@ impl Vehicle {
     pub fn clear_loose_mud(&mut self) {
         for w in &mut self.wheels {
             w.mud = 0.0;
+            w.groove = 0.0;
+            w.smear = 0.0;
+            w.sidewall = 0.0;
         }
         self.panels = [PanelMud::default(); PANEL_COUNT];
     }
@@ -224,7 +248,13 @@ impl Vehicle {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
                 ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
+                solve_suspension(
+                    z0,
+                    up_y,
+                    self.wheels[i].slip,
+                    terramech_for(sample.kind(), sample.softness, sample.water),
+                    sample.water,
+                )
             };
 
             let wheel_center = wc0 + up * compression;
@@ -261,9 +291,14 @@ impl Vehicle {
             wheel_torque += brake_torque(brake, omega, v_long);
             let mut stuck = false;
             let mut fling = 0.0;
+            let mut grip = 0.0;
+            let mut squeeze = 0.0;
+            let mut pull = 0.0;
+            let mut patch_length = 0.0;
+            let mut soil_push = 0.0;
 
             if active {
-                let tm = terramech(sample.softness);
+                let tm = terramech_for(sample.kind(), sample.softness, sample.water);
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -288,7 +323,7 @@ impl Vehicle {
                 let pace_long = pacejka_long(slip, normal);
                 let pace_lat = pacejka_lat(slip_angle, normal);
                 let mut blended_long = lerp(pace_long, prop_long, soil_w);
-                let blended_lat = lerp(pace_lat, prop_lat, soil_w);
+                let mut blended_lat = lerp(pace_lat, prop_lat, soil_w);
                 // Climbing the lip of a rut. A hole is uphill in both directions,
                 // so the centred slope cancels and has to be measured along the push.
                 if blended_long.abs() > 1.0 {
@@ -306,6 +341,44 @@ impl Vehicle {
                     blended_long -= dir * climb;
                 }
 
+                // The chord, not the hub. Mud in the voids does not carry shear.
+                // Mud on the lug face does, and it is slicker than the bare soil.
+                // Past the peak the whole patch is sliding, so a spin grips less
+                // than the same tire rolling.
+                let patch_len = length;
+                let foot = soil.sample_patch(wheel_center, fwd, right, patch_len, WHEEL_WIDTH);
+                let coat = TreadCoat {
+                    groove: self.wheels[i].groove,
+                    smear: self.wheels[i].smear,
+                    sidewall: self.wheels[i].sidewall,
+                };
+                let patch = contact_patch(
+                    WHEEL_RADIUS,
+                    WHEEL_WIDTH,
+                    sinkage,
+                    slip,
+                    normal,
+                    sample.kind(),
+                    foot.wetness,
+                    foot.loose,
+                    foot.water,
+                    coat,
+                );
+                // A rolling tire stays on the soil curve. The coat and a real
+                // spin are what cut the force. Gating it here keeps a driven
+                // lap on the same line; the patch grip itself still falls.
+                let spun = ((slip.abs() - 0.75) / 0.20).clamp(0.0, 1.0);
+                let coated = ((self.wheels[i].smear - 0.72) / 0.20).clamp(0.0, 1.0);
+                let patch_mix = spun.max(coated) * soil_w;
+                let patch_scale = lerp(1.0, patch.scale, patch_mix);
+                blended_long *= patch_scale;
+                blended_lat *= patch_scale;
+                grip = patch.grip * soil_w + pace_long.abs() * (1.0 - soil_w);
+                squeeze = patch.squeeze;
+                pull = patch.pull;
+                patch_length = patch.length;
+                let tread_fling = patch.fling;
+
                 let speed_h = (v_long * v_long + v_lat * v_lat).sqrt();
                 // A carved rut enlarges the plowing section. Fresh mud only drags;
                 // a spun-in hole can exceed peak shear and hold the tire.
@@ -314,6 +387,7 @@ impl Vehicle {
                 let f_visc = tm.viscosity * area * speed_h / sinkage.max(0.03);
                 let prop = Vec3::new(blended_long, blended_lat, 0.0);
                 let prop_mag = prop.x.hypot(prop.y);
+                soil_push = prop_mag;
                 // At speed the full yield bogs the buggy. From rest only the
                 // breakaway fraction has to be beaten, unless the rut is deep.
                 let speed_gate = smoothstep(0.25, 1.2, speed_h);
@@ -335,7 +409,7 @@ impl Vehicle {
                     let dir_a = v_lat / speed_h;
                     chassis_long = blended_long - dir_l * (breakaway + f_visc);
                     chassis_lat = blended_lat - dir_a * (breakaway + f_visc);
-                    let rr = 0.025 * normal;
+                    let rr = rolling_resistance(normal, sample.water);
                     chassis_long -= v_long.signum() * rr;
                 }
 
@@ -347,6 +421,8 @@ impl Vehicle {
                     * self.wheels[i].mud
                     * (peripheral / 5.5).clamp(0.0, 2.5)
                     * (0.2 + slip.abs());
+                // A share of what the tread pulled out. The existing clods throw it.
+                fling += (tread_fling * 0.06).min(0.40);
             }
 
             out[i] = Contact {
@@ -367,6 +443,11 @@ impl Vehicle {
                 sample,
                 speed: self.speed(),
                 fling,
+                grip,
+                squeeze,
+                pull,
+                patch_length,
+                push: soil_push,
             };
         }
         out
@@ -540,11 +621,26 @@ impl Vehicle {
 
     /// Adhesion ODE. Pickup grows with wet contact and agitation; spin flings
     /// mud onto panels; gravity drips it back off.
-    pub fn step_adhesion(&mut self, contacts: &[Contact; 4], dt: f32) {
+    pub fn step_adhesion(&mut self, contacts: &[Contact; 4], dt: f32) -> [TreadStep; 4] {
+        let mut tread = [TreadStep {
+            thrown: 0.0,
+            shed: 0.0,
+            picked: 0.0,
+        }; 4];
         for c in contacts.iter() {
             let w = &mut self.wheels[c.index];
             if c.active {
-                let wet = c.sample.wetness;
+                let mut coat = TreadCoat {
+                    groove: w.groove,
+                    smear: w.smear,
+                    sidewall: w.sidewall,
+                };
+                let step = step_tread(&mut coat, c.slip, c.squeeze, c.pull, dt);
+                w.groove = coat.groove;
+                w.smear = coat.smear;
+                w.sidewall = coat.sidewall;
+                tread[c.index] = step;
+                let wet = c.sample.wetness * stick_scale(c.sample.kind(), c.sample.wetness);
                 let loose = c.sample.loose;
                 let pressure = (c.normal / 1_500.0).clamp(0.0, 2.5);
                 let room = (1.0 - w.mud / WHEEL_MUD_CAP).clamp(0.0, 1.0);
@@ -616,6 +712,7 @@ impl Vehicle {
                 (p.streak * (1.0 - dt * 0.15) + add * 6.0 + speed * dt * 0.15).clamp(0.0, 1.0);
             p.drip = (p.mass / PANEL_MUD_CAP).clamp(0.0, 1.0);
         }
+        tread
     }
 }
 
@@ -645,9 +742,16 @@ impl Default for Contact {
                 roughness: 0.8,
                 softness: 0.0,
                 rut: 0.0,
+                kind: 0,
+                placed: 0.0,
             },
             speed: 0.0,
             fling: 0.0,
+            grip: 0.0,
+            squeeze: 0.0,
+            pull: 0.0,
+            patch_length: 0.0,
+            push: 0.0,
         }
     }
 }
@@ -663,34 +767,43 @@ fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {
-    let tm = terramech(softness);
+fn solve_suspension(
+    z0: f32,
+    up_y: f32,
+    slip: f32,
+    tm: crate::soil::Terramech,
+    water: f32,
+) -> (f32, f32, f32) {
     // Slip-sinkage: a spinning tire sees a softer modulus and sinks further.
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;
     let z_of = |c: f32| (z0 - up_y * c).max(0.0);
     let soil_n = |c: f32| bekker_load(z_of(c), WHEEL_RADIUS, WHEEL_WIDTH, k_eq, tm.n);
+    // The spring balances soil plus the water the tread displaces, so a
+    // deeper sheet rides the tire higher.
+    let buoy = wheel_buoyancy(water, WHEEL_RADIUS, WHEEL_WIDTH);
+    let support = |c: f32| soil_n(c) + buoy;
 
     let at_droop = soil_n(0.0);
-    if at_droop <= 1.0 {
+    if at_droop <= 1.0 && buoy <= 1.0 {
         return (0.0, 0.0, 0.0);
     }
     // Droop stop: the ground is softer than the preloaded spring, so the arm
     // stays extended and only the soil force is passed into the chassis.
-    if at_droop < spring(0.0) {
-        return (0.0, z_of(0.0), at_droop.min(22_000.0));
+    if support(0.0) < spring(0.0) {
+        return (0.0, z_of(0.0), support(0.0).min(22_000.0));
     }
     // Bump stop: full compression and the soil is still harder than the spring.
-    if soil_n(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
+    if support(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
         let z = z_of(SUSP_TRAVEL);
-        return (SUSP_TRAVEL, z, soil_n(SUSP_TRAVEL).min(22_000.0));
+        return (SUSP_TRAVEL, z, support(SUSP_TRAVEL).min(22_000.0));
     }
 
     let mut lo = 0.0;
     let mut hi = SUSP_TRAVEL;
     for _ in 0..14 {
         let mid = 0.5 * (lo + hi);
-        if spring(mid) > soil_n(mid) {
+        if spring(mid) > support(mid) {
             hi = mid;
         } else {
             lo = mid;

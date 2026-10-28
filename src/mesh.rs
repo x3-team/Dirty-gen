@@ -52,7 +52,7 @@ pub struct CpuMesh {
 }
 
 impl CpuMesh {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -704,7 +704,8 @@ pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
     // The solver stores one height per ~20 cm. A rut is often a single cell,
     // which is one kink and reads as a tint. Draw a finer mesh and sample the
     // same heightfield so the displaced walls have real triangles.
-    let sub = 3usize;
+    // Lug pitch is ~20 cm. At sub 4 a void is one quad and reads as a card.
+    let sub = 8usize;
     let n = (res - 1) * sub + 1;
     let mut verts = Vec::with_capacity(n * n);
     let half = size * 0.5;
@@ -836,39 +837,9 @@ pub fn environment_mesh() -> CpuMesh {
     );
 
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
-    // sits on the ground instead of floating as boxes.
+    // sits on the ground instead of floating as boxes. Trees, rocks and grass
+    // are the Gobkit meshes placed around the oval.
     add_horizon(&mut m);
-
-    let trees = [
-        Vec3::new(-16.0, 0.0, 14.0),
-        Vec3::new(18.0, 0.0, -16.0),
-        Vec3::new(14.0, 0.0, 16.0),
-        Vec3::new(-18.0, 0.0, -11.0),
-        Vec3::new(20.0, 0.0, 6.0),
-    ];
-    for (k, p) in trees.iter().enumerate() {
-        let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
-        add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
-        // Stacked cones so the crown has volume instead of a flat card.
-        let layers = [
-            (trunk_h * 0.42, 1.25, 1.45),
-            (trunk_h * 0.85, 1.0, 1.2),
-            (trunk_h * 1.25, 0.72, 0.95),
-        ];
-        for (i, (y, radius, height)) in layers.iter().enumerate() {
-            let j = hash(40 + k as u32 * 3 + i as u32);
-            let jx = (j - 0.5) * 0.2;
-            let jz = (hash(90 + k as u32 * 3 + i as u32) - 0.5) * 0.2;
-            add_cone(
-                &mut m,
-                *p + Vec3::new(jx, *y, jz),
-                *height,
-                *radius * (0.9 + j * 0.2),
-                PANEL_TREE,
-                6,
-            );
-        }
-    }
     m
 }
 
@@ -1059,8 +1030,50 @@ fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, s
     );
 }
 
+/// Airborne ledger soil. A flat ribbon of the carried volume. A sphere of
+/// `cbrt(volume)` was a blob several times the field.
+fn add_soil_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.22, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::Z;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = (0.22 + p.vel.length() * 0.05).clamp(0.24, 0.80);
+    let width = (p.volume / length).sqrt().clamp(0.018, 0.09);
+    let thick = (p.volume / (length * width)).clamp(0.005, 0.022);
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (1.0 - (t * 2.0 - 1.0).abs()).clamp(0.15, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * taper;
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
 /// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+/// smaller lumps. Ledger soil is not in this mesh once it has landed: that
+/// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
@@ -1068,6 +1081,12 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     for kind in [3u8, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
+                continue;
+            }
+            if p.ledger {
+                if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 200 < MAX_VERTS {
+                    add_soil_ribbon(&mut mesh, p);
+                }
                 continue;
             }
             if mesh.vertices.len() + 700 > MAX_VERTS {
