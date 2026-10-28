@@ -1386,7 +1386,10 @@ impl Renderer {
         }
         for (i, px) in self.mat_scratch.chunks_exact_mut(4).enumerate() {
             px[0] = (soil.wetness[i].clamp(0.0, 1.0) * 255.0) as u8;
-            px[1] = ((soil.water[i] / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
+            // Free water and the mixed body share this channel. The mesh
+            // already sits on the slurry, so the tint is that one surface.
+            let liquid = soil.water[i] + soil.slurry[i];
+            px[1] = ((liquid / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
         }

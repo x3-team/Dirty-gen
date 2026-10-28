@@ -514,6 +514,8 @@ struct CaptureArgs {
     roll_proof: PathBuf,
     force: bool,
     force_proof: PathBuf,
+    slurry: bool,
+    slurry_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -578,6 +580,10 @@ fn capture(args: &[String]) {
     }
     if parsed.force {
         capture_force(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry {
+        capture_slurry(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -754,6 +760,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut roll_proof = PathBuf::from(format!("{MEDIA}/roll-proof.png"));
     let mut force = false;
     let mut force_proof = PathBuf::from(format!("{MEDIA}/force-proof.png"));
+    let mut slurry = false;
+    let mut slurry_proof = PathBuf::from(format!("{MEDIA}/slurry-mix-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -794,6 +802,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 force = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     force_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-proof" => {
+                slurry = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -873,6 +887,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         roll_proof,
         force,
         force_proof,
+        slurry,
+        slurry_proof,
     }
 }
 
@@ -1614,6 +1630,127 @@ fn roll_camera(world: &World) -> CameraPose {
     // ground beside the rolled Niva instead of sitting in a wide empty frame.
     let eye = look + fwd * 2.85 - right * 0.55 + Vec3::Y * 0.92;
     let ortho = 4.15;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+/// Hard-pass ruts with the standing water mixed into the wet clay.
+/// The floor is one slurry. The water column is gone.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{
+        mixes_as_slurry, rut_depth_from_force, slurry_viscosity, SurfaceKind, HARD_PASS_NORMAL,
+        HARD_PASS_PUSH, SLURRY_COMPARE_MOISTURE,
+    };
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let moisture = SLURRY_COMPARE_MOISTURE;
+    for (name, kind) in [
+        ("clay", SurfaceKind::WetMud),
+        ("silt", SurfaceKind::Silt),
+        ("sand", SurfaceKind::Sand),
+    ] {
+        let visc = slurry_viscosity(kind, moisture);
+        println!("slurry viscosity {name} {visc:.2} Pa·s at moisture {moisture:.2}");
+    }
+
+    let hard_bed = rut_depth_from_force(
+        HARD_PASS_NORMAL,
+        HARD_PASS_PUSH,
+        0.38,
+        0.28,
+        SurfaceKind::WetMud,
+        0.82,
+        0.02,
+        0.0,
+    );
+    let mut world = World::wet_clay();
+    let z0 = -2.6_f32;
+    let z1 = 1.8_f32;
+    for side in [-0.74_f32, 0.74] {
+        world.soil.roll_with_force(
+            Vec3::new(side, 0.0, z0),
+            Vec3::new(side, 0.0, z1),
+            hard_bed.max(0.012),
+            0.0,
+            HARD_PASS_NORMAL,
+            HARD_PASS_PUSH,
+        );
+    }
+    let mut poured = 0u32;
+    for idx in 0..world.soil.bed.len() {
+        let dug = world.soil.initial_height[idx] - world.soil.bed[idx];
+        let kind = SurfaceKind::from_u8(world.soil.kind[idx]);
+        if dug < 0.04 || !mixes_as_slurry(kind) {
+            continue;
+        }
+        if !matches!(
+            kind,
+            SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay
+        ) {
+            continue;
+        }
+        world.soil.water[idx] = (dug * 0.42).clamp(0.05, 0.10);
+        world.soil.wetness[idx] = moisture;
+        poured += 1;
+    }
+    let before = world.soil.mix_volumes();
+    println!(
+        "slurry before  soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3  cells {poured}",
+        before.soil, before.water, before.slurry, before.total()
+    );
+    world.soil.mix_slurry();
+    let after = world.soil.mix_volumes();
+    println!(
+        "slurry after   soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+        after.soil, after.water, after.slurry, after.total()
+    );
+    world.vehicle.pos = Vec3::new(0.0, 0.8, 0.15);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    let ori = world.vehicle.orientation();
+    let mut seated = 0.0_f32;
+    for i in 0..4 {
+        let local = ori * world.vehicle.wheel_center_local(i);
+        let ground = world
+            .soil
+            .sample(world.vehicle.pos.x + local.x, world.vehicle.pos.z + local.z)
+            .height;
+        seated += ground + 0.38 - local.y;
+    }
+    world.vehicle.pos.y = seated / 4.0;
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "slurry",
+        &parsed.slurry_proof,
+        parsed,
+        slurry_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let p = world.vehicle.pos;
+    let bed = p - fwd * 1.35 + right * 0.74;
+    let floor = world.soil.sample(bed.x, bed.z);
+    let look = Vec3::new(
+        bed.x * 0.62 + p.x * 0.38,
+        floor.height + 0.02,
+        bed.z * 0.55 + p.z * 0.45,
+    );
+    let eye = look - fwd * 2.15 + right * 2.05 + Vec3::Y * 0.92;
+    let ortho = 3.8;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,

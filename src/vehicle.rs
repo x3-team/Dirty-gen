@@ -744,6 +744,7 @@ impl Default for Contact {
                 rut: 0.0,
                 kind: 0,
                 placed: 0.0,
+                slurry: 0.0,
             },
             speed: 0.0,
             fling: 0.0,

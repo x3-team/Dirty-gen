@@ -2,8 +2,9 @@
 //!
 //! The cut and the spoil are different layers. `bed` is the ground the tire
 //! carved. `placed` is soil that has already been put somewhere else (berm,
-//! crest clod, impact ring). The visible height is their sum, and a cell's
-//! kind says which one the tire is on.
+//! crest clod, impact ring). Standing water in a rut or a hole mixes with the
+//! wet soil into one slurry. The visible height is bed + placed + that slurry,
+//! so the picture is not a solid floor under a separate water column.
 //!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
@@ -14,8 +15,8 @@ use glam::Vec3;
 pub const MAP_SIZE: f32 = 40.0;
 pub const MAP_RES: usize = 192;
 
-/// Soil the tire can stand on. Liquid film and slurry sit on top of these
-/// and are not stored as a second height.
+/// Soil the tire can stand on. A mixed slurry is not a second kind: it is
+/// the water and the wet soil as one thickness on the cell.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceKind {
@@ -142,6 +143,45 @@ pub fn water_conduct(kind: SurfaceKind) -> f32 {
     }
 }
 
+/// Water fraction where clay, silt, and sand slurries are compared.
+pub const SLURRY_COMPARE_MOISTURE: f32 = 0.55;
+
+/// Clay, silt, and sand join standing water. Gravel and a dry crust do not.
+pub fn mixes_as_slurry(kind: SurfaceKind) -> bool {
+    matches!(
+        kind,
+        SurfaceKind::WetMud
+            | SurfaceKind::FreshCut
+            | SurfaceKind::PackedClay
+            | SurfaceKind::Silt
+            | SurfaceKind::Sand
+    )
+}
+
+/// Metres of soil that join `water` metres so the slurry's water fraction
+/// is `moisture`. The same moisture takes the same soil from clay, silt, and sand.
+pub fn slurry_soil_depth(water: f32, moisture: f32) -> f32 {
+    let water = water.max(0.0);
+    if water <= 1.0e-6 {
+        return 0.0;
+    }
+    let m = moisture.clamp(0.08, 0.92);
+    water * (1.0 - m) / m
+}
+
+/// Dynamic viscosity (Pa·s) of one slurry. `moisture` is the water fraction,
+/// 0 a stiff paste and 1 thin. Clay stays thick. Silt sits under it. Sand does not.
+pub fn slurry_viscosity(kind: SurfaceKind, moisture: f32) -> f32 {
+    let thin = moisture.clamp(0.0, 1.0).powf(1.35);
+    let (stiff, fluid) = match kind {
+        SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay => (260.0, 22.0),
+        SurfaceKind::Silt => (78.0, 6.0),
+        SurfaceKind::Sand => (12.0, 0.45),
+        _ => (1.5, 0.08),
+    };
+    lerp(stiff, fluid, thin)
+}
+
 /// Stadium centerline. South cap sits on `TRACK_ZS`, north cap on `TRACK_ZN`.
 /// The scripted buggy and the heightfield share these so the lap stays on the mud.
 pub const TRACK_R: f32 = 6.35;
@@ -162,6 +202,8 @@ pub struct SoilSample {
     pub kind: u8,
     /// Spoil thickness on this cell. Separate from the cut.
     pub placed: f32,
+    /// Mixed water and soil, metres. Zero where the column has not joined.
+    pub slurry: f32,
 }
 
 impl SoilSample {
@@ -204,6 +246,10 @@ pub struct SoilField {
     /// Cubic metres that left a contact and have not been placed yet.
     /// A snapshot does not carry this. Land it before saving.
     pub airborne: f32,
+    /// One slurry thickness, metres. Soil that left the bed plus the water
+    /// that left the column. The mesh adds this to the solid. It is not a
+    /// second surface.
+    pub slurry: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -589,6 +635,7 @@ impl SoilField {
             tread_ang: vec![0.0; n],
             tread_lat: vec![0.0; n],
             airborne: 0.0,
+            slurry: vec![0.0; n],
         }
     }
 
@@ -858,6 +905,7 @@ impl SoilField {
                 rut: 0.0,
                 kind: SurfaceKind::Undisturbed as u8,
                 placed: 0.0,
+                slurry: 0.0,
             };
         }
         let i = u.floor() as usize;
@@ -891,6 +939,7 @@ impl SoilField {
             rut,
             kind,
             placed,
+            slurry: self.slurry[nidx],
         }
     }
 
@@ -908,7 +957,7 @@ impl SoilField {
     }
 
     fn sync(&mut self, idx: usize) {
-        self.height[idx] = self.bed[idx] + self.placed[idx];
+        self.height[idx] = self.bed[idx] + self.placed[idx] + self.slurry[idx];
     }
 
     /// Remove `drop` metres. Placed spoil comes off before the bed is cut.
@@ -1058,6 +1107,7 @@ impl SoilField {
             rut: mid.rut,
             kind: mid.kind,
             placed: mid.placed,
+            slurry: mid.slurry,
         }
     }
 
@@ -2432,6 +2482,98 @@ impl SoilField {
         (x, z)
     }
 
+    /// Standing water in a rut or a hole joins the wet soil under it.
+    /// The water column is cleared. The soil it takes leaves the bed and
+    /// the two become one slurry thickness. Volume of water plus soil is
+    /// unchanged. This does not move slurry along the ground.
+    pub fn mix_slurry(&mut self) {
+        let n = self.water.len();
+        for idx in 0..n {
+            let water = self.water[idx];
+            if water <= 0.008 {
+                continue;
+            }
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            if !mixes_as_slurry(kind) {
+                continue;
+            }
+            let moisture = self.wetness[idx];
+            if moisture < 0.15 || !self.in_rut_or_hole(idx) {
+                continue;
+            }
+            // Cap the bite so a deep pond cannot empty the column under the map.
+            // The cap still conserves volume: whatever soil leaves is the slurry's soil.
+            let soil_m = slurry_soil_depth(water, moisture).min(0.35);
+            if soil_m <= 1.0e-5 {
+                continue;
+            }
+            let removed = self.excavate(idx, soil_m);
+            self.slurry[idx] += removed + water;
+            self.water[idx] = 0.0;
+            self.sync(idx);
+        }
+    }
+
+    /// A tire rut is a bed below the surface it started at. A hole is a
+    /// closed bowl or a groove with higher ground on both sides. A flat
+    /// sheet of water is neither.
+    fn in_rut_or_hole(&self, idx: usize) -> bool {
+        if self.initial_height[idx] - self.bed[idx] > 0.012 {
+            return true;
+        }
+        let res = self.res as isize;
+        let i = (idx % self.res) as isize;
+        let j = (idx / self.res) as isize;
+        if i <= 0 || j <= 0 || i + 1 >= res || j + 1 >= res {
+            return false;
+        }
+        let h = self.bed[idx] + self.placed[idx];
+        let at = |di: isize, dj: isize| -> f32 {
+            let ii = i + di;
+            let jj = j + dj;
+            if ii < 0 || jj < 0 || ii >= res || jj >= res {
+                return h;
+            }
+            let n = jj as usize * self.res + ii as usize;
+            self.bed[n] + self.placed[n]
+        };
+        let side = 0.02;
+        let groove = (at(-1, 0) > h + side && at(1, 0) > h + side)
+            || (at(0, -1) > h + side && at(0, 1) > h + side);
+        if groove {
+            return true;
+        }
+        let mut min_barrier = f32::MAX;
+        for (di, dj) in [(1isize, 0), (-1, 0), (0, 1), (0, -1)] {
+            let mut barrier = h;
+            for s in 1..=28 {
+                barrier = barrier.max(at(di * s, dj * s));
+            }
+            min_barrier = min_barrier.min(barrier);
+        }
+        min_barrier > h + side
+    }
+
+    /// Solid, free water, and slurry, in cubic metres. Their sum is the
+    /// conserved water-plus-soil volume. Slurry is the joined body, not a
+    /// column sitting on unchanged clay.
+    pub fn mix_volumes(&self) -> MixVolumes {
+        let area = self.cell * self.cell;
+        let mut soil = 0.0_f32;
+        let mut water = 0.0_f32;
+        let mut slurry = 0.0_f32;
+        for idx in 0..self.bed.len() {
+            soil += self.bed[idx] + self.placed[idx];
+            water += self.water[idx];
+            slurry += self.slurry[idx];
+        }
+        MixVolumes {
+            soil: soil * area,
+            water: water * area,
+            slurry: slurry * area,
+        }
+    }
+
     /// Displace puddle water out of a wheel footprint. Returns displaced depth scale.
     pub fn displace_water(&mut self, x: f32, z: f32, forward: Vec3, amount: f32) {
         let Some(idx) = self.idx_at(x, z) else {
@@ -2789,6 +2931,7 @@ impl SoilField {
         push_f32s(&mut out, &self.tread_amp);
         push_f32s(&mut out, &self.tread_ang);
         push_f32s(&mut out, &self.tread_lat);
+        push_f32s(&mut out, &self.slurry);
         out
     }
 
@@ -2816,19 +2959,26 @@ impl SoilField {
         let rest = read_f32s(bytes, &mut i, n)?;
         let kind = read_u8s(bytes, &mut i, n)?;
         let passes = read_u8s(bytes, &mut i, n)?;
-        let (tread_amp, tread_ang, tread_lat) = if i == bytes.len() {
-            (vec![0.0; n], vec![0.0; n], vec![0.0; n])
-        } else if bytes.len() - i == n * 12 {
+        let remain = bytes.len() - i;
+        let (tread_amp, tread_ang, tread_lat, slurry) = if remain == 0 {
+            (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n])
+        } else if remain == n * 12 {
             let tread_amp = read_f32s(bytes, &mut i, n)?;
             let tread_ang = read_f32s(bytes, &mut i, n)?;
             let tread_lat = read_f32s(bytes, &mut i, n)?;
-            (tread_amp, tread_ang, tread_lat)
+            (tread_amp, tread_ang, tread_lat, vec![0.0; n])
+        } else if remain == n * 16 {
+            let tread_amp = read_f32s(bytes, &mut i, n)?;
+            let tread_ang = read_f32s(bytes, &mut i, n)?;
+            let tread_lat = read_f32s(bytes, &mut i, n)?;
+            let slurry = read_f32s(bytes, &mut i, n)?;
+            (tread_amp, tread_ang, tread_lat, slurry)
         } else {
             return Err("soil snapshot has trailing bytes".into());
         };
         let mut height = vec![0.0; n];
         for idx in 0..n {
-            height[idx] = bed[idx] + placed[idx];
+            height[idx] = bed[idx] + placed[idx] + slurry[idx];
         }
         Ok(Self {
             res,
@@ -2851,6 +3001,7 @@ impl SoilField {
             tread_ang,
             tread_lat,
             airborne: 0.0,
+            slurry,
         })
     }
 
@@ -3709,6 +3860,20 @@ pub struct PlowCut {
     pub thrown: f32,
 }
 
+/// Water plus soil, split into the solid, the free column, and the slurry.
+#[derive(Clone, Copy, Debug)]
+pub struct MixVolumes {
+    pub soil: f32,
+    pub water: f32,
+    pub slurry: f32,
+}
+
+impl MixVolumes {
+    pub fn total(self) -> f32 {
+        self.soil + self.water + self.slurry
+    }
+}
+
 /// Cut soil against the pile that received it.
 #[derive(Clone, Copy, Debug)]
 pub struct SoilVolumes {
@@ -4512,7 +4677,7 @@ mod tests {
     }
 
     /// Bed depth and placed volume of one force pass on the wet-clay pad.
-    /// The mesh height is `bed + placed` on every column.
+    /// The mesh height is `bed + placed + slurry` on every column.
     fn force_pass(normal: f32, push: f32) -> (f32, f32, f32) {
         let mut soil = SoilField::mud_pad();
         let kind = SurfaceKind::WetMud;
@@ -4526,7 +4691,7 @@ mod tests {
             push,
         );
         for i in 0..soil.height.len() {
-            let field = soil.bed[i] + soil.placed[i];
+            let field = soil.bed[i] + soil.placed[i] + soil.slurry[i];
             assert!(
                 (soil.height[i] - field).abs() < 1.0e-5,
                 "mesh height left the field at {i}: {:.5} vs {:.5}",
@@ -5306,9 +5471,165 @@ mod tests {
             "reload dropped the tread height"
         );
         assert!((loaded.tread_ang[idx] - soil.tread_ang[idx]).abs() < 1.0e-6);
-        let legacy_len = saved.len() - soil.res * soil.res * 12;
+        let cells = soil.res * soil.res;
+        let legacy_len = saved.len() - cells * 16;
         let legacy = SoilField::load_state(&saved[..legacy_len]).expect("old snapshot");
         assert_eq!(legacy.tread_amp[idx], 0.0);
+        assert_eq!(legacy.slurry[idx], 0.0);
         assert!((legacy.bed[idx] - soil.bed[idx]).abs() < 1.0e-6);
+        let prior = SoilField::load_state(&saved[..saved.len() - cells * 4]).expect("pre-slurry");
+        assert_eq!(prior.slurry[idx], 0.0);
+        assert!((prior.tread_amp[idx] - amp).abs() < 1.0e-6);
+        assert!((loaded.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn slurry_mix_conserves_volume_and_kinds_differ_at_one_moisture() {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let clay_v = slurry_viscosity(SurfaceKind::WetMud, moisture);
+        let silt_v = slurry_viscosity(SurfaceKind::Silt, moisture);
+        let sand_v = slurry_viscosity(SurfaceKind::Sand, moisture);
+        assert!(
+            clay_v > silt_v * 1.5,
+            "clay {clay_v:.2} should be thicker than silt {silt_v:.2}"
+        );
+        assert!(
+            silt_v > sand_v * 1.5,
+            "silt {silt_v:.2} should be thicker than sand {sand_v:.2}"
+        );
+        let stiff = slurry_viscosity(SurfaceKind::WetMud, 0.30);
+        let thin = slurry_viscosity(SurfaceKind::WetMud, 0.85);
+        assert!(
+            stiff > clay_v && clay_v > thin,
+            "clay viscosity should fall as moisture rises, {stiff:.2} {clay_v:.2} {thin:.2}"
+        );
+        eprintln!(
+            "slurry viscosity at moisture {moisture:.2}  clay {clay_v:.2} Pa·s  silt {silt_v:.2} Pa·s  sand {sand_v:.2} Pa·s"
+        );
+
+        let mut soil = SoilField::mud_pad();
+        let water = 0.08_f32;
+        let clay_n = paint_mix(&mut soil, -3.2, -2.2, -0.8, 0.8, SurfaceKind::WetMud, moisture, water, 0.08, false);
+        let silt_n = paint_mix(&mut soil, -0.6, 0.6, -0.8, 0.8, SurfaceKind::Silt, moisture, water, 0.07, true);
+        let sand_n = paint_mix(&mut soil, 2.2, 3.2, -0.8, 0.8, SurfaceKind::Sand, moisture, water, 0.06, false);
+        let flat_n = paint_mix(&mut soil, 5.0, 5.6, -0.4, 0.4, SurfaceKind::WetMud, moisture, water, 0.0, false);
+        let gravel_n = paint_mix(&mut soil, 6.6, 7.4, -0.6, 0.6, SurfaceKind::Gravel, moisture, water, 0.07, true);
+        assert!(clay_n > 8 && silt_n > 8 && sand_n > 8 && flat_n > 2 && gravel_n > 4);
+
+        let before = soil.mix_volumes();
+        let clay_i = soil.idx_at(-2.7, 0.0).expect("clay");
+        let silt_i = soil.idx_at(0.0, 0.0).expect("silt");
+        let sand_i = soil.idx_at(2.7, 0.0).expect("sand");
+        let flat_i = soil.idx_at(5.3, 0.0).expect("flat");
+        let gravel_i = soil.idx_at(7.0, 0.0).expect("gravel");
+        let beds = [
+            soil.bed[clay_i],
+            soil.bed[silt_i],
+            soil.bed[sand_i],
+        ];
+        soil.mix_slurry();
+        let after = soil.mix_volumes();
+        eprintln!(
+            "slurry volumes before  soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+            before.soil, before.water, before.slurry, before.total()
+        );
+        eprintln!(
+            "slurry volumes after   soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+            after.soil, after.water, after.slurry, after.total()
+        );
+        assert!(
+            (after.total() - before.total()).abs() < 1.0e-3,
+            "water plus soil drifted {:.6} -> {:.6}",
+            before.total(),
+            after.total()
+        );
+        let soil_left = before.soil - after.soil;
+        let water_left = before.water - after.water;
+        assert!(soil_left > 1.0e-4, "no soil entered the slurry");
+        assert!(water_left > 1.0e-4, "no water entered the slurry");
+        assert!(
+            (after.slurry - (soil_left + water_left)).abs() < 1.0e-3,
+            "slurry {:.4} is not the soil {:.4} plus the water {:.4}",
+            after.slurry,
+            soil_left,
+            water_left
+        );
+
+        let expect = slurry_soil_depth(water, moisture);
+        for (idx, bed0, name) in [
+            (clay_i, beds[0], "clay"),
+            (silt_i, beds[1], "silt"),
+            (sand_i, beds[2], "sand"),
+        ] {
+            assert!(
+                soil.water[idx] < 1.0e-6,
+                "{name} still has a water column {:.4}",
+                soil.water[idx]
+            );
+            let joined = bed0 - soil.bed[idx];
+            assert!(
+                (joined - expect).abs() < 1.0e-4,
+                "{name} soil {:.4} m is not the moisture depth {:.4}",
+                joined,
+                expect
+            );
+            assert!(
+                (soil.slurry[idx] - (joined + water)).abs() < 1.0e-4,
+                "{name} slurry is not one body"
+            );
+            let h = soil.bed[idx] + soil.placed[idx] + soil.slurry[idx];
+            assert!((soil.height[idx] - h).abs() < 1.0e-5, "{name} mesh is a second surface");
+            let mix_m = water / soil.slurry[idx];
+            assert!(
+                (mix_m - moisture).abs() < 1.0e-3,
+                "{name} moisture {mix_m:.3} left {moisture:.3}"
+            );
+        }
+        assert!(
+            (soil.water[flat_i] - water).abs() < 1.0e-6 && soil.slurry[flat_i] == 0.0,
+            "flat water mixed without a rut or a hole"
+        );
+        assert!(
+            (soil.water[gravel_i] - water).abs() < 1.0e-6 && soil.slurry[gravel_i] == 0.0,
+            "gravel became a slurry"
+        );
+    }
+
+    fn paint_mix(
+        soil: &mut SoilField,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        kind: SurfaceKind,
+        moisture: f32,
+        water: f32,
+        dig: f32,
+        hole: bool,
+    ) -> usize {
+        let half = soil.size * 0.5;
+        let mut n = 0usize;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                soil.kind[idx] = kind as u8;
+                soil.wetness[idx] = moisture;
+                soil.water[idx] = water;
+                if dig > 0.0 {
+                    soil.bed[idx] -= dig;
+                    if hole {
+                        soil.initial_height[idx] -= dig;
+                    }
+                }
+                soil.sync(idx);
+                n += 1;
+            }
+        }
+        n
     }
 }
