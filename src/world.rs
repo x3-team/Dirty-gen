@@ -4,10 +4,14 @@ use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
-use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
+use crate::patch::SIDEWALL_VOLUME;
+use crate::soil::{
+    on_launch_crest, stick_scale, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
+};
 use crate::vehicle::{
     hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
     PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
+    WHEEL_WIDTH,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +68,12 @@ pub struct World {
     air_time: f32,
     impact_latched: bool,
     did_launch: bool,
+    spawn_pos: Vec3,
+    spawn_yaw: f32,
+    bike_spawn: Vec3,
+    bike_spawn_yaw: f32,
+    /// Cubic metres of sidewall coat that landed back in a rut.
+    pub coat_in_rut: f32,
 }
 
 /// Wheels on one side of the axle, averaged into a single groove.
@@ -137,11 +147,17 @@ impl World {
             air_time: 0.0,
             impact_latched: false,
             did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::ZERO,
+            bike_spawn_yaw: 0.0,
+            coat_in_rut: 0.0,
         };
         world.place_on_soil();
         for _ in 0..120 {
             world.step(1.0 / 60.0, &Input::default());
         }
+        world.restore_sidewall_skim();
         world.vehicle.clear_loose_mud();
         world.particles.clear();
         world.time = 0.0;
@@ -150,14 +166,25 @@ impl World {
             ..Telemetry::default()
         };
         world.drip_acc = 0.0;
+        world.coat_in_rut = 0.0;
         world.bike.place_on(&world.soil);
+        world.remember_spawn();
         world
     }
 
     /// Uniform flat pad. `wetness` 0 is firm, 1 is deep mud. No puddle.
     pub fn flat(wetness: f32) -> Self {
+        Self::rest(SoilField::flat(wetness))
+    }
+
+    /// Niva settled across wet clay and gravel. The bed starts flat.
+    pub fn surface_split() -> Self {
+        Self::rest(SoilField::surface_split())
+    }
+
+    fn rest(soil: SoilField) -> Self {
         let mut world = Self {
-            soil: SoilField::flat(wetness),
+            soil,
             vehicle: Vehicle::new(),
             bike: Bike::new(),
             particles: Particles::new(),
@@ -171,6 +198,11 @@ impl World {
             air_time: 0.0,
             impact_latched: false,
             did_launch: false,
+            spawn_pos: Vec3::ZERO,
+            spawn_yaw: 0.0,
+            bike_spawn: Vec3::ZERO,
+            bike_spawn_yaw: 0.0,
+            coat_in_rut: 0.0,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -178,14 +210,58 @@ impl World {
         for _ in 0..90 {
             world.step(1.0 / 60.0, &Input::default());
         }
+        world.restore_sidewall_skim();
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.coat_in_rut = 0.0;
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
             ..Telemetry::default()
         };
+        world.remember_spawn();
         world
+    }
+
+    fn remember_spawn(&mut self) {
+        self.spawn_pos = self.vehicle.pos;
+        self.spawn_yaw = self.vehicle.yaw;
+        self.bike_spawn = self.bike.pos;
+        self.bike_spawn_yaw = self.bike.yaw;
+    }
+
+    /// Put both vehicles back on their start poses. The heightfield, the
+    /// berm, and any mud still in the air stay where they are.
+    pub fn reset_vehicle(&mut self) {
+        self.vehicle = Vehicle::new();
+        self.vehicle.pos = self.spawn_pos;
+        self.vehicle.yaw = self.spawn_yaw;
+        self.place_on_soil();
+        self.bike = Bike::new();
+        self.bike.pos.x = self.bike_spawn.x;
+        self.bike.pos.z = self.bike_spawn.z;
+        self.bike.yaw = self.bike_spawn_yaw;
+        self.bike.place_on(&self.soil);
+        self.crest_armed = false;
+        self.air_time = 0.0;
+        self.impact_latched = false;
+        self.did_launch = false;
+        self.drip_acc = 0.0;
+    }
+
+    /// The spawn settle can pack a coat. That is not a shed. Put the skim
+    /// back into the loose smear so the parking step does not delete it
+    /// and does not leave a pile that the cutter did not make.
+    fn restore_sidewall_skim(&mut self) {
+        for i in 0..4 {
+            let vol = self.vehicle.wheels[i].sidewall.clamp(0.0, 1.0) * SIDEWALL_VOLUME;
+            if vol > 1.0e-8 {
+                let center = self.vehicle.pos
+                    + self.vehicle.orientation() * self.vehicle.wheel_center_local(i);
+                self.soil.give_loose(center, vol);
+            }
+            self.vehicle.wheels[i].sidewall = 0.0;
+        }
     }
 
     fn place_on_soil(&mut self) {
@@ -270,6 +346,15 @@ impl World {
                 dt,
                 false,
             );
+            // The lug negative is a record of this contact. It does not cut.
+            self.soil.imprint_tread(
+                c.wheel_center,
+                c.forward,
+                c.right,
+                WHEEL_RADIUS,
+                crate::vehicle::WHEEL_WIDTH,
+                c.sinkage,
+            );
             // One groove per side of the axle. Front and rear share it, so a
             // turn does not chew a second slot into the berm.
             sides[c.index % 2].add(c.wheel_center, c.forward, c.right, c.sinkage, slip_stamp);
@@ -291,7 +376,47 @@ impl World {
         let planted = contacts.iter().filter(|c| c.active).count();
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
-        self.vehicle.step_adhesion(&contacts, dt);
+        let tread = self.vehicle.step_adhesion(&contacts, dt);
+        for c in &contacts {
+            if !c.active {
+                continue;
+            }
+            let step = tread[c.index];
+            if step.picked > 1.0e-7 {
+                let want = step.picked * SIDEWALL_VOLUME;
+                let got = self.soil.take_loose(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    c.patch_length.max(0.08),
+                    WHEEL_WIDTH,
+                    want,
+                );
+                if want - got > 1.0e-8 {
+                    let short = (want - got) / SIDEWALL_VOLUME;
+                    let w = &mut self.vehicle.wheels[c.index];
+                    w.sidewall = (w.sidewall - short).max(0.0);
+                }
+            }
+            if step.shed > 1.0e-7 {
+                let vol = step.shed * SIDEWALL_VOLUME;
+                let land = self.soil.return_coat(c.wheel_center, c.forward, c.right, vol);
+                self.coat_in_rut += land.in_rut;
+            }
+        }
+        for c in &contacts {
+            if c.active && c.squeeze > 0.02 {
+                // Loose smear only. The cut still lands on the berm.
+                self.soil.skim_loose(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    c.patch_length.max(0.08),
+                    crate::vehicle::WHEEL_WIDTH,
+                    c.squeeze * 0.0025 * dt,
+                );
+            }
+        }
 
         let speed = self.vehicle.speed();
         for c in &contacts {
@@ -483,7 +608,8 @@ fn stick_impact_mud(vehicle: &mut Vehicle, soil: &SoilField) {
         let world = vehicle.pos + ori * local;
         let sample = soil.sample(world.x, world.z);
         if world.y < vehicle.pos.y + 0.05 || world.y < sample.height + 0.55 {
-            let add = 0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0);
+            let add = (0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0))
+                * stick_scale(sample.kind(), sample.wetness);
             let p = &mut vehicle.panels[panel];
             p.mass = (p.mass + add).min(PANEL_MUD_CAP);
             p.wet = (p.wet + 0.7).min(1.0);
@@ -698,6 +824,110 @@ fn closest_s(pos: Vec3) -> f32 {
         }
     }
     s.rem_euclid(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle::{MASS, WHEEL_RADIUS};
+
+    #[test]
+    fn hubs_sit_on_the_solver_sink() {
+        let world = World::flat(0.72);
+        let mut support = 0.0_f32;
+        for i in 0..4 {
+            let w = world.vehicle.wheels[i];
+            let center =
+                world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+            let h = world.soil.sample(center.x, center.z).height;
+            let bottom = center.y - WHEEL_RADIUS;
+            let seat = h - w.sinkage;
+            assert!(w.normal > 200.0, "wheel {i} is not supporting the body");
+            assert!(w.sinkage > 0.02 && w.sinkage < 0.09, "wheel {i} sink {}", w.sinkage);
+            assert!(
+                (bottom - seat).abs() < 0.002,
+                "wheel {i} hub is not on soil-sink, bottom {bottom:.4} soil-sink {seat:.4} sink {:.4}",
+                w.sinkage
+            );
+            assert!(
+                (center.y - (seat + WHEEL_RADIUS)).abs() < 0.002,
+                "wheel {i} hub {:.4} is off the seat {:.4}",
+                center.y,
+                seat + WHEEL_RADIUS
+            );
+            support += w.normal;
+        }
+        let weight = MASS * 9.81;
+        assert!(
+            (support - weight).abs() < weight * 0.04,
+            "support {support:.0} N does not match weight {weight:.0} N"
+        );
+        let (n, amp) = world.soil.tread_imprint_stats();
+        assert!(n > 0 && amp > 0.01, "settle did not leave a tread negative");
+        let saved = world.soil.save_state();
+        let loaded = crate::soil::SoilField::load_state(&saved).expect("reload");
+        let (n2, amp2) = loaded.tread_imprint_stats();
+        assert_eq!(n2, n);
+        assert!((amp2 - amp).abs() < 1.0e-5, "the imprint did not survive reload");
+    }
+
+    #[test]
+    fn niva_sinks_on_two_surfaces() {
+        use crate::soil::SurfaceKind;
+
+        let world = World::surface_split();
+        let mut clay_sink = 0.0_f32;
+        let mut clay_n = 0.0_f32;
+        let mut gravel_sink = 0.0_f32;
+        let mut gravel_n = 0.0_f32;
+        for i in 0..4 {
+            let w = world.vehicle.wheels[i];
+            let center = world.vehicle.pos
+                + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+            let sample = world.soil.sample(center.x, center.z);
+            let bottom = center.y - WHEEL_RADIUS;
+            let seat = sample.height - w.sinkage;
+            assert!(w.normal > 200.0, "wheel {i} is not supporting the body");
+            assert!(
+                (bottom - seat).abs() < 0.002,
+                "wheel {i} hub is not on soil-sink, bottom {bottom:.4} soil-sink {seat:.4}"
+            );
+            match sample.kind() {
+                SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay => {
+                    clay_sink += w.sinkage;
+                    clay_n += 1.0;
+                }
+                SurfaceKind::Gravel => {
+                    gravel_sink += w.sinkage;
+                    gravel_n += 1.0;
+                }
+                other => panic!("wheel {i} left its surface, kind {other:?} at {center:?}"),
+            }
+            eprintln!(
+                "split wheel {i} kind {:?} sink {:.4} m x {:.2}",
+                sample.kind(),
+                w.sinkage,
+                center.x
+            );
+        }
+        assert_eq!(clay_n, 2.0, "the clay side lost a tire");
+        assert_eq!(gravel_n, 2.0, "the gravel side lost a tire");
+        let clay = clay_sink / clay_n;
+        let gravel = gravel_sink / gravel_n;
+        assert!(
+            clay > gravel + 0.015,
+            "the two surfaces sank the same, clay {clay:.4} gravel {gravel:.4}"
+        );
+        let v = world.soil.volumes();
+        assert!(
+            (v.cut - v.placed).abs() < v.cut * 0.02 + 1.0e-5,
+            "split settle broke cut = placed, cut {} placed {}",
+            v.cut,
+            v.placed
+        );
+        let (n, amp) = world.soil.tread_imprint_stats();
+        assert!(n > 0 && amp > 0.01, "the clay contact left no tread height");
+    }
 }
 
 fn wrap_pi(mut a: f32) -> f32 {
