@@ -1563,10 +1563,41 @@ fn roll_camera(world: &World) -> CameraPose {
     let yaw = world.vehicle.yaw;
     let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // The settled Niva sits beside the furrow. A wide shot on the body
+    // leaves the trench and the ridge as a wrinkle in bare ground.
+    let soil = &world.soil;
+    let half = soil.size * 0.5;
+    let mut sx = 0.0_f32;
+    let mut sz = 0.0_f32;
+    let mut sw = 0.0_f32;
+    for idx in 0..soil.placed.len() {
+        let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+        let placed = soil.placed[idx];
+        let w = depth.max(placed);
+        if w < 0.05 {
+            continue;
+        }
+        let i = idx % soil.res;
+        let j = idx / soil.res;
+        sx += ((i as f32 + 0.5) * soil.cell - half) * w;
+        sz += ((j as f32 + 0.5) * soil.cell - half) * w;
+        sw += w;
+    }
     let p = world.vehicle.pos;
-    let look = Vec3::new(p.x * 0.42, 0.2, p.z * 0.42);
-    let eye = look + fwd * 4.6 - right * 1.1 + Vec3::Y * 2.15;
-    let ortho = 7.2;
+    let focus = if sw > 1.0e-4 {
+        Vec3::new(sx / sw, 0.0, sz / sw)
+    } else {
+        p
+    };
+    let look = Vec3::new(
+        focus.x * 0.78 + p.x * 0.22,
+        0.08,
+        focus.z * 0.78 + p.z * 0.22,
+    );
+    // From the nose, low and close, so the trench and the ridge fill the
+    // ground beside the rolled Niva instead of sitting in a wide empty frame.
+    let eye = look + fwd * 2.85 - right * 0.55 + Vec3::Y * 0.92;
+    let ortho = 4.15;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
