@@ -64,6 +64,8 @@ pub struct Renderer {
     height_bg: wgpu::BindGroup,
     height_tex: wgpu::Texture,
     mat_tex: wgpu::Texture,
+    #[allow(dead_code)]
+    clay_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth: wgpu::Texture,
@@ -271,6 +273,22 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -420,6 +438,67 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let clay_levels = crate::clay::clay_mips(&crate::clay::clay_image());
+        let clay_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("clay"),
+            size: wgpu::Extent3d {
+                width: crate::clay::CLAY_RES,
+                height: crate::clay::CLAY_RES,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: clay_levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, (size, bytes)) in clay_levels.iter().enumerate() {
+            let row = size * 4;
+            let padded = row.div_ceil(256) * 256;
+            let upload: Vec<u8> = if padded == row {
+                bytes.clone()
+            } else {
+                let mut out = vec![0u8; (padded * size) as usize];
+                for y in 0..*size as usize {
+                    let src = y * row as usize;
+                    let dst = y * padded as usize;
+                    out[dst..dst + row as usize]
+                        .copy_from_slice(&bytes[src..src + row as usize]);
+                }
+                out
+            };
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &clay_tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &upload,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(*size),
+                },
+                wgpu::Extent3d {
+                    width: *size,
+                    height: *size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let clay_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("clay"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            anisotropy_clamp: 8,
+            ..Default::default()
+        });
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tex-bg"),
             layout: &tex_bgl,
@@ -443,6 +522,16 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(
+                        &clay_tex.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&clay_samp),
                 },
             ],
         });
@@ -712,6 +801,7 @@ impl Renderer {
             height_bg,
             height_tex,
             mat_tex,
+            clay_tex,
             color,
             color_view,
             depth,
@@ -821,6 +911,15 @@ impl Renderer {
         });
     }
 
+fn ground_pixel_hint(cam: CameraPose, width: u32, height: u32) -> f32 {
+    if let Some(ortho) = cam.ortho_width {
+        let elev = (cam.target - cam.eye).normalize().y.abs().max(0.22);
+        (ortho / width.max(1) as f32) / elev
+    } else {
+        -(2.0 * 23.0_f32.to_radians().tan() / height.max(1) as f32)
+    }
+}
+
     pub fn draw(
         &mut self,
         world: &World,
@@ -878,7 +977,7 @@ impl Renderer {
                 world.time,
                 SHADOW as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
-                0.0,
+                Self::ground_pixel_hint(cam, self.width, self.height),
             ],
         };
         self.queue
