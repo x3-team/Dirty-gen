@@ -53,6 +53,8 @@ struct Model {
 @group(3) @binding(4) var tire_nor: texture_2d<f32>;
 @group(3) @binding(5) var prop_tex: texture_2d<f32>;
 @group(3) @binding(6) var paint_samp: sampler;
+@group(3) @binding(7) var flora_tex: texture_2d<f32>;
+@group(3) @binding(8) var niva_tex: texture_2d<f32>;
 
 fn hash12(p: vec2<f32>) -> f32 {
     let h = dot(p, vec2<f32>(127.1, 311.7));
@@ -159,7 +161,7 @@ fn shade(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough: f32, emit:
     col += frame.sun_color.rgb * spec * 0.7;
     col += emit;
     let dist = length(world - frame.cam_pos.xyz);
-    let fog = smoothstep(58.0, 150.0, dist);
+    let fog = smoothstep(96.0, 240.0, dist);
     let fog_col = frame.sky_horizon.rgb * 0.28 + frame.sky_zenith.rgb * 0.12;
     col = mix(col, fog_col, fog * 0.65);
     return col;
@@ -580,6 +582,36 @@ fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
     return o;
 }
 
+struct ShadowCutOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) depth: f32,
+    @location(1) uv: vec2<f32>,
+    @location(2) panel: f32,
+}
+
+@vertex
+fn vs_shadow_cut(in: MeshIn) -> ShadowCutOut {
+    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let clip = frame.light_vp * world;
+    var o: ShadowCutOut;
+    o.clip = clip;
+    o.depth = clip.z / max(clip.w, 1e-5);
+    o.uv = in.uv;
+    o.panel = in.panel;
+    return o;
+}
+
+@fragment
+fn fs_shadow_cut(in: ShadowCutOut) -> @location(0) vec4<f32> {
+    if (in.panel > 70.5 && in.panel < 71.5) {
+        let c = textureSample(flora_tex, paint_samp, in.uv);
+        if (c.a < 0.12) {
+            discard;
+        }
+    }
+    return encode_depth(in.depth);
+}
+
 @fragment
 fn fs_shadow(in: ShadowOut) -> @location(0) vec4<f32> {
     return encode_depth(in.depth);
@@ -630,11 +662,16 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     } else if (panel < 17.5) {
         return vec4<f32>(0.7, 0.02, 0.015, 0.2);
     } else if (panel < 40.5) {
-        let g = noise(world.xz * 0.35);
-        return vec4<f32>(vec3<f32>(0.055, 0.030, 0.016) * (0.85 + g * 0.25), 0.96);
+        // Skirt. Grass and dry dirt, so the square does not end in a dark void.
+        let g = noise(world.xz * 0.09);
+        let col = mix(vec3<f32>(0.15, 0.13, 0.07), vec3<f32>(0.20, 0.17, 0.09), g);
+        return vec4<f32>(col, 0.95);
     } else if (panel < 41.5) {
-        let g = noise(world.xz * 0.07);
-        return vec4<f32>(vec3<f32>(0.092, 0.048, 0.024) * (0.78 + g * 0.4), 0.97);
+        let g = noise(world.xz * 0.05);
+        let h = clamp(world.y / 3.4, 0.0, 1.0);
+        let dirt = vec3<f32>(0.17, 0.13, 0.07);
+        let grass = vec3<f32>(0.13, 0.16, 0.07);
+        return vec4<f32>(mix(dirt, grass, h) * (0.86 + g * 0.28), 0.95);
     } else if (panel < 42.5) {
         return vec4<f32>(vec3<f32>(0.07, 0.046, 0.028), 0.94);
     } else if (panel < 43.5) {
@@ -673,6 +710,26 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         }
         albedo = c.rgb * 0.8;
         rough = 0.84;
+    } else if (in.panel > 70.5 && in.panel < 71.5) {
+        let c = textureSample(flora_tex, paint_samp, in.uv);
+        if (c.a < 0.12) {
+            discard;
+        }
+        albedo = c.rgb;
+        rough = 0.78;
+    } else if (in.panel > 71.5 && in.panel < 72.5) {
+        let c = textureSampleLevel(niva_tex, paint_samp, in.uv, 0.0).rgb;
+        albedo = c.rgb;
+        rough = 0.48;
+        let ground = height_bilinear(in.world.xz);
+        let splash = smoothstep(0.62, 0.16, in.world.y - ground);
+        albedo = mix(albedo, vec3<f32>(0.07, 0.034, 0.016), splash * 0.62);
+        rough = mix(rough, 0.22, splash * 0.5);
+    } else if (in.panel > 72.5 && in.panel < 73.5) {
+        let c = textureSampleLevel(niva_tex, paint_samp, in.uv, 0.0).rgb;
+        albedo = mix(vec3<f32>(0.55, 0.74, 0.82), c, 0.35);
+        rough = 0.06;
+        alpha = 0.42;
     } else if (in.panel > 64.5 && in.panel < 65.5) {
         albedo = vec3<f32>(0.52, 0.77, 0.85);
         rough = 0.06;

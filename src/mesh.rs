@@ -746,8 +746,8 @@ fn hash(n: u32) -> f32 {
 fn add_horizon(mesh: &mut CpuMesh) {
     let segs = 72usize;
     let rings = 7usize;
-    let r0 = 26.0;
-    let r1 = 58.0;
+    let r0 = 48.0;
+    let r1 = 86.0;
     let mut crest = vec![0.0_f32; segs];
     for i in 0..segs {
         let a = hash(i as u32 * 17 + 3);
@@ -792,8 +792,8 @@ pub fn environment_mesh() -> CpuMesh {
     let mut m = CpuMesh::new();
     let y = -0.02;
     // Skirt outside the 40 m heightfield so the world does not end in a void.
-    let far = 78.0;
-    let edge = 20.0;
+    let far = 96.0;
+    let edge = 31.6;
     add_quad(
         &mut m,
         [

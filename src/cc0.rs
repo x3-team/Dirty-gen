@@ -3,10 +3,9 @@
 
 use std::collections::HashMap;
 
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use image::imageops::FilterType;
-use silt::soil::{track_offset, MAP_SIZE};
-use silt::world::World;
+use silt::course;
 
 use crate::mesh::{CpuMesh, MeshVertex};
 
@@ -16,31 +15,6 @@ const SRC_DIM: u32 = 512;
 const BUGGY_DIM: u32 = 1024;
 
 const BUGGY_GLB: &[u8] = include_bytes!("../assets/vehicle/dune-buggy.glb");
-
-struct PropBytes {
-    name: &'static str,
-    bytes: &'static [u8],
-    scale: f32,
-}
-
-const PROPS: &[PropBytes] = &[
-    PropBytes { name: "TreeHigh001", bytes: include_bytes!("../assets/env/TreeHigh001.glb"), scale: 0.0065 },
-    PropBytes { name: "TreeHigh002", bytes: include_bytes!("../assets/env/TreeHigh002.glb"), scale: 0.0065 },
-    PropBytes { name: "TreeHigh003", bytes: include_bytes!("../assets/env/TreeHigh003.glb"), scale: 0.0062 },
-    PropBytes { name: "TreeMed001", bytes: include_bytes!("../assets/env/TreeMed001.glb"), scale: 0.0080 },
-    PropBytes { name: "TreeMed002", bytes: include_bytes!("../assets/env/TreeMed002.glb"), scale: 0.0076 },
-    PropBytes { name: "TreeMed003", bytes: include_bytes!("../assets/env/TreeMed003.glb"), scale: 0.0072 },
-    PropBytes { name: "TreeLow001", bytes: include_bytes!("../assets/env/TreeLow001.glb"), scale: 0.010 },
-    PropBytes { name: "TreeLow002", bytes: include_bytes!("../assets/env/TreeLow002.glb"), scale: 0.010 },
-    PropBytes { name: "TreeLow003", bytes: include_bytes!("../assets/env/TreeLow003.glb"), scale: 0.0095 },
-    PropBytes { name: "TreeLow004", bytes: include_bytes!("../assets/env/TreeLow004.glb"), scale: 0.0090 },
-    PropBytes { name: "Rock001", bytes: include_bytes!("../assets/env/Rock001.glb"), scale: 0.0045 },
-    PropBytes { name: "Rock002", bytes: include_bytes!("../assets/env/Rock002.glb"), scale: 0.0042 },
-    PropBytes { name: "Rock003", bytes: include_bytes!("../assets/env/Rock003.glb"), scale: 0.0040 },
-    PropBytes { name: "Grass001", bytes: include_bytes!("../assets/env/Grass001.glb"), scale: 0.0022 },
-    PropBytes { name: "Grass002", bytes: include_bytes!("../assets/env/Grass002.glb"), scale: 0.0024 },
-    PropBytes { name: "Grass003", bytes: include_bytes!("../assets/env/Grass003.glb"), scale: 0.0020 },
-];
 
 const PROP_ATLAS: &[u8] = include_bytes!("../assets/env/Grass001.glb");
 
@@ -320,8 +294,8 @@ fn bake_ground(maps: &[GroundMaps]) -> (RgbaTex, RgbaTex, RgbaTex) {
     let tiles = [3.2f32, 2.7, 3.5, 2.3, 3.3];
     for j in 0..GROUND_RES {
         for i in 0..GROUND_RES {
-            let x = (i as f32 + 0.5) / GROUND_RES as f32 * MAP_SIZE - MAP_SIZE * 0.5;
-            let z = (j as f32 + 0.5) / GROUND_RES as f32 * MAP_SIZE - MAP_SIZE * 0.5;
+            let x = (i as f32 + 0.5) / GROUND_RES as f32 * course::SIZE - course::SIZE * 0.5;
+            let z = (j as f32 + 0.5) / GROUND_RES as f32 * course::SIZE - course::SIZE * 0.5;
             let w = weights(x, z);
             for k in 0..5 {
                 sum_w[k] += w[k];
@@ -428,58 +402,7 @@ fn u8f(v: f32) -> u8 {
 }
 
 fn weights(x: f32, z: f32) -> [f32; 5] {
-    let off = track_offset(x, z);
-    let lane = smooth(1.55, 0.15, off.abs());
-    let berm = smooth(0.45, 1.55, off.abs()) * smooth(3.8, 2.05, off.abs());
-    let infield = smooth(0.2, -2.6, off);
-    let outside = smooth(2.15, 5.2, off.abs());
-    let far = smooth(7.2, 13.5, (x * x + z * z).sqrt());
-    let bog = {
-        let d = (x * x + (z - 1.05).powi(2)).sqrt() / 4.2;
-        smooth(1.2, 0.35, d)
-    };
-    let mut puddle = 0.0f32;
-    for (cx, cz, rx, rz) in [(-6.15, 5.05, 2.35, 2.55), (6.35, 2.4, 2.3, 1.8), (1.15, 9.25, 2.15, 2.05)]
-    {
-        let d = (((x - cx) / rx).powi(2) + ((z - cz) / rz).powi(2)).sqrt();
-        puddle = puddle.max(smooth(1.25, 0.35, d));
-    }
-    let wet_soil = lane.max(bog).max(puddle);
-    let n = value_noise(x * 0.16, z * 0.16);
-    let n2 = value_noise(x * 0.07 + 4.2, z * 0.07 - 1.5);
-    let clay_n = smooth(0.54, 0.74, n);
-    let rock_n = smooth(0.50, 0.72, n2);
-    let mud = wet_soil;
-    let dry = berm * (1.0 - clay_n * 0.8) * (1.0 - wet_soil);
-    let clay = (berm * 0.95 + infield * 0.4 + outside * 0.28) * clay_n * (1.0 - wet_soil * 0.9);
-    let grass = (infield * 0.95 + outside * 0.9) * (1.0 - clay_n * 0.5) * (1.0 - wet_soil) * (1.0 - far * 0.55);
-    let mut rock = (far * 0.95 + outside * rock_n * 0.7 + berm * rock_n * 0.2) * (1.0 - wet_soil);
-    rock = rock.max(smooth(8.5, 13.0, x.abs().max((z - 1.2).abs())) * 0.85 * (1.0 - wet_soil));
-    let sum = (mud + dry + clay + grass + rock).max(1e-4);
-    [mud / sum, dry / sum, clay / sum, grass / sum, rock / sum]
-}
-
-fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn value_noise(x: f32, z: f32) -> f32 {
-    let x0 = x.floor();
-    let z0 = z.floor();
-    let fx = x - x0;
-    let fz = z - z0;
-    let ux = fx * fx * (3.0 - 2.0 * fx);
-    let uz = fz * fz * (3.0 - 2.0 * fz);
-    let h = |x: f32, z: f32| -> f32 {
-        let s = (x * 127.1 + z * 311.7).sin() * 43758.5453;
-        s - s.floor()
-    };
-    let a = h(x0, z0);
-    let b = h(x0 + 1.0, z0);
-    let c = h(x0, z0 + 1.0);
-    let d = h(x0 + 1.0, z0 + 1.0);
-    a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz
+    course::blend(x, z)
 }
 
 fn load_buggy() -> (CpuMesh, CpuMesh, [CpuMesh; 4]) {
@@ -653,136 +576,26 @@ fn append_mesh(dst: &mut CpuMesh, mesh: &gltf::Mesh, blob: &[u8], node: Mat4, mi
 }
 
 fn place_props() -> CpuMesh {
-    let soil = World::demo().soil;
+    // Gobkit meshes stay on disk. The course forest is the photoreal kits.
     let mut mesh = CpuMesh::new();
-    let by_name = |name: &str| -> &PropBytes {
-        PROPS
-            .iter()
-            .find(|p| p.name == name)
-            .unwrap_or_else(|| panic!("prop {name}"))
-    };
-    let trees = [
-        ("TreeHigh001", -12.2, 0.4),
-        ("TreeHigh002", 12.4, 1.2),
-        ("TreeHigh003", -1.2, 14.4),
-        ("TreeMed001", -11.8, 7.2),
-        ("TreeMed002", 12.0, -6.4),
-        ("TreeMed003", 2.8, -12.6),
-        ("TreeLow001", -13.2, -4.4),
-        ("TreeLow002", 13.4, 6.6),
-        ("TreeLow003", -8.8, -10.8),
-        ("TreeLow004", 7.2, 13.4),
-        ("TreeMed001", -5.2, 13.8),
-        ("TreeLow002", 10.8, -10.4),
-    ];
-    for (i, (name, x, z)) in trees.iter().enumerate() {
-        let (x, z) = push_out(*x, *z, 3.3);
-        let h = soil.sample(x, z).height;
-        let prop = by_name(name);
-        append_prop(&mut mesh, prop.bytes, x, h, z, hash01(i as u32 * 9 + 2) * std::f32::consts::TAU, prop.scale);
-    }
-    let rocks = [
-        ("Rock001", -9.4, 1.6),
-        ("Rock002", 9.3, 2.8),
-        ("Rock003", -2.4, -10.0),
-        ("Rock001", 3.6, 12.2),
-        ("Rock002", -11.2, -5.6),
-        ("Rock003", 10.8, 8.4),
-        ("Rock001", 1.4, -11.4),
-        ("Rock002", -9.0, 9.6),
-        ("Rock003", 8.6, -8.8),
-    ];
-    for (i, (name, x, z)) in rocks.iter().enumerate() {
-        let (x, z) = push_out(*x, *z, 2.15);
-        let h = soil.sample(x, z).height;
-        let prop = by_name(name);
-        let scale = prop.scale * (0.85 + 0.3 * hash01(40 + i as u32));
-        append_prop(&mut mesh, prop.bytes, x, h, z, hash01(20 + i as u32) * std::f32::consts::TAU, scale);
-    }
-    let grasses = ["Grass001", "Grass002", "Grass003"];
-    let mut kept = 0u32;
-    let mut n = 0u32;
-    while kept < 52 && n < 500 {
-        let x = (hash01(n.wrapping_mul(3) + 11) * 2.0 - 1.0) * 15.5;
-        let z = (hash01(n.wrapping_mul(5) + 19) * 2.0 - 1.0) * 16.0 + 1.1;
-        n += 1;
-        let off = track_offset(x, z);
-        let bog = (x * x + (z - 1.05).powi(2)).sqrt();
-        if off.abs() < 1.85 || off.abs() > 8.2 || bog < 3.5 {
-            continue;
-        }
-        let h = soil.sample(x, z).height;
-        let name = grasses[(kept as usize) % grasses.len()];
-        let prop = by_name(name);
-        let scale = prop.scale * (0.75 + 0.5 * hash01(n + 70));
-        append_prop(
-            &mut mesh,
-            prop.bytes,
-            x,
-            h,
-            z,
-            hash01(n + 90) * std::f32::consts::TAU,
-            scale,
-        );
-        kept += 1;
-    }
+    mesh.vertices.push(MeshVertex {
+        pos: [0.0, -50.0, 0.0],
+        nrm: [0.0, 1.0, 0.0],
+        uv: [0.0, 0.0],
+        panel: 70.0,
+    });
+    mesh.vertices.push(MeshVertex {
+        pos: [0.02, -50.0, 0.0],
+        nrm: [0.0, 1.0, 0.0],
+        uv: [1.0, 0.0],
+        panel: 70.0,
+    });
+    mesh.vertices.push(MeshVertex {
+        pos: [0.0, -50.0, 0.02],
+        nrm: [0.0, 1.0, 0.0],
+        uv: [0.0, 1.0],
+        panel: 70.0,
+    });
+    mesh.indices.extend([0, 1, 2]);
     mesh
-}
-
-fn push_out(x: f32, z: f32, min_off: f32) -> (f32, f32) {
-    if track_offset(x, z).abs() >= min_off {
-        return (x, z);
-    }
-    let mut p = Vec2::new(x, z - 1.25);
-    if p.length() < 0.2 {
-        p = Vec2::new(1.0, 0.0);
-    }
-    for _ in 0..14 {
-        p *= 1.14;
-        let x = p.x;
-        let z = p.y + 1.25;
-        if track_offset(x, z).abs() >= min_off {
-            return (x, z);
-        }
-    }
-    (x, z)
-}
-
-fn hash01(n: u32) -> f32 {
-    let mut x = n.wrapping_mul(747796405).wrapping_add(2891336453);
-    x = (x >> 16) ^ x;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    (x & 0xffff) as f32 / 65535.0
-}
-
-fn append_prop(dst: &mut CpuMesh, glb: &[u8], x: f32, h: f32, z: f32, yaw: f32, scale: f32) {
-    let doc = gltf::Gltf::from_slice(glb).expect("prop glb");
-    let blob = doc.blob.as_deref().expect("prop bin");
-    let mut local = CpuMesh::new();
-    for node in doc.nodes() {
-        let Some(mesh) = node.mesh() else { continue };
-        append_mesh(&mut local, &mesh, blob, node_matrix(&node), false);
-    }
-    let min_y = local
-        .vertices
-        .iter()
-        .map(|v| v.pos[1])
-        .fold(f32::MAX, f32::min);
-    let q = Quat::from_rotation_y(yaw);
-    let base = dst.vertices.len() as u32;
-    for v in &local.vertices {
-        let p = Vec3::new(v.pos[0], v.pos[1] - min_y, v.pos[2]) * scale;
-        let p = Vec3::new(x, h, z) + q * p;
-        let n = q * Vec3::from(v.nrm);
-        dst.vertices.push(MeshVertex {
-            pos: p.to_array(),
-            nrm: n.normalize_or_zero().to_array(),
-            uv: v.uv,
-            panel: 70.0,
-        });
-    }
-    for idx in &local.indices {
-        dst.indices.push(base + idx);
-    }
 }
