@@ -238,6 +238,94 @@ fn stamp_bilinear(xz: vec2<f32>) -> f32 {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
+// Cells. Wide enough that a one-cell tyre lip becomes an S, narrow enough
+// that a flat rut floor stays within a few millimetres of the solver.
+const DRAW_SIGMA: f32 = 0.64;
+
+fn draw_gauss(d: f32) -> f32 {
+    let q = d / DRAW_SIGMA;
+    return exp(-0.5 * q * q);
+}
+
+struct DrawAxis {
+    w: array<f32, 5>,
+    dw: array<f32, 5>,
+};
+
+// Normalized gaussian and its derivative in index space. Radius 2 cells.
+// Kept in lockstep with `draw_axis` in mesh.rs tests.
+fn draw_axis(f: f32) -> DrawAxis {
+    var g: array<f32, 5>;
+    var dg: array<f32, 5>;
+    var sum = 0.0;
+    var dsum = 0.0;
+    let inv_s2 = 1.0 / (DRAW_SIGMA * DRAW_SIGMA);
+    for (var i = 0; i < 5; i++) {
+        let d = f - (f32(i) - 2.0);
+        let gi = draw_gauss(d);
+        let dgi = gi * (-d * inv_s2);
+        g[i] = gi;
+        dg[i] = dgi;
+        sum += gi;
+        dsum += dgi;
+    }
+    var ax: DrawAxis;
+    let inv = 1.0 / sum;
+    let inv2 = inv * inv;
+    for (var i = 0; i < 5; i++) {
+        ax.w[i] = g[i] * inv;
+        ax.dw[i] = (dg[i] * sum - g[i] * dsum) * inv2;
+    }
+    return ax;
+}
+
+fn height_draw(xz: vec2<f32>) -> f32 {
+    let ij = world_to_ij(xz);
+    let o = vec2<i32>(floor(ij));
+    let fx = draw_axis(fract(ij).x);
+    let fz = draw_axis(fract(ij).y);
+    var h = 0.0;
+    for (var j = 0; j < 5; j++) {
+        var row = 0.0;
+        for (var i = 0; i < 5; i++) {
+            row += fx.w[i] * height_at(o + vec2<i32>(i - 2, j - 2));
+        }
+        h += fz.w[j] * row;
+    }
+    return h;
+}
+
+// xy: dh/dx, dh/dz in metres. zw: stamp slope, same kernel, same units.
+fn draw_grads(xz: vec2<f32>) -> vec4<f32> {
+    let ij = world_to_ij(xz);
+    let o = vec2<i32>(floor(ij));
+    let fx = draw_axis(fract(ij).x);
+    let fz = draw_axis(fract(ij).y);
+    let cell = max(frame.params.z, 1e-4);
+    var dhdx = 0.0;
+    var dhdz = 0.0;
+    var dsdx = 0.0;
+    var dsdz = 0.0;
+    for (var j = 0; j < 5; j++) {
+        var row_h = 0.0;
+        var row_s = 0.0;
+        var drow_h = 0.0;
+        var drow_s = 0.0;
+        for (var i = 0; i < 5; i++) {
+            let hs = load_height_stamp(o + vec2<i32>(i - 2, j - 2));
+            row_h += fx.w[i] * hs.x;
+            row_s += fx.w[i] * hs.y;
+            drow_h += fx.dw[i] * hs.x;
+            drow_s += fx.dw[i] * hs.y;
+        }
+        dhdx += fz.w[j] * drow_h;
+        dsdx += fz.w[j] * drow_s;
+        dhdz += fz.dw[j] * row_h;
+        dsdz += fz.dw[j] * row_s;
+    }
+    return vec4<f32>(dhdx, dhdz, dsdx, dsdz) / cell;
+}
+
 // Same samples as height_bilinear, but the step sits in a short wall.
 // A linear blend across a 20 cm cell shades a 10 cm rut as a tint.
 fn height_sharp(xz: vec2<f32>) -> f32 {
@@ -266,73 +354,260 @@ fn mat_bilinear(xz: vec2<f32>) -> vec4<f32> {
     return mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y);
 }
 
-// Continuous slope of the real displaced height. Not the triangle normal,
-// which is constant across a 20 cm cell and flattens a 14 cm groove.
-fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
-    // Short step. A wider sample flattens a tyre-width cut into the lane slope.
-    let e = max(frame.params.z * 0.28, 0.05);
-    let h_l = height_bilinear(xz - vec2<f32>(e, 0.0));
-    let h_r = height_bilinear(xz + vec2<f32>(e, 0.0));
-    let h_d = height_bilinear(xz - vec2<f32>(0.0, e));
-    let h_u = height_bilinear(xz + vec2<f32>(0.0, e));
-    var n = normalize(vec3<f32>(h_l - h_r, e * 2.0, h_d - h_u));
-    // The berm's real slope stays as it is. Only the stamp's slope is tipped,
-    // so a centimetre wall catches the low sun without serrating the berm.
-    let se = max(frame.params.z * 0.7, 0.1);
-    let s_l = stamp_bilinear(xz - vec2<f32>(se, 0.0));
-    let s_r = stamp_bilinear(xz + vec2<f32>(se, 0.0));
-    let s_d = stamp_bilinear(xz - vec2<f32>(0.0, se));
-    let s_u = stamp_bilinear(xz + vec2<f32>(0.0, se));
-    let raw = vec3<f32>(s_l - s_r, 0.0, s_d - s_u);
-    let mag = length(raw);
-    // A centimetre of wall stays a shallow tilt. Millimetre noise does not
-    // become a cord, and a few centimetres does not become a cliff.
-    // A few centimetres of tire wall. Sub-millimetre noise stays under the grit.
-    if (mag > 0.004) {
-        let gain = min(3.5, 0.07 / mag);
-        n = normalize(n + raw * gain);
-    }
+// Slope of the curved draw height. A finite difference of the bilinear
+// ramp still kinks on the solver-cell edge the tyre lip sits on.
+// `grit_amp` is the dry grain. Wet mud passes a small value so the sheen
+// follows this slope instead of breaking into gravel.
+fn slope_draw(xz: vec2<f32>) -> vec3<f32> {
+    let g = draw_grads(xz);
+    return normalize(vec3<f32>(-g.x, 1.0, -g.y));
+}
+
+// Wider sample of the same curved height. The short gaussian still rings
+// once per solver cell under the low sun, and that ring draws the sheen
+// as a stair. Water stays on this wider slope. The tyre lip stays on
+// slope_draw.
+fn slope_draw_wide(xz: vec2<f32>, step: f32) -> vec3<f32> {
+    let e = max(step, 0.05);
+    let h_l = height_draw(xz - vec2<f32>(e, 0.0));
+    let h_r = height_draw(xz + vec2<f32>(e, 0.0));
+    let h_d = height_draw(xz - vec2<f32>(0.0, e));
+    let h_u = height_draw(xz + vec2<f32>(0.0, e));
+    return normalize(vec3<f32>(h_l - h_r, e * 2.0, h_d - h_u));
+}
+
+fn terrain_normal(xz: vec2<f32>, grit_amp: f32) -> vec3<f32> {
+    // The slope is the curved height difference. Amplifying the stamp on
+    // its own turned a centimetre of noise into a cliff, and the sheen
+    // into rings.
+    var n = slope_draw(xz);
     let grit = noise(xz * 2.4);
     let grit_x = noise(xz * 2.4 + vec2<f32>(0.45, 0.0));
     let grit_z = noise(xz * 2.4 + vec2<f32>(0.0, 0.45));
-    // Keep the grit under the slope of a centimetre-deep stamp.
-    n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * 0.035);
+    n = normalize(n + vec3<f32>(grit - grit_x, 0.0, grit - grit_z) * grit_amp);
     return n;
 }
 
+// Height minus a wide neighbourhood. Positive on a berm, negative in a bowl.
+// A short radius turned the two edges of one tyre cut into extra scars.
+fn local_relief(xz: vec2<f32>) -> f32 {
+    let h = height_bilinear(xz);
+    let r = max(frame.params.z * 5.0, 0.9);
+    let d = r * 0.7071;
+    let avg = (
+        height_bilinear(xz + vec2<f32>(r, 0.0))
+        + height_bilinear(xz - vec2<f32>(r, 0.0))
+        + height_bilinear(xz + vec2<f32>(0.0, r))
+        + height_bilinear(xz - vec2<f32>(0.0, r))
+        + height_bilinear(xz + vec2<f32>(d, d))
+        + height_bilinear(xz + vec2<f32>(-d, d))
+        + height_bilinear(xz + vec2<f32>(d, -d))
+        + height_bilinear(xz + vec2<f32>(-d, -d))
+    ) * 0.125;
+    return h - avg;
+}
+
+// Sky without the sun disc. The disc is one point; folding it into the wet
+// lobe turned a slope into a white plate.
+fn sky_dome(dir_in: vec3<f32>) -> vec3<f32> {
+    let dir = normalize(dir_in);
+    let h = clamp(dir.y, 0.0, 1.0);
+    var col = mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, smoothstep(0.0, 0.55, h));
+    let p = dir.xz / (abs(dir.y) * 0.45 + 0.25);
+    let n = noise(p * 0.18);
+    let cloud = smoothstep(0.58, 0.82, n) * smoothstep(0.08, 0.45, dir.y);
+    col = mix(col, vec3<f32>(0.93, 0.94, 0.96), cloud * 0.65);
+    return col;
+}
+
+// Sheen on a wet slope. Flat mud looks back at the camera and contributes
+// nothing, so standing water cannot fill in as a disc. The broad term is the
+// same clay as the lane, darker. The sky is only a thin streak: a wide lobe
+// of the zenith is what read as blue plastic.
+fn mud_sheen(world: vec3<f32>, n_in: vec3<f32>, rough: f32, wet: f32, water: f32) -> vec3<f32> {
+    let film = smoothstep(0.004, 0.02, water);
+    let wet_g = smoothstep(0.48, 0.88, wet);
+    let smooth_g = smoothstep(0.86, 0.32, rough);
+    let gate = smooth_g * max(wet_g, film);
+    if (gate <= 0.001) {
+        return vec3<f32>(0.0);
+    }
+    let n = normalize(n_in);
+    // A few degrees of real wall. Flat film stays matte, so the rut floor
+    // is the soil colour from fs_terrain and not this coat.
+    let along = smoothstep(0.012, 0.055, 1.0 - n.y);
+    if (along <= 0.001) {
+        return vec3<f32>(0.0);
+    }
+    let view = normalize(frame.cam_pos.xyz - world);
+    let sun = normalize(frame.sun_dir.xyz);
+    let halfv = normalize(sun + view);
+    let ndoth = clamp(dot(n, halfv), 0.0, 1.0);
+    let refl = reflect(-view, n);
+    let sky_gate = smoothstep(0.04, 0.22, refl.y);
+    let sky = sky_dome(refl);
+    let shadow = shadow_factor(world + n * 0.02, n);
+    // A slope still glints when the reflection is not aimed at the sky.
+    let amp = gate * along * shadow * mix(0.55, 1.0, sky_gate);
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    // Shadowed slurry stays brown. A sky-coloured ambient here was the blue.
+    let wrap = 0.58 + 0.42 * ndl * shadow;
+    // Lane clay is (0.105, 0.052, 0.026). This is that hue, darker.
+    let clay = vec3<f32>(0.068, 0.034, 0.017);
+    let standing = smoothstep(0.003, 0.014, water);
+    let body = clay * wrap * gate * along * mix(0.28, 1.0, standing);
+    // Wet churned edges. A broad warm gloss, plus a pale sky tint that stays
+    // off the saturated zenith. Flat standing water is the sheet, not this lobe.
+    let ndotv = clamp(dot(n, view), 0.0, 1.0);
+    let pale = mix(vec3<f32>(0.48, 0.42, 0.34), sky, 0.15);
+    let graze = pow(1.0 - ndotv, 3.0);
+    let edge_refl = pale * graze * amp * 0.34;
+    let soft = pow(ndoth, 8.0);
+    let wet_glint = vec3<f32>(0.58, 0.40, 0.22) * soft * amp * 1.15;
+    let sun_tight = pow(ndoth, 46.0);
+    let glint = vec3<f32>(0.72, 0.52, 0.30) * sun_tight * amp * 0.4;
+    return body * 0.35 + wet_glint + edge_refl + glint;
+}
+
+// Along a tyre cut. The stamp rises toward the berm, so its gradient
+// points across the rut. Open water has no cut and returns zero.
+fn rut_along(xz: vec2<f32>) -> vec2<f32> {
+    let e = 0.26;
+    let gx = stamp_bilinear(xz + vec2<f32>(e, 0.0)) - stamp_bilinear(xz - vec2<f32>(e, 0.0));
+    let gz = stamp_bilinear(xz + vec2<f32>(0.0, e)) - stamp_bilinear(xz - vec2<f32>(0.0, e));
+    let g = vec2<f32>(gx, gz);
+    let glen = length(g);
+    if (glen < 0.006) {
+        return vec2<f32>(0.0);
+    }
+    let across = g / glen;
+    return vec2<f32>(-across.y, across.x);
+}
+
+struct Ripple {
+    h: f32,
+    // dh/dx, dh/dz of the unitless field. The axis is local.
+    grad: vec2<f32>,
+    // 0 in the gaps, 1 where a patch of ripple actually exists.
+    brk: f32,
+}
+
+fn ridge(p: vec2<f32>) -> f32 {
+    // Contours of warped noise. They close and die. They are not a phase.
+    let n = noise(p);
+    let r = 1.0 - abs(n * 2.0 - 1.0);
+    return smoothstep(0.55, 0.92, r);
+}
+
+// Unitless crest in rut space. Irregular ridge fragments, biased along the
+// cut, with gaps so nothing runs on as a streak.
+fn broken_h(s: f32, c: f32, t: f32) -> vec2<f32> {
+    let w0 = noise(vec2<f32>(s * 1.2, c * 1.5) + t * 0.04);
+    let w1 = noise(vec2<f32>(c * 1.4 + 3.1, s * 0.85) - t * 0.03);
+    let s2 = s + (w0 - 0.5) * 1.15;
+    let c2 = c + (w1 - 0.5) * 0.85;
+    // Slightly longer along the rut. The field is still a contour, not a comb.
+    let p = vec2<f32>(s2 * 2.6, c2 * 3.4);
+    let bend = vec2<f32>(
+        noise(p * 0.45 + t * 0.02),
+        noise(p * 0.45 + vec2<f32>(2.2, 6.0)),
+    );
+    let q = p + (bend - 0.5) * 1.8;
+    let gap = smoothstep(0.38, 0.66, noise(vec2<f32>(s2 * 1.7 + 0.4, c2 * 2.1)));
+    let h1 = ridge(q) * gap;
+    let q2 = vec2<f32>(s2 * 5.4 + 1.8, c2 * 4.7) + (bend - 0.5) * 1.2;
+    let gap2 = smoothstep(0.46, 0.74, noise(vec2<f32>(c2 * 3.3 + 2.0, s2 * 2.8)));
+    let h2 = ridge(q2) * gap2;
+    let h = clamp(h1 * 0.72 + h2 * 0.5, 0.0, 1.0);
+    let brk = clamp(gap * h1 + gap2 * 0.55, 0.0, 1.0);
+    return vec2<f32>(h, brk);
+}
+
+fn ripple_wave(xz: vec2<f32>, t: f32) -> Ripple {
+    var along = rut_along(xz);
+    if (length(along) < 0.5) {
+        along = vec2<f32>(0.71, 0.70);
+    }
+    let across = vec2<f32>(-along.y, along.x);
+    let s = dot(xz, along);
+    let c = dot(xz, across);
+    let h = broken_h(s, c, t);
+    // Crests are a few centimetres wide. The step has to be shorter than that.
+    let e = 0.012;
+    let hs = broken_h(s + e, c, t).x;
+    let hc = broken_h(s, c + e, t).x;
+    // Slope on the flank, not the unitless derivative. About half a unit of
+    // tilt where a crest actually rises.
+    let scale = 0.007;
+    let dhs = (hs - h.x) / e * scale;
+    let dhc = (hc - h.x) / e * scale;
+    var w: Ripple = Ripple(0.0, vec2<f32>(0.0), 0.0);
+    w.h = h.x * 0.006;
+    w.grad = vec2<f32>(dhs * along.x + dhc * across.x, dhs * along.y + dhc * across.y);
+    w.brk = h.y;
+    return w;
+}
+
 fn ripple_height(xz: vec2<f32>, t: f32) -> f32 {
-    let x = xz.x;
-    let z = xz.y;
-    // Long waves. A tight lattice of sines reads as a checker from above.
-    return 0.012 * sin(x * 0.72 + z * 0.18 + t * 0.55)
-        + 0.009 * sin(z * 0.95 - x * 0.22 - t * 0.42)
-        + 0.005 * sin(x * 1.5 + z * 1.25 + t * 0.8);
+    return ripple_wave(xz, t).h;
+}
+
+fn standing_depth(xz: vec2<f32>) -> f32 {
+    return mat_bilinear(xz).g * 0.34;
+}
+
+// How far the sheet sits above the clay. A film in the shallows, the free
+// surface once the column is deep. The sag cups a rut so the sheet follows
+// the cut instead of spanning it like a taut cover.
+fn sheet_lift(xz: vec2<f32>, depth: f32) -> f32 {
+    let rise = smoothstep(0.012, 0.075, depth);
+    let cut = max(-stamp_bilinear(xz), 0.0);
+    let sag = smoothstep(0.012, 0.042, cut) * min(depth, 0.055) * 0.4;
+    return mix(0.011, depth, rise) - sag;
+}
+
+// Drawn clay plus the standing column. Same reconstruction the terrain uses,
+// so the film is above the mesh you see and not under a bilinear ledge.
+fn sheet_y(xz: vec2<f32>) -> f32 {
+    return height_draw(xz) + sheet_lift(xz, standing_depth(xz));
 }
 
 // Analytic water normal. Screen derivatives of the mesh are a hard grid.
+// The base slope is the sheet in the rut. The wave is a small tilt on it.
 fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
-    let x = xz.x;
-    let z = xz.y;
-    let dx = 0.012 * cos(x * 0.72 + z * 0.18 + t * 0.55) * 0.72
-        - 0.009 * cos(z * 0.95 - x * 0.22 - t * 0.42) * 0.22
-        + 0.005 * cos(x * 1.5 + z * 1.25 + t * 0.8) * 1.5;
-    let dz = 0.012 * cos(x * 0.72 + z * 0.18 + t * 0.55) * 0.18
-        + 0.009 * cos(z * 0.95 - x * 0.22 - t * 0.42) * 0.95
-        + 0.005 * cos(x * 1.5 + z * 1.25 + t * 0.8) * 1.25;
-    // A small tilt. Large normals turned the pond into a chrome dome.
-    return normalize(vec3<f32>(-dx * 1.6, 1.0, -dz * 1.6));
+    let e = 0.16;
+    let y_l = sheet_y(xz - vec2<f32>(e, 0.0));
+    let y_r = sheet_y(xz + vec2<f32>(e, 0.0));
+    let y_d = sheet_y(xz - vec2<f32>(0.0, e));
+    let y_u = sheet_y(xz + vec2<f32>(0.0, e));
+    let sx = (y_l - y_r) / (e * 2.0);
+    let sz = (y_d - y_u) / (e * 2.0);
+    let wave = ripple_wave(xz, t);
+    let amp = smoothstep(0.004, 0.02, standing_depth(xz));
+    // A broad wobble breaks a flat mirror. The ridge tilt stays small so the
+    // pool does not grow a comb of streaks along the rut.
+    let q = xz * 0.85;
+    let n0 = noise(q);
+    let nx = noise(q + vec2<f32>(0.37, 0.08));
+    let nz = noise(q + vec2<f32>(0.06, 0.37));
+    let wobble = amp * 0.028;
+    return normalize(vec3<f32>(
+        sx + wave.grad.x * amp * 0.12 + (n0 - nx) * wobble,
+        1.0,
+        sz + wave.grad.y * amp * 0.12 + (n0 - nz) * wobble,
+    ));
 }
 
 fn terrain_height(xz: vec2<f32>) -> f32 {
-    // Bilinear across the cell. The per-cell step that keeps a rut wall
-    // turns a smooth berm into a corrugated ring from the isometric camera.
-    return height_bilinear(xz);
+    // Curved reconstruction of the solver samples. Bilinear leaves the tyre
+    // lip as a straight ramp with a corner on the cell boundary.
+    return height_draw(xz);
 }
 
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
-    // Sample the same heightfield. Integer ij would flatten every subdivided
-    // vertex inside a cell, so a 9 cm rut stays one kink.
+    // Draw height, not the solver bilinear. Integer ij would flatten every
+    // subdivided vertex back onto one ramp per cell.
     let h = terrain_height(in.xz);
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     var o: TerrOut;
@@ -345,22 +620,21 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 @fragment
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
-    let h = height_bilinear(xz);
-    var n = terrain_normal(xz);
-
-    let mat_dims = vec2<f32>(textureDimensions(mat_tex));
-    let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
+    // Same xz as the height so wetness sits on the displaced cell, not a
+    // texel to the side of the rut.
+    let mat = mat_bilinear(xz);
     let wet = mat.r;
     let water = mat.g * 0.34;
     let darken = mat.b;
+    let stored_rough = mat.a;
+
+    let film = smoothstep(0.006, 0.035, water);
+    let wet_face = smoothstep(0.18, 0.8, wet);
+    // Grain on dry dirt. Wet faces keep the heightfield slope intact.
+    let grit_amp = mix(0.36, mix(0.04, 0.012, film), max(wet_face, film));
+    var n = terrain_normal(xz, grit_amp);
 
     let grit = noise(xz * 1.4) * 0.6 + noise(xz * 4.8) * 0.4;
-    // Grain on the dry face, smoothed off where the soil is wet.
-    let wet_face = smoothstep(0.18, 0.8, wet);
-    let g0 = noise(xz * 2.7);
-    let gx = noise((xz + vec2<f32>(0.14, 0.0)) * 2.7);
-    let gz = noise((xz + vec2<f32>(0.0, 0.14)) * 2.7);
-    n = normalize(n + vec3<f32>(g0 - gx, 0.0, g0 - gz) * mix(0.38, 0.05, wet_face));
     // Dark saturated soil. The noon tan read as flat beige.
     let dry = vec3<f32>(0.105, 0.052, 0.026) * (0.86 + grit * 0.28);
     let soaked = vec3<f32>(0.04, 0.022, 0.012);
@@ -375,34 +649,53 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Shallow shoulders of the kernel stay the lane colour. Only the tyre
     // centre, a few centimetres down, reads as the groove.
     let groove = smoothstep(0.030, 0.046, cut);
-    // Dark mud in the cut. A wide sheen here turned the floor into a tan stripe.
-    albedo = mix(albedo, vec3<f32>(0.010, 0.0045, 0.002), groove * 0.88);
+    // Dark mud in a dry trough. Under a shallow film the floor stays clay,
+    // grit included, so the water sheet can show that grain.
+    // Clay stays readable while the film is still thin. By 18 cm the sheet
+    // covers the floor, so the ink under it does not matter.
+    let floor_film = smoothstep(0.004, 0.018, water) * (1.0 - smoothstep(0.11, 0.17, water));
+    let ink = groove * mix(0.88, 0.16, floor_film);
+    albedo = mix(albedo, vec3<f32>(0.010, 0.0045, 0.002), ink);
+    let mottled = dry * (0.52 + noise(xz * 3.4) * 0.62 + noise(xz * 9.4) * 0.42);
+    albedo = mix(albedo, mottled, floor_film * 0.95);
+    // The wet slope keeps a clean normal for the bank sheen. The shallow
+    // floor puts a little clay grain back so it reads through the film.
+    let cg = noise(xz * 5.6);
+    let cgx = noise(xz * 5.6 + vec2<f32>(0.41, 0.07));
+    let cgz = noise(xz * 5.6 + vec2<f32>(0.05, 0.41));
+    n = normalize(n + vec3<f32>(cg - cgx, 0.0, cg - cgz) * floor_film * 0.6);
     let pile = max(stamp, 0.0);
     let lip = smoothstep(0.012, 0.026, pile) * (1.0 - groove);
-    // Loose soil on the shoulder. Lighter than the lane, only where the stamp piled it.
+    // Loose soil on the berm. Lighter than the lane, only where the stamp piled it.
     albedo = mix(albedo, vec3<f32>(0.15, 0.078, 0.034), lip * 0.92);
 
-    // Wet rim on the soil. The sky reflection is the water sheet, not this grid.
-    let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
-    albedo = mix(albedo, vec3<f32>(0.012, 0.008, 0.006), rim * 0.85);
+    // The bank of the same heightfield stays lighter. Deep water hides it;
+    // the sheet in fs_water is what covers the bowl.
+    let relief = local_relief(xz);
+    let bank = smoothstep(0.04, 0.12, relief) * (1.0 - groove);
+    let deep_w = smoothstep(0.030, 0.080, water);
+    let bank_col = mix(vec3<f32>(0.16, 0.082, 0.036), vec3<f32>(0.062, 0.032, 0.014), wet_face);
+    albedo = mix(albedo, bank_col, bank * mix(0.45, 0.28, wet_face) * (1.0 - deep_w));
 
-    // The lane stays matte. Shine is the soil ringing a puddle. The same lobe
-    // on the tire cut turned the groove into a tan stripe, so the floor stays dark.
-    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
-    // Standing water is drawn as its own sheet. A mirror bed under that film
-    // is the gray metal disc.
-    let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(0.94, 0.2, shore * (1.0 - drowned)), 0.90, drowned);
+    // Dry dirt stays rough. Wet mud takes the stored smoothness. A water film
+    // is smoother, and the highlight is still the slope lobe, not a mirror fill.
+    let dry_r = max(stored_rough, 0.92);
+    let wet_r = clamp(stored_rough, 0.15, 0.72);
+    let rough_out = mix(dry_r, mix(wet_r, 0.09, film), max(wet_face, film));
+
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
-    // The sun sits low, so a tight Phong highlight misses this camera.
-    // A wide lobe on the shore is the wet sheen.
-    let view = normalize(frame.cam_pos.xyz - in.world);
-    let ndotv = clamp(dot(n, view), 0.0, 1.0);
-    let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
-    let facing = pow(1.0 - ndotv, 2.0);
-    let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
-    let wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
-    lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
+    // Standing water is the sheet in fs_water. Recolouring the clay here
+    // hid the floor the shallow film is meant to show.
+    // Sheen follows the curved height, not the bilinear kink. Standing
+    // water uses the wider sample so the bowl does not stair. A rut keeps
+    // the short slope, or the tyre wall disappears. Grit stays off this
+    // normal so the streak is the slope.
+    let n_sheen = normalize(mix(
+        slope_draw(xz),
+        slope_draw_wide(xz, frame.params.z * 2.1),
+        film,
+    ));
+    lit += mud_sheen(in.world, n_sheen, rough_out, wet, water);
     return present(lit);
 }
 
@@ -437,28 +730,14 @@ fn covered_depth(xz: vec2<f32>) -> f32 {
     return max(here, across);
 }
 
-fn water_bed(xz: vec2<f32>) -> f32 {
-    // Blur a single-cell rut out of the sheet so the pool stays one surface.
-    let e = 0.55;
-    return (
-        height_bilinear(xz)
-        + height_bilinear(xz + vec2<f32>(e, 0.0))
-        + height_bilinear(xz - vec2<f32>(e, 0.0))
-        + height_bilinear(xz + vec2<f32>(0.0, e))
-        + height_bilinear(xz - vec2<f32>(0.0, e))
-    ) * 0.2;
-}
-
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
-    let bed = water_bed(in.xz);
     let depth = covered_depth(in.xz);
-    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
-    // Film on the bed, but never below the soil. A bump left uncovered
-    // reads as a black hole. bed + full depth was a sheet 30 cm up that
-    // cut the tire like a clip plane.
-    let cover = height_bilinear(in.xz) + 0.01;
-    let y = max(bed + 0.016 + rip, cover) + smoothstep(0.02, 0.16, depth) * 0.012;
+    let amp = smoothstep(0.0, 0.025, depth);
+    let rip = ripple_height(in.xz, frame.misc.x) * amp;
+    // On the drawn clay, lifted by the column. A dry speck with water on
+    // both sides takes the covered column so the sheet does not hole.
+    let y = max(sheet_y(in.xz), height_draw(in.xz) + sheet_lift(in.xz, depth)) + rip;
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
@@ -470,37 +749,69 @@ fn vs_water(in: TerrIn) -> WaterOut {
 
 @fragment
 fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
-    if (in.depth < 0.006) {
+    let xz = in.world.xz;
+    // Local column, not the dilated sheet depth. The dilation fills holes;
+    // it must not turn a 2 cm film into the deep pool.
+    let local = standing_depth(xz);
+    let jag = noise(xz * 1.6 + vec2<f32>(0.2, 1.1)) * 0.55 + noise(xz * 4.4 + 1.7) * 0.45;
+    let walked = local + (jag - 0.48) * 0.04;
+    // A dry speck inside a filled bowl keeps the column. A real 2 cm film does not.
+    let interior = smoothstep(0.02, 0.0, local) * step(0.05, in.depth);
+    let depth = mix(max(walked, 0.0), max(walked, in.depth), interior);
+    if (depth < 0.004) {
         discard;
     }
-    let n = ripple_normal(in.world.xz, frame.misc.x);
-    // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
+    // Ragged shoulder only where a pool meets dry mud. A broad 2 cm film has
+    // no dry neighbour, and a thin speck inside the pool has no dry side,
+    // so neither one is eaten into holes.
+    let edge = noise(xz * 0.55 + vec2<f32>(0.4, 2.2)) * 0.65
+        + noise(xz * 1.7 + vec2<f32>(1.7, 0.3)) * 0.35;
+    let shore_cut = 0.006 + edge * 0.03;
+    let se = 0.46;
+    let px = standing_depth(xz + vec2<f32>(se, 0.0));
+    let nx = standing_depth(xz - vec2<f32>(se, 0.0));
+    let pz = standing_depth(xz + vec2<f32>(0.0, se));
+    let nz = standing_depth(xz - vec2<f32>(0.0, se));
+    let near_deep = max(max(px, nx), max(pz, nz));
+    let near_dry = min(min(px, nx), min(pz, nz));
+    if (near_dry < 0.005 && near_deep > 0.06 && local < shore_cut) {
+        discard;
+    }
+    let t = frame.misc.x;
+    var n = ripple_normal(xz, t);
+    if (n.y < 0.0) {
+        n = -n;
+    }
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
-    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.4);
-    // Stored water tops out near a decimetre after the shader scale.
-    // The middle goes to dark mud inside that range, not to black.
-    let depth_t = smoothstep(0.006, 0.075, in.depth);
-    // Muddy brown, lighter at the shore. A near-black center read as a hole,
-    // and a bright rim around it read as the lip of that hole.
-    let shore_col = vec3<f32>(0.085, 0.036, 0.013);
-    let deep_col = vec3<f32>(0.026, 0.010, 0.0036);
-    let absorption = mix(shore_col, deep_col, depth_t);
-    // Quiet reflection. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.10, 0.042, 0.015);
-    let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);
-    var col = mix(absorption, quiet, reflect_amt);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
-    col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);
-    let shore = smoothstep(0.002, 0.07, in.depth);
-    // Only a cut of a couple of centimetres thins the film, and only on that cut.
-    // The rest of the pond stays a dark cover, shore and middle alike.
-    let dug = max(-stamp_bilinear(in.world.xz), 0.0);
-    let reveal = smoothstep(0.016, 0.034, dug);
-    let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
-    let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal);
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    let shadow = shadow_factor(in.world + n * 0.02, n);
+    // Warm wrap. shade() folds the blue zenith into the hemi, which turned
+    // the pool into a gray sheet.
+    let wrap = 0.9 + 0.08 * ndl * shadow;
+    // Film stays a brown tint. The filled rut is an opaque tan pool.
+    // The step is tight so the pool meets the mud on a line, not a soft halo.
+    let cover = smoothstep(0.03, 0.075, depth);
+    let shallow_c = vec3<f32>(0.09, 0.042, 0.02);
+    let deep_c = vec3<f32>(0.172, 0.112, 0.058);
+    let q = xz + vec2<f32>(t * 0.006, -t * 0.004);
+    let murk = noise(q * 0.45) * 0.55 + noise(q * 1.15 + 1.3) * 0.45;
+    let grit = noise(q * 4.2 + vec2<f32>(2.0, 0.4));
+    var body = mix(shallow_c, deep_c, cover);
+    body *= 0.9 + murk * 0.16;
+    body = mix(body, body * vec3<f32>(0.82, 0.76, 0.64), smoothstep(0.84, 0.96, grit) * cover * 0.25);
+    var col = body * wrap;
+    let ndotv = clamp(dot(n, view), 0.0, 1.0);
+    let flat = smoothstep(0.78, 0.97, n.y);
+    let pool = smoothstep(0.06, 0.12, depth);
+    // Dull warm lift on the flat of the pool. Kept small so it is not a gloss.
+    let fres = pow(1.0 - ndotv, 3.0);
+    let broken = smoothstep(0.4, 0.75, noise(xz * 0.42 + vec2<f32>(1.2, 0.4)));
+    col += vec3<f32>(0.12, 0.10, 0.07) * fres * flat * pool * broken * 0.05;
+    let shore = smoothstep(0.002, 0.008, depth);
+    // About 0.22 at 2 cm. Opaque once the rut is a real pool.
+    var alpha = mix(0.2, 0.99, cover) * shore;
+    alpha = clamp(alpha, 0.0, 0.99);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
@@ -540,7 +851,7 @@ struct ShadowOut {
 
 @vertex
 fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
-    let h = height_bilinear(in.xz);
+    let h = height_draw(in.xz);
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     let clip = frame.light_vp * vec4<f32>(world, 1.0);
     var o: ShadowOut;
@@ -691,6 +1002,23 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
     // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
+    if (in.panel > 47.5 && in.panel < 48.5) {
+        // Continuous muddy sheet thrown off a tire. Brown, not a white ball.
+        let fray = noise(in.world.xz * 2.4 + vec2<f32>(in.world.y * 1.4, 0.4));
+        if (in.uv.y > 0.93 && fray < 0.42) {
+            discard;
+        }
+        let n = normalize(nrm);
+        let sun = normalize(frame.sun_dir.xyz);
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        let grit = noise(in.world.xz * 6.0 + vec2<f32>(in.world.y * 2.2, 1.0));
+        var sheet = vec3<f32>(0.145, 0.068, 0.028) * (0.88 + grit * 0.2);
+        sheet *= 0.72 + ndl * max(shadow, 0.5) * 0.5;
+        let lip = smoothstep(0.62, 0.96, in.uv.y);
+        sheet = mix(sheet, vec3<f32>(0.2, 0.12, 0.055), lip * 0.28);
+        return present(sheet);
+    }
     if (in.panel > 45.5 && in.panel < 46.5) {
         var n = normalize(nrm);
         // Soft skin. A strong bump turns the highlight into gravel.
