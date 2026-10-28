@@ -474,7 +474,13 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let (ground_diff, ground_diff_view) = upload_rgba(&device, &queue, "ground-diff", &cc0.ground_diff);
+        let (ground_diff, ground_diff_view) = upload_rgba_fmt(
+            &device,
+            &queue,
+            "ground-diff",
+            &cc0.ground_diff,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
         let (ground_nor, ground_nor_view) = upload_rgba(&device, &queue, "ground-nor", &cc0.ground_nor);
         let (ground_pack, ground_pack_view) = upload_rgba(&device, &queue, "ground-pack", &cc0.ground_pack);
         let (buggy_base, buggy_base_view) = upload_rgba(&device, &queue, "buggy-base", &cc0.buggy_base);
@@ -1061,8 +1067,8 @@ impl Renderer {
             cam_pos: vec4(cam.eye, 1.0),
             sun_dir: vec4(sun, 0.0),
             sun_color: [1.70, 1.78, 1.90, 1.0],
-            sky_zenith: [0.42, 0.64, 0.98, 1.0],
-            sky_horizon: [0.76, 0.84, 0.96, 1.0],
+            sky_zenith: [0.18, 0.42, 0.96, 1.0],
+            sky_horizon: [0.80, 0.86, 0.94, 1.0],
             amb: [0.18, 0.20, 0.22, 1.0],
             params: [
                 self.width as f32,
@@ -1541,6 +1547,16 @@ fn upload_rgba(
     label: &str,
     tex: &RgbaTex,
 ) -> (wgpu::Texture, wgpu::TextureView) {
+    upload_rgba_fmt(device, queue, label, tex, wgpu::TextureFormat::Rgba8Unorm)
+}
+
+fn upload_rgba_fmt(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    tex: &RgbaTex,
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -1551,7 +1567,7 @@ fn upload_rgba(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });

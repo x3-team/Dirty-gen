@@ -7,10 +7,10 @@ The motocross picture uses the Lada Niva and the photoreal forest. The dune bugg
 - vehicle/dune-buggy.glb — Grab3D https://grab3d.com/models/vehicles/dune-buggy/ (full GLB: /dl/dune-buggy/dune-buggy.glb). CC0 1.0. See vehicle/LICENSE.txt. Hidden on the course.
 - vehicle/niva-greg/lada_niva.glb — Lada Niva by Greg McKechnie, https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2. CC BY 4.0. Meshopt and quantization were flattened for the renderer; textures stayed WebP. Changes do not remove the attribution requirement.
 
-## Ground (CC0)
+## Ground (CC0, 4K WebP optimized)
 
-- ground/{mud_forest,brown_mud_dry,rocky_gravel,grass_ground}/ — Poly Haven (https://polyhaven.com/a/<id>, via api.polyhaven.com/files), 2K JPG: diff, nor_gl, rough, ao, disp, arm. CC0. https://polyhaven.com/license
-- ground/clay_001/ — ambientCG Clay001 2K-JPG (https://ambientcg.com/view?id=Clay001). CC0.
+- ground/{mud_forest,brown_mud_dry,rocky_gravel,grass_ground}/ — Poly Haven (https://polyhaven.com/a/<id>), 4K WebP: diff, nor_gl, arm, disp. AO, roughness, and metal come from ARM. Separate ao/rough files are not shipped. CC0. https://polyhaven.com/license
+- ground/clay_001/ — ambientCG Clay001, 4K WebP: diff, nor_gl, rough, disp, ao. No ARM. CC0. https://ambientcg.com/view?id=Clay001
 
 The course blends those five packs by soil state: dry dirt on the racing line, mud in the hole and the slope puddle, clay in the rut floors, gravel on the start and the table, grass off the ribbon, rock in the far corners.
 

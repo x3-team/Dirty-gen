@@ -389,8 +389,8 @@ fn track_iso_camera() -> CameraPose {
     // Oblique daylight. Close enough that the ribbon fills the frame,
     // high enough that the whole lap, the hole and the whoops are in it.
     CameraPose {
-        eye: Vec3::new(0.0, 21.0, -42.0),
-        target: Vec3::new(0.5, 1.3, 1.0),
+        eye: Vec3::new(0.0, 17.5, -40.0),
+        target: Vec3::new(0.2, 4.2, 1.0),
         ortho_width: None,
     }
 }

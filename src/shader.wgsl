@@ -95,16 +95,23 @@ fn present(c: vec3<f32>) -> vec4<f32> {
 
 fn sky_color(dir_in: vec3<f32>) -> vec3<f32> {
     let dir = normalize(dir_in);
-    let h = clamp(dir.y, -0.05, 1.0);
-    var col = mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, smoothstep(-0.02, 0.55, h));
+    let h = dir.y;
+    // The lap cameras look down, so the sky in frame is only a low band.
+    // The blue has to arrive just above the land, not halfway to the zenith.
+    let t = smoothstep(-0.20, 0.10, h);
+    let horizon = frame.sky_horizon.rgb;
+    let zenith = frame.sky_zenith.rgb;
+    var col = mix(horizon, zenith, t);
     let sun = normalize(frame.sun_dir.xyz);
     let d = max(dot(dir, sun), 0.0);
-    col += frame.sun_color.rgb * pow(d, 900.0) * 4.0;
-    col += frame.sun_color.rgb * pow(d, 18.0) * 0.55;
-    let p = dir.xz / (abs(dir.y) * 0.45 + 0.25);
-    let n = noise(p * 0.18);
-    let cloud = smoothstep(0.58, 0.82, n) * smoothstep(0.08, 0.4, dir.y);
-    col = mix(col, vec3<f32>(0.93, 0.94, 0.96), cloud * 0.7);
+    let warm = pow(d, 3.0) * smoothstep(0.18, -0.08, h);
+    col = mix(col, vec3<f32>(0.98, 0.78, 0.52), warm * 0.42);
+    col += frame.sun_color.rgb * pow(d, 1200.0) * 2.4;
+    col += frame.sun_color.rgb * pow(d, 10.0) * 0.28 * smoothstep(-0.12, 0.15, h);
+    let p = dir.xz / (abs(dir.y) * 0.35 + 0.16);
+    let n = noise(p * 0.20);
+    let cloud = smoothstep(0.50, 0.78, n) * smoothstep(-0.08, 0.14, h);
+    col = mix(col, vec3<f32>(0.97, 0.97, 0.98), cloud * 0.62);
     return col;
 }
 
@@ -447,11 +454,10 @@ fn water_depth(xz: vec2<f32>) -> f32 {
     return max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
 }
 
-// A dry patch with water on both sides is a hole in the sheet, not a shore.
-// The outer bank has water on only one side, so this does not grow the pond.
+// Fill a dry speck inside the bowl. A wide step turned the pond into a block.
 fn covered_depth(xz: vec2<f32>) -> f32 {
     let here = water_depth(xz);
-    let e = 1.35;
+    let e = 0.42;
     let px = water_depth(xz + vec2<f32>(e, 0.0));
     let nx = water_depth(xz - vec2<f32>(e, 0.0));
     let pz = water_depth(xz + vec2<f32>(0.0, e));
@@ -460,28 +466,13 @@ fn covered_depth(xz: vec2<f32>) -> f32 {
     return max(here, across);
 }
 
-fn water_bed(xz: vec2<f32>) -> f32 {
-    // Blur a single-cell rut out of the sheet so the pool stays one surface.
-    let e = 0.55;
-    return (
-        height_bilinear(xz)
-        + height_bilinear(xz + vec2<f32>(e, 0.0))
-        + height_bilinear(xz - vec2<f32>(e, 0.0))
-        + height_bilinear(xz + vec2<f32>(0.0, e))
-        + height_bilinear(xz - vec2<f32>(0.0, e))
-    ) * 0.2;
-}
-
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
-    let bed = water_bed(in.xz);
+    let soil = height_bilinear(in.xz);
     let depth = covered_depth(in.xz);
-    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
-    // Film on the bed, but never below the soil. A bump left uncovered
-    // reads as a black hole. bed + full depth was a sheet 30 cm up that
-    // cut the tire like a clip plane.
-    let cover = height_bilinear(in.xz) + 0.01;
-    let y = max(bed + 0.016 + rip, cover) + smoothstep(0.02, 0.16, depth) * 0.012;
+    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.04, depth);
+    // On the soil, in the hole. Averaging the bed lifted a flat card off the bowl.
+    let y = soil + 0.02 + rip;
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
@@ -493,37 +484,34 @@ fn vs_water(in: TerrIn) -> WaterOut {
 
 @fragment
 fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
-    if (in.depth < 0.006) {
+    if (in.depth < 0.004) {
         discard;
     }
-    let n = ripple_normal(in.world.xz, frame.misc.x);
-    // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
+    // Slope of the bed, so the pond shades as a bowl instead of a flat fill.
+    let e = 0.55;
+    let xz = in.world.xz;
+    let slope = normalize(vec3<f32>(
+        height_bilinear(xz - vec2<f32>(e, 0.0)) - height_bilinear(xz + vec2<f32>(e, 0.0)),
+        e * 2.0,
+        height_bilinear(xz - vec2<f32>(0.0, e)) - height_bilinear(xz + vec2<f32>(0.0, e)),
+    ));
+    let rip = ripple_normal(xz, frame.misc.x);
+    let nrm = normalize(slope + vec3<f32>(rip.x, 0.0, rip.z) * 0.22);
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.4);
-    // Stored water tops out near a decimetre after the shader scale.
-    // The middle goes to dark mud inside that range, not to black.
-    let depth_t = smoothstep(0.006, 0.075, in.depth);
-    // Muddy brown, lighter at the shore. A near-black center read as a hole,
-    // and a bright rim around it read as the lip of that hole.
-    let shore_col = vec3<f32>(0.085, 0.036, 0.013);
-    let deep_col = vec3<f32>(0.026, 0.010, 0.0036);
-    let absorption = mix(shore_col, deep_col, depth_t);
-    // Quiet reflection. sky_color carries the sun disc and white clouds.
-    let quiet = vec3<f32>(0.10, 0.042, 0.015);
-    let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);
-    var col = mix(absorption, quiet, reflect_amt);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
-    col += vec3<f32>(0.04, 0.016, 0.005) * spec * shadow_factor(in.world, nrm);
-    let shore = smoothstep(0.002, 0.07, in.depth);
-    // Only a cut of a couple of centimetres thins the film, and only on that cut.
-    // The rest of the pond stays a dark cover, shore and middle alike.
-    let dug = max(-stamp_bilinear(in.world.xz), 0.0);
-    let reveal = smoothstep(0.016, 0.034, dug);
-    let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
-    let alpha = shore * mix(0.88, 0.98, depth_t) * mix(1.0, open, reveal);
+    let fres = pow(1.0 - ndotv, 2.2);
+    let depth_t = smoothstep(0.004, 0.055, in.depth);
+    let shore_col = vec3<f32>(0.11, 0.048, 0.018);
+    let deep_col = vec3<f32>(0.030, 0.013, 0.005);
+    var col = mix(shore_col, deep_col, depth_t);
+    let refl = sky_color(reflect(-view, nrm));
+    col = mix(col, refl, fres * 0.34);
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 48.0);
+    col += vec3<f32>(0.06, 0.045, 0.030) * spec * shadow_factor(in.world, nrm);
+    let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
+    col += deep_col * ndl * 0.35;
+    let alpha = smoothstep(0.003, 0.028, in.depth) * mix(0.62, 0.92, depth_t);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);

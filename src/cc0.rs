@@ -11,7 +11,8 @@ use crate::mesh::{CpuMesh, MeshVertex};
 
 pub const GROUND_RES: u32 = 2048;
 
-const SRC_DIM: u32 = 512;
+/// Bake sources. The shipped maps stay 4K WebP; this only sizes the in-memory sample.
+const SRC_DIM: u32 = 2048;
 const BUGGY_DIM: u32 = 1024;
 
 const BUGGY_GLB: &[u8] = include_bytes!("../assets/vehicle/dune-buggy.glb");
@@ -21,52 +22,54 @@ const PROP_ATLAS: &[u8] = include_bytes!("../assets/env/Grass001.glb");
 struct MapSpec {
     diff: &'static str,
     nor: &'static str,
+    disp: Option<&'static str>,
+    /// Poly Haven ARM: R ambient occlusion, G roughness, B metal.
+    /// When this is set, separate ao/rough files are not loaded.
+    arm: Option<&'static str>,
     rough: Option<&'static str>,
     ao: Option<&'static str>,
-    disp: Option<&'static str>,
-    arm: Option<&'static str>,
 }
 
 const GROUND: &[MapSpec] = &[
     MapSpec {
-        diff: "ground/mud_forest/mud_forest_diff_2k.jpg",
-        nor: "ground/mud_forest/mud_forest_nor_gl_2k.jpg",
-        rough: Some("ground/mud_forest/mud_forest_rough_2k.jpg"),
-        ao: Some("ground/mud_forest/mud_forest_ao_2k.jpg"),
-        disp: Some("ground/mud_forest/mud_forest_disp_2k.jpg"),
-        arm: Some("ground/mud_forest/mud_forest_arm_2k.jpg"),
+        diff: "ground/mud_forest/mud_forest_diff_4k.webp",
+        nor: "ground/mud_forest/mud_forest_nor_gl_4k.webp",
+        disp: Some("ground/mud_forest/mud_forest_disp_4k.webp"),
+        arm: Some("ground/mud_forest/mud_forest_arm_4k.webp"),
+        rough: None,
+        ao: None,
     },
     MapSpec {
-        diff: "ground/brown_mud_dry/brown_mud_dry_diff_2k.jpg",
-        nor: "ground/brown_mud_dry/brown_mud_dry_nor_gl_2k.jpg",
-        rough: Some("ground/brown_mud_dry/brown_mud_dry_rough_2k.jpg"),
-        ao: Some("ground/brown_mud_dry/brown_mud_dry_ao_2k.jpg"),
-        disp: Some("ground/brown_mud_dry/brown_mud_dry_disp_2k.jpg"),
-        arm: Some("ground/brown_mud_dry/brown_mud_dry_arm_2k.jpg"),
+        diff: "ground/brown_mud_dry/brown_mud_dry_diff_4k.webp",
+        nor: "ground/brown_mud_dry/brown_mud_dry_nor_gl_4k.webp",
+        disp: Some("ground/brown_mud_dry/brown_mud_dry_disp_4k.webp"),
+        arm: Some("ground/brown_mud_dry/brown_mud_dry_arm_4k.webp"),
+        rough: None,
+        ao: None,
     },
     MapSpec {
-        diff: "ground/clay_001/Clay001_2K-JPG_Color.jpg",
-        nor: "ground/clay_001/Clay001_2K-JPG_NormalGL.jpg",
-        rough: Some("ground/clay_001/Clay001_2K-JPG_Roughness.jpg"),
-        ao: Some("ground/clay_001/Clay001_2K-JPG_AmbientOcclusion.jpg"),
-        disp: None,
+        diff: "ground/clay_001/Clay001_diff_4k.webp",
+        nor: "ground/clay_001/Clay001_nor_gl_4k.webp",
+        disp: Some("ground/clay_001/Clay001_disp_4k.webp"),
         arm: None,
+        rough: Some("ground/clay_001/Clay001_rough_4k.webp"),
+        ao: Some("ground/clay_001/Clay001_ao_4k.webp"),
     },
     MapSpec {
-        diff: "ground/grass_ground/grass_ground_diff_2k.jpg",
-        nor: "ground/grass_ground/grass_ground_nor_gl_2k.jpg",
-        rough: Some("ground/grass_ground/grass_ground_rough_2k.jpg"),
-        ao: Some("ground/grass_ground/grass_ground_ao_2k.jpg"),
-        disp: Some("ground/grass_ground/grass_ground_disp_2k.jpg"),
-        arm: Some("ground/grass_ground/grass_ground_arm_2k.jpg"),
+        diff: "ground/grass_ground/grass_ground_diff_4k.webp",
+        nor: "ground/grass_ground/grass_ground_nor_gl_4k.webp",
+        disp: Some("ground/grass_ground/grass_ground_disp_4k.webp"),
+        arm: Some("ground/grass_ground/grass_ground_arm_4k.webp"),
+        rough: None,
+        ao: None,
     },
     MapSpec {
-        diff: "ground/rocky_gravel/rocky_gravel_diff_2k.jpg",
-        nor: "ground/rocky_gravel/rocky_gravel_nor_gl_2k.jpg",
-        rough: Some("ground/rocky_gravel/rocky_gravel_rough_2k.jpg"),
-        ao: Some("ground/rocky_gravel/rocky_gravel_ao_2k.jpg"),
-        disp: Some("ground/rocky_gravel/rocky_gravel_disp_2k.jpg"),
-        arm: Some("ground/rocky_gravel/rocky_gravel_arm_2k.jpg"),
+        diff: "ground/rocky_gravel/rocky_gravel_diff_4k.webp",
+        nor: "ground/rocky_gravel/rocky_gravel_nor_gl_4k.webp",
+        disp: Some("ground/rocky_gravel/rocky_gravel_disp_4k.webp"),
+        arm: Some("ground/rocky_gravel/rocky_gravel_arm_4k.webp"),
+        rough: None,
+        ao: None,
     },
 ];
 
@@ -107,28 +110,15 @@ struct Tex {
 struct GroundMaps {
     diff: Tex,
     nor: Tex,
-    rough: Tex,
-    ao: Tex,
     disp: Option<Tex>,
     arm: Option<Tex>,
+    rough: Option<Tex>,
+    ao: Option<Tex>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load() -> Cc0Scene {
-    let maps = GROUND
-        .iter()
-        .map(|spec| {
-            eprintln!("cc0 {}", spec.diff);
-            GroundMaps {
-                diff: tex_from_bytes(&read_file(spec.diff), SRC_DIM, true),
-                nor: tex_from_bytes(&read_file(spec.nor), SRC_DIM, false),
-                rough: tex_from_bytes(&read_file(spec.rough.expect("rough")), SRC_DIM, false),
-                ao: tex_from_bytes(&read_file(spec.ao.expect("ao")), SRC_DIM, false),
-                disp: spec.disp.map(|p| tex_from_bytes(&read_file(p), SRC_DIM, false)),
-                arm: spec.arm.map(|p| tex_from_bytes(&read_file(p), SRC_DIM, false)),
-            }
-        })
-        .collect();
+    let maps = GROUND.iter().map(load_spec).collect();
     build(maps)
 }
 
@@ -138,10 +128,8 @@ pub async fn load() -> Cc0Scene {
     for spec in GROUND {
         web_sys::console::log_1(&format!("cc0 {}", spec.diff).into());
         maps.push(GroundMaps {
-            diff: tex_from_bytes(&fetch_file(spec.diff).await, SRC_DIM, true),
+            diff: tex_from_bytes(&fetch_file(spec.diff).await, SRC_DIM, false),
             nor: tex_from_bytes(&fetch_file(spec.nor).await, SRC_DIM, false),
-            rough: tex_from_bytes(&fetch_file(spec.rough.expect("rough")).await, SRC_DIM, false),
-            ao: tex_from_bytes(&fetch_file(spec.ao.expect("ao")).await, SRC_DIM, false),
             disp: match spec.disp {
                 Some(p) => Some(tex_from_bytes(&fetch_file(p).await, SRC_DIM, false)),
                 None => None,
@@ -150,9 +138,37 @@ pub async fn load() -> Cc0Scene {
                 Some(p) => Some(tex_from_bytes(&fetch_file(p).await, SRC_DIM, false)),
                 None => None,
             },
+            rough: match spec.rough {
+                Some(p) if spec.arm.is_none() => {
+                    Some(tex_from_bytes(&fetch_file(p).await, SRC_DIM, false))
+                }
+                _ => None,
+            },
+            ao: match spec.ao {
+                Some(p) if spec.arm.is_none() => {
+                    Some(tex_from_bytes(&fetch_file(p).await, SRC_DIM, false))
+                }
+                _ => None,
+            },
         });
     }
     build(maps)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_spec(spec: &MapSpec) -> GroundMaps {
+    eprintln!("cc0 {}", spec.diff);
+    let file = |rel: &str| tex_from_bytes(&read_file(rel), SRC_DIM, false);
+    // ARM carries ao, roughness, and metal. Clay has no ARM, so it keeps rough and ao.
+    let separate = spec.arm.is_none();
+    GroundMaps {
+        diff: file(spec.diff),
+        nor: file(spec.nor),
+        disp: spec.disp.map(file),
+        arm: spec.arm.map(file),
+        rough: if separate { spec.rough.map(file) } else { None },
+        ao: if separate { spec.ao.map(file) } else { None },
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -202,6 +218,25 @@ fn tex_from_bytes(bytes: &[u8], max_dim: u32, srgb: bool) -> Tex {
         }
     }
     Tex { w, h, rgba }
+}
+
+fn srgb_to_linear(s: f32) -> f32 {
+    let s = s.clamp(0.0, 1.0);
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb_u8(l: f32) -> u8 {
+    let l = l.clamp(0.0, 1.0);
+    let s = if l <= 0.0031308 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (s.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn linear_u8(c: u8) -> u8 {
@@ -316,30 +351,34 @@ fn bake_ground(maps: &[GroundMaps]) -> (RgbaTex, RgbaTex, RgbaTex) {
                 let u = x / tiles[k];
                 let v = z / tiles[k];
                 let d = map.diff.sample(u, v);
-                alb[0] += d[0] * wk;
-                alb[1] += d[1] * wk;
-                alb[2] += d[2] * wk;
+                // Blend in linear. The bake is stored sRGB so 8-bit does not band the dirt.
+                alb[0] += srgb_to_linear(d[0]) * wk;
+                alb[1] += srgb_to_linear(d[1]) * wk;
+                alb[2] += srgb_to_linear(d[2]) * wk;
                 let ns = map.nor.sample(u, v);
                 nrm[0] += (ns[0] * 2.0 - 1.0) * wk;
                 nrm[1] += (ns[1] * 2.0 - 1.0) * wk;
                 nrm[2] += (ns[2] * 2.0 - 1.0) * wk;
-                let r = map.rough.sample(u, v)[0];
-                let a = map.ao.sample(u, v)[0];
-                let (arm_r, arm_g, arm_b) = match &map.arm {
-                    Some(arm) => {
-                        let s = arm.sample(u, v);
-                        (s[0], s[1], s[2])
-                    }
-                    None => (a, r, 0.0),
+                let (ao_s, rough_s, metal_s) = if let Some(arm) = &map.arm {
+                    let s = arm.sample(u, v);
+                    (s[0], s[1], s[2])
+                } else {
+                    let rough = map
+                        .rough
+                        .as_ref()
+                        .expect("rough map")
+                        .sample(u, v)[0];
+                    let ao = map.ao.as_ref().expect("ao map").sample(u, v)[0];
+                    (ao, rough, 0.0)
                 };
-                rough += (r * 0.65 + arm_g * 0.35) * wk;
-                ao += (a * arm_r).sqrt() * wk;
+                rough += rough_s * wk;
+                ao += ao_s * wk;
                 let dv = match &map.disp {
                     Some(disp) => disp.sample(u, v)[0],
                     None => 0.5,
                 };
                 disp += dv * wk;
-                metal += arm_b * wk;
+                metal += metal_s * wk;
             }
             if wn < 1e-4 {
                 alb = [0.15, 0.12, 0.08];
@@ -363,9 +402,9 @@ fn bake_ground(maps: &[GroundMaps]) -> (RgbaTex, RgbaTex, RgbaTex) {
             }
             let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-5);
             let o = ((j * GROUND_RES + i) * 4) as usize;
-            diff[o] = u8f(alb[0]);
-            diff[o + 1] = u8f(alb[1]);
-            diff[o + 2] = u8f(alb[2]);
+            diff[o] = linear_to_srgb_u8(alb[0]);
+            diff[o + 1] = linear_to_srgb_u8(alb[1]);
+            diff[o + 2] = linear_to_srgb_u8(alb[2]);
             diff[o + 3] = 255;
             nor[o] = u8f(nrm[0] / nl * 0.5 + 0.5);
             nor[o + 1] = u8f(nrm[1] / nl * 0.5 + 0.5);
