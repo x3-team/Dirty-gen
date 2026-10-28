@@ -4,7 +4,8 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField, SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech_at, SoilField,
+    SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -224,7 +225,14 @@ impl Vehicle {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
                 ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
+                solve_suspension(
+                    z0,
+                    up_y,
+                    self.wheels[i].slip,
+                    sample.softness,
+                    sample.rut,
+                    sample.water,
+                )
             };
 
             let wheel_center = wc0 + up * compression;
@@ -263,7 +271,7 @@ impl Vehicle {
             let mut fling = 0.0;
 
             if active {
-                let tm = terramech(sample.softness);
+                let tm = terramech_at(sample.softness, sample.rut, sample.water);
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -663,8 +671,15 @@ fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {
-    let tm = terramech(softness);
+fn solve_suspension(
+    z0: f32,
+    up_y: f32,
+    slip: f32,
+    softness: f32,
+    rut: f32,
+    water: f32,
+) -> (f32, f32, f32) {
+    let tm = terramech_at(softness, rut, water);
     // Slip-sinkage: a spinning tire sees a softer modulus and sinks further.
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;

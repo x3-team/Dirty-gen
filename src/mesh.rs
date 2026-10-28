@@ -21,6 +21,12 @@ pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
 /// Wet mud clod. Not body paint, and not a camera-facing card.
 pub const PANEL_CLOD: f32 = 46.0;
+/// Drier crust on the outside of a torn clod.
+const PANEL_CRUST: f32 = 47.0;
+/// Sand caught in the clay.
+const PANEL_SAND: f32 = 48.0;
+/// A small stone packed into the clod.
+const PANEL_STONE: f32 = 49.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -670,7 +676,14 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
         4,
     );
     let pivot = Vec3::new(0.0, 0.02, -0.12);
-    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot,
+        rear + Vec3::new(0.0, 0.02, 0.0),
+        0.03,
+        arm,
+        5,
+    );
     add_tube(
         &mut m,
         pivot + Vec3::new(0.06, 0.0, 0.0),
@@ -916,8 +929,7 @@ fn add_tri_smooth(
         push_smooth(mesh, b, nb, panel);
         push_smooth(mesh, c, nc, panel);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
 /// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
@@ -986,15 +998,7 @@ fn add_lump(
         let a = ring(1, i);
         let b = ring(1, i + 1);
         add_tri_smooth(
-            mesh,
-            pts[0],
-            nrm[0],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
     for s in 1..stacks.saturating_sub(1) {
@@ -1004,26 +1008,10 @@ fn add_lump(
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
             add_tri_smooth(
-                mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
+                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center,
             );
             add_tri_smooth(
-                mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
+                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center,
             );
         }
     }
@@ -1033,64 +1021,291 @@ fn add_lump(
         let a = ring(last, i + 1);
         let b = ring(last, i);
         add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
     add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded,
     );
 }
 
-/// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+fn ang_dist(i: usize, j: usize, sides: usize) -> usize {
+    let d = i.abs_diff(j);
+    d.min(sides - d)
+}
+
+fn add_pebble(mesh: &mut CpuMesh, center: Vec3, rot: Quat, radius: f32, seed: u32) {
+    let h = |n: u32| chunk_hash(seed, n);
+    let axis = Vec3::new(0.7 + h(1) * 0.55, 0.45 + h(2) * 0.4, 0.65 + h(3) * 0.6);
+    let slices = 5usize;
+    let place = |dir: Vec3, rad: f32| {
+        let y_scale = if dir.y < -0.2 {
+            axis.y * (0.62 + h(4) * 0.2)
+        } else {
+            axis.y
+        };
+        let shaped = Vec3::new(dir.x * axis.x, dir.y * y_scale, dir.z * axis.z) * rad;
+        let n = Vec3::new(dir.x / axis.x, dir.y / y_scale.max(0.2), dir.z / axis.z);
+        (center + rot * shaped, (rot * n).normalize_or_zero())
+    };
+    let mut pts = Vec::new();
+    let mut nrm = Vec::new();
+    let (p, n) = place(Vec3::Y, radius * (0.75 + h(5) * 0.3));
+    pts.push(p);
+    nrm.push(n);
+    let phi = std::f32::consts::PI * 0.5;
+    for i in 0..slices {
+        let th = i as f32 / slices as f32 * std::f32::consts::TAU + h(6);
+        let wob = 0.82 + h(20 + i as u32) * 0.3;
+        let dir = Vec3::new(th.cos() * phi.sin(), phi.cos() * 0.15, th.sin() * phi.sin());
+        let (p, n) = place(dir.normalize_or_zero(), radius * wob);
+        pts.push(p);
+        nrm.push(n);
+    }
+    let (p, n) = place(-Vec3::Y, radius * (0.55 + h(7) * 0.25));
+    pts.push(p);
+    nrm.push(n);
+    for i in 0..slices {
+        let a = 1 + i;
+        let b = 1 + (i + 1) % slices;
+        add_tri_smooth(
+            mesh,
+            pts[0],
+            nrm[0],
+            pts[a],
+            nrm[a],
+            pts[b],
+            nrm[b],
+            PANEL_STONE,
+            center,
+        );
+        let bot = pts.len() - 1;
+        add_tri_smooth(
+            mesh,
+            pts[bot],
+            nrm[bot],
+            pts[b],
+            nrm[b],
+            pts[a],
+            nrm[a],
+            PANEL_STONE,
+            center,
+        );
+    }
+}
+
+/// Thick wet soil plate. Soft skin, a torn outline, crust on the dry side,
+/// stones sunk in. Landed pieces keep that shape; only the mesh sits up.
+fn add_torn_clay(
+    mesh: &mut CpuMesh,
+    center: Vec3,
+    rot: Quat,
+    radius: f32,
+    seed: u32,
+    grounded: bool,
+) {
+    let h = |n: u32| chunk_hash(seed, n);
+    let chunky = h(4) > 0.62;
+    let thick = radius
+        * if chunky {
+            0.55 + h(5) * 0.18
+        } else {
+            0.34 + h(5) * 0.12
+        };
+    let scale = Vec3::new(0.78 + h(1) * 0.55, 0.94 + h(2) * 0.16, 0.72 + h(3) * 0.6);
+    let bulk = 0.88 + h(11) * 0.32;
+    let stones_n = 1 + (h(36) * 1.6) as u32;
+    let sink = if grounded {
+        let heavy = (stones_n as f32 - 1.0) * 0.05;
+        let tall = if chunky { 0.14 } else { 0.0 };
+        // Sit in the soil, like the torn shoulder of the rut. Volume is unchanged.
+        Vec3::Y * radius * (0.12 + h(12) * 0.06 + tall * 0.4 - heavy)
+    } else {
+        Vec3::ZERO
+    };
+    let laid = if grounded {
+        let fwd = rot * Vec3::Z;
+        let yaw = fwd.x.atan2(fwd.z);
+        let tilt = (h(6) - 0.5) * 0.28;
+        let roll = (h(8) - 0.5) * 0.32;
+        Quat::from_rotation_y(yaw) * Quat::from_rotation_x(tilt) * Quat::from_rotation_z(roll)
+    } else {
+        rot
+    };
+    let xform = |p: Vec3| {
+        center + laid * Vec3::new(p.x * scale.x, p.y * scale.y, p.z * scale.z) * bulk + sink
+    };
+    let interior = xform(Vec3::ZERO);
+    let up = laid * Vec3::Y;
+    let sides = 14 + (h(9) * 3.0) as usize;
+    let bite = (h(13) * sides as f32) as usize % sides;
+    let lump = (bite + sides / 2) % sides;
+    let sand_i = (lump + 1) % sides;
+    let phase = h(14) * std::f32::consts::TAU;
+    let phase2 = h(15) * std::f32::consts::TAU;
+    let step = std::f32::consts::TAU / sides as f32;
+    // A thick plate: wide, with a soft rim rather than an egg.
+    let profile = [
+        (-0.46_f32, 0.86_f32),
+        (-0.2, 1.0),
+        (0.0, 1.02),
+        (0.2, 1.0),
+        (0.44, 0.84),
+    ];
+    let mut rings: Vec<Vec<Vec3>> = Vec::new();
+    let mut norms: Vec<Vec<Vec3>> = Vec::new();
+    for (band, (y, rad)) in profile.iter().enumerate() {
+        let mut pts = Vec::with_capacity(sides);
+        let mut nrm = Vec::with_capacity(sides);
+        for i in 0..sides {
+            let wobble = (h(40 + band as u32 * 20 + i as u32) - 0.5) * step * 0.28;
+            let ang = i as f32 * step + wobble;
+            let lobe = 1.0 + 0.2 * (ang * 2.0 + phase).cos() + 0.1 * (ang * 3.0 + phase2).sin();
+            let mut rr = radius * rad * lobe * (0.82 + h(70 + band as u32 * 20 + i as u32) * 0.32);
+            if i == bite {
+                rr *= 0.52 + h(17) * 0.08;
+            } else if ang_dist(i, bite, sides) == 1 {
+                rr *= 0.74;
+            }
+            if i == lump {
+                rr *= 1.22 + h(18) * 0.12;
+            }
+            let yy = y * thick + (h(90 + band as u32 * 20 + i as u32) - 0.5) * thick * 0.05;
+            let world = xform(Vec3::new(rr * ang.cos(), yy, rr * ang.sin()));
+            let radial = (world - interior).normalize_or_zero();
+            let n = if band == 4 {
+                (up + radial * 0.28).normalize_or_zero()
+            } else if band == 0 {
+                (-up + radial * 0.28).normalize_or_zero()
+            } else if band == 3 {
+                (radial + up * 0.55).normalize_or_zero()
+            } else if band == 1 {
+                (radial - up * 0.55).normalize_or_zero()
+            } else {
+                radial
+            };
+            nrm.push(n);
+            pts.push(world);
+        }
+        rings.push(pts);
+        norms.push(nrm);
+    }
+
+    let skin = |band: usize, i: usize| -> f32 {
+        if band < 3 {
+            return PANEL_CLOD;
+        }
+        // One drier patch and a sandy streak on the top. The torn side stays wet.
+        if ang_dist(i, sand_i, sides) <= 1 {
+            PANEL_SAND
+        } else if ang_dist(i, lump, sides) <= sides / 5 {
+            PANEL_CRUST
+        } else {
+            PANEL_CLOD
+        }
+    };
+
+    let floor = xform(Vec3::new(0.0, profile[0].0 * thick * 0.45, 0.0));
+    let floor_n = (laid * -Vec3::Y).normalize();
+    let crown = xform(Vec3::new(0.0, profile[4].0 * thick * 0.62, 0.0));
+    for i in 0..sides {
+        let j = (i + 1) % sides;
+        add_tri_smooth(
+            mesh,
+            rings[0][i],
+            norms[0][i],
+            rings[0][j],
+            norms[0][j],
+            floor,
+            floor_n,
+            PANEL_CLOD,
+            interior,
+        );
+        add_tri_smooth(
+            mesh,
+            rings[4][i],
+            norms[4][i],
+            crown,
+            up,
+            rings[4][j],
+            norms[4][j],
+            skin(4, i),
+            interior,
+        );
+    }
+    for band in 0..4 {
+        for i in 0..sides {
+            let j = (i + 1) % sides;
+            let panel = skin(band, i);
+            add_tri_smooth(
+                mesh,
+                rings[band][i],
+                norms[band][i],
+                rings[band + 1][i],
+                norms[band + 1][i],
+                rings[band][j],
+                norms[band][j],
+                panel,
+                interior,
+            );
+            add_tri_smooth(
+                mesh,
+                rings[band][j],
+                norms[band][j],
+                rings[band + 1][i],
+                norms[band + 1][i],
+                rings[band + 1][j],
+                norms[band + 1][j],
+                panel,
+                interior,
+            );
+        }
+    }
+
+    let mut cursor = (lump + 2) % sides;
+    for s in 0..stones_n {
+        if ang_dist(cursor, sand_i, sides) <= 1 {
+            cursor = (cursor + 2) % sides;
+        }
+        let host = rings[3][cursor];
+        let n = norms[3][cursor];
+        let stone_r = radius * (0.2 + h(220 + s) * 0.12);
+        let at = host + n * stone_r * 0.05;
+        let spin =
+            Quat::from_rotation_y(h(240 + s) * 4.0) * Quat::from_rotation_z(h(250 + s) * 2.0);
+        add_pebble(
+            mesh,
+            at,
+            laid * spin,
+            stone_r,
+            seed ^ 0x51C0_u32.wrapping_mul(s + 1),
+        );
+        cursor = (cursor + sides / 2) % sides;
+    }
+}
+
+/// Wet mud in world space. Impact chunks are torn clods; droplets stay small lumps.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
-    const MAX_VERTS: usize = 14000;
+    const MAX_VERTS: usize = 15000;
     // Draw the big clumps first so a full splash cannot crowd them out.
     for kind in [3u8, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
-            if mesh.vertices.len() + 700 > MAX_VERTS {
+            let room = if kind == 3 { 1600 } else { 480 };
+            if mesh.vertices.len() + room > MAX_VERTS {
+                if kind == 3 {
+                    continue;
+                }
                 return mesh;
             }
             if p.kind == 3 {
-                add_piece(&mut mesh, p, 8, 16);
-                // Two side lobes so the clump is a soft mass, not one pebble.
-                for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {
-                    let dir = Vec3::new(
-                        chunk_hash(p.seed, slot) * 2.0 - 1.0,
-                        chunk_hash(p.seed, slot + 1) * 0.28,
-                        chunk_hash(p.seed, slot + 2) * 2.0 - 1.0,
-                    )
-                    .normalize_or_zero();
-                    let lobe = silt::particles::Particle {
-                        pos: p.pos + p.rot * dir * p.size * dist,
-                        size: p.size * scale,
-                        seed: p.seed ^ 0xA5A5_5A5Au32.wrapping_mul(slot | 1),
-                        ..*p
-                    };
-                    add_piece(&mut mesh, &lobe, 6, 12);
-                }
+                add_torn_clay(&mut mesh, p.pos, p.rot, p.size, p.seed, p.grounded);
             } else if p.kind == 1 {
                 let mut q = *p;
                 q.size = p.size.max(0.08);
