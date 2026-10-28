@@ -349,10 +349,11 @@ impl Bike {
         if land {
             let vy = self.vel.y.abs();
             let depth = (vy * 0.024).clamp(0.10, 0.22);
-            let _dug = soil.stamp_impact(x, z, 1.15, depth);
+            let sample = soil.sample(x, z);
+            let dug = soil.stamp_impact(x, z, 1.15, depth);
             soil.shock_ring(x, z);
             let h = soil.sample(x, z).height;
-            let _n = particles.impact_burst(Vec3::new(x, h + 0.12, z));
+            let _n = particles.impact_from_cut(Vec3::new(x, h + 0.12, z), sample, dug.ejected);
             stick_mud(self, soil);
             if self.vel.y < 0.0 {
                 self.vel.y *= 0.22;

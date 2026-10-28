@@ -24,6 +24,14 @@ pub struct SoilSample {
     pub rut: f32,
 }
 
+/// What one dig did to the heightfield. `depth` is the deepest drop.
+/// `ejected` is the cut volume that was not piled back onto the field.
+#[derive(Clone, Copy, Debug)]
+pub struct Dig {
+    pub depth: f32,
+    pub ejected: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct SoilField {
     pub res: usize,
@@ -369,9 +377,9 @@ impl SoilField {
         slip: f32,
         dt: f32,
         lane: bool,
-    ) {
+    ) -> f32 {
         if sinkage < 0.004 {
-            return;
+            return 0.0;
         }
         let len = contact_length(radius, sinkage).max(radius * 0.35);
         let slip_n = slip.abs().min(1.2);
@@ -500,11 +508,12 @@ impl SoilField {
         // A thin lip on the lane ribbon only. Per-tire scuffs do not pile a
         // second ridge, or the berm reads as extra grooves.
         if !lane || n_left + n_right == 0 {
-            return;
+            return vol;
         }
         let berm_vol = vol * 0.85;
         let n_berm = (n_left + n_right) as f32;
         let dh = berm_vol / (n_berm * area);
+        let mut placed = 0.0_f32;
         for idx in left_cells.iter().take(n_left).chain(right_cells.iter().take(n_right)) {
             let pile = (self.height[*idx] - self.initial_height[*idx]).max(0.0);
             let add = dh.min((0.032 - pile).max(0.0));
@@ -515,7 +524,9 @@ impl SoilField {
             self.roughness[*idx] = lerp(self.roughness[*idx], 0.96, 0.25);
             self.darken[*idx] = lerp(self.darken[*idx], 0.28, 0.15);
             self.loose[*idx] = (self.loose[*idx] + add * 0.4).min(0.18);
+            placed += add * area;
         }
+        (vol - placed).max(0.0)
     }
 
     /// Displace puddle water out of a wheel footprint. Returns displaced depth scale.
@@ -605,7 +616,7 @@ impl SoilField {
 
     /// Body-sized crater. The displaced soil is piled on the rim. Returns the
     /// deepest cut this stamp wrote into the heightfield.
-    pub fn stamp_impact(&mut self, x: f32, z: f32, radius: f32, depth: f32) -> f32 {
+    pub fn stamp_impact(&mut self, x: f32, z: f32, radius: f32, depth: f32) -> Dig {
         let radius = radius.clamp(0.5, 2.2);
         let depth = depth.clamp(0.04, 0.24);
         let half = self.size * 0.5;
@@ -639,6 +650,7 @@ impl SoilField {
                 }
             }
         }
+        let mut placed = 0.0_f32;
         if ring_n > 0.0 && vol > 0.0 {
             let dh = vol * 0.7 / (ring_n * area);
             for j in j0.max(1)..j1.min(res - 1) {
@@ -649,12 +661,17 @@ impl SoilField {
                     if (1.0..1.5).contains(&d) {
                         let idx = j as usize * self.res + i as usize;
                         let lip = 1.0 - (d - 1.0) / 0.5;
-                        self.height[idx] += dh * lip;
+                        let add = dh * lip;
+                        self.height[idx] += add;
+                        placed += add * area;
                     }
                 }
             }
         }
-        dug_max
+        Dig {
+            depth: dug_max,
+            ejected: (vol - placed).max(0.0),
+        }
     }
 
     /// Push standing water out of the impact into a ring. The pipe step then
