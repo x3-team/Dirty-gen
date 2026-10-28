@@ -9,9 +9,11 @@
 //! Deep slurry also drags. The viscosity is the mix — clay, silt, or sand —
 //! and it resists both the roll of the tread and the forward motion of the
 //! tire. Pulling the tire out holds a short suction, then the seal breaks and
-//! throws ribbons and drops taken from the slurry. That thrown part leaves
-//! the slurry column and stays in the airborne or placed account. The visible
-//! height is bed + placed + the slurry that is still on the ground.
+//! throws ribbons and drops taken from the slurry. Slurry that stays behind
+//! sits in the tread voids. Spinning the wheel, or shedding the coat, lets
+//! that hold leave as ribbons. What is in the grooves, what is thrown, and
+//! what returns to the rut add up to the slurry that left the column. The
+//! visible height is bed + placed + the slurry that is still on the ground.
 //!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
@@ -3146,6 +3148,147 @@ impl SoilField {
             self.airborne += vol;
         }
         vol
+    }
+
+    /// Slurry that clings in the tread when the tire is pulled clear.
+    ///
+    /// `room` is the cubic metres the voids can still take. The rut keeps
+    /// most of the column. Nothing here is thrown, and the bed is not cut.
+    /// Rolling through the slurry does not use this path.
+    pub fn pack_slurry_into_grooves(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        radius: f32,
+        width: f32,
+        room: f32,
+    ) -> f32 {
+        let room = room.max(0.0);
+        if room <= 1.0e-8 || !room.is_finite() {
+            return 0.0;
+        }
+        let cells = self.slurry_under_tread(x, z, forward, radius, width);
+        let area = self.cell * self.cell;
+        let available: f32 = cells.iter().map(|idx| self.slurry[*idx] * area).sum();
+        if available <= 1.0e-8 {
+            return 0.0;
+        }
+        // The voids take what they can hold, and no more than two fifths of
+        // the slurry under the tread.
+        let want = room.min(available * 0.40);
+        let frac = (want / available).clamp(0.0, 1.0);
+        let mut vol = 0.0_f32;
+        for idx in cells {
+            let take = self.slurry[idx] * frac;
+            self.slurry[idx] -= take;
+            vol += take * area;
+            self.sync(idx);
+        }
+        vol
+    }
+
+    /// Put thrown groove slurry back into the nearest rut. The bed is not cut.
+    /// Returns the surface point the volume landed on.
+    pub fn return_slurry_to_rut(&mut self, x: f32, z: f32, volume: f32) -> Option<Vec3> {
+        let take = volume.min(self.airborne).max(0.0);
+        if take <= 1.0e-8 || !take.is_finite() {
+            return None;
+        }
+        let idx = self.nearest_rut_idx(x, z)?;
+        self.airborne -= take;
+        self.slurry[idx] += take / (self.cell * self.cell);
+        self.sync(idx);
+        let half = self.size * 0.5;
+        let i = idx % self.res;
+        let j = idx / self.res;
+        Some(Vec3::new(
+            (i as f32 + 0.5) * self.cell - half,
+            self.height[idx],
+            (j as f32 + 0.5) * self.cell - half,
+        ))
+    }
+
+    fn slurry_under_tread(
+        &self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        radius: f32,
+        width: f32,
+    ) -> Vec<usize> {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let radius = radius.max(0.15);
+        let half_w = width * 0.72 + self.cell * 0.35;
+        let back = -radius * 0.20;
+        let front = radius * 0.95;
+        let reach = radius + half_w + self.cell;
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let mut cells = Vec::new();
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                if !(back..=front).contains(&along) || lat.abs() > half_w {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if self.slurry[idx] > 1.0e-5 {
+                    cells.push(idx);
+                }
+            }
+        }
+        cells
+    }
+
+    fn nearest_rut_idx(&self, x: f32, z: f32) -> Option<usize> {
+        let start = self.idx_at(x, z)?;
+        if self.in_rut_or_hole(start) {
+            return Some(start);
+        }
+        let res = self.res as isize;
+        let i0 = (start % self.res) as isize;
+        let j0 = (start / self.res) as isize;
+        let half = self.size * 0.5;
+        let mut best: Option<(usize, f32)> = None;
+        for rad in 1isize..=16 {
+            for dj in -rad..=rad {
+                for di in -rad..=rad {
+                    if di.abs() != rad && dj.abs() != rad {
+                        continue;
+                    }
+                    let i = i0 + di;
+                    let j = j0 + dj;
+                    if i < 0 || j < 0 || i >= res || j >= res {
+                        continue;
+                    }
+                    let idx = j as usize * self.res + i as usize;
+                    if !self.in_rut_or_hole(idx) {
+                        continue;
+                    }
+                    let cx = (i as f32 + 0.5) * self.cell - half;
+                    let cz = (j as f32 + 0.5) * self.cell - half;
+                    let d = (cx - x).hypot(cz - z);
+                    if best.map(|b| d < b.1).unwrap_or(true) {
+                        best = Some((idx, d));
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        best.map(|b| b.0)
     }
 
     /// A tire rut is a bed below the surface it started at. A hole is a

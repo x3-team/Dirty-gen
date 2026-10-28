@@ -75,6 +75,8 @@ pub struct Wheel {
     pub slurry_lift: f32,
     /// Armed once the tire has sat in deep slurry. Cleared on breakaway.
     pub slurry_sealed: bool,
+    /// Cubic metres of slurry sitting in the tread voids after a pull-out.
+    pub slurry_groove: f32,
 }
 
 impl Default for Wheel {
@@ -95,6 +97,7 @@ impl Default for Wheel {
             drive_force: 0.0,
             slurry_lift: 0.0,
             slurry_sealed: false,
+            slurry_groove: 0.0,
         }
     }
 }

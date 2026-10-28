@@ -7,7 +7,8 @@ use std::path::Path;
 use glam::{Mat4, Vec3};
 use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
 use silt::bike::{Bike, BIKE_RADIUS};
-use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
+use silt::patch::groove_slurry_capacity;
+use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS, WHEEL_WIDTH};
 use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
@@ -1622,20 +1623,25 @@ fn wheel_model(
             * Mat4::from_scale(Vec3::splat(fit))
     };
     let mud_n = (wheel.mud / 1.5).clamp(0.0, 1.4);
+    let slurry_fill = (wheel.slurry_groove
+        / groove_slurry_capacity(WHEEL_RADIUS, WHEEL_WIDTH).max(1.0e-6))
+    .clamp(0.0, 1.0);
+    let fill = wheel.groove.max(slurry_fill).clamp(0.0, 1.0);
     // Niva kind 2 carries the contact patch: sidewall, groove fill, lug smear.
     // The procedural tire stays kind 1. Its grooves are the mesh, not this carcass.
+    // Slurry held after a pull-out uses the same void fill as packed clay.
     let extra = if niva {
         [
             2.0,
             wheel.sidewall.clamp(0.0, 1.0),
-            wheel.groove.clamp(0.0, 1.0),
+            fill,
             wheel.smear.clamp(0.0, 1.0),
         ]
     } else {
         [
             1.0,
             mud_n,
-            wheel.groove.clamp(0.0, 1.0),
+            fill,
             wheel.smear.clamp(0.0, 1.0),
         ]
     };

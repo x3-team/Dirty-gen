@@ -522,6 +522,8 @@ struct CaptureArgs {
     slurry_drag_proof: PathBuf,
     slurry_suction: bool,
     slurry_suction_proof: PathBuf,
+    slurry_groove: bool,
+    slurry_groove_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -602,6 +604,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_suction {
         capture_slurry_suction(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_groove {
+        capture_slurry_groove(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -786,6 +792,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_drag_proof = PathBuf::from(format!("{MEDIA}/slurry-drag-proof.png"));
     let mut slurry_suction = false;
     let mut slurry_suction_proof = PathBuf::from(format!("{MEDIA}/slurry-suction-proof.png"));
+    let mut slurry_groove = false;
+    let mut slurry_groove_proof = PathBuf::from(format!("{MEDIA}/slurry-groove-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -850,6 +858,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_suction = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_suction_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-groove-proof" => {
+                slurry_groove = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_groove_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -937,6 +951,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_drag_proof,
         slurry_suction,
         slurry_suction_proof,
+        slurry_groove,
+        slurry_groove_proof,
     }
 }
 
@@ -2114,6 +2130,96 @@ fn capture_slurry_suction(renderer: &mut Renderer, parsed: &CaptureArgs) {
     );
 }
 
+/// The right front tire has been pulled out of a slurry rut. The voids still
+/// hold slurry, and a spin is throwing the rest off as ribbons.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_groove(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::patch::{groove_slurry_capacity, release_groove_slurry};
+    use silt::soil::{SurfaceKind, SLURRY_COMPARE_MOISTURE};
+    use silt::vehicle::{WHEEL_RADIUS, WHEEL_WIDTH};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let moisture = SLURRY_COMPARE_MOISTURE;
+    let depth = 0.16_f32;
+    let mut world = World::wet_clay();
+    let poured = world.soil.fill_slurry_pool(
+        -2.4,
+        2.4,
+        -2.8,
+        2.6,
+        depth,
+        SurfaceKind::WetMud,
+        moisture,
+    );
+    let before = world.soil.mix_volumes();
+    println!("groove pool {poured:.4} m3  volume before {:.4} m3", before.total());
+
+    world.vehicle.pos = Vec3::new(0.0, 0.72, 0.15);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    for (i, w) in world.vehicle.wheels.iter_mut().enumerate() {
+        w.compression = 0.12;
+        w.omega = if i == 3 { 14.0 } else { 0.2 };
+        w.spin = if i == 3 { 1.1 } else { 0.0 };
+        w.slurry_sealed = false;
+        w.slurry_lift = 0.05;
+        w.slurry_groove = 0.0;
+        w.groove = 0.0;
+        w.smear = 0.0;
+        w.sidewall = 0.0;
+    }
+    // Rear tire, clear of the rut, so the crown faces a camera behind the Niva.
+    seat_axle(&mut world, 3, -0.04);
+
+    let ori = world.vehicle.orientation();
+    let local = ori * world.vehicle.wheel_center_local(3);
+    let x = world.vehicle.pos.x + local.x;
+    let z = world.vehicle.pos.z + local.z;
+    let cap = groove_slurry_capacity(WHEEL_RADIUS, WHEEL_WIDTH);
+    let packed = world
+        .soil
+        .pack_slurry_into_grooves(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH, cap);
+    let mut held = packed;
+    let dt = 1.0 / 60.0;
+    let mut thrown = 0.0_f32;
+    // A short spin. Ribbons leave, and most of the slurry is still in the voids.
+    for _ in 0..5 {
+        thrown += release_groove_slurry(&mut held, 1.0, 0.0, dt);
+    }
+    world.soil.airborne += thrown;
+    world.vehicle.wheels[3].slurry_groove = held;
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let origin = world.vehicle.pos + local;
+    let carried = world
+        .particles
+        .throw_groove_ribbons(origin, fwd, right, thrown);
+    let after = world.soil.mix_volumes();
+    let returned = 0.0_f32;
+    println!(
+        "groove-hold packed {packed:.5} m3  groove {held:.5} m3  thrown {thrown:.5} m3  carried {carried:.5} m3  returned {returned:.5} m3  sum {:.5} m3",
+        held + thrown + returned
+    );
+    println!(
+        "groove column before slurry {:.4} m3  after {:.4} m3  cap {cap:.5} m3",
+        before.slurry, after.slurry
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "slurry-groove",
+        &parsed.slurry_groove_proof,
+        parsed,
+        slurry_groove_camera(&world),
+    );
+}
+
 /// Put one axle's tire bottoms `sink` metres under the slurry surface.
 /// Negative sink lifts the tread clear.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2174,6 +2280,23 @@ fn slurry_suction_camera(world: &World) -> CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
         ortho_width: Some(ortho),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_groove_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let ori = world.vehicle.orientation();
+    let wheel = world.vehicle.pos + ori * world.vehicle.wheel_center_local(3);
+    // Behind the rear crown, far enough out that the rim is an edge and
+    // the ribbons have air beside the tread.
+    let look = wheel - fwd * 0.20 + right * 0.02 - Vec3::Y * 0.08;
+    let eye = wheel - fwd * 1.08 + right * 0.26 + Vec3::Y * 0.10;
+    CameraPose {
+        eye,
+        target: look,
+        ortho_width: Some(1.00),
     }
 }
 

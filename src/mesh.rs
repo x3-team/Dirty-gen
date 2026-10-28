@@ -1183,6 +1183,31 @@ mod slurry_shapes {
         }
     }
 
+    /// Length, width, thickness in the same frame the ribbon mesh uses.
+    fn ribbon_frame(mesh: &CpuMesh, vel: Vec3) -> [f32; 3] {
+        let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
+        if dir.length_squared() < 1.0e-6 {
+            dir = Vec3::Z;
+        }
+        dir = dir.normalize();
+        let mut side = dir.cross(Vec3::Y);
+        if side.length_squared() < 1.0e-6 {
+            side = dir.cross(Vec3::X);
+        }
+        side = side.normalize();
+        let up = side.cross(dir).normalize();
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(-f32::MAX);
+        for v in &mesh.vertices {
+            let p = Vec3::from_array(v.pos);
+            let q = Vec3::new(p.dot(dir), p.dot(side), p.dot(up));
+            min = min.min(q);
+            max = max.max(q);
+        }
+        let span = max - min;
+        [span.x, span.y, span.z]
+    }
+
     fn extents(mesh: &CpuMesh) -> [f32; 3] {
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(-f32::MAX);
@@ -1228,6 +1253,35 @@ mod slurry_shapes {
         );
         assert!(d[1] > d[2] * 1.8, "drop is a bar {d:?}");
         assert!(d[0] / d[1] < 6.0, "drop is a needle {d:?}");
+    }
+
+    #[test]
+    fn groove_shed_is_ribbons_not_blocks() {
+        use silt::particles::{Particles, KIND_SLURRY_DROP, KIND_SLURRY_RIBBON};
+        let mut particles = Particles::new();
+        let volume = 0.0024_f32;
+        let carried = particles.throw_groove_ribbons(Vec3::new(0.2, 0.4, 0.1), Vec3::Z, Vec3::X, volume);
+        assert!((carried - volume).abs() < 1.0e-5, "carried {carried} of {volume}");
+        let pieces: Vec<_> = particles
+            .items
+            .iter()
+            .filter(|p| p.alive && p.volume > 1.0e-8)
+            .collect();
+        assert!(pieces.len() >= 3, "ribbon count {}", pieces.len());
+        for p in &pieces {
+            assert_eq!(p.kind, KIND_SLURRY_RIBBON, "groove shed used kind {}", p.kind);
+            assert_ne!(p.kind, KIND_SLURRY_DROP);
+            let mut mesh = CpuMesh::new();
+            add_slurry_ribbon(&mut mesh, p);
+            let mut e = ribbon_frame(&mesh, p.vel);
+            e.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            assert!(
+                e[0] > e[1] * 2.4 && e[0] > e[2] * 3.0,
+                "groove shed is not a ribbon {e:?}"
+            );
+            assert!(e[1] / e[0] < 0.42, "groove shed reads as a tablet {e:?}");
+            assert!(e[0] / e[2] > 4.0, "groove shed is a sphere or a cube {e:?}");
+        }
     }
 
     #[test]

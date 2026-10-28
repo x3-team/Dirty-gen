@@ -7,6 +7,8 @@
 //! tread is coated. A coat also climbs the sidewall. That thickness is real
 //! volume, skimmed from the loose smear, and when it sheds it is placed
 //! back on the rut. It is not deleted. The cut itself is a different budget.
+//! Slurry from a pull-out can sit in the same voids. It stays until the
+//! wheel spins or the coat sheds, and then it leaves as ribbons.
 
 use crate::soil::{
     contact_length, softness_of, stick_scale, terramech_for, SurfaceKind,
@@ -24,6 +26,43 @@ pub const SIDEWALL_AREA: f32 = 0.34;
 pub const SIDEWALL_THICK: f32 = 0.025;
 /// Cubic metres on one tire when `TreadCoat::sidewall` is 1.
 pub const SIDEWALL_VOLUME: f32 = SIDEWALL_AREA * SIDEWALL_THICK;
+
+/// Cubic metres of slurry the tread voids hold when they are full.
+///
+/// The open share of the crown, around the whole tire. Slurry mounds up to
+/// the lug, so the hold is deeper than the dry pack in [`GROOVE_DEPTH`].
+pub fn groove_slurry_capacity(radius: f32, width: f32) -> f32 {
+    let radius = radius.max(0.05);
+    let width = width.max(0.02);
+    let depth = GROOVE_DEPTH * 1.75;
+    std::f32::consts::TAU * radius * width * (1.0 - LUG_FRAC) * depth
+}
+
+/// Let slurry out of the voids. `spin` is 0 on a roll and 1 when the tread
+/// is spinning. `coat_shed` is the sidewall fraction that left this step.
+/// Either one opens the voids. A parked or rolling tire keeps the pack.
+/// The return is cubic metres that left, for the caller to throw as ribbons.
+pub fn release_groove_slurry(held: &mut f32, spin: f32, coat_shed: f32, dt: f32) -> f32 {
+    let now = (*held).max(0.0);
+    if now <= 1.0e-8 || dt <= 0.0 || !now.is_finite() {
+        *held = now;
+        return 0.0;
+    }
+    // Below this the tire is still rolling. Only a real spin opens the voids.
+    let spin = if spin < 0.12 { 0.0 } else { spin.clamp(0.0, 1.0) };
+    let coat = coat_shed.max(0.0);
+    if spin < 1.0e-3 && coat <= 1.0e-6 {
+        *held = now;
+        return 0.0;
+    }
+    // Full spin empties the voids in about a second. A coat that is already
+    // leaving pulls the slurry with it on this step.
+    let from_spin = now * (1.0 - (-3.2 * spin * dt).exp());
+    let from_coat = now * (coat * 12.0).clamp(0.0, 1.0);
+    let out = from_spin.max(from_coat).min(now);
+    *held = now - out;
+    out
+}
 
 /// Mud the tread is holding. `groove` is packed in the voids. `smear` is the
 /// film on the lug faces, and that film is what changes grip. `sidewall` is

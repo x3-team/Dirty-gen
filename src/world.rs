@@ -4,7 +4,9 @@ use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
-use crate::patch::SIDEWALL_VOLUME;
+use crate::patch::{
+    groove_slurry_capacity, release_groove_slurry, TreadStep, SIDEWALL_VOLUME,
+};
 use crate::soil::{
     on_launch_crest, stick_scale, track_offset, SlurrySeal, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
@@ -343,7 +345,9 @@ impl World {
 
     /// A tire that has sat in deep slurry picks up a seal. Rising through it
     /// holds the suction already applied on the contact, then the break throws
-    /// ribbons and drops taken from the slurry column.
+    /// ribbons and drops taken from the slurry column. Slurry that stays in
+    /// the tread is packed on that same break. Rolling through the rut does
+    /// not fill the voids.
     fn pull_slurry_seals(&mut self, contacts: &[Contact; 4], dt: f32) {
         for c in contacts.iter() {
             let i = c.index;
@@ -387,6 +391,52 @@ impl World {
                     .particles
                     .throw_slurry(origin, c.forward, c.right, out.thrown);
             }
+            if seal.broken {
+                self.pack_slurry_groove(c);
+            }
+        }
+    }
+
+    /// The pull-out left slurry in the voids, up to what one tread can hold.
+    fn pack_slurry_groove(&mut self, c: &Contact) {
+        let held = self.vehicle.wheels[c.index].slurry_groove;
+        let room = (groove_slurry_capacity(WHEEL_RADIUS, WHEEL_WIDTH) - held).max(0.0);
+        if room <= 1.0e-8 {
+            return;
+        }
+        let packed = self.soil.pack_slurry_into_grooves(
+            c.wheel_center.x,
+            c.wheel_center.z,
+            c.forward,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            room,
+        );
+        self.vehicle.wheels[c.index].slurry_groove += packed;
+    }
+
+    /// Spin, or a coat that is shedding, pulls the held slurry out as ribbons.
+    fn shed_slurry_grooves(&mut self, contacts: &[Contact; 4], tread: &[TreadStep; 4], dt: f32) {
+        for c in contacts.iter() {
+            let i = c.index;
+            let spin = ((c.slip.abs() - 0.28) / 0.55).clamp(0.0, 1.0);
+            let shed = tread[i].shed;
+            let left = release_groove_slurry(
+                &mut self.vehicle.wheels[i].slurry_groove,
+                spin,
+                shed,
+                dt,
+            );
+            if left <= 1.0e-8 {
+                continue;
+            }
+            self.soil.airborne += left;
+            let _carried = self.particles.throw_groove_ribbons(
+                c.wheel_center,
+                c.forward,
+                c.right,
+                left,
+            );
         }
     }
 
@@ -469,6 +519,7 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         let tread = self.vehicle.step_adhesion(&contacts, dt);
+        self.shed_slurry_grooves(&contacts, &tread, dt);
         for c in &contacts {
             if !c.active {
                 continue;
