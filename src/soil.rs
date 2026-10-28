@@ -1,5 +1,7 @@
 //! Heightfield soil: Bekker sinkage, plastic ruts, wetness and shallow water.
 
+use std::collections::VecDeque;
+
 use glam::Vec3;
 
 pub const MAP_SIZE: f32 = 40.0;
@@ -24,6 +26,15 @@ pub struct SoilSample {
     pub rut: f32,
 }
 
+/// Soil cut from a rut and not yet a flying chunk. `volume` is cubic metres.
+#[derive(Clone, Copy, Debug)]
+pub struct ThrownClod {
+    pub origin: Vec3,
+    pub forward: Vec3,
+    pub right: Vec3,
+    pub volume: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct SoilField {
     pub res: usize,
@@ -43,6 +54,9 @@ pub struct SoilField {
     pub rest: Vec<f32>,
     /// Distinct passes that have cut this cell. The groove deepens with this.
     pub passes: Vec<u8>,
+    /// Rut spoil waiting to leave as a clod. Held here so a cleared flight
+    /// cannot delete it, and so the height sum plus this volume stays put.
+    thrown: VecDeque<ThrownClod>,
 }
 
 /// A tire that leaves and comes back after this many seconds cuts a new pass.
@@ -198,6 +212,7 @@ impl SoilField {
             roughness: vec![0.0; n],
             rest: vec![PASS_GAP + 1.0; n],
             passes: vec![0; n],
+            thrown: VecDeque::new(),
         }
     }
 
@@ -535,9 +550,123 @@ impl SoilField {
             }
         }
 
-        // Every cubic metre cut out of the rut is piled on the shoulders.
-        // Nothing is deleted and nothing is painted back into the floor.
-        self.deposit_berm(&berms, vol, area);
+        // Part of the cut is piled on the shoulders now. The rest leaves as
+        // clods and is added back where those clods land. Neither share is
+        // deleted, and neither is painted back into the floor.
+        const CLOD_SHARE: f32 = 0.70;
+        let fly = vol * CLOD_SHARE;
+        let stay = vol - fly;
+        if fly > 1.0e-8 {
+            self.withhold_clod(center, forward, right, fly);
+        }
+        if stay > 1.0e-8 && berms.is_empty() {
+            self.withhold_clod(center, forward, right, stay);
+        } else {
+            self.deposit_berm(&berms, stay, area);
+        }
+    }
+
+    /// Queue rut spoil for the chunk flight. Nearby cuts merge into one clod
+    /// so a tyre does not throw a speck per cell.
+    fn withhold_clod(&mut self, origin: Vec3, forward: Vec3, right: Vec3, volume: f32) {
+        if !volume.is_finite() || volume <= 1.0e-8 {
+            return;
+        }
+        const MERGE_DIST: f32 = 0.40;
+        const MERGE_CAP: f32 = 0.0075;
+        if let Some(last) = self.thrown.back_mut() {
+            let dx = last.origin.x - origin.x;
+            let dz = last.origin.z - origin.z;
+            if dx * dx + dz * dz < MERGE_DIST * MERGE_DIST && last.volume < MERGE_CAP {
+                let sum = last.volume + volume;
+                let t = volume / sum;
+                last.origin = last.origin.lerp(origin, t);
+                last.forward = forward;
+                last.right = right;
+                last.volume = sum;
+                return;
+            }
+        }
+        self.thrown.push_back(ThrownClod {
+            origin,
+            forward,
+            right,
+            volume,
+        });
+    }
+
+    /// Cubic metres of rut spoil waiting to be thrown.
+    pub fn thrown_volume(&self) -> f32 {
+        self.thrown.iter().map(|c| c.volume).sum()
+    }
+
+    pub fn pop_thrown(&mut self) -> Option<ThrownClod> {
+        self.thrown.pop_front()
+    }
+
+    /// Put a clod back at the head of the queue when the flight has no slot.
+    pub fn return_thrown(&mut self, clod: ThrownClod) {
+        if clod.volume > 1.0e-8 {
+            self.thrown.push_front(clod);
+        }
+    }
+
+    /// Add `volume` cubic metres around (x, z). Returns the tallest cell gain.
+    /// Off-map landings are pulled onto the field so the volume is not dropped.
+    pub fn land_volume(&mut self, x: f32, z: f32, volume: f32) -> f32 {
+        if !volume.is_finite() || volume <= 1.0e-8 {
+            return 0.0;
+        }
+        let inset = self.cell * 0.5;
+        let limit = self.size * 0.5 - inset;
+        let x = x.clamp(-limit, limit);
+        let z = z.clamp(-limit, limit);
+        let radius = self.cell * 1.45;
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let i0 = (((x - radius) + half) / self.cell).floor() as isize;
+        let i1 = (((x + radius) + half) / self.cell).floor() as isize;
+        let j0 = (((z - radius) + half) / self.cell).floor() as isize;
+        let j1 = (((z + radius) + half) / self.cell).floor() as isize;
+        let mut weights: Vec<(usize, f32)> = Vec::new();
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let d = ((cx - x).powi(2) + (cz - z).powi(2)).sqrt();
+                if d < radius {
+                    let w = 1.0 - d / radius;
+                    if w > 0.0 {
+                        weights.push((j as usize * self.res + i as usize, w));
+                    }
+                }
+            }
+        }
+        if weights.is_empty() {
+            let Some(idx) = self.idx_at(x, z) else {
+                return 0.0;
+            };
+            let dh = volume / (self.cell * self.cell);
+            self.height[idx] += dh;
+            self.note_spoil(idx, dh);
+            return dh;
+        }
+        let sum: f32 = weights.iter().map(|(_, w)| *w).sum();
+        let area = self.cell * self.cell;
+        let mut peak = 0.0_f32;
+        for (idx, w) in weights {
+            let dh = volume * (w / sum) / area;
+            self.height[idx] += dh;
+            self.note_spoil(idx, dh);
+            peak = peak.max(dh);
+        }
+        peak
+    }
+
+    fn note_spoil(&mut self, idx: usize, dh: f32) {
+        self.loose[idx] = (self.loose[idx] + dh * 0.45).min(0.18);
+        self.roughness[idx] = lerp(self.roughness[idx], 0.96, 0.22);
+        self.darken[idx] = lerp(self.darken[idx], 0.28, 0.12);
     }
 
     fn note_pass(&mut self, idx: usize, claim: bool) -> u8 {
@@ -1122,25 +1251,52 @@ mod tests {
         soil.height.iter().sum()
     }
 
+    /// Height sum plus spoil that is waiting to fly. Landing puts that spoil back.
+    fn height_accounted(soil: &SoilField) -> f32 {
+        let area = soil.cell * soil.cell;
+        height_sum(soil) + soil.thrown_volume() / area
+    }
+
+    #[test]
+    fn landed_volume_raises_height_and_is_kept() {
+        let mut soil = SoilField::flat(0.3);
+        let before = height_sum(&soil);
+        let area = soil.cell * soil.cell;
+        let vol = 0.018_f32;
+        let peak = soil.land_volume(0.4, -0.2, vol);
+        let got = (height_sum(&soil) - before) * area;
+        eprintln!("land peak {peak:.4} volume {vol:.4} accounted {got:.4}");
+        assert!(peak > 0.02, "landing did not raise a cell, peak {peak:.4}");
+        assert!(
+            (got - vol).abs() < 1.0e-4,
+            "landed volume was not kept: {vol:.5} -> {got:.5}"
+        );
+        assert!(soil.sample(0.4, -0.2).height > 0.02);
+    }
+
     #[test]
     fn second_pass_deepens_the_same_rut() {
         let mut soil = SoilField::flat(0.25);
         let origin = Vec3::new(-2.2, 0.0, 0.0);
         let dir = Vec3::X;
-        let before = height_sum(&soil);
+        let before = height_accounted(&soil);
         let first = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
-        let after_first = height_sum(&soil);
+        let after_first = height_accounted(&soil);
         // Saturated albedo. A second pass has nothing left to repaint.
         for d in &mut soil.darken {
             *d = 1.0;
         }
         soil.age_water(0.55);
         let second = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
-        let after_second = height_sum(&soil);
+        let after_second = height_accounted(&soil);
         let floor = soil.sample(1.0, 0.0);
-        let berm = soil.sample(1.0, 0.45).height.max(soil.sample(1.0, -0.45).height);
+        let berm = soil
+            .sample(1.0, 0.45)
+            .height
+            .max(soil.sample(1.0, -0.45).height);
+        let thrown = soil.thrown_volume();
         eprintln!(
-            "pass depths {first:.4} -> {second:.4}  berm {berm:.4} floor {:.4}  volume {before:.4} {after_first:.4} {after_second:.4}",
+            "pass depths {first:.4} -> {second:.4}  berm {berm:.4} floor {:.4}  volume {before:.4} {after_first:.4} {after_second:.4}  thrown {thrown:.4}",
             floor.height
         );
         assert!(
@@ -1152,12 +1308,16 @@ mod tests {
             "second pass did not deepen the rut: {first:.4} -> {second:.4}"
         );
         assert!(
+            thrown > 0.01,
+            "cut soil was not thrown as clods, volume {thrown:.4}"
+        );
+        assert!(
             (after_first - before).abs() < 5.0e-3,
-            "first pass deleted soil: height sum {before:.5} -> {after_first:.5}"
+            "first pass deleted soil: accounted height {before:.5} -> {after_first:.5}"
         );
         assert!(
             (after_second - before).abs() < 8.0e-3,
-            "second pass deleted soil: height sum {before:.5} -> {after_second:.5}"
+            "second pass deleted soil: accounted height {before:.5} -> {after_second:.5}"
         );
         assert!(
             berm > floor.height + 0.02,
@@ -1165,7 +1325,9 @@ mod tests {
             floor.height
         );
         assert!(
-            soil.darken.iter().all(|d| (*d - 1.0).abs() < 1.0e-5 || *d <= 1.0),
+            soil.darken
+                .iter()
+                .all(|d| (*d - 1.0).abs() < 1.0e-5 || *d <= 1.0),
             "darken left the 0..1 range"
         );
     }
