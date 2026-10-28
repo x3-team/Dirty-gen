@@ -242,11 +242,13 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.05);
         self.last = now;
+        // The eye sits behind `heading + orbit_yaw`, so a positive offset
+        // walks the camera onto the vehicle's left. Q orbits left.
         if self.keys.orbit_left {
-            self.orbit_yaw -= dt * 0.9;
+            self.orbit_yaw += dt * 0.9;
         }
         if self.keys.orbit_right {
-            self.orbit_yaw += dt * 0.9;
+            self.orbit_yaw -= dt * 0.9;
         }
         if self.keys.orbit_up {
             self.orbit_pitch = (self.orbit_pitch + dt * 0.7).min(1.1);
