@@ -57,7 +57,7 @@ pub struct CpuMesh {
 }
 
 impl CpuMesh {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -843,7 +843,12 @@ pub fn environment_mesh() -> CpuMesh {
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
     // sits on the ground instead of floating as boxes.
     add_horizon(&mut m);
+    m
+}
 
+/// A few pines for the course. Spray stills leave this mesh undrawn.
+pub fn tree_mesh() -> CpuMesh {
+    let mut m = CpuMesh::new();
     let trees = [
         Vec3::new(-16.0, 0.0, 14.0),
         Vec3::new(18.0, 0.0, -16.0),
@@ -854,7 +859,6 @@ pub fn environment_mesh() -> CpuMesh {
     for (k, p) in trees.iter().enumerate() {
         let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
         add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
-        // Stacked cones so the crown has volume instead of a flat card.
         let layers = [
             (trunk_h * 0.42, 1.25, 1.45),
             (trunk_h * 0.85, 1.0, 1.2),
@@ -960,14 +964,20 @@ fn add_tri_double(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32, uv:
 fn world_of(p: &silt::particles::Particle, local: Vec3) -> Vec3 {
     let mut q = local;
     if p.grounded {
-        q.y *= 0.32;
+        q.y *= match p.shape {
+            silt::particles::SHAPE_RIBBON => 0.84,
+            silt::particles::SHAPE_DUST => 0.35,
+            _ => 0.62,
+        };
     } else {
         // The mesh trails along the throw. Centering it put half the ribbon
         // back through the tire.
         let shift = match p.shape {
-            silt::particles::SHAPE_RIBBON | silt::particles::SHAPE_DROP => 0.48,
-            silt::particles::SHAPE_CLOD => 0.3,
-            _ => 0.22,
+            // The ribbon mesh itself starts at the tread and runs along the throw.
+            silt::particles::SHAPE_RIBBON => 0.0,
+            silt::particles::SHAPE_DROP => 0.35,
+            silt::particles::SHAPE_CLOD => 0.22,
+            _ => 0.18,
         };
         q.x += p.span.x * shift;
     }
@@ -975,111 +985,150 @@ fn world_of(p: &silt::particles::Particle, local: Vec3) -> Vec3 {
 }
 
 fn add_torn_clod(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    // Span is ellipsoid radii. Corners sit on that bulk, one of them bitten
-    // in, so the chunk has thickness from every side.
-    let rx = p.span.x.max(0.012);
+    // Radii. A lumpy torn clod along the throw: pinched ends, a bitten side.
+    // Enough sides that it is not a gem, long enough that it is not a ball.
+    let length = p.span.x.max(0.012) * 2.0;
     let ry = p.span.y.max(0.01);
     let rz = p.span.z.max(0.01);
-    let mut corner = [Vec3::ZERO; 8];
-    let mut n = 0u32;
-    for sx in [-1.0_f32, 1.0] {
-        for sy in [-1.0_f32, 1.0] {
-            for sz in [-1.0_f32, 1.0] {
-                let jag = 0.82 + chunk_hash(p.seed, n) * 0.32;
-                let bite = if n == 5 { 0.52 } else { 1.0 };
-                let mut c = Vec3::new(sx * rx, sy * ry, sz * rz) * jag * bite;
-                c.x += sy * rx * 0.12;
-                c.z += sx * rz * 0.1;
-                corner[n as usize] = c;
-                n += 1;
-            }
-        }
-    }
-    // sz fastest, then sy, then sx. See the loop above.
-    let quads = [
-        [0usize, 1, 3, 2],
-        [4, 6, 7, 5],
-        [0, 2, 6, 4],
-        [1, 5, 7, 3],
-        [0, 4, 5, 1],
-        [2, 3, 7, 6],
-    ];
+    let n = 8usize;
+    let segs = 5usize;
     let panel = soil_panel(p);
     let uv = soil_uv(p);
+    let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let envelope = (t * (1.0 - t) * 4.0).sqrt();
+        let end = 0.42 + 0.58 * envelope;
+        let x = (t - 0.42) * length;
+        let mut ring = Vec::with_capacity(n);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU + 0.4;
+            let jag = 0.7 + chunk_hash(p.seed, (i * 8 + k) as u32) * 0.45;
+            let bite = if i == 2 && k % 3 == 0 {
+                0.5
+            } else {
+                1.0
+            };
+            ring.push(Vec3::new(
+                x,
+                a.sin() * ry * end * jag * bite,
+                a.cos() * rz * end * jag,
+            ));
+        }
+        rings.push(ring);
+    }
     let origin = world_of(p, Vec3::ZERO);
-    for (f, q) in quads.iter().enumerate() {
-        let a = corner[q[0]];
-        let b = corner[q[1]];
-        let c = corner[q[2]];
-        let d = corner[q[3]];
-        let mid0 = (a + b + c + d) * 0.25;
-        let out = mid0.normalize_or_zero();
-        let bulge = (0.16 + chunk_hash(p.seed, 30 + f as u32) * 0.2) * (rx + ry + rz) / 3.0;
-        // One face is the tear.
-        let bulge = if f == 1 { -bulge * 0.85 } else { bulge };
-        let mid = mid0 + out * bulge;
-        let aw = world_of(p, a);
-        let bw = world_of(p, b);
-        let cw = world_of(p, c);
-        let dw = world_of(p, d);
-        let mw = world_of(p, mid);
-        add_tri_tint(mesh, aw, bw, mw, panel, uv, origin);
-        add_tri_tint(mesh, bw, cw, mw, panel, uv, origin);
-        add_tri_tint(mesh, cw, dw, mw, panel, uv, origin);
-        add_tri_tint(mesh, dw, aw, mw, panel, uv, origin);
+    for i in 0..segs {
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            add_tri_tint(
+                mesh,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i][k2]),
+                world_of(p, rings[i + 1][k2]),
+                panel,
+                uv,
+                origin,
+            );
+            add_tri_tint(
+                mesh,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i + 1][k2]),
+                world_of(p, rings[i + 1][k]),
+                panel,
+                uv,
+                origin,
+            );
+        }
+    }
+    for ring in [rings[0].clone(), rings[segs].clone()] {
+        let mut cap = Vec3::ZERO;
+        for pnt in &ring {
+            cap += *pnt;
+        }
+        cap /= ring.len() as f32;
+        let cap_w = world_of(p, cap);
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            add_tri_tint(
+                mesh,
+                cap_w,
+                world_of(p, ring[k]),
+                world_of(p, ring[k2]),
+                panel,
+                uv,
+                origin,
+            );
+        }
     }
 }
 
 fn add_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    // Full box extents. The cross section stays fat on both axes so a side
-    // view cannot collapse the piece into a card.
-    let length = p.span.x.max(0.03);
-    let half_w = p.span.y.max(0.02) * 0.5;
-    let half_t = p.span.z.max(0.016) * 0.5;
-    let segs = 4usize;
+    // Span is the full box. Half-width and half-thickness are halves, or the
+    // strap draws as a wall in front of the tread.
+    let length = p.span.x.max(0.05) * 3.2;
+    let half_w = p.span.y.max(0.02) * 0.58;
+    let half_t = p.span.z.max(0.016) * 1.45;
+    let segs = 12usize;
     let panel = soil_panel(p);
     let uv = soil_uv(p);
-    // Torn quad, not a lathe. One corner is the bite.
+    // A thick torn strap. The section is wide, with a bitten edge, so the
+    // side view is a ribbon and not a sheet or a gem.
     let profile = [
-        (1.05_f32, 0.35_f32),
-        (0.25, 1.05),
-        (-0.95, 0.2),
-        (-0.15, -1.0),
-        (0.72, -0.55),
+        (0.2_f32, 0.9_f32),
+        (0.85, 0.4),
+        (1.0, 0.0),
+        (0.8, -0.45),
+        (0.15, -0.95),
+        (-0.65, -0.5),
+        (-1.0, 0.05),
+        (-0.5, 0.7),
     ];
-    let mut rings: Vec<[Vec3; 5]> = Vec::with_capacity(segs + 1);
+    let n = profile.len();
+    let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
     for i in 0..=segs {
         let t = i as f32 / segs as f32;
-        let edge = if i == 0 || i == segs { 0.55 } else { 1.0 };
-        let belly = (0.78 + 0.22 * (t * (1.0 - t) * 4.0).sqrt()) * edge;
-        let x = (t - 0.5) * length;
-        let bow = ((t - 0.42) * std::f32::consts::PI).sin() * half_w * 0.35;
-        let twist = (t - 0.5) * 0.55 + (chunk_hash(p.seed, 6) - 0.5) * 0.3;
+        let edge = if i == 0 {
+            0.72
+        } else if i == segs {
+            0.4
+        } else {
+            1.0
+        };
+        let chew = 0.58 + 0.42 * chunk_hash(p.seed, 40 + i as u32);
+        let belly = (0.84 + 0.16 * (t * (1.0 - t) * 4.0).sqrt()) * edge * chew;
+        let x = (t - 0.74) * length;
+        let bow = ((t - 0.35) * std::f32::consts::PI).sin() * half_w * 0.3;
+        // Peel up off the tread, then the torn tail drops.
+        let sag = -((t * std::f32::consts::PI).sin()) * half_w * 2.1 + t * t * half_t * 0.35;
+        let twist = (t - 0.15) * 0.85 + (chunk_hash(p.seed, 6) - 0.5) * 0.2;
         let (s, c) = twist.sin_cos();
-        let mut ring = [Vec3::ZERO; 5];
-        for k in 0..5 {
-            let bite = if k == 2 {
-                0.62 + chunk_hash(p.seed, 4) * 0.15
+        let mut ring = Vec::with_capacity(n);
+        for k in 0..n {
+            let bite = if k == 4 && i % 3 == 1 {
+                0.45
+            } else if k == 6 && i % 4 == 2 {
+                0.6
             } else {
                 1.0
             };
-            let jag = 0.84 + chunk_hash(p.seed, (i * 5 + k) as u32) * 0.28;
+            let jag = 0.8 + chunk_hash(p.seed, (i * 8 + k) as u32) * 0.35;
             let (py, pz) = profile[k];
             let y = py * half_w * belly * bite * jag;
             let z = pz * half_t * belly * jag;
-            ring[k] = Vec3::new(x, y * c - z * s + bow, y * s + z * c);
+            ring.push(Vec3::new(x, y * c - z * s + bow - sag, y * s + z * c));
         }
         rings.push(ring);
     }
     for i in 0..segs {
         let mut axis = Vec3::ZERO;
-        for k in 0..5 {
+        for k in 0..n {
             axis += rings[i][k] + rings[i + 1][k];
         }
-        axis /= 10.0;
+        axis /= (n * 2) as f32;
         let axis_w = world_of(p, axis);
-        for k in 0..5 {
-            let k2 = (k + 1) % 5;
+        for k in 0..n {
+            let k2 = (k + 1) % n;
             let a = world_of(p, rings[i][k]);
             let b = world_of(p, rings[i][k2]);
             let c = world_of(p, rings[i + 1][k2]);
@@ -1089,15 +1138,15 @@ fn add_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
         }
     }
     let hub = world_of(p, Vec3::ZERO);
-    for ring in [rings[0], rings[segs]] {
+    for ring in [rings[0].clone(), rings[segs].clone()] {
         let mut cap = Vec3::ZERO;
-        for k in 0..5 {
-            cap += ring[k];
+        for pnt in &ring {
+            cap += *pnt;
         }
-        cap /= 5.0;
+        cap /= ring.len() as f32;
         let cap_w = world_of(p, cap);
-        for k in 0..5 {
-            let k2 = (k + 1) % 5;
+        for k in 0..ring.len() {
+            let k2 = (k + 1) % ring.len();
             add_tri_tint(
                 mesh,
                 cap_w,
@@ -1117,103 +1166,118 @@ fn add_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     let rz = p.span.z.max(0.003);
     let panel = soil_panel(p);
     let uv = soil_uv(p);
-    // A pinched triangular tail, not a lathed ball.
-    let stations = [0.0_f32, 0.18, 0.48, 0.78, 1.0];
-    let scales = [0.05_f32, 0.28, 1.0, 0.62, 0.16];
-    let mut rings: Vec<[Vec3; 3]> = Vec::new();
-    let yaw = chunk_hash(p.seed, 3) * 0.8;
+    // A droplet: thin tail, round head. A spindle reads as a diamond.
+    let n = 8usize;
+    let stations = [0.0_f32, 0.1, 0.24, 0.4, 0.56, 0.72, 0.86, 1.0];
+    let scales = [0.08_f32, 0.14, 0.28, 0.55, 0.86, 1.0, 0.7, 0.38];
+    let mut rings: Vec<Vec<Vec3>> = Vec::new();
     for (i, (t, scale)) in stations.iter().zip(scales).enumerate() {
-        let jag = 0.75 + chunk_hash(p.seed, i as u32) * 0.45;
-        let s = scale * jag;
-        let x = (t - 0.5) * 2.0 * rx;
-        let kick = (chunk_hash(p.seed, 14 + i as u32) - 0.35) * ry * 0.45 * s;
-        let mut ring = [Vec3::ZERO; 3];
-        for k in 0..3 {
-            let a = yaw + k as f32 / 3.0 * std::f32::consts::TAU;
-            let rad_y = if k == 0 { ry * 1.25 } else { ry * 0.72 };
-            let rad_z = if k == 1 { rz * 1.15 } else { rz * 0.7 };
-            ring[k] = Vec3::new(x, kick + a.sin() * rad_y * s, a.cos() * rad_z * s);
+        let s = scale * (0.9 + chunk_hash(p.seed, i as u32) * 0.15);
+        let x = (t - 0.42) * 2.0 * rx;
+        let mut ring = Vec::with_capacity(n);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            ring.push(Vec3::new(x, a.sin() * ry * s, a.cos() * rz * s));
         }
         rings.push(ring);
     }
     for i in 0..rings.len() - 1 {
-        for k in 0..3 {
-            let k2 = (k + 1) % 3;
-            let a = world_of(p, rings[i][k]);
-            let b = world_of(p, rings[i][k2]);
-            let c = world_of(p, rings[i + 1][k2]);
-            let d = world_of(p, rings[i + 1][k]);
-            add_tri_double(mesh, a, b, c, panel, uv);
-            add_tri_double(mesh, a, c, d, panel, uv);
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            add_tri_double(
+                mesh,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i][k2]),
+                world_of(p, rings[i + 1][k2]),
+                panel,
+                uv,
+            );
+            add_tri_double(
+                mesh,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i + 1][k2]),
+                world_of(p, rings[i + 1][k]),
+                panel,
+                uv,
+            );
         }
     }
-    let mut cap = |ring: [Vec3; 3]| {
-        add_tri_double(
-            mesh,
-            world_of(p, ring[0]),
-            world_of(p, ring[1]),
-            world_of(p, ring[2]),
-            panel,
-            uv,
-        );
+    let mut cap = |ring: &[Vec3]| {
+        let mut c = Vec3::ZERO;
+        for pnt in ring {
+            c += *pnt;
+        }
+        c /= ring.len() as f32;
+        let cw = world_of(p, c);
+        for k in 0..ring.len() {
+            let k2 = (k + 1) % ring.len();
+            add_tri_double(mesh, cw, world_of(p, ring[k]), world_of(p, ring[k2]), panel, uv);
+        }
     };
-    cap(rings[0]);
-    cap(*rings.last().unwrap());
+    cap(&rings[0]);
+    cap(rings.last().unwrap());
 }
 
 fn add_dust(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let rx = p.span.x.max(0.008) * 0.5;
-    let hy = p.span.y.max(0.001) * 0.5;
-    let rz = p.span.z.max(0.006) * 0.5;
+    // A loose puff. One wafer reads as a stone, so this is a few thin ragged flakes.
+    let rx = p.span.x.max(0.008) * 0.55;
+    let hy = p.span.y.max(0.001) * 0.28;
+    let rz = p.span.z.max(0.006) * 0.55;
     let panel = soil_panel(p);
     let uv = soil_uv(p);
-    let n = 5usize;
-    let mut top = Vec::with_capacity(n);
-    let mut bot = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = i as f32 / n as f32 * std::f32::consts::TAU + 0.35;
-        let j = 0.5 + chunk_hash(p.seed, i as u32) * 0.7;
-        let x = a.cos() * rx * j;
-        let z = a.sin() * rz * j * (0.75 + chunk_hash(p.seed, 10 + i as u32) * 0.4);
-        top.push(Vec3::new(x, hy, z));
-        bot.push(Vec3::new(x * 0.92, -hy, z * 0.92));
-    }
-    for i in 1..n - 1 {
-        add_tri_double(
-            mesh,
-            world_of(p, top[0]),
-            world_of(p, top[i]),
-            world_of(p, top[i + 1]),
-            panel,
-            uv,
-        );
-        add_tri_double(
-            mesh,
-            world_of(p, bot[0]),
-            world_of(p, bot[i + 1]),
-            world_of(p, bot[i]),
-            panel,
-            uv,
-        );
-    }
-    for i in 0..n {
-        let j = (i + 1) % n;
-        add_tri_double(
-            mesh,
-            world_of(p, top[i]),
-            world_of(p, bot[i]),
-            world_of(p, top[j]),
-            panel,
-            uv,
-        );
-        add_tri_double(
-            mesh,
-            world_of(p, top[j]),
-            world_of(p, bot[i]),
-            world_of(p, bot[j]),
-            panel,
-            uv,
-        );
+    let n = 7usize;
+    for flake in 0..3u32 {
+        let ox = (chunk_hash(p.seed, flake) - 0.5) * rx * 1.1;
+        let oz = (chunk_hash(p.seed, 20 + flake) - 0.5) * rz * 1.1;
+        let oy = (flake as f32 - 1.0) * hy * 2.2;
+        let spin = chunk_hash(p.seed, 40 + flake) * 1.4;
+        let mut top = Vec::with_capacity(n);
+        let mut bot = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU + spin;
+            let j = 0.35 + chunk_hash(p.seed, flake * 8 + i as u32) * 0.85;
+            let x = ox + a.cos() * rx * j;
+            let z = oz + a.sin() * rz * j * (0.6 + chunk_hash(p.seed, 80 + i as u32) * 0.5);
+            top.push(Vec3::new(x, oy + hy, z));
+            bot.push(Vec3::new(x * 0.94, oy - hy, z * 0.94));
+        }
+        for i in 1..n - 1 {
+            add_tri_double(
+                mesh,
+                world_of(p, top[0]),
+                world_of(p, top[i]),
+                world_of(p, top[i + 1]),
+                panel,
+                uv,
+            );
+            add_tri_double(
+                mesh,
+                world_of(p, bot[0]),
+                world_of(p, bot[i + 1]),
+                world_of(p, bot[i]),
+                panel,
+                uv,
+            );
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            add_tri_double(
+                mesh,
+                world_of(p, top[i]),
+                world_of(p, bot[i]),
+                world_of(p, top[j]),
+                panel,
+                uv,
+            );
+            add_tri_double(
+                mesh,
+                world_of(p, top[j]),
+                world_of(p, bot[i]),
+                world_of(p, bot[j]),
+                panel,
+                uv,
+            );
+        }
     }
 }
 
@@ -1236,7 +1300,7 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     });
     for i in order {
         let p = &items[i];
-        if mesh.vertices.len() + 180 > MAX_VERTS {
+        if mesh.vertices.len() + 360 > MAX_VERTS {
             break;
         }
         match p.shape {

@@ -713,24 +713,25 @@ pub fn spray_frame() -> SprayFrame {
         brake: 0.28,
         steer: 0.0,
     };
-    for _ in 0..22 {
+    for _ in 0..10 {
         world.step(1.0 / 60.0, &input);
     }
     let v = &world.vehicle;
     let ori = v.orientation();
     let fwd = ori * Vec3::Z;
     let right = ori * Vec3::X;
-    let fl = v.pos + ori * v.wheel_center_local(0);
-    // Rear sidewall of the front-left tire, where the slurry leaves.
-    let exit = fl - fwd * (WHEEL_RADIUS * 1.05) - right * (WHEEL_WIDTH * 0.55) + Vec3::Y * 0.02;
+    let rl = v.pos + ori * v.wheel_center_local(2);
+    // The rear tire's strap leaves the tread and runs back about a metre.
+    // Both cameras sit on that run. The ribbon between the axles stays under
+    // the body.
     let tire = CameraPose {
-        eye: exit - right * 1.2 - fwd * 0.42 + Vec3::Y * 0.28,
-        target: exit - fwd * 0.05 + Vec3::Y * 0.22,
+        eye: rl - right * 2.15 + Vec3::Y * 0.82 - fwd * 1.85,
+        target: rl - right * 0.04 - fwd * 0.78 + Vec3::Y * 0.2,
         ortho_width: None,
     };
     let side = CameraPose {
-        eye: v.pos - right * 4.8 + Vec3::Y * 1.2 + fwd * 0.35,
-        target: v.pos + Vec3::Y * 0.85 - fwd * 0.15,
+        eye: rl - right * 2.25 + Vec3::Y * 0.72 - fwd * 1.95,
+        target: rl - right * 0.02 - fwd * 0.72 + Vec3::Y * 0.1,
         ortho_width: None,
     };
     SprayFrame { world, tire, side }
@@ -827,8 +828,10 @@ mod tests {
         let frame = spray_frame();
         let mut mud_ribbon = 0;
         let mut mud_drop = 0;
+        let mut mud_clod = 0;
         let mut gravel_clod = 0;
         let mut gravel_dust = 0;
+        let mut gravel_ribbon = 0;
         let mut air = 0.0_f32;
         for p in frame.world.particles.items.iter().filter(|p| p.alive) {
             if !p.grounded {
@@ -840,20 +843,52 @@ mod tests {
             if p.face == FACE_MUD && p.shape == SHAPE_DROP {
                 mud_drop += 1;
             }
+            if p.face == FACE_MUD && p.shape == SHAPE_CLOD {
+                mud_clod += 1;
+            }
             if p.face == FACE_GRAVEL && p.shape == SHAPE_CLOD {
                 gravel_clod += 1;
             }
             if p.face == FACE_GRAVEL && p.shape == SHAPE_DUST {
                 gravel_dust += 1;
             }
+            if p.face == FACE_GRAVEL && p.shape == SHAPE_RIBBON {
+                gravel_ribbon += 1;
+            }
         }
+        let v = &frame.world.vehicle;
+        let ori = v.orientation();
+        let rl = v.pos + ori * v.wheel_center_local(2);
         eprintln!(
             "speed {:.2} pos {:?} ribbons {mud_ribbon} drops {mud_drop} clods {gravel_clod} dust {gravel_dust} air {air:.5}",
-            frame.world.vehicle.speed(),
-            frame.world.vehicle.pos
+            v.speed(),
+            v.pos
         );
-        assert!(mud_ribbon > 4, "slurry ribbons {mud_ribbon}");
+        for p in frame
+            .world
+            .particles
+            .items
+            .iter()
+            .filter(|p| p.alive && p.face == FACE_MUD && p.shape == SHAPE_RIBBON)
+        {
+            let axis = (p.rot * glam::Vec3::X).normalize_or_zero();
+            assert!(
+                axis.y.abs() < 0.4,
+                "ribbon stood on end at {:?} axis {axis:?}",
+                p.pos - rl
+            );
+            let travel = glam::Vec3::new(p.vel.x, 0.0, p.vel.z);
+            if !p.grounded && travel.length() > 0.4 {
+                assert!(
+                    axis.dot(travel.normalize()) > 0.7,
+                    "ribbon axis {axis:?} left the throw {travel:?}"
+                );
+            }
+        }
+        assert!(mud_ribbon >= 2, "slurry ribbons {mud_ribbon}");
         assert!(mud_drop > 2, "slurry drops {mud_drop}");
+        assert_eq!(mud_clod, 0, "wet clods {mud_clod}");
+        assert_eq!(gravel_ribbon, 0, "dry ribbons {gravel_ribbon}");
         assert!(gravel_clod > 2, "gravel clods {gravel_clod}");
         assert!(gravel_dust > 2, "gravel dust {gravel_dust}");
         assert!(air > 1.0e-4, "nothing in the air");

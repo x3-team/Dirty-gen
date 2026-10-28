@@ -3,6 +3,7 @@
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
 mod mesh;
+mod niva;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -311,7 +312,7 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
+        renderer.draw(&self.world, pose, Some((&view, self.srgb)), false, true, false);
         frame.present();
     }
 
@@ -496,7 +497,7 @@ fn capture(args: &[String]) {
             (frame.side, &parsed.still_side),
         ] {
             let pose = lift_camera(world, pose);
-            let rgba = renderer.draw(world, pose, None, true).expect("readback");
+            let rgba = renderer.draw(world, pose, None, true, false, true).expect("readback");
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
@@ -531,7 +532,7 @@ fn capture(args: &[String]) {
                     &world,
                     demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
                 );
-                let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+                let rgba = renderer.draw(&world, pose, None, true, true, false).expect("readback");
                 write_png(dest, parsed.width, parsed.height, &rgba).expect("still");
                 println!(
                     "still {} at t={:.2} pos=({:.1},{:.1}) mud={:.2} rut={:.3}",
@@ -563,7 +564,7 @@ fn capture(args: &[String]) {
             &world,
             demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
         );
-        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        let rgba = renderer.draw(&world, pose, None, true, true, false).expect("readback");
         let path = dir.join(format!("frame_{frame:04}.png"));
         write_png(&path, parsed.width, parsed.height, &rgba).expect("png");
         for (i, (when, dest)) in stills.iter().enumerate() {

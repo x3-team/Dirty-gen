@@ -290,7 +290,12 @@ impl Particles {
     fn absorb(&mut self, pos: Vec3, shape: u8, face: u8, volume: f32) -> bool {
         let cap = absorb_cap(shape);
         let mut best: Option<usize> = None;
-        let mut best_d = 0.48_f32;
+        let mut best_d = match shape {
+            SHAPE_RIBBON => 0.85,
+            SHAPE_CLOD => 0.7,
+            _ => 0.35,
+        };
+        let age_limit = if shape == SHAPE_RIBBON { 0.28 } else { 0.3 };
         for (i, p) in self.items.iter().enumerate() {
             if !p.alive || p.grounded || p.shape != shape || p.face != face {
                 continue;
@@ -298,7 +303,7 @@ impl Particles {
             if p.volume >= cap || p.volume + volume > cap * 1.08 {
                 continue;
             }
-            if p.max_life - p.life > 0.22 {
+            if p.max_life - p.life > age_limit {
                 continue;
             }
             let d = (p.pos - pos).length();
@@ -340,13 +345,29 @@ impl Particles {
         right = right.normalize();
         let radius = throw.wheel_radius.max(0.18);
         let width = throw.wheel_width.max(0.08);
-        // One exit on the rear shoulder. Scatter used to put each speck on a
-        // different side of the tire, so the cut never became a ribbon.
-        // Just off the rear sidewall. A point on the contact sits inside the
-        // carcass, so the ribbon was drawing through the tire.
-        let along = radius * (1.02 + self.rnd() * 0.1);
-        let lift = radius * (0.78 + self.rnd() * 0.18);
-        let lateral = side * (width * 0.62 + 0.02 + self.rnd() * width * 0.12);
+        // Just off the rear of the tread. The contact patch is under the hub;
+        // the rubber there has already turned up, so the tear starts on that
+        // shoulder instead of inside the footprint.
+        let clear = match shape {
+            SHAPE_RIBBON => 0.88,
+            SHAPE_DROP => 0.7,
+            _ => 0.48,
+        };
+        let along = radius * (clear + self.rnd() * 0.06);
+        let lift = radius
+            * match shape {
+                SHAPE_RIBBON => 0.52 + self.rnd() * 0.08,
+                SHAPE_DUST => 0.42 + self.rnd() * 0.16,
+                _ => 0.2 + self.rnd() * 0.08,
+            };
+        // A ribbon stays on the tread it tore from. Dust and clods can leave
+        // the shoulder. A spawn outside the sidewall reads as a strap beside
+        // the tire.
+        let lateral = match shape {
+            SHAPE_RIBBON => side * width * (0.16 + self.rnd() * 0.14),
+            SHAPE_DROP => side * width * (0.3 + self.rnd() * 0.22),
+            _ => side * (width * 0.62 + 0.02 + self.rnd() * width * 0.12),
+        };
         let pos = throw.origin - fwd * along + right * lateral + Vec3::Y * lift;
         if self.absorb(pos, shape, face, volume) {
             return;
@@ -356,37 +377,50 @@ impl Particles {
         let drive = slip_s.max(0.0);
         let brake = (-slip_s).max(0.0);
         let speed = throw.speed.max(0.0);
-        // Slip and speed set the throw. Loft stays high enough that the cut
-        // leaves the tread as an arc; wet slurry stays under dry dust.
-        let rate = 1.15 + speed * 0.75 + drive * 2.2 + brake * 1.1;
-        let rearward = (0.38 + drive * 0.55 - brake * 0.2).max(0.22);
+        // Speed and slip set how hard the tread throws. Moisture keeps wet
+        // slurry in a low peel; dry dust is the part that rises.
+        let rate = 0.85 + speed * 0.48 + drive * 1.25 + brake * 0.7;
+        let rearward = (0.82 + drive * 0.3 - brake * 0.42).clamp(0.3, 1.25);
         let speed_n = (speed / 6.0).clamp(0.0, 1.0);
-        let loft = 1.15
-            + drive * 0.7 * (1.15 - 0.25 * moisture)
-            + (1.0 - moisture) * 0.85
-            + speed_n * 0.28;
-        let out = side * (0.28 + (drive + brake) * 0.32 + (1.0 - moisture) * 0.22);
+        let dry = (1.0 - moisture).clamp(0.0, 1.0);
+        let shape_loft = match shape {
+            // A wet ribbon arcs off the tread. Wet clods tumble out low.
+            // Dry clods may hop; dust is the part that rises.
+            SHAPE_RIBBON => 0.62 + moisture * 0.08,
+            SHAPE_DROP => 0.7 + moisture * 0.06,
+            SHAPE_DUST => 1.2 + dry * 0.28,
+            _ => 0.14 + dry * 0.5,
+        };
+        let loft = shape_loft + drive * 0.08 * dry + speed_n * 0.05;
+        let out = match shape {
+            SHAPE_RIBBON => side * (0.03 + brake * 0.05),
+            SHAPE_DROP => side * (0.08 + (drive + brake) * 0.1),
+            _ => side * (0.12 + (drive + brake) * 0.16 + dry * 0.18),
+        };
         let jitter = Vec3::new(
-            (self.rnd() - 0.5) * 0.18,
-            (self.rnd() - 0.5) * 0.16,
-            (self.rnd() - 0.5) * 0.18,
+            (self.rnd() - 0.5) * 0.06,
+            (self.rnd() - 0.5) * 0.04,
+            (self.rnd() - 0.5) * 0.06,
         );
-        let vel = -fwd * rate * rearward + fwd * rate * brake * 0.55
+        // The tread throws backward. The scale keeps a still of the pass
+        // from showing the strap a car-length behind the tire.
+        let vel = -fwd * rate * rearward * 0.68
+            + fwd * rate * brake * 0.55
             + Vec3::Y * rate * loft
             + right * rate * out
             + jitter;
 
         let life = match shape {
-            SHAPE_RIBBON => 0.72 + self.rnd() * 0.28,
+            SHAPE_RIBBON => 1.05 + self.rnd() * 0.25,
             SHAPE_DROP => 0.55 + self.rnd() * 0.22,
-            SHAPE_DUST => 0.78 + self.rnd() * 0.35,
-            _ => 0.7 + self.rnd() * 0.3,
+            SHAPE_DUST => 0.9 + self.rnd() * 0.35,
+            _ => 0.85 + self.rnd() * 0.25,
         };
         let spin_rate = match shape {
-            SHAPE_RIBBON => 0.7,
-            SHAPE_DUST => 1.1,
-            SHAPE_DROP => 2.2,
-            _ => 3.2 + drive * 1.4,
+            SHAPE_RIBBON => 0.28,
+            SHAPE_DUST => 0.9,
+            SHAPE_DROP => 0.4,
+            _ => 1.4 + drive * 0.6,
         };
         self.push_shaped(
             pos,
@@ -423,11 +457,25 @@ impl Particles {
         let _ = self.rnd();
         let span = span_for(shape, volume.max(1.0e-9), slip, speed, wet);
         let roll = match shape {
-            SHAPE_RIBBON => (self.rnd() - 0.5) * 0.85,
+            SHAPE_RIBBON => (self.rnd() - 0.5) * 0.2,
             SHAPE_DUST => (self.rnd() - 0.5) * 0.7,
-            _ => (self.rnd() - 0.5) * 1.1,
+            _ => (self.rnd() - 0.5) * 0.7,
         };
-        let rot = flight_frame(vel, roll);
+        // A ribbon stays along the peel. Falling velocity would stand it on end.
+        let mut aim = vel;
+        if shape == SHAPE_RIBBON {
+            aim.y *= 0.12;
+        } else if shape == SHAPE_DROP {
+            aim.y *= 0.22;
+        } else if shape == SHAPE_DUST {
+            // The puff is thin along local Y. Keep that axis upright so the
+            // dust lies in the wind instead of standing up as cards.
+            aim.y = 0.0;
+            if aim.length_squared() < 1.0e-6 {
+                aim = Vec3::Z;
+            }
+        }
+        let rot = flight_frame(aim, roll);
         let spin = Vec3::new(
             (self.rnd() - 0.5) * spin_rate,
             (self.rnd() - 0.5) * spin_rate,
@@ -526,41 +574,43 @@ impl Particles {
     }
 }
 
-/// Wet ground throws thick clods and ribbons, plus a few drops.
-/// Dry ground stays dust and clods.
+/// Wet ground throws ribbons and drops. Dry ground stays dust and clods.
 fn shape_budget(face: u8, moisture: f32) -> [f32; 4] {
     // clod, ribbon, drop, dust
-    if face == FACE_MUD && moisture > 0.42 {
-        [0.48, 0.36, 0.16, 0.0]
-    } else if face == FACE_MUD {
-        [0.40, 0.40, 0.20, 0.0]
-    } else if face == FACE_GRAVEL || moisture < 0.28 {
-        [0.64, 0.0, 0.0, 0.36]
-    } else if moisture > 0.55 {
-        [0.40, 0.38, 0.22, 0.0]
+    if face == FACE_MUD || moisture > 0.55 {
+        let drop = if moisture > 0.7 { 0.34 } else { 0.26 };
+        [0.0, 1.0 - drop, drop, 0.0]
     } else {
-        [0.74, 0.16, 0.10, 0.0]
+        let dust = if face == FACE_GRAVEL || moisture < 0.28 {
+            0.38
+        } else {
+            0.22
+        };
+        [1.0 - dust, 0.0, 0.0, dust]
     }
 }
 
 /// A piece stops taking new cut once it is large enough to read as one chunk.
 fn absorb_cap(shape: u8) -> f32 {
     match shape {
-        SHAPE_RIBBON => 3.2e-3,
-        SHAPE_DROP => 1.1e-3,
-        SHAPE_DUST => 4.2e-4,
-        _ => 4.5e-3,
+        SHAPE_RIBBON => 2.4e-2,
+        SHAPE_DROP => 7.0e-4,
+        SHAPE_DUST => 3.2e-4,
+        _ => 1.4e-2,
     }
 }
 
 fn piece_count(part: f32, slip: f32, speed: f32, shape: u8) -> u32 {
+    if shape == SHAPE_RIBBON || shape == SHAPE_CLOD {
+        return 1;
+    }
     let target = match shape {
-        SHAPE_RIBBON | SHAPE_DROP => 1.4e-4 * (1.0 + slip.abs() * 0.35),
-        SHAPE_DUST => 4.5e-5,
-        _ => 2.0e-4 * (1.0 + slip.abs() * 0.4),
+        SHAPE_DROP => 1.6e-4 * (1.0 + slip.abs() * 0.25),
+        SHAPE_DUST => 5.5e-5,
+        _ => 2.2e-4 * (1.0 + slip.abs() * 0.35),
     };
     let mut n = ((part / target).round() as u32).clamp(1, 2);
-    if speed > 3.2 && (shape == SHAPE_RIBBON || shape == SHAPE_DROP || shape == SHAPE_DUST) {
+    if speed > 4.5 && shape == SHAPE_DUST {
         n = n.max(2);
     }
     n
@@ -580,16 +630,16 @@ fn span_for(shape: u8, volume: f32, slip: f32, speed: f32, moisture: f32) -> Vec
     let speed_n = (speed / 6.0).clamp(0.0, 1.0);
     match shape {
         SHAPE_RIBBON => {
-            // A thick strap. The short axis stays large enough to read as
-            // volume from the side, not a card.
-            let elong = (2.55 + speed_n * 0.7 + moisture * 0.25).clamp(2.45, 3.5);
-            let wide = (1.45 + slip_n * 0.2).clamp(1.4, 1.85);
-            let thick = (1.05 + (1.0 - moisture) * 0.08).clamp(1.0, 1.2);
-            fit_box(volume, Vec3::new(elong, wide, thick), 0.62)
+            // A torn strap. Length follows speed; slip widens it; moisture
+            // keeps the section thick enough that it is not a card.
+            let elong = (4.8 + speed_n * 1.2 + moisture * 0.5).clamp(4.6, 6.2);
+            let wide = (2.4 + slip_n * 0.45).clamp(2.3, 3.1);
+            let thick = (1.05 + moisture * 0.15).clamp(1.0, 1.25);
+            fit_box(volume, Vec3::new(elong, wide, thick), 0.5)
         }
         SHAPE_DROP => {
-            let elong = (2.15 + moisture * 0.35 + speed_n * 0.2).clamp(2.1, 2.8);
-            fit_ellipsoid(volume, Vec3::new(elong, 1.05, 0.82), 0.5)
+            let elong = (2.5 + moisture * 0.25 + speed_n * 0.2).clamp(2.4, 3.1);
+            fit_ellipsoid(volume, Vec3::new(elong, 1.05, 0.95), 0.55)
         }
         SHAPE_DUST => {
             let wide = 2.1 + speed_n * 0.9 + (1.0 - moisture) * 0.4;
@@ -597,9 +647,9 @@ fn span_for(shape: u8, volume: f32, slip: f32, speed: f32, moisture: f32) -> Vec
             fit_box(volume, Vec3::new(wide, tall, 1.05), 0.85)
         }
         _ => {
-            let long = 2.05 + slip_n * 0.35;
-            let tall = 1.35 + moisture * 0.08;
-            let thick = 1.05;
+            let long = 2.2 + slip_n * 0.35;
+            let tall = 1.22 + moisture * 0.08;
+            let thick = 0.92;
             fit_ellipsoid(volume, Vec3::new(long, tall, thick), 0.62)
         }
     }
@@ -621,11 +671,22 @@ fn flight_frame(dir: Vec3, roll: f32) -> Quat {
         x = Vec3::X;
     }
     let up = if x.y.abs() > 0.92 { Vec3::Z } else { Vec3::Y };
-    let mut z = x.cross(up).normalize_or_zero();
-    let y = z.cross(x).normalize_or_zero();
-    z = (z * roll.cos() + y * roll.sin()).normalize_or_zero();
-    let y = x.cross(z).normalize_or_zero();
-    Quat::from_mat3(&Mat3::from_cols(x, y, z))
+    // Right-handed. local X is the throw. z = X × up, y = Z × X, so X × Y = Z.
+    // Finishing with Y = X × Z flips the basis into a reflection, and the
+    // quat extracted from that matrix does not point the mesh along the throw.
+    let z0 = {
+        let z = x.cross(up).normalize_or_zero();
+        if z.length_squared() < 1.0e-6 {
+            Vec3::Z
+        } else {
+            z
+        }
+    };
+    let y0 = z0.cross(x).normalize_or_zero();
+    let (s, c) = roll.sin_cos();
+    let y = (y0 * c + z0 * s).normalize_or_zero();
+    let z = (z0 * c - y0 * s).normalize_or_zero();
+    Quat::from_mat3(&Mat3::from_cols(x, y, z)).normalize()
 }
 
 #[cfg(test)]
@@ -639,6 +700,29 @@ mod tests {
             .zip(after)
             .map(|(a, b)| (a - b) * area)
             .sum()
+    }
+
+    #[test]
+    fn ribbon_frame_follows_the_throw() {
+        let dir = Vec3::new(-0.25, 1.4, -2.2);
+        let aim = Vec3::new(dir.x, dir.y * 0.12, dir.z);
+        let q = flight_frame(aim, 0.08);
+        assert!(
+            (q.length() - 1.0).abs() < 1.0e-4,
+            "frame quat length {}",
+            q.length()
+        );
+        let axis = q * Vec3::X;
+        let y = q * Vec3::Y;
+        let z = q * Vec3::Z;
+        let aim_n = aim.normalize();
+        assert!(
+            axis.dot(aim_n) > 0.98,
+            "long axis {axis:?} left the throw {aim_n:?}"
+        );
+        let det = axis.dot(y.cross(z));
+        assert!((det - 1.0).abs() < 1.0e-3, "frame det {det}");
+        assert!(axis.y.abs() < 0.25, "ribbon stood up {axis:?}");
     }
 
     #[test]
@@ -698,22 +782,20 @@ mod tests {
                 p.span
             );
             assert!(
-                p.shape == SHAPE_CLOD || p.shape == SHAPE_RIBBON || p.shape == SHAPE_DROP,
+                p.shape == SHAPE_RIBBON || p.shape == SHAPE_DROP,
                 "wet piece shape {}",
                 p.shape
             );
             if p.shape == SHAPE_RIBBON {
                 assert!(
-                    p.span.z > p.span.x * 0.24,
+                    p.span.z > p.span.x * 0.08,
                     "ribbon is a card {:?}",
                     p.span
                 );
-            }
-            if p.shape == SHAPE_CLOD {
+                let axis = (p.rot * Vec3::X).normalize_or_zero();
                 assert!(
-                    e[0] > e[2] * 0.4,
-                    "clod is a card {:?}",
-                    p.span
+                    axis.z < -0.75 && axis.y.abs() < 0.35,
+                    "ribbon axis {axis:?} is not the rearward peel"
                 );
             }
             assert_eq!(p.face, FACE_MUD);
@@ -725,8 +807,12 @@ mod tests {
             .map(|p| p.shape)
             .collect();
         assert!(
-            shapes.contains(&SHAPE_CLOD) && shapes.contains(&SHAPE_RIBBON),
-            "wet throw needs a clod and a ribbon, got {shapes:?}"
+            shapes.contains(&SHAPE_RIBBON) && shapes.contains(&SHAPE_DROP),
+            "wet throw needs a ribbon and a drop, got {shapes:?}"
+        );
+        assert!(
+            !shapes.contains(&SHAPE_CLOD) && !shapes.contains(&SHAPE_DUST),
+            "wet throw is ribbons and drops, got {shapes:?}"
         );
     }
 
