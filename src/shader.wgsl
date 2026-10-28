@@ -253,9 +253,10 @@ fn tread_delta(xz: vec2<f32>) -> f32 {
     // Visual crown, not the wider physics lane. The edge fades into the rut.
     // One groove the width of the crown. The lugs bite deeper into that floor
     // so the print stays a track when the tire has moved on.
-    let ribbon = 1.0 - smoothstep(0.088, 0.142, abs(lat));
-    let block = 1.0 - smoothstep(0.11, 0.36, lug);
-    let floor = ribbon * 0.46;
+    // The void is the lug. A deep flat floor was a sheet lying on the print.
+    let ribbon = 1.0 - smoothstep(0.09, 0.15, abs(lat));
+    let block = 1.0 - smoothstep(0.12, 0.34, lug);
+    let floor = ribbon * 0.12;
     return -amp * max(floor, block * ribbon);
 }
 
@@ -387,8 +388,8 @@ fn lip_near(xz: vec2<f32>) -> bool {
     let k10 = kind_of(i0 + vec2<i32>(1, 0));
     let k01 = kind_of(i0 + vec2<i32>(0, 1));
     let k11 = kind_of(i0 + vec2<i32>(1, 1));
-    return k00 == 6u || k10 == 6u || k01 == 6u || k11 == 6u
-        || k00 == 8u || k10 == 8u || k01 == 8u || k11 == 8u;
+    // Placed spoil stays bilinear. A sharp face on it was a flat card.
+    return k00 == 6u || k10 == 6u || k01 == 6u || k11 == 6u;
 }
 
 fn height_bilinear(xz: vec2<f32>) -> f32 {
@@ -511,11 +512,14 @@ fn sample_h(xz: vec2<f32>, torn: bool) -> f32 {
 // every 20 cm cell into a flat tile, which reads as loose boxes.
 fn track_near(xz: vec2<f32>) -> bool {
     let ij = vec2<i32>(round(world_to_ij(xz)));
-    if (imprint_at(ij).a > 0.5) { return true; }
-    if (imprint_at(ij + vec2<i32>(1, 0)).a > 0.5) { return true; }
-    if (imprint_at(ij + vec2<i32>(-1, 0)).a > 0.5) { return true; }
-    if (imprint_at(ij + vec2<i32>(0, 1)).a > 0.5) { return true; }
-    if (imprint_at(ij + vec2<i32>(0, -1)).a > 0.5) { return true; }
+    // Include the lip beside the print. A sharp step one cell out was a hard line.
+    for (var dz: i32 = -2; dz <= 2; dz++) {
+        for (var dx: i32 = -2; dx <= 2; dx++) {
+            if (imprint_at(ij + vec2<i32>(dx, dz)).a > 0.5) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -638,7 +642,7 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     let quiet = clamp(max(seated.y, seated.z), 0.0, 1.0);
     // The print and the spoil are the height. The gravel map was breaking them into tiles.
     let calm = select(0.0, 1.0, track_near(in.xz));
-    let h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - quiet) * (1.0 - 0.85 * calm);
+    let h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - quiet) * (1.0 - 0.35 * calm);
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -705,7 +709,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     var ts = ntex * 2.0 - vec3<f32>(1.0);
     // Dry crust and gravel stay flatter. The torn lip keeps the mud normal.
     var n_gain = 1.0;
-    if (track_near(xz)) { n_gain = 0.22; }
+    if (track_near(xz)) { n_gain = 0.7; }
     else if (kind == 2u || kind == 3u || kind == 10u || kind == 11u) { n_gain = 0.28; }
     else if (kind == 6u) { n_gain = 1.7; }
     else if (kind == 8u) { n_gain = 1.35; }
@@ -720,9 +724,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (kind == 9u) {
         albedo *= mix(1.0, 0.8, smoothstep(0.35, 0.9, darken));
         // The clay color is almost one tone. In the cut, the mud under it shows.
-        if (-stamp_bilinear(xz) > 0.012) {
-            // Clay's color is one tone. Sample the mud without the grazing mip
-            // so the grain stays on the floor of the cut.
+        // The printed rut stays the soil it was pressed into. The clay
+        // multiply was a pale sheet over the lugs.
+        if (-stamp_bilinear(xz) > 0.012 && !track_near(xz)) {
             let mud = textureSampleLevel(ground_diff, ground_samp, uv0, 0, 0.0).rgb;
             albedo = mud * vec3<f32>(1.08, 0.78, 0.52);
         }
@@ -771,11 +775,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (kind == 10u) { rough_out = max(rough_out, 0.74); }
     if (kind == 11u) { rough_out = mix(rough_out, 0.2, smoothstep(0.35, 0.85, wet)); }
     let lug_h = tread_delta(xz);
-    // A steep rut wall stretched in xz becomes one flat color. Sample the
-    // wall in the vertical plane so the ridge keeps the mud grain.
-    if (n.y < 0.42) {
-        let wall = textureSampleLevel(ground_diff, ground_samp, vec2<f32>(in.world.x + in.world.z, in.world.y) / 0.8, 0, 0.0).rgb;
-        albedo = mix(albedo, wall * vec3<f32>(0.62, 0.48, 0.36), 0.72);
+    if (track_near(xz)) {
+        // A flat highlight on the print was a white sheet over the lugs.
+        rough_out = max(rough_out, 0.92);
     }
     if (lug_h < -0.003) {
         let k = clamp(-lug_h / 0.045, 0.0, 1.0);

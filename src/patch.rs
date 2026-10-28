@@ -486,12 +486,12 @@ mod tests {
         }
         let roll_grip = wet_patch(0.08, roll).grip;
         assert!(
-            roll.groove > 0.55,
+            roll.groove > 0.95,
             "rolling should pack the voids, groove {}",
             roll.groove
         );
         assert!(
-            roll.sidewall > 0.55,
+            roll.sidewall > 0.90,
             "rolling should build a sidewall coat, {}",
             roll.sidewall
         );
@@ -520,13 +520,13 @@ mod tests {
             spin.groove, spin.sidewall, spin.smear, spin_grip, shed
         );
         assert!(
-            spin.groove < roll.groove * 0.45,
+            spin.groove < 0.40 && spin.groove < roll.groove * 0.45,
             "spinning should empty the voids, roll {} spin {}",
             roll.groove,
             spin.groove
         );
         assert!(
-            spin_grip < roll_grip * 0.72,
+            spin_grip < roll_grip * 0.45,
             "spinning should grip less, roll {roll_grip} spin {spin_grip}"
         );
         assert!(
@@ -599,7 +599,7 @@ mod tests {
             land.volume
         );
         assert!(
-            land.in_rut > shed_vol * 0.9,
+            land.in_rut > shed_vol * 0.99 && (land.in_rut - land.volume).abs() < 1.0e-5,
             "shed volume missed the rut, in rut {} of {shed_vol}",
             land.in_rut
         );

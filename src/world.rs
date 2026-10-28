@@ -834,18 +834,24 @@ mod tests {
             let bottom = center.y - WHEEL_RADIUS;
             let seat = h - w.sinkage;
             assert!(w.normal > 200.0, "wheel {i} is not supporting the body");
-            assert!(w.sinkage > 0.005 && w.sinkage < 0.16, "wheel {i} sink {}", w.sinkage);
+            assert!(w.sinkage > 0.02 && w.sinkage < 0.09, "wheel {i} sink {}", w.sinkage);
             assert!(
-                (bottom - seat).abs() < 0.012,
-                "wheel {i} bottom {bottom:.4} soil-sink {seat:.4} sink {:.4}",
+                (bottom - seat).abs() < 0.002,
+                "wheel {i} hub is not on soil-sink, bottom {bottom:.4} soil-sink {seat:.4} sink {:.4}",
                 w.sinkage
+            );
+            assert!(
+                (center.y - (seat + WHEEL_RADIUS)).abs() < 0.002,
+                "wheel {i} hub {:.4} is off the seat {:.4}",
+                center.y,
+                seat + WHEEL_RADIUS
             );
             support += w.normal;
         }
         let weight = MASS * 9.81;
         assert!(
-            support > weight * 0.65 && support < weight * 1.45,
-            "tires are not carrying the body, support {support:.0} weight {weight:.0}"
+            (support - weight).abs() < weight * 0.04,
+            "support {support:.0} N does not match weight {weight:.0} N"
         );
         let (n, amp) = world.soil.tread_imprint_stats();
         assert!(n > 0 && amp > 0.01, "settle did not leave a tread negative");

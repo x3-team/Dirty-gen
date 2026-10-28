@@ -2181,6 +2181,16 @@ impl SoilField {
         }
     }
 
+    /// Metres the persisted tread record sits below the rut surface.
+    /// Negative inside a print, zero where no contact was stored.
+    /// This is the height record. It does not move the bed or the pile.
+    pub fn tread_drop(&self, x: f32, z: f32) -> f32 {
+        match self.idx_at(x, z) {
+            Some(idx) if self.tread_amp[idx] > 0.001 => -self.tread_amp[idx],
+            _ => 0.0,
+        }
+    }
+
     /// Cells that still carry a tread negative, and the deepest lug.
     pub fn tread_imprint_stats(&self) -> (u32, f32) {
         let mut n = 0u32;
@@ -3629,12 +3639,36 @@ mod tests {
         let mut soil = SoilField::flat(0.72);
         let before = soil.cut_volume();
         let center = glam::Vec3::new(0.74, 0.3, 0.2);
-        soil.imprint_tread(center, glam::Vec3::Z, glam::Vec3::X, 0.38, 0.28, 0.04);
         let idx = soil.idx_at(0.74, 0.2).expect("cell");
+        let height = soil.height[idx];
+        let bed = soil.bed[idx];
+        let placed = soil.placed[idx];
+        let kind = soil.kind[idx];
+        soil.imprint_tread(center, glam::Vec3::Z, glam::Vec3::X, 0.38, 0.28, 0.04);
         let amp = soil.tread_amp[idx];
-        assert!(amp > 0.015, "the contact did not press a tread, amp {amp}");
+        assert!(
+            (0.026..=0.048).contains(&amp),
+            "the contact did not press a tread height, amp {amp}"
+        );
+        let drop = soil.tread_drop(0.74, 0.2);
+        assert!(
+            (drop + amp).abs() < 1.0e-6,
+            "the lug negative is not the persisted height, drop {drop} amp {amp}"
+        );
+        assert!(
+            (soil.height[idx] - height).abs() < 1.0e-6
+                && (soil.bed[idx] - bed).abs() < 1.0e-6
+                && (soil.placed[idx] - placed).abs() < 1.0e-6
+                && soil.kind[idx] == kind,
+            "the imprint painted or rebuilt the cell instead of storing a height"
+        );
         let (n, deep) = soil.tread_imprint_stats();
         assert!(n >= 1 && deep >= amp - 1.0e-6, "imprint missing on a second look");
+        soil.imprint_tread(center, glam::Vec3::Z, glam::Vec3::X, 0.38, 0.28, 0.04);
+        assert!(
+            (soil.tread_drop(0.74, 0.2) - drop).abs() < 1.0e-6,
+            "a second look rewrote the tread height"
+        );
         assert!(
             (soil.cut_volume() - before).abs() < 1.0e-6,
             "the tread negative cut the bed"
@@ -3644,6 +3678,10 @@ mod tests {
         assert!(
             (loaded.tread_amp[idx] - amp).abs() < 1.0e-6,
             "reload dropped the tread"
+        );
+        assert!(
+            (loaded.tread_drop(0.74, 0.2) - drop).abs() < 1.0e-6,
+            "reload dropped the tread height"
         );
         assert!((loaded.tread_ang[idx] - soil.tread_ang[idx]).abs() < 1.0e-6);
         let legacy_len = saved.len() - soil.res * soil.res * 12;

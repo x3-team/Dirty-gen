@@ -1432,20 +1432,12 @@ fn niva_shed_camera(world: &World, wheel: usize) -> CameraPose {
         .soil
         .sample(pile.x + right.x * side * 0.55, pile.z + right.z * side * 0.55)
         .height;
-    // Across the rut, above the lip, so the ridge's side is the subject.
-    // In the empty rut beyond the pile, looking back at the step.
-    // Three-quarter, above the lip. The old eye sat on the rut wall and
-    // the ridge smeared into the grazing mip.
-    // Past the tail, looking back down into the rut. High enough that the
-    // ridge face is a step under the lip, not a grazing tile.
-    // Across the rut. Looking back along the car put a body panel in frame
-    // and it read as a flat card. The car stays out of this frustum.
-    // Far enough that the mud grain stays sharp, close enough that the
-    // ridge's step under the lip is the subject.
-    let look = Vec3::new(pile.x, lip - 0.025, pile.z);
-    let eye = pile - fwd * 0.32 + right * side * 0.52;
-    let eye = Vec3::new(eye.x, lip + 0.68, eye.z);
-    let ortho = 0.92;
+    // Onto the mound, steep enough to stay sharp, wide enough to show it
+    // sitting in the rut under the lip.
+    let look = Vec3::new(pile.x, (pile.y + lip) * 0.5, pile.z);
+    let eye = pile - fwd * 0.22 + right * side * 0.40;
+    let eye = Vec3::new(eye.x, lip + 0.58, eye.z);
+    let ortho = 0.70;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
