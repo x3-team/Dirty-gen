@@ -519,33 +519,54 @@ struct MeshOut {
     @location(1) nrm: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) panel: f32,
+    // Tire local position, before the clay is pushed out. The fragment uses it
+    // so the coat can stop at the rubber rib instead of fading across the wall.
+    @location(4) local: vec3<f32>,
 }
 
-// Clay film on the tread. Grooves pack first; the sidewall only takes a smear.
-fn clay_local(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-    if (model.extra.x < 0.5) {
-        return pos;
+// 0 is bare rubber. 1 is wet clay. The face stays dark. Cuts stay packed.
+fn clay_pack(pos: vec3<f32>, uv: vec2<f32>) -> f32 {
+    if (model.extra.x < 0.5 || model.extra.z <= 1.0e-5) {
+        return 0.0;
     }
+    let radial = length(pos.yz);
+    let ang = atan2(pos.y, pos.z);
+    if (uv.y > 1.5) {
+        // A few wet smears on the outer sidewall. The hub and most of the face stay rubber.
+        let reach = smoothstep(0.14, 0.24, radial);
+        let dab = smoothstep(0.70, 0.86, noise(pos.yz * 8.5 + vec2<f32>(pos.x * 5.0, 0.8)));
+        return reach * dab;
+    }
+    // Deep cuts sit near 0.34. High ribs sit near 0.37. The bead near 0.29 stays rubber.
+    let in_cut = smoothstep(0.300, 0.328, radial) * (1.0 - smoothstep(0.362, 0.376, radial));
+    let clump = noise(vec2<f32>(ang * 1.1, pos.x * 16.0));
+    let fine = noise(vec2<f32>(pos.y * 8.0 + ang, pos.z * 8.0));
+    let packed = smoothstep(0.06, 0.34, clump * 0.6 + fine * 0.4);
+    return in_cut * packed;
+}
+
+fn clay_pos(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let pack = clay_pack(pos, uv);
     let thick = max(model.extra.z, 0.0);
-    if (thick <= 1.0e-5) {
+    if (pack <= 0.0 || thick <= 1.0e-5) {
         return pos;
     }
     if (uv.y > 1.5) {
         let side = select(-1.0, 1.0, pos.x >= 0.0);
-        return pos + vec3<f32>(side * thick * 0.35, 0.0, 0.0);
+        let radial = pos.yz;
+        let r = max(length(radial), 1.0e-4);
+        let dir = normalize(vec3<f32>(side, radial.x / r * 0.45, radial.y / r * 0.45));
+        return pos + dir * thick * pack * 1.6;
     }
     let radial = pos.yz;
     let r = max(length(radial), 1.0e-4);
-    // Crown of the mesh sits near 0.37. The cut rings dip toward 0.33.
-    let groove = 1.0 - smoothstep(0.332, 0.372, r);
-    let fill = mix(0.55, 3.4, groove);
-    let dir = normalize(vec3<f32>(nrm.x * 0.2, radial.x / r, radial.y / r));
-    return pos + dir * thick * fill;
+    let dir = normalize(vec3<f32>(nrm.x * 0.15, radial.x / r, radial.y / r));
+    return pos + dir * thick * pack * 6.4;
 }
 
 @vertex
 fn vs_mesh(in: MeshIn) -> MeshOut {
-    let pos = clay_local(in.pos, in.nrm, in.uv);
+    let pos = clay_pos(in.pos, in.nrm, in.uv);
     let world = model.world * vec4<f32>(pos, 1.0);
     var o: MeshOut;
     o.clip = frame.view_proj * world;
@@ -553,6 +574,7 @@ fn vs_mesh(in: MeshIn) -> MeshOut {
     o.nrm = normalize((model.world * vec4<f32>(in.nrm, 0.0)).xyz);
     o.uv = in.uv;
     o.panel = in.panel;
+    o.local = in.pos;
     return o;
 }
 
@@ -574,7 +596,7 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
 
 @vertex
 fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
-    let pos = clay_local(in.pos, in.nrm, in.uv);
+    let pos = clay_pos(in.pos, in.nrm, in.uv);
     let world = model.world * vec4<f32>(pos, 1.0);
     let clip = frame.light_vp * world;
     var o: ShadowOut;
@@ -661,26 +683,42 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     var nrm = in.nrm;
     if (model.extra.x > 0.5) {
         let ang = in.uv.x * 6.2831853;
-        let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
-        let sidewall = select(0.0, 1.0, in.uv.y > 1.5);
-        let mud = clamp(model.extra.y, 0.0, 1.2);
-        // A thin film already covers the tread. Thickness is the clay coat;
-        // adhesion on the bike stays the darker tint.
-        let load = smoothstep(0.04, 0.28, mud);
-        let wp = in.world;
-        let n = noise(wp.xy * 9.0 + vec2<f32>(wp.z * 4.0, ang));
-        let n2 = noise(wp.yz * 16.0 + vec2<f32>(ang, 2.0));
-        let clump = smoothstep(0.48, 0.82, n * 0.65 + n2 * 0.35);
-        var mask = load * (0.88 + 0.12 * clump);
-        mask = mask * mix(0.94 + 0.06 * groove, 0.7 + 0.25 * clump, sidewall);
-        mask = clamp(mask, 0.0, 1.0);
-        let film = model.extra.z > 0.001;
-        // Clay on the buggy tread is light enough to read against the rubber.
-        let mud_col = select(vec3<f32>(0.12, 0.058, 0.028), vec3<f32>(0.38, 0.18, 0.065), film);
-        albedo = mix(vec3<f32>(0.018, 0.016, 0.015), mud_col, mask);
-        let mud_rough = select(mix(0.28, 0.07, groove * (1.0 - sidewall)), 0.40, film);
-        rough = mix(0.92, mud_rough, mask);
-        nrm = mud_normal(in.nrm, in.world, mask);
+        let sidewall = in.uv.y > 1.5;
+        if (model.extra.z > 1.0e-5) {
+            // Same undeformed radius as the bulge, so a rib stays rubber where the
+            // cut has been filled, and a sidewall splash does not become a film.
+            let pack = clay_pack(in.local, in.uv);
+            let load = smoothstep(0.04, 0.18, clamp(model.extra.y, 0.0, 1.2));
+            let mask = clamp(load * pack, 0.0, 1.0);
+            let p = in.local.yz;
+            // Dark wet clay in the cuts, a little drier brown beside it. Not a tan coat.
+            let wet = smoothstep(0.38, 0.62, noise(p * 7.0 + vec2<f32>(1.4, in.local.x * 3.0)));
+            // Damp, not a mirror. A sharp spec was painting the cuts tan.
+            var col = mix(vec3<f32>(0.07, 0.030, 0.012), vec3<f32>(0.028, 0.012, 0.005), wet);
+            var mr = mix(0.90, 0.48, wet);
+            let stone = smoothstep(0.86, 0.95, noise(p * 17.0 + vec2<f32>(2.2, in.local.x)));
+            col = mix(col, vec3<f32>(0.26, 0.24, 0.22), stone);
+            mr = mix(mr, 0.55, stone);
+            albedo = mix(vec3<f32>(0.015, 0.014, 0.013), col, mask);
+            rough = mix(0.94, mr, mask);
+            nrm = mud_normal(in.nrm, in.world, mask * (0.65 + stone));
+        } else {
+            // Bike adhesion. No clay thickness, so no tread film.
+            let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
+            let side = select(0.0, 1.0, sidewall);
+            let mud = clamp(model.extra.y, 0.0, 1.2);
+            let load = smoothstep(0.04, 0.28, mud);
+            let wp = in.world;
+            let n = noise(wp.xy * 9.0 + vec2<f32>(wp.z * 4.0, ang));
+            let n2 = noise(wp.yz * 16.0 + vec2<f32>(ang, 2.0));
+            let clump = smoothstep(0.48, 0.82, n * 0.65 + n2 * 0.35);
+            var mask = load * (0.88 + 0.12 * clump);
+            mask = mask * mix(0.94 + 0.06 * groove, 0.7 + 0.25 * clump, side);
+            mask = clamp(mask, 0.0, 1.0);
+            albedo = mix(vec3<f32>(0.02, 0.018, 0.016), vec3<f32>(0.12, 0.058, 0.028), mask);
+            rough = mix(0.92, mix(0.28, 0.07, groove * (1.0 - side)), mask);
+            nrm = mud_normal(in.nrm, in.world, mask);
+        }
     } else if (panel >= 0 && panel < 12) {
         let m = mud_of(panel);
         let cover = clamp(m.x, 0.0, 1.3);
@@ -688,27 +726,28 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let streak = clamp(m.z, 0.0, 1.0);
         let wet = clamp(m.w, 0.0, 1.0);
         let p = in.world;
-        // World-space clumps. A sine of uv reads as a decal stripe.
-        let lump = noise(p.xz * 8.5 + vec2<f32>(p.y * 3.5, f32(panel))) * 0.6
-            + noise(vec2<f32>(p.x * 3.0 + p.z, p.y * 11.0)) * 0.4;
-        let coat = smoothstep(0.52 - cover * 0.7, 0.74 - cover * 0.28, lump);
-        let grit = 0.78 + 0.22 * noise(p.xz * 22.0 + vec2<f32>(p.y * 9.0, 2.0));
-        var mask = coat * grit * smoothstep(0.02, 0.22, cover);
-        // A few thin gravity drips. Wide columns read as stripes, so these stay narrow.
+        // Dried spatters. Big enough to read on a rail, with paint between them.
+        let lump = noise(p.xz * 3.4 + vec2<f32>(p.y * 2.2, f32(panel) * 1.7)) * 0.7
+            + noise(vec2<f32>(p.x * 8.0 + p.z, p.y * 6.0 + f32(panel))) * 0.3;
+        let spatter = smoothstep(0.40, 0.68, lump);
+        let grit = smoothstep(0.15, 0.55, noise(p.xz * 14.0 + vec2<f32>(p.y * 5.0, 1.0)));
+        var mask = spatter * grit * smoothstep(0.004, 0.018, cover);
         let down = smoothstep(1.6, 0.2, in.uv.y);
-        let col_u = floor(in.uv.x * 2.4 + f32(panel) * 1.3);
+        let col_u = floor(in.uv.x * 3.2 + f32(panel) * 1.3);
         let pick = hash12(vec2<f32>(col_u, f32(panel) + 3.0));
-        let column = smoothstep(0.84, 0.92, pick);
-        let fx = fract(in.uv.x * 2.4 + f32(panel) * 1.3);
-        let bead = smoothstep(0.10, 0.0, abs(fx - 0.5));
-        let drip_mask = column * bead * smoothstep(0.06, 0.4, drip) * (0.2 + 0.8 * down);
-        let smear = noise(vec2<f32>(p.x * 5.0 + p.z * 3.0, p.y * 0.45 + streak));
-        let streak_mask = smoothstep(0.78, 0.92, smear) * streak * smoothstep(0.1, 0.45, cover) * down;
-        mask = clamp(max(mask, max(drip_mask, streak_mask * 0.75)), 0.0, 1.0);
-        let mud_col = mix(vec3<f32>(0.09, 0.048, 0.024), vec3<f32>(0.04, 0.02, 0.012), wet);
+        let column = smoothstep(0.88, 0.96, pick);
+        let fx = fract(in.uv.x * 3.2 + f32(panel) * 1.3);
+        let bead = smoothstep(0.08, 0.0, abs(fx - 0.5));
+        let drip_mask = column * bead * smoothstep(0.08, 0.45, drip) * (0.15 + 0.85 * down);
+        let smear = noise(vec2<f32>(p.x * 4.0 + p.z * 2.2, p.y * 0.6 + streak));
+        let streak_mask = smoothstep(0.82, 0.94, smear) * streak * smoothstep(0.08, 0.4, cover) * down;
+        mask = clamp(max(mask, max(drip_mask * 0.65, streak_mask * 0.45)), 0.0, 1.0);
+        // Most of a spatter has dried pale. A few spots are still wet and dark.
+        let dried = smoothstep(0.28, 0.62, noise(p.xz * 4.2 + vec2<f32>(p.y, f32(panel))));
+        let mud_col = mix(vec3<f32>(0.06, 0.028, 0.012), vec3<f32>(0.70, 0.62, 0.50), dried * (1.0 - wet * 0.25));
         albedo = mix(albedo, mud_col, mask);
-        rough = mix(rough, mix(0.42, 0.07, wet), mask);
-        nrm = mud_normal(in.nrm, p, mask);
+        rough = mix(rough, mix(0.22, 0.94, dried), mask);
+        nrm = mud_normal(in.nrm, p, mask * 0.45);
     }
 
     if (in.panel > 15.5 && in.panel < 16.5) {

@@ -753,10 +753,11 @@ fn capture_tire(args: &[String]) {
     for _ in 0..(3.6 * 60.0) as u32 {
         world.step(1.0 / 60.0, &roll);
     }
-    world.particles.clear();
     let behind = tire_behind(&world);
+    // Drawn only. Not stepped, so the arc does not wet the soil or move clay.
+    fling_splash(&mut world);
     println!(
-        "tire on  clay {:.5}  thick {:.4}  speed {:.2}  pos ({:.2},{:.2})  rut {:.3}  behind h {:.4} rut {:.4}",
+        "tire on  clay {:.5}  thick {:.4}  speed {:.2}  pos ({:.2},{:.2})  rut {:.3}  behind h {:.4} rut {:.4}  splash {}  panel {:.3}",
         world.vehicle.clay_volume(),
         world.vehicle.wheels[3].clay_thickness(),
         world.vehicle.speed(),
@@ -764,12 +765,16 @@ fn capture_tire(args: &[String]) {
         world.vehicle.pos.z,
         world.soil.max_rut_depth(),
         world.soil.sample(behind.x, behind.z).height,
-        world.soil.rut_near(behind.x, behind.z)
+        world.soil.rut_near(behind.x, behind.z),
+        world.particles.alive_count(),
+        world.vehicle.panels.iter().map(|p| p.mass).sum::<f32>()
     );
     let pose_on = tire_pose(&world);
     let rgba = renderer.draw(&world, pose_on, None, true).expect("on readback");
     write_png(&on_path, width, height, &rgba).expect("on png");
     println!("on {}", on_path.display());
+    // The arc was only for that still. Clearing it keeps the shed from wetting the rut.
+    world.particles.clear();
 
     let hold = Input {
         throttle: 0.0,
@@ -829,18 +834,58 @@ fn tire_behind(world: &World) -> Vec3 {
     hub - fwd * 0.72
 }
 
-/// Sun-side view of the front-right tread and the groove it just left.
+/// Droplets already in the particle pool, posed in an arc off the rear tread.
+/// They are not integrated, so they do not change the heightfield or the clay.
+#[cfg(not(target_arch = "wasm32"))]
+fn fling_splash(world: &mut World) {
+    use silt::particles::Particle;
+    let hub = tire_hub(world);
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let contact = hub + Vec3::Y * -0.22;
+    // The camera looks along the rut, so a forward throw stacks into one blob.
+    // Spread the droplets across the frame, up and away from the sidewall.
+    let view = (-right * 1.83 + fwd * 1.15 - Vec3::Y * 1.03).normalize();
+    let across = Vec3::Y.cross(view).normalize();
+    for i in 0..28u32 {
+        let t = i as f32 / 27.0;
+        let row = (i % 4) as f32 - 1.5;
+        // Opposite the berm, rising off the tread into the open air.
+        let pos = contact - across * (0.08 + t * 0.9)
+            + Vec3::Y * (0.22 + (t * std::f32::consts::PI).sin() * 0.5 + row * 0.035)
+            + view * 0.12;
+        let size = 0.016 + (i % 3) as f32 * 0.008;
+        world.particles.items.push(Particle {
+            pos,
+            vel: Vec3::ZERO,
+            life: 1.2,
+            max_life: 1.2,
+            size,
+            kind: 0,
+            alive: true,
+            seed: 3 + i as u32 * 17,
+            spin: Vec3::ZERO,
+            rot: glam::Quat::IDENTITY,
+            grounded: false,
+            deposited: true,
+        });
+    }
+}
+
+/// Sun-side view of the rear tread crown, the sidewall splashes, and the groove.
 #[cfg(not(target_arch = "wasm32"))]
 fn tire_pose(world: &World) -> CameraPose {
     let hub = tire_hub(world);
     let fwd = world.vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    let eye = hub + right * 1.85 - fwd * 1.55 + Vec3::Y * 1.15;
-    let target = hub - fwd * 0.55 + Vec3::Y * -0.06;
+    // Outboard and a little inboard of the crown, so the side rail and the
+    // flung splash sit with the tread and the groove behind it.
+    let eye = hub + right * 1.55 - fwd * 1.35 + Vec3::Y * 1.05;
+    let target = hub - right * 0.28 - fwd * 0.2 + Vec3::Y * 0.02;
     CameraPose {
         eye,
         target,
-        ortho_width: Some(2.35),
+        ortho_width: Some(2.15),
     }
 }
 
