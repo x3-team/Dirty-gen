@@ -642,7 +642,16 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     let quiet = clamp(max(seated.y, seated.z), 0.0, 1.0);
     // The print and the spoil are the height. The gravel map was breaking them into tiles.
     let calm = select(0.0, 1.0, track_near(in.xz));
-    let h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - quiet) * (1.0 - 0.35 * calm);
+    var h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - quiet) * (1.0 - 0.35 * calm);
+    // A column the tire moved is the solver field: bed plus placed berm.
+    // Map relief and the lug ribbon are not stacked on that height. The
+    // carcass may only press the field down onto the rubber.
+    if (abs(stamp_bilinear(in.xz)) > 0.004) {
+        h = base;
+        if (seated.y > 0.2 && seated.x < base) {
+            h = mix(base, seated.x, seated.y);
+        }
+    }
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);

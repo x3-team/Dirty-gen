@@ -84,6 +84,8 @@ struct LaneAccum {
     right: Vec3,
     sink: f32,
     slip: f32,
+    normal: f32,
+    push: f32,
     n: u32,
 }
 
@@ -95,25 +97,40 @@ impl Default for LaneAccum {
             right: Vec3::X,
             sink: 0.0,
             slip: 0.0,
+            normal: 0.0,
+            push: 0.0,
             n: 0,
         }
     }
 }
 
 impl LaneAccum {
-    fn add(&mut self, center: Vec3, forward: Vec3, right: Vec3, sink: f32, slip: f32) {
-        if self.n == 0 || sink >= self.sink {
+    fn add(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        sink: f32,
+        slip: f32,
+        normal: f32,
+        push: f32,
+    ) {
+        let load = (normal * normal + push * push).sqrt();
+        let prev = (self.normal * self.normal + self.push * self.push).sqrt();
+        if self.n == 0 || load >= prev {
             self.forward = forward;
             self.right = right;
             self.sink = sink;
             self.slip = slip.abs();
+            self.normal = normal.max(0.0);
+            self.push = push.max(0.0);
         }
         self.center += center;
         self.n += 1;
     }
 
     fn stamp(&self, soil: &mut SoilField, radius: f32, width: f32, dt: f32) {
-        if self.n == 0 || self.sink < 0.004 {
+        if self.n == 0 || (self.sink < 0.004 && self.normal < 1.0 && self.push < 1.0) {
             return;
         }
         soil.stamp_wheel(
@@ -126,6 +143,8 @@ impl LaneAccum {
             self.slip,
             dt,
             true,
+            self.normal,
+            self.push,
         );
     }
 }
@@ -310,6 +329,8 @@ impl World {
                         slip,
                         h,
                         false,
+                        0.0,
+                        0.0,
                     );
                 }
             }
@@ -345,6 +366,8 @@ impl World {
                 slip_stamp,
                 dt,
                 false,
+                c.normal,
+                c.push,
             );
             // The lug negative is a record of this contact. It does not cut.
             self.soil.imprint_tread(
@@ -357,7 +380,15 @@ impl World {
             );
             // One groove per side of the axle. Front and rear share it, so a
             // turn does not chew a second slot into the berm.
-            sides[c.index % 2].add(c.wheel_center, c.forward, c.right, c.sinkage, slip_stamp);
+            sides[c.index % 2].add(
+                c.wheel_center,
+                c.forward,
+                c.right,
+                c.sinkage,
+                slip_stamp,
+                c.normal,
+                c.push,
+            );
             if c.sample.water > 0.008 {
                 let speed = c.speed.max(0.2);
                 self.soil.displace_water(

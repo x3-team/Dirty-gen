@@ -512,6 +512,8 @@ struct CaptureArgs {
     surfaces_proof: PathBuf,
     roll: bool,
     roll_proof: PathBuf,
+    force: bool,
+    force_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -572,6 +574,10 @@ fn capture(args: &[String]) {
     }
     if parsed.roll {
         capture_roll(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.force {
+        capture_force(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -746,6 +752,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let niva_tread_side = PathBuf::from(format!("{MEDIA}/niva-tread-side.png"));
     let mut surfaces_proof = PathBuf::from(format!("{MEDIA}/surfaces-proof.png"));
     let mut roll_proof = PathBuf::from(format!("{MEDIA}/roll-proof.png"));
+    let mut force = false;
+    let mut force_proof = PathBuf::from(format!("{MEDIA}/force-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -780,6 +788,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 roll = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     roll_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--force-proof" => {
+                force = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    force_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -857,6 +871,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         surfaces_proof,
         roll,
         roll_proof,
+        force,
+        force_proof,
     }
 }
 
@@ -1598,6 +1614,122 @@ fn roll_camera(world: &World) -> CameraPose {
     // ground beside the rolled Niva instead of sitting in a wide empty frame.
     let eye = look + fwd * 2.85 - right * 0.55 + Vec3::Y * 0.92;
     let ortho = 4.15;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+/// Hard-pass ruts under the Niva. The bed and the berm are the force field.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_force(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{
+        rut_depth_from_force, SoilField, SurfaceKind, HARD_PASS_NORMAL, HARD_PASS_PUSH,
+        LIGHT_PASS_NORMAL, LIGHT_PASS_PUSH,
+    };
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut hard_bed = 0.0_f32;
+    for (label, normal, push) in [
+        ("light", LIGHT_PASS_NORMAL, LIGHT_PASS_PUSH),
+        ("hard", HARD_PASS_NORMAL, HARD_PASS_PUSH),
+    ] {
+        let mut soil = SoilField::mud_pad();
+        let want = rut_depth_from_force(
+            normal,
+            push,
+            0.38,
+            0.28,
+            SurfaceKind::WetMud,
+            0.82,
+            0.02,
+            0.0,
+        );
+        let before = soil.placed_volume();
+        soil.roll_with_force(
+            Vec3::new(0.0, 0.0, -1.2),
+            Vec3::new(0.0, 0.0, 1.2),
+            want.max(0.012),
+            0.0,
+            normal,
+            push,
+        );
+        let depth = soil.max_rut_depth();
+        let placed = soil.placed_volume() - before;
+        println!("{label} depth {depth:.4} m  placed {placed:.4} m3");
+        if label == "hard" {
+            hard_bed = depth;
+        }
+    }
+
+    let mut world = World::wet_clay();
+    let z0 = -2.6_f32;
+    let z1 = 1.8_f32;
+    for side in [-0.74_f32, 0.74] {
+        world.soil.roll_with_force(
+            Vec3::new(side, 0.0, z0),
+            Vec3::new(side, 0.0, z1),
+            hard_bed.max(0.012),
+            0.0,
+            HARD_PASS_NORMAL,
+            HARD_PASS_PUSH,
+        );
+    }
+    world.vehicle.pos = Vec3::new(0.0, 0.8, 0.15);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    let ori = world.vehicle.orientation();
+    let mut seated = 0.0_f32;
+    for i in 0..4 {
+        let local = ori * world.vehicle.wheel_center_local(i);
+        let ground = world
+            .soil
+            .sample(world.vehicle.pos.x + local.x, world.vehicle.pos.z + local.z)
+            .height;
+        seated += ground + 0.38 - local.y;
+    }
+    world.vehicle.pos.y = seated / 4.0;
+    silence_chunks(&mut world);
+    let v = world.soil.volumes();
+    println!(
+        "picture depth {:.4} m  placed {:.4} m3  cut {:.4} m3",
+        world.soil.max_rut_depth(),
+        v.placed,
+        v.cut
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "force",
+        &parsed.force_proof,
+        parsed,
+        force_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn force_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let p = world.vehicle.pos;
+    let bed = p - fwd * 1.7 + right * 0.74;
+    let berm = bed + right * 0.46;
+    let bed_h = world.soil.sample(bed.x, bed.z).height;
+    let berm_h = world.soil.sample(berm.x, berm.z).height;
+    let look = Vec3::new(
+        bed.x * 0.55 + p.x * 0.45,
+        (bed_h + berm_h) * 0.5,
+        bed.z * 0.45 + p.z * 0.55,
+    );
+    // Behind the shoulder, wide enough that the trench and the ridge read
+    // as one rut beside the Niva.
+    let eye = look - fwd * 2.5 + right * 2.35 + Vec3::Y * 1.15;
+    let ortho = 4.6;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,

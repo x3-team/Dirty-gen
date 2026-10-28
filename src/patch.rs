@@ -439,6 +439,8 @@ mod tests {
             0.1,
             0.12,
             true,
+            0.0,
+            0.0,
         );
         let cut = soil.cut_volume() - before_cut;
         let placed = soil.placed_volume() - before_placed;

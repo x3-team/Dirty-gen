@@ -153,6 +153,9 @@ pub struct Contact {
     /// Rate a spinning tread is pulling mud back out, 1/s.
     pub pull: f32,
     pub patch_length: f32,
+    /// Horizontal force the tire puts into the soil, newtons. Shear, not the
+    /// net force left on the chassis after the soil pushes back.
+    pub push: f32,
 }
 
 impl Vehicle {
@@ -292,6 +295,7 @@ impl Vehicle {
             let mut squeeze = 0.0;
             let mut pull = 0.0;
             let mut patch_length = 0.0;
+            let mut soil_push = 0.0;
 
             if active {
                 let tm = terramech_for(sample.kind(), sample.softness, sample.water);
@@ -383,6 +387,7 @@ impl Vehicle {
                 let f_visc = tm.viscosity * area * speed_h / sinkage.max(0.03);
                 let prop = Vec3::new(blended_long, blended_lat, 0.0);
                 let prop_mag = prop.x.hypot(prop.y);
+                soil_push = prop_mag;
                 // At speed the full yield bogs the buggy. From rest only the
                 // breakaway fraction has to be beaten, unless the rut is deep.
                 let speed_gate = smoothstep(0.25, 1.2, speed_h);
@@ -442,6 +447,7 @@ impl Vehicle {
                 squeeze,
                 pull,
                 patch_length,
+                push: soil_push,
             };
         }
         out
@@ -745,6 +751,7 @@ impl Default for Contact {
             squeeze: 0.0,
             pull: 0.0,
             patch_length: 0.0,
+            push: 0.0,
         }
     }
 }

@@ -358,6 +358,15 @@ pub fn surface_rest(kind: SurfaceKind) -> (f32, f32, f32) {
 /// Wheel load used when reporting sink for one surface, newtons.
 pub const SURFACE_WHEEL_LOAD: f32 = 1_600.0;
 
+/// Upward soil reaction and horizontal shear for a light pass, newtons.
+/// The bed of that pass is [`rut_depth_from_force`] of this pair.
+pub const LIGHT_PASS_NORMAL: f32 = 650.0;
+pub const LIGHT_PASS_PUSH: f32 = 150.0;
+
+/// A harder push: more weight on the patch and more shear into the soil.
+pub const HARD_PASS_NORMAL: f32 = 5_400.0;
+pub const HARD_PASS_PUSH: f32 = 4_200.0;
+
 /// Grip (`tan φ`) and sink (m) of a rested surface under [`SURFACE_WHEEL_LOAD`].
 pub fn surface_grip_sink(kind: SurfaceKind) -> (f32, f32) {
     let (wetness, loose, water) = surface_rest(kind);
@@ -408,6 +417,41 @@ pub fn sinkage_on(
         }
     }
     0.5 * (lo + hi)
+}
+
+/// Plastic rut depth (m) for the force on one tire.
+///
+/// `normal` is the soil's upward reaction. `push` is the horizontal force
+/// the tire puts into the soil, the shear, not the net force left on the
+/// chassis after drag cancels. The bed is the Bekker sinkage of that
+/// resultant, so a harder push cuts deeper and moves more soil onto the berm.
+pub fn rut_depth_from_force(
+    normal: f32,
+    push: f32,
+    radius: f32,
+    width: f32,
+    kind: SurfaceKind,
+    wetness: f32,
+    loose: f32,
+    water: f32,
+) -> f32 {
+    let n = normal.max(0.0);
+    let p = push.max(0.0);
+    let load = (n * n + p * p).sqrt();
+    if load < 1.0 || !load.is_finite() {
+        return 0.0;
+    }
+    let radius = radius.max(0.05);
+    let depth = sinkage_on(
+        load,
+        kind,
+        wetness,
+        loose,
+        water,
+        radius,
+        width.max(0.02),
+    );
+    depth.min(radius * 0.85)
 }
 
 /// Wetness alone makes the ground heavy. Standing water and loose spoil
@@ -734,6 +778,8 @@ impl SoilField {
                 0.35,
                 0.12,
                 true,
+                0.0,
+                0.0,
             );
             z += 0.1;
         }
@@ -1412,6 +1458,30 @@ impl SoilField {
     /// stair-steps into a row of pits, and those pits read as a nest of scars
     /// on the berm. The per-tire call is only a scuff under the tread, plus
     /// the slow dig when a tire spins in place.
+    /// The cell the tire is cutting. A berm beside an earlier rut is spoil,
+    /// not the soil the Bekker depth is taken from.
+    fn soil_for_force(&self, x: f32, z: f32) -> SoilSample {
+        let spoil = |s: SoilSample| {
+            s.placed > 0.008
+                || matches!(s.kind(), SurfaceKind::Berm | SurfaceKind::PlacedClod)
+        };
+        let s = self.sample(x, z);
+        if !spoil(s) {
+            return s;
+        }
+        let step = self.cell;
+        for ring in 1..12 {
+            let d = ring as f32 * step;
+            for (dx, dz) in [(d, 0.0), (-d, 0.0), (0.0, d), (0.0, -d)] {
+                let n = self.sample(x + dx, z + dz);
+                if !spoil(n) {
+                    return n;
+                }
+            }
+        }
+        s
+    }
+
     pub fn stamp_wheel(
         &mut self,
         center: Vec3,
@@ -1423,19 +1493,49 @@ impl SoilField {
         slip: f32,
         dt: f32,
         lane: bool,
+        normal: f32,
+        push: f32,
     ) {
-        if sinkage < 0.004 {
+        let loaded = normal > 1.0 || push > 1.0;
+        let forced = if loaded {
+            // Spoil on the flank is not a softer bed. The depth is the clay
+            // under the tire, so a second rut does not run away to the cap.
+            let s = self.soil_for_force(center.x, center.z);
+            rut_depth_from_force(
+                normal,
+                push,
+                radius,
+                width,
+                s.kind(),
+                s.wetness,
+                s.loose,
+                s.water,
+            )
+        } else {
+            0.0
+        };
+        if sinkage < 0.004 && forced < 0.004 {
             return;
         }
-        let len = contact_length(radius, sinkage).max(radius * 0.35);
+        let len = contact_length(radius, sinkage.max(forced)).max(radius * 0.35);
         let slip_n = slip.abs().min(1.2);
         // One visit bites this deep. A later visit of the same lane, after the
         // tire has left, raises the pass count and cuts deeper into that slot.
         // The bed is only lowered. A second stamp never fills the first cut
         // back up to a fresh shallow groove. Slip still digs past the rolling
         // bite, on the slow rate, so a driver can back out of a hole they spin.
-        let one_pass = (sinkage * 0.82).min(0.055);
-        let spun = sinkage * (0.48 + 0.90 * slip_n);
+        // A tire force replaces that cap: the bed is the Bekker depth of the
+        // resultant, and a harder push is a deeper bed.
+        let one_pass = if loaded {
+            forced
+        } else {
+            (sinkage * 0.82).min(0.055)
+        };
+        let spun = if loaded {
+            forced
+        } else {
+            sinkage * (0.48 + 0.90 * slip_n)
+        };
         let sigma = (width * 0.42).max(self.cell * 0.34);
         // Flat floor, then a broken step. A ramped shoulder smeared the cut
         // lip and the placed berm into one slope.
@@ -1525,12 +1625,18 @@ impl SoilField {
                     } else {
                         self.passes[idx].max(1)
                     };
-                    let groove = if lane {
+                    let groove = if loaded {
+                        forced
+                    } else if lane {
                         pass_groove(one_pass, passes)
                     } else {
                         one_pass
                     };
-                    let want = spun.max(groove).min(0.40);
+                    let want = if loaded {
+                        forced.min(0.40)
+                    } else {
+                        spun.max(groove).min(0.40)
+                    };
                     let fast = if lane { groove } else { groove.min(0.008) };
                     let already = (self.initial_height[idx] - self.bed[idx]).max(0.0);
                     let local_want = if lane {
@@ -2930,7 +3036,479 @@ impl SoilField {
             let p = from.lerp(to, t);
             let h = self.initial_at(p.x, p.z);
             let hub = Vec3::new(p.x, h + radius - sink, p.z);
-            self.stamp_wheel(hub, radius, 0.28, forward, right, sink, slip, 0.12, true);
+            self.stamp_wheel(
+                hub, radius, 0.28, forward, right, sink, slip, 0.12, true, 0.0, 0.0,
+            );
+        }
+    }
+
+    /// One lane cut to the tire force. `sink` still sizes the chord. The bed
+    /// depth is [`rut_depth_from_force`] when `normal` or `push` is set, and
+    /// the cut volume is placed on the berm.
+    pub fn roll_with_force(
+        &mut self,
+        from: Vec3,
+        to: Vec3,
+        sink: f32,
+        slip: f32,
+        normal: f32,
+        push: f32,
+    ) {
+        let from = Vec3::new(from.x, 0.0, from.z);
+        let to = Vec3::new(to.x, 0.0, to.z);
+        let delta = to - from;
+        let len = delta.length();
+        if len < 1.0e-3 {
+            return;
+        }
+        let forward = delta / len;
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let n = (len / 0.1).round().max(1.0) as i32;
+        let radius = 0.38;
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let p = from.lerp(to, t);
+            let h = self.initial_at(p.x, p.z);
+            let hub = Vec3::new(p.x, h + radius - sink, p.z);
+            self.stamp_wheel(
+                hub, radius, 0.28, forward, right, sink, slip, 0.12, true, normal, push,
+            );
+        }
+        if normal > 1.0 || push > 1.0 {
+            // The stamp drops the cut on a one-cell shoulder. A hard push
+            // fills that cell into a tower. Spread the same volume into a ridge.
+            self.shape_force_berm();
+        }
+    }
+
+    /// The force cut is a groove at the tire depth, and the spoil is the
+    /// flank ridge. The deepest cell stays at that depth. Placed matches the cut.
+    pub fn shape_force_berm(&mut self) {
+        let res = self.res;
+        let n = res * res;
+        let total: f32 = self.placed.iter().copied().sum();
+        if total <= 1.0e-6 {
+            return;
+        }
+        let mut depth = vec![0.0_f32; n];
+        let mut max_d = 0.0_f32;
+        for idx in 0..n {
+            let d = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+            depth[idx] = d;
+            max_d = max_d.max(d);
+        }
+        if max_d < 0.02 {
+            return;
+        }
+        // A flat run of cells is a rectangular pit. Spread the same deepest
+        // depth into a groove so the wall is a slope, not a cliff.
+        let orig = depth.clone();
+        let sigma = (self.cell * 1.45).max(0.22);
+        let rad = 3isize;
+        let mut near_cut = vec![false; n];
+        for idx in 0..n {
+            if orig[idx] <= 0.004 {
+                continue;
+            }
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            for dj in -rad..=rad {
+                for di in -rad..=rad {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    near_cut[jj as usize * res + ii as usize] = true;
+                }
+            }
+        }
+        let mut soft = vec![0.0_f32; n];
+        for idx in 0..n {
+            if !near_cut[idx] {
+                continue;
+            }
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            let mut acc = 0.0_f32;
+            let mut wacc = 0.0_f32;
+            for dj in -rad..=rad {
+                for di in -rad..=rad {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    let dist = ((di * di + dj * dj) as f32).sqrt() * self.cell;
+                    let w = (-0.5 * (dist / sigma).powi(2)).exp();
+                    acc += orig[jj as usize * res + ii as usize] * w;
+                    wacc += w;
+                }
+            }
+            if wacc > 0.0 {
+                soft[idx] = acc / wacc;
+            }
+        }
+        let soft_max = soft.iter().copied().fold(0.0_f32, f32::max);
+        if soft_max > 1.0e-6 {
+            let scale = max_d / soft_max;
+            for d in &mut soft {
+                *d *= scale;
+            }
+        }
+        for idx in 0..n {
+            if !near_cut[idx] && orig[idx] <= 0.004 {
+                continue;
+            }
+            depth[idx] = soft[idx];
+            self.bed[idx] = self.initial_height[idx] - soft[idx];
+            self.sync(idx);
+        }
+        max_d = depth.iter().copied().fold(0.0_f32, f32::max);
+        let trench_at = (max_d * 0.45).max(0.03);
+        let mut trench = vec![false; n];
+        for idx in 0..n {
+            trench[idx] = depth[idx] >= trench_at;
+        }
+        let mut comp_of = vec![-1i32; n];
+        let mut comps: Vec<Vec<usize>> = Vec::new();
+        for start in 0..n {
+            if !trench[start] || comp_of[start] >= 0 {
+                continue;
+            }
+            let id = comps.len() as i32;
+            let mut comp = Vec::new();
+            let mut stack = vec![start];
+            comp_of[start] = id;
+            while let Some(idx) = stack.pop() {
+                comp.push(idx);
+                let i = (idx % res) as isize;
+                let j = (idx / res) as isize;
+                for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    let nidx = jj as usize * res + ii as usize;
+                    if trench[nidx] && comp_of[nidx] < 0 {
+                        comp_of[nidx] = id;
+                        stack.push(nidx);
+                    }
+                }
+            }
+            comps.push(comp);
+        }
+        if comps.is_empty() {
+            return;
+        }
+        let mut pile = vec![0.0_f32; comps.len()];
+        let mut seen = vec![false; n];
+        let mut wave: Vec<usize> = Vec::new();
+        for (id, comp) in comps.iter().enumerate() {
+            for &idx in comp {
+                seen[idx] = true;
+                wave.push(idx);
+                let _ = id;
+            }
+        }
+        let mut owner = vec![-1i32; n];
+        for &idx in &wave {
+            owner[idx] = comp_of[idx];
+        }
+        let mut head = 0usize;
+        while head < wave.len() {
+            let idx = wave[head];
+            head += 1;
+            let id = owner[idx];
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let ii = i + di;
+                let jj = j + dj;
+                if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                    continue;
+                }
+                let nidx = jj as usize * res + ii as usize;
+                if seen[nidx] {
+                    continue;
+                }
+                seen[nidx] = true;
+                owner[nidx] = id;
+                wave.push(nidx);
+            }
+        }
+        for idx in 0..n {
+            let p = depth[idx];
+            if p <= 1.0e-8 {
+                continue;
+            }
+            let id = if owner[idx] >= 0 {
+                owner[idx] as usize
+            } else {
+                0
+            };
+            pile[id] += p;
+        }
+        let cut_sum: f32 = depth.iter().copied().sum();
+        let mut pad_counts = [0u32; 16];
+        for idx in 0..n {
+            if depth[idx] < 0.005 && self.placed[idx] < 0.001 {
+                let k = self.kind[idx] as usize;
+                if k < 16
+                    && k != SurfaceKind::Berm as usize
+                    && k != SurfaceKind::PlacedClod as usize
+                    && k != SurfaceKind::CutLip as usize
+                    && k != SurfaceKind::FreshCut as usize
+                {
+                    pad_counts[k] += 1;
+                }
+            }
+        }
+        let pad_kind = pad_counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| *c)
+            .map(|(k, _)| k as u8)
+            .filter(|_| pad_counts.iter().any(|c| *c > 0))
+            .unwrap_or(SurfaceKind::WetMud as u8);
+        for idx in 0..n {
+            if self.placed[idx] != 0.0 {
+                self.placed[idx] = 0.0;
+                self.sync(idx);
+            }
+        }
+        let cell = self.cell;
+        let diag = cell * std::f32::consts::SQRT_2;
+        for (ci, comp) in comps.iter().enumerate() {
+            let vol = pile[ci];
+            if vol <= 1.0e-8 {
+                continue;
+            }
+            // Metres outside the groove. The crest sits on the flank, not on the wall.
+            let mut lip = vec![f32::MAX; n];
+            let mut queue = Vec::with_capacity(comp.len() * 2);
+            for idx in 0..n {
+                if depth[idx] > 0.02 {
+                    lip[idx] = 0.0;
+                    queue.push(idx);
+                }
+            }
+            let mut qh = 0usize;
+            while qh < queue.len() {
+                let idx = queue[qh];
+                qh += 1;
+                if lip[idx] > 1.05 {
+                    continue;
+                }
+                let i = (idx % res) as isize;
+                let j = (idx / res) as isize;
+                for (di, dj, step) in [
+                    (1isize, 0, cell),
+                    (-1, 0, cell),
+                    (0, 1, cell),
+                    (0, -1, cell),
+                    (1, 1, diag),
+                    (1, -1, diag),
+                    (-1, 1, diag),
+                    (-1, -1, diag),
+                ] {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    let nidx = jj as usize * res + ii as usize;
+                    if trench[nidx] && comp_of[nidx] != ci as i32 {
+                        continue;
+                    }
+                    let nd = lip[idx] + step;
+                    if nd + 1.0e-5 < lip[nidx] && nd < 1.15 {
+                        lip[nidx] = nd;
+                        queue.push(nidx);
+                    }
+                }
+            }
+            let mut weights: Vec<(usize, f32)> = Vec::new();
+            let mut wsum = 0.0_f32;
+            for idx in 0..n {
+                let d = lip[idx];
+                if d > 1.05 || depth[idx] > 0.012 || owner[idx] != ci as i32 {
+                    continue;
+                }
+                // Crest just off the lip, then a fall. Both flanks, one ridge.
+                let w = (-0.5 * ((d - 0.24) / 0.15).powi(2)).exp();
+                if w < 0.12 {
+                    continue;
+                }
+                wsum += w;
+                weights.push((idx, w));
+            }
+            if wsum <= 1.0e-6 {
+                let add = vol / comp.len().max(1) as f32;
+                for &idx in comp {
+                    self.placed[idx] += add;
+                    self.sync(idx);
+                }
+                continue;
+            }
+            let scale = vol / wsum;
+            for (idx, w) in weights {
+                self.placed[idx] += scale * w;
+                if !firm_cover(SurfaceKind::from_u8(self.kind[idx])) {
+                    self.kind[idx] = pad_kind;
+                }
+                self.loose[idx] = (self.loose[idx] + self.placed[idx] * 0.15).min(0.18);
+                self.sync(idx);
+            }
+        }
+        let after: f32 = self.placed.iter().copied().sum();
+        let drift = cut_sum - after;
+        if drift.abs() > 1.0e-5 {
+            let mut crest: Vec<usize> = Vec::new();
+            for idx in 0..n {
+                if self.placed[idx] > 0.01 && !trench[idx] {
+                    crest.push(idx);
+                }
+            }
+            if !crest.is_empty() {
+                let add = drift / crest.len() as f32;
+                for idx in crest {
+                    self.placed[idx] += add;
+                    self.sync(idx);
+                }
+            }
+        }
+        // Share the crest with its neighbours so the end of the lane is not a tower.
+        let mut src = self.placed.clone();
+        for _ in 0..3 {
+            let mut blurred = vec![0.0_f32; n];
+            for idx in 0..n {
+                if depth[idx] > 0.012 {
+                    continue;
+                }
+                let i = (idx % res) as isize;
+                let j = (idx / res) as isize;
+                let mut acc = src[idx] * 0.30;
+                let mut wacc = 0.30_f32;
+                let mut any = src[idx] > 0.0;
+                for dj in -1isize..=1 {
+                    for di in -1isize..=1 {
+                        if di == 0 && dj == 0 {
+                            continue;
+                        }
+                        let ii = i + di;
+                        let jj = j + dj;
+                        if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                            continue;
+                        }
+                        let nidx = jj as usize * res + ii as usize;
+                        if depth[nidx] > 0.012 {
+                            continue;
+                        }
+                        let w = if di.abs() + dj.abs() == 1 { 0.12 } else { 0.05 };
+                        acc += src[nidx] * w;
+                        wacc += w;
+                        any = any || src[nidx] > 0.0;
+                    }
+                }
+                if any && wacc > 0.0 {
+                    blurred[idx] = acc / wacc;
+                }
+            }
+            src = blurred;
+        }
+        let bsum: f32 = src.iter().copied().sum();
+        if bsum > 1.0e-6 {
+            let fix = cut_sum / bsum;
+            for idx in 0..n {
+                self.placed[idx] = src[idx] * fix;
+                if self.placed[idx] > 1.0e-4
+                    && depth[idx] <= 0.012
+                    && !firm_cover(SurfaceKind::from_u8(self.kind[idx]))
+                {
+                    self.kind[idx] = pad_kind;
+                }
+                self.sync(idx);
+            }
+        }
+        // The lip is a sharp step in the mesh. This scar is the bed and the
+        // ridge, so a lip cell is the cut or the berm.
+        for idx in 0..n {
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            if !matches!(kind, SurfaceKind::CutLip | SurfaceKind::PlacedClod) {
+                continue;
+            }
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            let mut near = trench[idx] || self.placed[idx] > 1.0e-4;
+            if !near {
+                for (di, dj) in [
+                    (1isize, 0),
+                    (-1, 0),
+                    (0, 1),
+                    (0, -1),
+                    (1, 1),
+                    (1, -1),
+                    (-1, 1),
+                    (-1, -1),
+                ] {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                        continue;
+                    }
+                    let nidx = jj as usize * res + ii as usize;
+                    if trench[nidx] || self.placed[nidx] > 1.0e-4 {
+                        near = true;
+                        break;
+                    }
+                }
+            }
+            if !near {
+                continue;
+            }
+            self.kind[idx] = if depth[idx] >= 0.08 {
+                SurfaceKind::FreshCut as u8
+            } else {
+                pad_kind
+            };
+            self.sync(idx);
+        }
+        for idx in 0..n {
+            if firm_cover(SurfaceKind::from_u8(self.kind[idx])) {
+                continue;
+            }
+            if depth[idx] >= 0.08 && self.placed[idx] <= depth[idx] {
+                self.kind[idx] = SurfaceKind::FreshCut as u8;
+                self.sync(idx);
+            } else if self.placed[idx] > 1.0e-4 || depth[idx] >= 0.01 {
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                if matches!(
+                    kind,
+                    SurfaceKind::Berm
+                        | SurfaceKind::PlacedClod
+                        | SurfaceKind::CutLip
+                        | SurfaceKind::PackedClay
+                        | SurfaceKind::FreshCut
+                ) {
+                    self.kind[idx] = pad_kind;
+                    self.sync(idx);
+                }
+            }
+        }
+        for idx in 0..n {
+            if self.placed[idx] > 1.0e-4 || depth[idx] >= 0.01 {
+                continue;
+            }
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            if matches!(
+                kind,
+                SurfaceKind::Berm | SurfaceKind::PlacedClod | SurfaceKind::CutLip
+            ) {
+                self.kind[idx] = pad_kind;
+                self.sync(idx);
+            }
         }
     }
 
@@ -3771,6 +4349,8 @@ mod tests {
             0.4,
             0.12,
             true,
+            0.0,
+            0.0,
         );
         let cut = soil.cut_volume() - before_cut;
         let placed = soil.placed_volume() - before_placed;
@@ -3830,6 +4410,8 @@ mod tests {
                 0.35,
                 0.12,
                 true,
+                0.0,
+                0.0,
             );
             z += 0.1;
         }
@@ -3927,6 +4509,95 @@ mod tests {
             "water left the rut"
         );
         assert!(gallery.sample(0.7, -1.0).water < 0.004, "the berm is wet");
+    }
+
+    /// Bed depth and placed volume of one force pass on the wet-clay pad.
+    /// The mesh height is `bed + placed` on every column.
+    fn force_pass(normal: f32, push: f32) -> (f32, f32, f32) {
+        let mut soil = SoilField::mud_pad();
+        let kind = SurfaceKind::WetMud;
+        let want = rut_depth_from_force(normal, push, 0.38, 0.28, kind, 0.82, 0.02, 0.0);
+        soil.roll_with_force(
+            Vec3::new(0.0, 0.0, -1.2),
+            Vec3::new(0.0, 0.0, 1.2),
+            want.max(0.012),
+            0.0,
+            normal,
+            push,
+        );
+        for i in 0..soil.height.len() {
+            let field = soil.bed[i] + soil.placed[i];
+            assert!(
+                (soil.height[i] - field).abs() < 1.0e-5,
+                "mesh height left the field at {i}: {:.5} vs {:.5}",
+                soil.height[i],
+                field
+            );
+        }
+        let depth = soil.max_rut_depth();
+        assert!(
+            (depth - want).abs() < 0.012,
+            "bed {depth:.4} m is not the force depth {want:.4} m"
+        );
+        let v = soil.volumes();
+        let gap = (v.cut - v.placed).abs();
+        assert!(
+            gap < v.cut * 0.02 + 1.0e-5,
+            "displaced {0:.4} placed {1:.4}",
+            v.cut,
+            v.placed
+        );
+        let mut towers = 0;
+        let mut crest = 0.0_f32;
+        let mut crest_n = 0.0_f32;
+        for idx in 0..soil.placed.len() {
+            let h = soil.placed[idx];
+            if h < 0.02 {
+                continue;
+            }
+            let i = (idx % soil.res) as isize;
+            let j = (idx / soil.res) as isize;
+            let mut best = 0.0_f32;
+            for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let ii = i + di;
+                let jj = j + dj;
+                if ii < 0 || jj < 0 || ii >= soil.res as isize || jj >= soil.res as isize {
+                    continue;
+                }
+                best = best.max(soil.placed[jj as usize * soil.res + ii as usize]);
+            }
+            if best < h * 0.55 {
+                towers += 1;
+            }
+            if h > crest {
+                crest = h;
+                crest_n = best;
+            }
+        }
+        assert_eq!(towers, 0, "the berm is still a row of towers");
+        assert!(
+            crest_n > crest * 0.7,
+            "berm crest is a spike, {crest:.3} m beside {crest_n:.3} m"
+        );
+        (depth, v.placed, v.cut)
+    }
+
+    #[test]
+    fn hard_push_cuts_deeper_and_places_more_than_a_light_pass() {
+        let (light_depth, light_placed, _) = force_pass(LIGHT_PASS_NORMAL, LIGHT_PASS_PUSH);
+        let (hard_depth, hard_placed, _) = force_pass(HARD_PASS_NORMAL, HARD_PASS_PUSH);
+        eprintln!(
+            "light depth {light_depth:.4} m  placed {light_placed:.4} m3   \
+             hard depth {hard_depth:.4} m  placed {hard_placed:.4} m3"
+        );
+        assert!(
+            hard_depth > light_depth + 0.02,
+            "hard bed {hard_depth:.4} m is not deeper than light {light_depth:.4} m"
+        );
+        assert!(
+            hard_placed > light_placed * 1.4,
+            "hard placed {hard_placed:.4} m3 did not grow from light {light_placed:.4} m3"
+        );
     }
 
     fn volumes_match(soil: &SoilField, label: &str) -> SoilVolumes {
