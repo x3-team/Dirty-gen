@@ -227,9 +227,12 @@ impl Particles {
                                 soil.wetness[idx] = (soil.wetness[idx] + 0.03).min(1.0);
                                 soil.darken[idx] = (soil.darken[idx] + 0.02).min(1.0);
                             }
-                            1 | 2 | 3 => {
+                            1 | 3 => {
+                                let volume = p.size * p.size * p.size * 0.35;
+                                soil.land_clod(p.pos.x, p.pos.z, volume);
+                            }
+                            2 => {
                                 soil.darken[idx] = (soil.darken[idx] + 0.05).min(1.0);
-                                soil.loose[idx] = (soil.loose[idx] + 0.008).min(0.16);
                                 soil.wetness[idx] = (soil.wetness[idx] + 0.1).min(1.0);
                             }
                             _ => {}
