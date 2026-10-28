@@ -52,7 +52,7 @@ pub struct CpuMesh {
 }
 
 impl CpuMesh {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -704,7 +704,8 @@ pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
     // The solver stores one height per ~20 cm. A rut is often a single cell,
     // which is one kink and reads as a tint. Draw a finer mesh and sample the
     // same heightfield so the displaced walls have real triangles.
-    let sub = 3usize;
+    // Lug pitch is ~20 cm. At sub 4 a void is one quad and reads as a card.
+    let sub = 8usize;
     let n = (res - 1) * sub + 1;
     let mut verts = Vec::with_capacity(n * n);
     let half = size * 0.5;
@@ -836,39 +837,9 @@ pub fn environment_mesh() -> CpuMesh {
     );
 
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
-    // sits on the ground instead of floating as boxes.
+    // sits on the ground instead of floating as boxes. Trees, rocks and grass
+    // are the Gobkit meshes placed around the oval.
     add_horizon(&mut m);
-
-    let trees = [
-        Vec3::new(-16.0, 0.0, 14.0),
-        Vec3::new(18.0, 0.0, -16.0),
-        Vec3::new(14.0, 0.0, 16.0),
-        Vec3::new(-18.0, 0.0, -11.0),
-        Vec3::new(20.0, 0.0, 6.0),
-    ];
-    for (k, p) in trees.iter().enumerate() {
-        let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
-        add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
-        // Stacked cones so the crown has volume instead of a flat card.
-        let layers = [
-            (trunk_h * 0.42, 1.25, 1.45),
-            (trunk_h * 0.85, 1.0, 1.2),
-            (trunk_h * 1.25, 0.72, 0.95),
-        ];
-        for (i, (y, radius, height)) in layers.iter().enumerate() {
-            let j = hash(40 + k as u32 * 3 + i as u32);
-            let jx = (j - 0.5) * 0.2;
-            let jz = (hash(90 + k as u32 * 3 + i as u32) - 0.5) * 0.2;
-            add_cone(
-                &mut m,
-                *p + Vec3::new(jx, *y, jz),
-                *height,
-                *radius * (0.9 + j * 0.2),
-                PANEL_TREE,
-                6,
-            );
-        }
-    }
     m
 }
 
