@@ -527,44 +527,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         albedo = mix(albedo, albedo * vec3<f32>(0.52, 0.48, 0.42), smoothstep(0.2, 0.85, wet));
     }
 
-    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
-    let drowned = smoothstep(0.012, 0.05, water);
-    // Film and slurry live on this mesh. A glossy sheet over the cut is a flat card.
-    let dug = max(-stamp_bilinear(xz), 0.0);
-    let in_cut = dug > 0.012 && water > 0.008;
-    var depth_t = 0.0;
-    if (in_cut) {
-        // A 3 cm film stays a tint on the clay. Only the deep end murks the mesh.
-        depth_t = smoothstep(0.04, 0.12, water);
-        let bed_muddy = kind == 4u || kind == 5u || kind == 6u || kind == 8u || kind == 9u;
-        let film_tint = select(vec3<f32>(0.90, 0.86, 0.78), vec3<f32>(0.74, 0.56, 0.40), bed_muddy);
-        let deep_tint = select(vec3<f32>(0.42, 0.36, 0.28), vec3<f32>(0.16, 0.07, 0.03), bed_muddy);
-        let tint = mix(film_tint, deep_tint, depth_t);
-        let murk = mix(select(0.05, 0.1, bed_muddy), select(0.55, 0.88, bed_muddy), depth_t);
-        albedo = mix(albedo, albedo * tint, murk);
-    }
-    var rough_out = mix(mix(rough_map, 0.16, shore * (1.0 - drowned)), max(rough_map, 0.72), drowned);
-    if (in_cut) {
-        // Keep the clay and mud grain. The shore roughness was the card.
-        rough_out = mix(rough_map, max(rough_map, 0.58), depth_t);
-    }
+    // Standing water is a volume above this bed, not a tint on it.
+    // Darken the pores a little where the column is wet.
+    let standing = smoothstep(0.012, 0.06, water);
+    albedo = mix(albedo, albedo * vec3<f32>(0.78, 0.68, 0.55), standing * 0.4);
+    var rough_out = rough_map;
     if (kind == 3u) { rough_out = max(rough_out, 0.8); }
     if (kind == 10u) { rough_out = max(rough_out, 0.74); }
     if (kind == 11u) { rough_out = mix(rough_out, 0.2, smoothstep(0.35, 0.85, wet)); }
-    var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
-    // The sun sits low, so a tight Phong highlight misses this camera.
-    // A wide lobe on the shore is the wet sheen. Inside the cut it stays small
-    // so the bed texture is what you see.
-    let view = normalize(frame.cam_pos.xyz - in.world);
-    let ndotv = clamp(dot(n, view), 0.0, 1.0);
-    let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
-    let facing = pow(1.0 - ndotv, 2.0);
-    let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
-    var wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
-    if (in_cut) {
-        wet_spec *= mix(0.28, 0.05, depth_t);
-    }
-    lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
+    let lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     return present(lit);
 }
 
@@ -575,57 +546,35 @@ struct WaterOut {
     @location(2) depth: f32,
 }
 
-fn water_depth(xz: vec2<f32>) -> f32 {
-    // Dilate slightly so a dry speck inside the bowl does not punch a black hole.
-    let e = 0.28;
-    let d0 = mat_bilinear(xz).g;
-    let d1 = mat_bilinear(xz + vec2<f32>(e, 0.0)).g;
-    let d2 = mat_bilinear(xz - vec2<f32>(e, 0.0)).g;
-    let d3 = mat_bilinear(xz + vec2<f32>(0.0, e)).g;
-    let d4 = mat_bilinear(xz - vec2<f32>(0.0, e)).g;
-    return max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
+// Metres of standing water. Same mat.g the solver uploaded from soil.water.
+fn field_depth(xz: vec2<f32>) -> f32 {
+    return mat_bilinear(xz).g * 0.34;
 }
 
-// A dry patch with water on both sides is a hole in the sheet, not a shore.
-// The outer bank has water on only one side, so this does not grow the pond.
-fn covered_depth(xz: vec2<f32>) -> f32 {
-    let here = water_depth(xz);
-    let e = 1.35;
-    let px = water_depth(xz + vec2<f32>(e, 0.0));
-    let nx = water_depth(xz - vec2<f32>(e, 0.0));
-    let pz = water_depth(xz + vec2<f32>(0.0, e));
-    let nz = water_depth(xz - vec2<f32>(0.0, e));
-    let across = max(min(px, nx), min(pz, nz));
-    return max(here, across);
+// Free surface of that column: the bed the tire stands on, plus the depth
+// the pipe, the drag, and the buoyancy all read. A few millimetres of lift
+// keep it off the soil mesh. The shape is the field, not a blurred sheet.
+fn free_surface(xz: vec2<f32>) -> f32 {
+    let depth = field_depth(xz);
+    let rip = ripple_height(xz, frame.misc.x) * 0.22 * smoothstep(0.02, 0.08, depth);
+    return terrain_height(xz) + depth + rip + 0.003;
 }
 
-fn water_bed(xz: vec2<f32>) -> f32 {
-    // Blur a single-cell rut out of the sheet so the pool stays one surface.
-    let e = 0.55;
-    return (
-        height_bilinear(xz)
-        + height_bilinear(xz + vec2<f32>(e, 0.0))
-        + height_bilinear(xz - vec2<f32>(e, 0.0))
-        + height_bilinear(xz + vec2<f32>(0.0, e))
-        + height_bilinear(xz - vec2<f32>(0.0, e))
-    ) * 0.2;
+fn field_normal(xz: vec2<f32>) -> vec3<f32> {
+    let e = max(frame.params.z * 0.55, 0.08);
+    let l = free_surface(xz - vec2<f32>(e, 0.0));
+    let r = free_surface(xz + vec2<f32>(e, 0.0));
+    let d = free_surface(xz - vec2<f32>(0.0, e));
+    let u = free_surface(xz + vec2<f32>(0.0, e));
+    let n = normalize(vec3<f32>(l - r, e * 2.0, d - u));
+    let rip = ripple_normal(xz, frame.misc.x);
+    return normalize(n + vec3<f32>(rip.x, 0.0, rip.z) * 0.15);
 }
 
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
-    let local = height_bilinear(in.xz);
-    let dug = max(-stamp_bilinear(in.xz), 0.0);
-    let depth = covered_depth(in.xz);
-    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
-    // Film on the bed, but never below the soil. A bump left uncovered
-    // reads as a black hole. bed + full depth was a sheet 30 cm up that
-    // cut the tire like a clip plane. The pond stays that blurred surface.
-    // A cut holds its own sheet down in the groove.
-    let cover = local + 0.01;
-    let pond = max(water_bed(in.xz) + 0.016 + rip, cover) + smoothstep(0.02, 0.16, depth) * 0.012;
-    let fill = smoothstep(0.04, 0.12, depth) * min(dug * 0.5, 0.032);
-    let in_rut = local + 0.01 + rip + fill;
-    let y = select(pond, in_rut, dug > 0.018 && depth > 0.004);
+    let depth = field_depth(in.xz);
+    let y = free_surface(in.xz);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
@@ -638,6 +587,11 @@ fn vs_water(in: TerrIn) -> WaterOut {
 @fragment
 fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
+    let depth = field_depth(xz);
+    // Dry bank stays the ground mesh. No dilated sheet, no card over the lip.
+    if (depth < 0.012) {
+        discard;
+    }
     let kind = kind_nearest(xz);
     let uv0 = xz / 3.2;
     let uv1 = xz / 2.7;
@@ -652,54 +606,24 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         textureSample(ground_diff, ground_samp, uv3, 3),
         textureSample(ground_diff, ground_samp, uv4, 4),
     ).rgb;
-    let own = mat_bilinear(xz).g * 0.34;
-    let dug = max(-stamp_bilinear(xz), 0.0);
-    // A cut keeps film and slurry on the soil mesh. Dilated water on the lip
-    // was drawing flat cards in the pockets beside the floor.
-    let e = vec2<f32>(0.45, 0.0);
-    let ez = vec2<f32>(0.0, 0.45);
-    let near_cut = dug > 0.008
-        || -stamp_bilinear(xz + e) > 0.02
-        || -stamp_bilinear(xz - e) > 0.02
-        || -stamp_bilinear(xz + ez) > 0.02
-        || -stamp_bilinear(xz - ez) > 0.02;
-    if (near_cut || own < 0.008 || in.depth < 0.008) {
-        discard;
-    }
-    let n = ripple_normal(xz, frame.misc.x);
-    // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
-    let view = normalize(frame.cam_pos.xyz - in.world);
-    let sun = normalize(frame.sun_dir.xyz);
-    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.4);
-    let depth_t = smoothstep(0.006, 0.075, in.depth);
-    // Film shows the bed. Deep slurry is that same bed, darker and opaque.
-    let muddy = kind == 4u || kind == 5u || kind == 6u || kind == 8u || kind == 9u;
-    var film_col = mix(bed, bed * vec3<f32>(0.5, 0.36, 0.22), 0.7);
-    var deep_col = mix(bed * vec3<f32>(0.32, 0.18, 0.1), vec3<f32>(0.022, 0.009, 0.003), 0.72);
-    if (!muddy) {
-        film_col = mix(bed, vec3<f32>(0.24, 0.2, 0.14), 0.2);
-        deep_col = mix(bed, vec3<f32>(0.07, 0.055, 0.04), 0.38);
-    }
-    let absorption = mix(film_col, deep_col, depth_t);
-    let quiet = mix(bed, vec3<f32>(0.1, 0.045, 0.016), select(0.3, 0.72, muddy));
-    let reflect_amt = fres * (0.22 + (1.0 - depth_t) * 0.16);
-    var col = mix(absorption, quiet, reflect_amt);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
-    let spec_col = mix(bed, vec3<f32>(0.04, 0.016, 0.005), 0.65);
-    col += spec_col * spec * shadow_factor(in.world, nrm);
-    let shore = smoothstep(0.002, 0.07, in.depth);
-    let reveal = smoothstep(0.016, 0.034, dug);
-    let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
-    let cover = select(mix(0.34, 0.58, depth_t), mix(0.55, 0.97, depth_t), muddy);
-    // A damp speck still opens the groove. A film and a slurry keep the
-    // opacity of the bed under them.
-    let skim = 1.0 - smoothstep(0.012, 0.028, in.depth);
-    let alpha = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
+    let nrm = field_normal(xz);
+    // Murky tan. Daylight lifts a brown albedo into one pale tone, so the
+    // displayed column is weighted by the standing depth: a film in the
+    // groove stays light, the hole goes dark. Rough, so the lip is not a
+    // white specular rim. The surface is still this column, not a card.
+    let t = smoothstep(0.02, 0.12, depth);
+    let thin = vec3<f32>(0.28, 0.18, 0.08);
+    let deep = vec3<f32>(0.045, 0.022, 0.01);
+    let murk = mix(thin, deep, t);
+    let albedo = mix(bed * vec3<f32>(0.55, 0.40, 0.22), murk, mix(0.78, 0.98, t));
+    let rough = mix(0.72, 0.50, t);
+    let lit = shade(in.world, nrm, albedo, rough, vec3<f32>(0.0));
+    let mapped = vec3<f32>(1.0) - exp(-max(lit, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
-    return vec4<f32>(gamma, alpha);
+    let ink = mix(1.0, 0.55, t);
+    let shown = gamma * vec3<f32>(ink, ink * 0.94, ink * 0.82);
+    let alpha = mix(0.84, 0.98, t);
+    return vec4<f32>(shown, alpha);
 }
 
 struct MeshIn {

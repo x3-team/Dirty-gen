@@ -473,6 +473,10 @@ struct CaptureArgs {
     niva_groove_roll: PathBuf,
     niva_groove_spin: PathBuf,
     niva_sidewall_shed: PathBuf,
+    rut_water: bool,
+    water_rut: PathBuf,
+    water_push: PathBuf,
+    water_settle: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -520,6 +524,10 @@ fn capture(args: &[String]) {
     }
     if parsed.niva_tread {
         capture_niva_tread(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.rut_water {
+        capture_rut_water(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -661,6 +669,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut patch = false;
     let mut persist = false;
     let mut niva_tread = false;
+    let mut rut_water = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -684,6 +693,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut niva_groove_roll = PathBuf::from(format!("{MEDIA}/niva-groove-roll.png"));
     let mut niva_groove_spin = PathBuf::from(format!("{MEDIA}/niva-groove-spin.png"));
     let mut niva_sidewall_shed = PathBuf::from(format!("{MEDIA}/niva-sidewall-shed.png"));
+    let mut water_rut = PathBuf::from(format!("{MEDIA}/water-rut.png"));
+    let mut water_push = PathBuf::from(format!("{MEDIA}/water-push.png"));
+    let mut water_settle = PathBuf::from(format!("{MEDIA}/water-settle.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -707,6 +719,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--patch" => patch = true,
             "--persist" => persist = true,
             "--niva-tread" => niva_tread = true,
+            "--rut-water" => rut_water = true,
+            "--water-rut" => water_rut = PathBuf::from(val(&mut i)),
+            "--water-push" => water_push = PathBuf::from(val(&mut i)),
+            "--water-settle" => water_settle = PathBuf::from(val(&mut i)),
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -772,6 +788,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         niva_groove_roll,
         niva_groove_spin,
         niva_sidewall_shed,
+        rut_water,
+        water_rut,
+        water_push,
+        water_settle,
     }
 }
 
@@ -1217,6 +1237,111 @@ fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn capture_rut_water(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::SoilField;
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::flat(0.2);
+    world.soil = SoilField::rut_water();
+    world.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+    world.bike.vel = Vec3::ZERO;
+    // Far enough back that the nose does not cover the hole. The right tires
+    // stay in the rut; the pool ahead of them is the thing in frame.
+    let park = Vec3::new(0.0, 0.55, -1.45);
+    world.vehicle.pos = park;
+    world.vehicle.yaw = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    let dt = 1.0 / 60.0;
+    let brake = Input {
+        throttle: 0.0,
+        brake: 1.0,
+        steer: 0.0,
+    };
+    for _ in 0..50 {
+        world.step(dt, &brake);
+        world.vehicle.pos.x = park.x;
+        world.vehicle.pos.z = park.z;
+        world.vehicle.vel = Vec3::ZERO;
+        world.vehicle.yaw = 0.0;
+        world.vehicle.yaw_rate = 0.0;
+    }
+    // The settle dug and scooped. Pour the free surface back so the first
+    // frame is the resting pool, then the tire push is the only wave.
+    world.soil.fill_to_line(-0.03);
+    for _ in 0..60 {
+        world.soil.step_water(dt);
+    }
+    let before = world.soil.water_volume();
+    silence_chunks(&mut world);
+    let pose = water_camera(&world);
+    write_cc0_still(renderer, &world, "water-rut", &parsed.water_rut, parsed, pose);
+
+    let wheel = world.vehicle.pos
+        + world.vehicle.orientation() * world.vehicle.wheel_center_local(1);
+    let fwd = world.vehicle.forward();
+    for _ in 0..14 {
+        world.soil.displace_water(wheel.x, wheel.z, fwd, 0.22);
+    }
+    let wave = world.soil.water_volume();
+    let crest = crest_depth(&world.soil, -0.03);
+    let hole = world.soil.sample(0.74, 1.9);
+    println!(
+        "water before {before:.5} m3  wave {wave:.5} m3  crest {crest:.4} m  wheel ({:.2},{:.2}) depth {:.3}  hole {:.3}",
+        wheel.x,
+        wheel.z,
+        world.soil.sample(wheel.x, wheel.z).water,
+        hole.water
+    );
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "water-push",
+        &parsed.water_push,
+        parsed,
+        pose,
+    );
+
+    for _ in 0..150 {
+        world.soil.step_water(dt);
+    }
+    let settled = world.soil.water_volume();
+    println!(
+        "water settle {settled:.5} m3  picture reads soil.water (drag, buoyancy, and this surface)"
+    );
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "water-settle",
+        &parsed.water_settle,
+        parsed,
+        pose,
+    );
+}
+
+fn crest_depth(soil: &silt::soil::SoilField, line: f32) -> f32 {
+    soil.height
+        .iter()
+        .zip(soil.water.iter())
+        .filter(|(h, _)| **h >= line)
+        .map(|(_, w)| *w)
+        .fold(0.0_f32, f32::max)
+}
+
+fn water_camera(_world: &World) -> CameraPose {
+    // Clay bank, above the hole, looking back along the rut at the Niva.
+    // The free surface sits between the camera and the tire.
+    CameraPose {
+        eye: Vec3::new(2.85, 2.55, 3.7),
+        target: Vec3::new(0.45, 0.0, -0.15),
+        ortho_width: None,
+    }
+}
+
 fn prescribe_roll(world: &mut World, speed: f32) {
     use silt::vehicle::WHEEL_RADIUS;
     world.vehicle.yaw = 0.0;

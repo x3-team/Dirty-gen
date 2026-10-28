@@ -57,6 +57,10 @@ const CREST_CLOD_CAP: f32 = 0.04;
 /// they do not fill the groove back in.
 const PASS_GAP: f32 = 0.40;
 
+/// Standing depth the pipe will keep. Deeper than this is spilled, not deleted
+/// in the tire push — the cap is the same clamp [`step_surface`](SoilField::step_surface) uses.
+const WATER_CAP: f32 = 0.34;
+
 impl SurfaceKind {
     pub fn from_u8(v: u8) -> Self {
         match v {
@@ -1622,30 +1626,168 @@ impl SoilField {
         }
     }
 
-    /// Displace puddle water out of a wheel footprint. Returns displaced depth scale.
+    /// Push standing water out of a tire footprint into a wave ahead of it.
+    ///
+    /// The cubic metres taken off the bed are the cubic metres added to the
+    /// crest. [`step_water`](Self::step_water) then carries that crest back
+    /// into the low cells. The cut and the berm are not moved.
     pub fn displace_water(&mut self, x: f32, z: f32, forward: Vec3, amount: f32) {
-        let Some(idx) = self.idx_at(x, z) else {
-            return;
-        };
-        let take = amount.min(self.water[idx] * 0.45).max(0.0);
-        if take <= 0.0 {
+        if !(amount > 1.0e-6) || !x.is_finite() || !z.is_finite() {
             return;
         }
-        self.water[idx] -= take;
-        // Push ahead of the tire and a little to both sides.
-        let spots = [
-            (
-                x + forward.x * self.cell * 1.4,
-                z + forward.z * self.cell * 1.4,
-                0.45,
-            ),
-            (x + forward.z * self.cell, z - forward.x * self.cell, 0.275),
-            (x - forward.z * self.cell, z + forward.x * self.cell, 0.275),
-        ];
-        for (sx, sz, share) in spots {
-            if let Some(sidx) = self.idx_at(sx, sz) {
-                self.water[sidx] = (self.water[sidx] + take * share).min(0.32);
-                self.wetness[sidx] = (self.wetness[sidx] + 0.04).min(1.0);
+        let fwd = Vec3::new(forward.x, 0.0, forward.z);
+        let fwd = if fwd.length_squared() < 1.0e-8 {
+            Vec3::Z
+        } else {
+            fwd.normalize()
+        };
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let area = self.cell * self.cell;
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let reach = 1.15_f32;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+
+        let mut donors: Vec<(usize, f32)> = Vec::new();
+        let mut mobile_sum = 0.0_f32;
+        for j in j0.max(1)..j1.min(res - 2) {
+            for i in i0.max(1)..i1.min(res - 2) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let along = rel_x * fwd.x + rel_z * fwd.z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                if along < -0.22 || along > 0.28 || lat.abs() > 0.22 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                let mobile = (self.water[idx] - water_hold(kind)).max(0.0);
+                if mobile <= 1.0e-5 {
+                    continue;
+                }
+                let fall = 1.0 - (along / 0.34).abs().clamp(0.0, 1.0) * 0.35;
+                let weight = fall * mobile;
+                donors.push((idx, weight));
+                mobile_sum += weight;
+            }
+        }
+        if donors.is_empty() || mobile_sum <= 1.0e-8 {
+            return;
+        }
+        // One cell-column of `amount`. A driving tire stays a scoop, not a pump
+        // that empties the pond. A test pushes the same scoop until a crest stands.
+        let want = amount.max(0.0) * area;
+        let mut taken = 0.0_f32;
+        for (idx, weight) in &donors {
+            let kind = SurfaceKind::from_u8(self.kind[*idx]);
+            let mobile = (self.water[*idx] - water_hold(kind)).max(0.0);
+            let share = want * (*weight / mobile_sum);
+            let vol = share.min(mobile * area);
+            if vol <= 0.0 {
+                continue;
+            }
+            self.water[*idx] -= vol / area;
+            taken += vol;
+        }
+        if taken <= 1.0e-8 {
+            return;
+        }
+
+        let bed_ref = self.sample(x, z).height;
+        let mut crest: Vec<(usize, f32)> = Vec::new();
+        for j in j0.max(1)..j1.min(res - 2) {
+            for i in i0.max(1)..i1.min(res - 2) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let along = rel_x * fwd.x + rel_z * fwd.z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                // Ahead of the contact, on the bank as well as in the groove.
+                if !(0.22..1.05).contains(&along) || lat.abs() > 0.72 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                // Gravel and sand drink a wave. The crest has to be able to run back.
+                if matches!(kind, SurfaceKind::Gravel | SurfaceKind::Sand) {
+                    continue;
+                }
+                let climb = (self.height[idx] - bed_ref).max(0.0);
+                let along_w = (-((along - 0.48) * (along - 0.48)) / (2.0 * 0.16 * 0.16)).exp();
+                let lat_w = (-(lat * lat) / (2.0 * 0.28 * 0.28)).exp();
+                let w = along_w * lat_w * (0.35 + climb * 7.0);
+                if w > 0.02 {
+                    crest.push((idx, w));
+                }
+            }
+        }
+        if crest.is_empty() {
+            // Nowhere to stand. Put the scoop back so the volume is kept.
+            let back = taken / (donors.len() as f32 * area);
+            for (idx, _) in &donors {
+                self.water[*idx] = (self.water[*idx] + back).min(WATER_CAP);
+            }
+            return;
+        }
+        let wsum: f32 = crest.iter().map(|(_, w)| *w).sum();
+        let mut left = taken;
+        for (idx, w) in &crest {
+            let add = taken * (*w / wsum);
+            let room = (WATER_CAP - self.water[*idx]).max(0.0) * area;
+            let put = add.min(room);
+            if put <= 0.0 {
+                continue;
+            }
+            self.water[*idx] += put / area;
+            self.wetness[*idx] = (self.wetness[*idx] + (put / area) * 0.35).min(1.0);
+            left -= put;
+        }
+        if left > 1.0e-7 {
+            // The crest was full. Spill onto the donors' neighbours, then the donors.
+            self.spill_water(&crest, &donors, left);
+        }
+    }
+
+    /// Put `volume` cubic metres onto cells that still have room, lowest free
+    /// surface first, so a capped crest does not delete the wave.
+    fn spill_water(&mut self, crest: &[(usize, f32)], donors: &[(usize, f32)], mut left: f32) {
+        let area = self.cell * self.cell;
+        let mut pile: Vec<usize> = crest.iter().map(|(i, _)| *i).collect();
+        for (i, _) in donors {
+            pile.push(*i);
+        }
+        for _ in 0..6 {
+            if left <= 1.0e-7 || pile.is_empty() {
+                break;
+            }
+            pile.sort_by(|&a, &b| {
+                let sa = self.height[a] + self.water[a];
+                let sb = self.height[b] + self.water[b];
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let open: Vec<usize> = pile
+                .iter()
+                .copied()
+                .filter(|&idx| self.water[idx] < WATER_CAP - 1.0e-4)
+                .collect();
+            if open.is_empty() {
+                break;
+            }
+            let share = left / open.len() as f32;
+            for idx in open {
+                let room = (WATER_CAP - self.water[idx]).max(0.0) * area;
+                let put = share.min(room);
+                if put <= 0.0 {
+                    continue;
+                }
+                self.water[idx] += put / area;
+                left -= put;
             }
         }
     }
@@ -1705,7 +1847,7 @@ impl SoilField {
             }
         }
         for w in &mut next {
-            *w = w.clamp(0.0, 0.34);
+            *w = w.clamp(0.0, WATER_CAP);
         }
         self.water = next;
         self.step_moisture(dt, rain);
@@ -1763,7 +1905,7 @@ impl SoilField {
                     SurfaceKind::Silt => 0.85,
                     _ => 1.0,
                 };
-                self.water[idx] = (self.water[idx] + rain * catch * dt).min(0.34);
+                self.water[idx] = (self.water[idx] + rain * catch * dt).min(WATER_CAP);
             }
             let hold = water_hold(kind);
             let standing = self.water[idx] > hold + 0.004;
@@ -1916,7 +2058,7 @@ impl SoilField {
                 let d = ((cx - x).powi(2) + (cz - z).powi(2)).sqrt();
                 if (0.85..2.05).contains(&d) {
                     let idx = j as usize * self.res + i as usize;
-                    self.water[idx] = (self.water[idx] + share).min(0.34);
+                    self.water[idx] = (self.water[idx] + share).min(WATER_CAP);
                     self.wetness[idx] = (self.wetness[idx] + 0.25).min(1.0);
                 }
             }
@@ -2277,6 +2419,110 @@ impl SoilField {
                 0.3,
             );
         }
+        field
+    }
+
+    /// Cubic metres of the standing-water field. Depth, drag, and the picture
+    /// all read this same column.
+    pub fn water_volume(&self) -> f32 {
+        self.water.iter().sum::<f32>() * self.cell * self.cell
+    }
+
+    /// Metres of water sitting above `bed_line`. The low pool is the rest.
+    pub fn water_above(&self, bed_line: f32) -> f32 {
+        let area = self.cell * self.cell;
+        self.height
+            .iter()
+            .zip(self.water.iter())
+            .filter(|(h, _)| **h >= bed_line)
+            .map(|(_, w)| *w)
+            .sum::<f32>()
+            * area
+    }
+
+    /// Fill every cell below `line` up to that free surface, and drop standing
+    /// water that is sitting on the bank above it. Pore water stays. Gravel
+    /// and sand are left dry so the bank does not become a second pond.
+    pub fn fill_to_line(&mut self, line: f32) {
+        for idx in 0..self.height.len() {
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            if matches!(kind, SurfaceKind::Gravel | SurfaceKind::Sand) {
+                self.water[idx] = 0.0;
+                continue;
+            }
+            let h = self.height[idx];
+            if h < line {
+                self.water[idx] = (line - h).min(WATER_CAP);
+                self.wetness[idx] = self.wetness[idx].max(0.9);
+            } else {
+                let hold = water_hold(kind);
+                if self.water[idx] > hold {
+                    self.water[idx] = hold;
+                }
+            }
+        }
+    }
+
+    /// A rut cut by the wheel, and a hole at the end of it. One bank is
+    /// gravel. The other is the clay and the lip the tire packed, on the
+    /// mud pad. Water is poured to one free surface in the low bed. The
+    /// picture and the push test both use this field.
+    pub fn rut_water() -> Self {
+        let mut field = Self::mud_pad();
+        let x = 0.74_f32;
+        field.roll_lane(
+            Vec3::new(x, 0.0, -2.5),
+            Vec3::new(x, 0.0, 1.2),
+            0.12,
+            0.28,
+        );
+        field.age_passes(1.0);
+        field.roll_lane(
+            Vec3::new(x, 0.0, -2.5),
+            Vec3::new(x, 0.0, 1.2),
+            0.14,
+            0.32,
+        );
+        field.stamp_impact(x, 1.9, 1.2, 0.2);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let dug = (field.initial_height[idx] - field.bed[idx]).max(0.0);
+                let kind = SurfaceKind::from_u8(field.kind[idx]);
+                if dug > 0.012
+                    || matches!(
+                        kind,
+                        SurfaceKind::FreshCut
+                            | SurfaceKind::PackedClay
+                            | SurfaceKind::CutLip
+                            | SurfaceKind::Berm
+                            | SurfaceKind::PlacedClod
+                    )
+                {
+                    continue;
+                }
+                // Gravel is one outer bank: the ground texture, with a
+                // wandering edge. The other bank is the clay and the lip
+                // the tire already packed. Painting clay onto the open pad
+                // was a flat card, so that side stays the mud it was born as.
+                let wander = (noise2(cz * 0.17 + 0.4, 2.2) - 0.5) * 1.5;
+                if cx < x - 0.7 + wander {
+                    field.kind[idx] = SurfaceKind::Gravel as u8;
+                    field.wetness[idx] = 0.05;
+                    field.base_wetness[idx] = 0.05;
+                    field.roughness[idx] = 0.96;
+                    field.loose[idx] = 0.0;
+                    field.water[idx] = 0.0;
+                }
+            }
+        }
+        // One free surface in the rut and the hole. Banks above it stay dry.
+        field.fill_to_line(-0.03);
         field
     }
 }
@@ -3454,6 +3700,132 @@ mod tests {
         assert!(
             stickiness(cell.kind(), cell.wetness, cell.loose, cell.water) > dry_stick,
             "standing water should make the clay sticky again"
+        );
+    }
+
+    /// A tire scoop lifts a wave onto the bank. The same pipe that feeds drag
+    /// and pore moisture brings that volume back into the low bed.
+    #[test]
+    fn push_throws_a_wave_then_pools_in_the_low_bed() {
+        let mut soil = SoilField::rut_water();
+        let mut rest = soil.clone();
+        let bed = soil.bed.clone();
+        let placed = soil.placed.clone();
+        let before = soil.water_volume();
+        assert!(before > 0.01, "the rut and the hole did not hold water, {before}");
+        let line = -0.03_f32;
+        let high_before = soil.water_above(line);
+        let low_before = before - high_before;
+        assert!(
+            low_before > before * 0.9,
+            "water started on the bank, low {low_before} of {before}"
+        );
+
+        // Deepest water in the groove, clear of the hole, is where the tire pushes.
+        let mut push = (0.74_f32, 0.0_f32, 0.0_f32);
+        let half = soil.size * 0.5;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                let idx = j * soil.res + i;
+                if (x - 0.74).abs() > 0.25 || !(-1.3..0.45).contains(&z) {
+                    continue;
+                }
+                if soil.water[idx] > push.2 {
+                    push = (x, z, soil.water[idx]);
+                }
+            }
+        }
+        assert!(push.2 > 0.04, "the rut floor was dry at the tire, depth {}", push.2);
+        let deep = soil.sample(0.74, 1.9);
+        let bank = soil.sample(0.74 - 1.6, 0.0);
+        assert!(
+            deep.water > bank.water + 0.05,
+            "the hole should be the deep field, hole {} bank {}",
+            deep.water,
+            bank.water
+        );
+        assert!(
+            rolling_resistance(4_000.0, deep.water) > rolling_resistance(4_000.0, bank.water) * 2.0,
+            "drag has to read the same depth the pool uses"
+        );
+        assert_eq!(bank.kind(), SurfaceKind::Gravel, "the outer bank should be gravel");
+
+        for _ in 0..14 {
+            soil.displace_water(push.0, push.1, Vec3::Z, 0.22);
+        }
+        let wave = soil.water_volume();
+        let high_wave = soil.water_above(line);
+        let low_wave = wave - high_wave;
+        let left = low_before - low_wave;
+        eprintln!(
+            "water push before {before:.5} m3  wave {wave:.5} m3  high {high_before:.5} -> {high_wave:.5}  left the bed {left:.5}"
+        );
+        assert!(
+            (wave - before).abs() < before * 0.02 + 1.0e-4,
+            "the push dropped volume {before:.5} -> {wave:.5}"
+        );
+        assert!(
+            left > 0.0015,
+            "no wave left the low bed, high {high_before:.5} -> {high_wave:.5}"
+        );
+        let mut crest = 0.0_f32;
+        for (h, w) in soil.height.iter().zip(soil.water.iter()) {
+            if *h >= line {
+                crest = crest.max(*w);
+            }
+        }
+        assert!(
+            crest > 0.012,
+            "the wave on the bank is a film, crest {crest:.4} m"
+        );
+
+        // The unpushed pool only evaporates. The pushed pool matches it once
+        // the crest has run back into the same low cells.
+        for _ in 0..90 {
+            soil.step_water(1.0 / 60.0);
+            rest.step_water(1.0 / 60.0);
+        }
+        for (a, b) in bed.iter().zip(soil.bed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "the wave moved the bed");
+        }
+        for (a, b) in placed.iter().zip(soil.placed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "the wave moved the berm");
+        }
+        let settled = soil.water_volume();
+        let rested = rest.water_volume();
+        let high_after = soil.water_above(line);
+        let low_after = settled - high_after;
+        let high_rest = rest.water_above(line);
+        eprintln!(
+            "water settle {settled:.5} m3  rested {rested:.5} m3  low {low_after:.5}  high {high_after:.5} (rest high {high_rest:.5})"
+        );
+        assert!(
+            settled > before * 0.85,
+            "settle lost the pool {before:.5} -> {settled:.5}"
+        );
+        assert!(
+            (settled - rested).abs() < before * 0.03 + 1.0e-3,
+            "the wave did not rejoin the resting pool, pushed {settled:.5} rested {rested:.5}"
+        );
+        assert!(
+            low_after > settled * 0.8,
+            "water did not pool in the low cells, low {low_after:.5} of {settled:.5}"
+        );
+        assert!(
+            high_after < high_wave * 0.55,
+            "the crest stayed on the bank, {high_wave:.5} -> {high_after:.5}"
+        );
+        assert!(
+            (low_after - (rested - high_rest)).abs() < before * 0.03 + 1.0e-3,
+            "the low cells do not match the resting pool"
+        );
+        let pool = soil.sample(push.0, push.1);
+        assert!(
+            pool.wetness > 0.5,
+            "the bed under the pool should be wet, {}",
+            pool.wetness
         );
     }
 }
