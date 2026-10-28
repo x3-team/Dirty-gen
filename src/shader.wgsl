@@ -706,7 +706,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let shadow = shadow_factor(in.world + n * 0.02, n);
         // Darker than the berm. A crown in the soil's own brown reads as a dry stone.
         let tone = clamp((albedo.r - 0.016) / 0.018, 0.0, 1.0);
-        let body = mix(vec3<f32>(0.0090, 0.0031, 0.0011), vec3<f32>(0.0155, 0.0052, 0.0018), tone);
+        let body = mix(vec3<f32>(0.020, 0.009, 0.0035), vec3<f32>(0.038, 0.016, 0.006), tone);
         let wrap = ndl * 0.28 + 0.72;
         lit = body * (0.85 + wrap * shadow * 0.22);
         // The flat top has almost one normal from this camera, so a Phong lobe
@@ -722,6 +722,47 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         lit += gloss * fres * 0.08;
         let belly = smoothstep(0.2, -0.45, n.y);
         lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+    } else if (in.panel > 46.5 && in.panel < 49.5) {
+        // Same clod light as the wet break, so crust, sand and stone stay
+        // mud-colored instead of picking up the sky. The body color is the mix.
+        var n = normalize(nrm);
+        let sandy = in.panel > 47.5 && in.panel < 48.5;
+        let stony = in.panel >= 48.5;
+        let e = 0.04;
+        let freq = select(6.5, 18.0, sandy);
+        let amp = select(select(0.14, 0.42, sandy), 0.04, stony);
+        let h0 = noise(in.world.xz * freq + vec2<f32>(in.world.y * 2.4, in.panel));
+        let hx = noise((in.world.xz + vec2<f32>(e, 0.0)) * freq + vec2<f32>(in.world.y * 2.4, in.panel));
+        let hz = noise((in.world.xz + vec2<f32>(0.0, e)) * freq + vec2<f32>(in.world.y * 2.4, in.panel));
+        n = normalize(n + vec3<f32>(h0 - hx, 0.035, h0 - hz) * amp);
+        let sun = normalize(frame.sun_dir.xyz);
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let halfv = normalize(sun + view);
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        let wrap = ndl * 0.62 + 0.38;
+        let g = noise(in.world.xz * 7.5 + vec2<f32>(in.world.y * 3.0, in.panel));
+        var body: vec3<f32>;
+        var gloss = 0.0;
+        var spec_pow = 12.0;
+        if (in.panel < 47.5) {
+            // Drier crust: lighter grey-brown than the wet break.
+            body = mix(vec3<f32>(0.075, 0.062, 0.048), vec3<f32>(0.13, 0.11, 0.086), g);
+            gloss = 0.03;
+            spec_pow = 14.0;
+        } else if (in.panel < 48.5) {
+            let grain = noise(in.world.xz * 26.0 + vec2<f32>(in.world.y * 11.0, 1.7));
+            body = mix(vec3<f32>(0.11, 0.082, 0.038), vec3<f32>(0.17, 0.125, 0.055), grain);
+            gloss = 0.012;
+            spec_pow = 8.0;
+        } else {
+            body = mix(vec3<f32>(0.055, 0.048, 0.040), vec3<f32>(0.095, 0.084, 0.070), g);
+            gloss = 0.035;
+            spec_pow = 22.0;
+        }
+        lit = body * (0.7 + wrap * shadow * 0.62);
+        let spec = pow(clamp(dot(n, halfv), 0.0, 1.0), spec_pow) * gloss * shadow;
+        lit += vec3<f32>(0.16, 0.12, 0.08) * spec;
     }
     return present(lit);
 }

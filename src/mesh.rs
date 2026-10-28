@@ -21,6 +21,12 @@ pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
 /// Wet mud clod. Not body paint, and not a camera-facing card.
 pub const PANEL_CLOD: f32 = 46.0;
+/// Drier crust on the outside of a torn clod.
+const PANEL_CRUST: f32 = 47.0;
+/// Sand caught in the clay.
+const PANEL_SAND: f32 = 48.0;
+/// A small stone packed into the clod.
+const PANEL_STONE: f32 = 49.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -670,7 +676,14 @@ pub fn bike_suspension(bike: &Bike) -> CpuMesh {
         4,
     );
     let pivot = Vec3::new(0.0, 0.02, -0.12);
-    add_tube(&mut m, pivot, rear + Vec3::new(0.0, 0.02, 0.0), 0.03, arm, 5);
+    add_tube(
+        &mut m,
+        pivot,
+        rear + Vec3::new(0.0, 0.02, 0.0),
+        0.03,
+        arm,
+        5,
+    );
     add_tube(
         &mut m,
         pivot + Vec3::new(0.06, 0.0, 0.0),
@@ -916,8 +929,7 @@ fn add_tri_smooth(
         push_smooth(mesh, b, nb, panel);
         push_smooth(mesh, c, nc, panel);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
 /// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
@@ -986,15 +998,7 @@ fn add_lump(
         let a = ring(1, i);
         let b = ring(1, i + 1);
         add_tri_smooth(
-            mesh,
-            pts[0],
-            nrm[0],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
     for s in 1..stacks.saturating_sub(1) {
@@ -1004,26 +1008,10 @@ fn add_lump(
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
             add_tri_smooth(
-                mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
+                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center,
             );
             add_tri_smooth(
-                mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
+                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center,
             );
         }
     }
@@ -1033,64 +1021,316 @@ fn add_lump(
         let a = ring(last, i + 1);
         let b = ring(last, i);
         add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
+            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
         );
     }
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
     add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded,
     );
 }
 
-/// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+fn ang_dist(i: usize, j: usize, sides: usize) -> usize {
+    let d = i.abs_diff(j);
+    d.min(sides - d)
+}
+
+fn add_chip(mesh: &mut CpuMesh, center: Vec3, rot: Quat, radius: f32, seed: u32, panel: f32) {
+    let h = |n: u32| chunk_hash(seed, n);
+    let n = 5usize;
+    let mut ring = Vec::with_capacity(n);
+    for i in 0..n {
+        let ang = i as f32 / n as f32 * std::f32::consts::TAU + (h(10 + i as u32) - 0.5) * 0.45;
+        let rr = radius * (0.55 + h(20 + i as u32) * 0.75);
+        let y = (h(30 + i as u32) - 0.5) * radius * 0.4;
+        ring.push(center + rot * Vec3::new(rr * ang.cos(), y, rr * ang.sin()));
+    }
+    let top = center
+        + rot
+            * Vec3::new(
+                (h(1) - 0.5) * radius * 0.45,
+                radius * (0.32 + h(2) * 0.5),
+                (h(3) - 0.5) * radius * 0.4,
+            );
+    let bot = center
+        + rot
+            * Vec3::new(
+                (h(4) - 0.5) * radius * 0.3,
+                -radius * (0.25 + h(5) * 0.4),
+                (h(6) - 0.5) * radius * 0.3,
+            );
+    let up = rot * Vec3::Y;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        add_outward(mesh, top, ring[i], ring[j], panel, up);
+        add_outward(mesh, bot, ring[j], ring[i], panel, -up);
+    }
+}
+
+fn add_outward(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32, outward: Vec3) {
+    let n = (b - a).cross(c - a);
+    if n.length_squared() < 1.0e-12 {
+        return;
+    }
+    if n.dot(outward) >= 0.0 {
+        add_tri(mesh, a, b, c, panel);
+    } else {
+        add_tri(mesh, a, c, b, panel);
+    }
+}
+
+/// Wet sheet, torn plate, or thicker chunk. Stones sit in the piece.
+/// Landed pieces keep that shape; only the mesh lies on the soil.
+fn add_torn_clay(
+    mesh: &mut CpuMesh,
+    center: Vec3,
+    rot: Quat,
+    radius: f32,
+    seed: u32,
+    grounded: bool,
+) {
+    let h = |n: u32| chunk_hash(seed, n);
+    // 0 wet sheet, 1 torn plate, 2 thicker chunk. Stones ride in all three.
+    let shape = (h(4) * 3.0) as u32;
+    let sheet = shape == 0;
+    let chunky = shape == 2;
+    let scale = if sheet {
+        Vec3::new(1.45 + h(1) * 0.85, 0.9 + h(2) * 0.12, 1.2 + h(3) * 0.9)
+    } else if chunky {
+        Vec3::new(0.68 + h(1) * 0.5, 0.86 + h(2) * 0.28, 0.62 + h(3) * 0.55)
+    } else {
+        Vec3::new(0.78 + h(1) * 0.72, 0.9 + h(2) * 0.18, 0.68 + h(3) * 0.8)
+    };
+    let bulk = if sheet {
+        0.95 + h(11) * 0.5
+    } else {
+        0.82 + h(11) * 0.4
+    };
+    let stones_n = if sheet {
+        2 + (h(36) * 2.0) as u32
+    } else {
+        1 + (h(36) * 2.2) as u32
+    };
+    // Mesh only. Stonier pieces sit lower. The soil volume is unchanged.
+    let sink = if grounded {
+        let heavy = (stones_n as f32 - 1.0) * 0.04;
+        let tall = if chunky {
+            0.2
+        } else if sheet {
+            0.02
+        } else {
+            0.06
+        };
+        Vec3::Y * radius * (0.3 + h(12) * 0.12 + tall - heavy)
+    } else {
+        Vec3::ZERO
+    };
+    let laid = if grounded {
+        let fwd = rot * Vec3::Z;
+        let yaw = fwd.x.atan2(fwd.z);
+        let tilt = (h(6) - 0.5) * if sheet { 0.65 } else { 0.4 };
+        let roll = (h(8) - 0.5) * if sheet { 0.55 } else { 0.42 };
+        let flip = if !sheet && h(7) > 0.8 {
+            std::f32::consts::PI
+        } else {
+            0.0
+        };
+        Quat::from_rotation_y(yaw)
+            * Quat::from_rotation_x(tilt + flip)
+            * Quat::from_rotation_z(roll)
+    } else {
+        rot
+    };
+    let up = laid * Vec3::Y;
+    let xform = |p: Vec3| {
+        center + laid * Vec3::new(p.x * scale.x, p.y * scale.y, p.z * scale.z) * bulk + sink
+    };
+    let sides = if sheet {
+        10 + (h(9) * 3.0) as usize
+    } else {
+        7 + (h(9) * 2.0) as usize
+    };
+    let bite = (h(13) * sides as f32) as usize % sides;
+    let spur = (bite + sides / 2) % sides;
+    let sand_i = (bite + sides / 3) % sides;
+    let thick = radius
+        * if sheet {
+            0.14 + h(5) * 0.08
+        } else if chunky {
+            0.58 + h(5) * 0.38
+        } else {
+            0.22 + h(5) * 0.14
+        };
+    let curl = if sheet {
+        radius * (0.06 + h(22) * 0.1)
+    } else if chunky {
+        radius * 0.05
+    } else {
+        radius * (0.05 + h(22) * 0.08)
+    };
+    let step = std::f32::consts::TAU / sides as f32;
+    let phase = h(14) * std::f32::consts::TAU;
+
+    let mut top = Vec::with_capacity(sides);
+    let mut bot = Vec::with_capacity(sides);
+    let mut ang_of = Vec::with_capacity(sides);
+    for i in 0..sides {
+        let wobble = (h(40 + i as u32) - 0.5) * step * 0.36;
+        let ang = i as f32 * step + wobble;
+        ang_of.push(ang);
+        let mut rr = radius * (0.48 + h(50 + i as u32) * 0.72);
+        if i == bite {
+            rr *= if sheet { 0.24 } else { 0.38 + h(17) * 0.08 };
+        } else if ang_dist(i, bite, sides) == 1 {
+            rr *= 0.62 + h(18) * 0.1;
+        }
+        if i == spur {
+            rr *= 1.12 + h(19) * 0.18;
+        }
+        let wave = (ang + phase).sin() * curl + (ang * 2.0 + phase).cos() * curl * 0.35;
+        let mut half = thick * (0.42 + h(60 + i as u32) * 0.28);
+        if ang_dist(i, bite, sides) <= 1 {
+            half *= 0.65;
+        }
+        if i == spur && !sheet {
+            half += thick * (0.3 + h(21) * 0.3);
+        }
+        top.push(xform(Vec3::new(
+            rr * ang.cos(),
+            wave + half,
+            rr * ang.sin(),
+        )));
+        bot.push(xform(Vec3::new(
+            rr * ang.cos(),
+            wave - half,
+            rr * ang.sin(),
+        )));
+    }
+
+    let crown = xform(Vec3::new(0.0, curl * 0.12, 0.0));
+    let floor = xform(Vec3::new(0.0, -thick * 0.2, 0.0));
+    let face = |i: usize| -> f32 {
+        let j = (i + 1) % sides;
+        if sheet {
+            if i == sand_i || j == sand_i {
+                PANEL_SAND
+            } else if i == spur || j == spur {
+                PANEL_CRUST
+            } else {
+                PANEL_CLOD
+            }
+        } else {
+            let wet = |k: usize| ang_dist(k, bite, sides) <= 1;
+            let sand = |k: usize| ang_dist(k, sand_i, sides) <= 1;
+            if wet(i) && wet(j) {
+                PANEL_CLOD
+            } else if sand(i) && sand(j) {
+                PANEL_SAND
+            } else if wet(i) || wet(j) {
+                PANEL_CLOD
+            } else if sand(i) || sand(j) {
+                PANEL_SAND
+            } else {
+                PANEL_CRUST
+            }
+        }
+    };
+
+    for i in 0..sides {
+        let j = (i + 1) % sides;
+        let panel = face(i);
+        add_tri_smooth(mesh, crown, up, top[i], up, top[j], up, panel, crown - up);
+        add_tri_smooth(
+            mesh,
+            floor,
+            -up,
+            bot[j],
+            -up,
+            bot[i],
+            -up,
+            PANEL_CLOD,
+            floor + up,
+        );
+        let dir = Vec3::new(ang_of[i].cos(), 0.0, ang_of[i].sin());
+        let outward = (laid * Vec3::new(dir.x * scale.x, 0.0, dir.z * scale.z)).normalize_or_zero();
+        add_outward(mesh, top[i], bot[i], top[j], panel, outward);
+        add_outward(mesh, top[j], bot[i], bot[j], panel, outward);
+    }
+
+    if !sheet {
+        let mut grains = 0u32;
+        let grain_budget = 3 + (h(35) * 3.0) as u32;
+        for i in 0..sides {
+            if grains >= grain_budget {
+                break;
+            }
+            if ang_dist(i, sand_i, sides) > 1 {
+                continue;
+            }
+            let grain_r = radius * (0.07 + h(120 + grains) * 0.06);
+            let at = top[i].lerp(crown, 0.4) - up * grain_r * 0.2;
+            let spin = Quat::from_rotation_y(h(140 + grains) * std::f32::consts::TAU);
+            add_chip(
+                mesh,
+                at,
+                laid * spin,
+                grain_r,
+                seed ^ grains.wrapping_mul(0x9E37_u32),
+                PANEL_SAND,
+            );
+            grains += 1;
+        }
+    }
+
+    let mut cursor = spur;
+    for s in 0..stones_n {
+        cursor = (cursor + 2 + (s as usize % 3)) % sides;
+        if cursor == bite {
+            cursor = (cursor + 1) % sides;
+        }
+        let stone_r = radius
+            * if s == 0 {
+                0.28 + h(220) * 0.16
+            } else if sheet {
+                0.16 + h(220 + s) * 0.08
+            } else {
+                0.22 + h(220 + s) * 0.1
+            };
+        let at = top[cursor].lerp(crown, 0.34) + up * stone_r * 0.15;
+        let spin =
+            Quat::from_rotation_z(h(240 + s) * 3.0) * Quat::from_rotation_y(h(250 + s) * 2.2);
+        add_chip(
+            mesh,
+            at,
+            laid * spin,
+            stone_r,
+            seed ^ 0x51C0_u32.wrapping_mul(s + 1),
+            PANEL_STONE,
+        );
+    }
+}
+
+/// Wet mud in world space. Impact chunks are torn clods; droplets stay small lumps.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
-    const MAX_VERTS: usize = 14000;
+    const MAX_VERTS: usize = 15000;
     // Draw the big clumps first so a full splash cannot crowd them out.
     for kind in [3u8, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
-            if mesh.vertices.len() + 700 > MAX_VERTS {
+            let room = if kind == 3 { 1600 } else { 480 };
+            if mesh.vertices.len() + room > MAX_VERTS {
+                if kind == 3 {
+                    continue;
+                }
                 return mesh;
             }
             if p.kind == 3 {
-                add_piece(&mut mesh, p, 8, 16);
-                // Two side lobes so the clump is a soft mass, not one pebble.
-                for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {
-                    let dir = Vec3::new(
-                        chunk_hash(p.seed, slot) * 2.0 - 1.0,
-                        chunk_hash(p.seed, slot + 1) * 0.28,
-                        chunk_hash(p.seed, slot + 2) * 2.0 - 1.0,
-                    )
-                    .normalize_or_zero();
-                    let lobe = silt::particles::Particle {
-                        pos: p.pos + p.rot * dir * p.size * dist,
-                        size: p.size * scale,
-                        seed: p.seed ^ 0xA5A5_5A5Au32.wrapping_mul(slot | 1),
-                        ..*p
-                    };
-                    add_piece(&mut mesh, &lobe, 6, 12);
-                }
+                add_torn_clay(&mut mesh, p.pos, p.rot, p.size, p.seed, p.grounded);
             } else if p.kind == 1 {
                 let mut q = *p;
                 q.size = p.size.max(0.08);
