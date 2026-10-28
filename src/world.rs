@@ -4,7 +4,9 @@ use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
-use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
+use crate::soil::{
+    on_launch_crest, stick_scale, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
+};
 use crate::vehicle::{
     hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
     PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
@@ -292,6 +294,19 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
+        for c in &contacts {
+            if c.active && c.squeeze > 0.02 {
+                // Loose smear only. The cut still lands on the berm.
+                self.soil.skim_loose(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    c.patch_length.max(0.08),
+                    crate::vehicle::WHEEL_WIDTH,
+                    c.squeeze * 0.0025 * dt,
+                );
+            }
+        }
 
         let speed = self.vehicle.speed();
         for c in &contacts {
@@ -483,7 +498,8 @@ fn stick_impact_mud(vehicle: &mut Vehicle, soil: &SoilField) {
         let world = vehicle.pos + ori * local;
         let sample = soil.sample(world.x, world.z);
         if world.y < vehicle.pos.y + 0.05 || world.y < sample.height + 0.55 {
-            let add = 0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0);
+            let add = (0.16 + 0.18 * sample.wetness + 0.12 * sample.water.min(1.0))
+                * stick_scale(sample.kind(), sample.wetness);
             let p = &mut vehicle.panels[panel];
             p.mass = (p.mass + add).min(PANEL_MUD_CAP);
             p.wet = (p.wet + 0.7).min(1.0);
