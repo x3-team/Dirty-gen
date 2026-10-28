@@ -852,8 +852,8 @@ impl Renderer {
             Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
         };
         let view_proj = proj * view;
-        // Low sun so rut walls and the buggy contact shadow separate from the ground.
-        let sun = Vec3::new(0.88, 0.32, 0.24).normalize();
+        // Cool-neutral midday sun. High enough that contact shadows stay short.
+        let sun = Vec3::new(0.38, 0.88, 0.18).normalize();
         let light_target = Vec3::new(0.0, 0.0, 2.0);
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
         let light_proj = Mat4::orthographic_rh(-36.0, 36.0, -36.0, 36.0, 1.0, 130.0);
@@ -864,10 +864,10 @@ impl Renderer {
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
             sun_dir: vec4(sun, 0.0),
-            sun_color: [1.15, 0.74, 0.42, 1.0],
-            sky_zenith: [0.13, 0.26, 0.52, 1.0],
-            sky_horizon: [0.50, 0.28, 0.18, 1.0],
-            amb: [0.10, 0.062, 0.038, 1.0],
+            sun_color: [1.70, 1.78, 1.90, 1.0],
+            sky_zenith: [0.42, 0.64, 0.98, 1.0],
+            sky_horizon: [0.76, 0.84, 0.96, 1.0],
+            amb: [0.18, 0.20, 0.22, 1.0],
             params: [
                 self.width as f32,
                 self.height as f32,

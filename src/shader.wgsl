@@ -112,22 +112,27 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
         return 1.0;
     }
     let dims = vec2<f32>(textureDimensions(shadow_tex));
-    let base = vec2<i32>(uv * dims);
+    let tex = uv * dims;
     // Flat ground can shadow a few centimetres of rut. A wall keeps a larger bias.
     let slope = clamp(1.0 - n.y, 0.0, 1.0);
-    let bias = 0.00015 + slope * 0.0014;
+    let bias = 0.00022 + slope * 0.0012;
+    // Wider taps than a 3x3, so the midday penumbra is soft instead of a hard stripe.
     var blocked = 0.0;
-    for (var y: i32 = -1; y <= 1; y = y + 1) {
-        for (var x: i32 = -1; x <= 1; x = x + 1) {
-            let c = clamp(base + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+    var weight = 0.0;
+    for (var y: i32 = -2; y <= 2; y = y + 1) {
+        for (var x: i32 = -2; x <= 2; x = x + 1) {
+            let o = vec2<f32>(f32(x), f32(y));
+            let w = exp(-dot(o, o) * 0.22);
+            let c = clamp(vec2<i32>(tex + o * 1.7), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
             let s = decode_depth(textureLoad(shadow_tex, c, 0));
             if (ndc.z > s + bias) {
-                blocked = blocked + 1.0;
+                blocked = blocked + w;
             }
+            weight = weight + w;
         }
     }
-    // 0.92 so the airborne buggy and the clods throw a shadow you can see.
-    return 1.0 - blocked / 9.0 * 0.92;
+    // Light enough to read as open sky, dark enough that the buggy still sits on the oval.
+    return 1.0 - blocked / max(weight, 0.001) * 0.64;
 }
 
 fn shade(world: vec3<f32>, n_in: vec3<f32>, albedo: vec3<f32>, rough: f32, emit: vec3<f32>) -> vec3<f32> {
