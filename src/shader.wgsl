@@ -89,6 +89,12 @@ fn mud_of(panel: i32) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
 
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
 fn bayer(frag: vec2<f32>) -> f32 {
     // Interleaved gradient noise. One step of 8-bit is enough to break a gradient.
     return fract(52.9829189 * fract(0.06711056 * frag.x + 0.00583715 * frag.y));
@@ -681,36 +687,23 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let dims = vec2<f32>(textureDimensions(niva_base));
         let dx = dpdx(in.uv) * dims.x;
         let dy = dpdy(in.uv) * dims.y;
-        let lod = clamp(0.5 * log2(max(dot(dx, dx), dot(dy, dy))), 0.0, 8.0);
+        let max_lod = max(f32(textureNumLevels(niva_base)) - 1.0, 0.0);
+        let lod = clamp(0.5 * log2(max(dot(dx, dx), dot(dy, dy))), 0.0, max_lod);
         let base = textureSampleLevel(niva_base, paint_samp, in.uv, layer, lod);
         let mr = textureSampleLevel(niva_mr, paint_samp, in.uv, layer, lod);
         let nm = textureSampleLevel(niva_nor, paint_samp, in.uv, layer, lod).rgb;
         if (layer == 7 && base.a < 0.35) {
             discard;
         }
-        albedo = base.rgb;
+        // WebP base color is sRGB. Decode here so the texels stay as authored.
+        albedo = srgb_to_linear(base.rgb);
         rough = clamp(mr.g, 0.045, 1.0);
         nrm = tbn_normal(in.nrm, nm);
-        // One tan on the shell. Dark trim stays dark.
-        if (layer == 0) {
-            let luma = dot(albedo, vec3<f32>(0.299, 0.587, 0.114));
-            let paint = vec3<f32>(0.40, 0.28, 0.16);
-            let paint_l = dot(paint, vec3<f32>(0.299, 0.587, 0.114));
-            let shade = clamp(luma / max(paint_l, 1e-3), 0.78, 1.16);
-            let trim = smoothstep(0.20, 0.07, luma);
-            albedo = mix(paint * shade, albedo, trim);
-        }
         if (layer == 3) {
             alpha = clamp(max(base.a, 0.22), 0.22, 0.62);
-            albedo = mix(base.rgb, vec3<f32>(0.62, 0.78, 0.84), 0.35);
+            albedo = mix(albedo, vec3<f32>(0.62, 0.78, 0.84), 0.35);
             rough = 0.05;
-        }
-        // Bright chassis metal is the wheel disc. The authored normal was concentric rings.
-        let disc = layer == 5 && mr.b > 0.55 && dot(base.rgb, vec3<f32>(0.3, 0.5, 0.2)) > 0.45;
-        if (disc) {
-            nrm = normalize(in.nrm);
-            rough = 0.30;
-        } else {
+        } else if (layer != 7) {
             let mud = clamp(model.extra.y, 0.0, 1.2);
             let cover = max(mud, max(model.mud5.x, max(model.mud1.x, max(model.mud4.x, max(model.mud2.x, model.mud3.x)))));
             let down = smoothstep(0.55, -0.2, nrm.y);

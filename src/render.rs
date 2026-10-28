@@ -491,10 +491,13 @@ impl Renderer {
         let (tire_base, tire_base_view) = upload_rgba(&device, &queue, "tire-base", &cc0.tire_base);
         let (tire_nor, tire_nor_view) = upload_rgba(&device, &queue, "tire-nor", &cc0.tire_nor);
         let (prop_tex, prop_view) = upload_rgba(&device, &queue, "prop", &cc0.prop_tex);
-        let niva = crate::niva::load();
+        let mut niva = crate::niva::load();
         let (niva_base, niva_base_view) = upload_array(&device, &queue, "niva-base", &niva.base);
+        niva.base = Vec::new();
         let (niva_nor, niva_nor_view) = upload_array(&device, &queue, "niva-nor", &niva.nor);
+        niva.nor = Vec::new();
         let (niva_mr, niva_mr_view) = upload_array(&device, &queue, "niva-mr", &niva.mr);
+        niva.mr = Vec::new();
         let mut resident = vec![
             ground_diff,
             ground_nor,

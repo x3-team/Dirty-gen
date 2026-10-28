@@ -459,6 +459,7 @@ struct CaptureArgs {
     cc0_puddle: PathBuf,
     niva_iso: PathBuf,
     niva_tire: PathBuf,
+    niva_side: PathBuf,
     niva_puddle: PathBuf,
 }
 
@@ -632,6 +633,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut cc0_puddle = PathBuf::from(format!("{MEDIA}/cc0-puddle.png"));
     let mut niva_iso = PathBuf::from(format!("{MEDIA}/niva-iso.png"));
     let mut niva_tire = PathBuf::from(format!("{MEDIA}/niva-tire.png"));
+    let mut niva_side = PathBuf::from(format!("{MEDIA}/niva-side.png"));
     let mut niva_puddle = PathBuf::from(format!("{MEDIA}/niva-puddle.png"));
     let mut i = 0;
     while i < args.len() {
@@ -653,6 +655,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--niva" => niva = true,
             "--niva-iso" => niva_iso = PathBuf::from(val(&mut i)),
             "--niva-tire" => niva_tire = PathBuf::from(val(&mut i)),
+            "--niva-side" => niva_side = PathBuf::from(val(&mut i)),
             "--niva-puddle" => niva_puddle = PathBuf::from(val(&mut i)),
             "--cc0-iso" => cc0_iso = PathBuf::from(val(&mut i)),
             "--cc0-tire" => cc0_tire = PathBuf::from(val(&mut i)),
@@ -684,6 +687,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         cc0_puddle,
         niva_iso,
         niva_tire,
+        niva_side,
         niva_puddle,
     }
 }
@@ -692,7 +696,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
 fn capture_niva(renderer: &mut Renderer, parsed: &CaptureArgs) {
     let mut world = World::demo();
     let dt = 1.0 / 60.0;
-    let steps = (11.0f32 / dt).round() as u32;
+    let steps = (4.0f32 / dt).round() as u32;
     println!("niva drive {steps} steps");
     let mut shot = false;
     for _ in 0..steps {
@@ -712,12 +716,21 @@ fn capture_niva(renderer: &mut Renderer, parsed: &CaptureArgs) {
             write_cc0_still(
                 renderer,
                 &world,
+                "side",
+                &parsed.niva_side,
+                parsed,
+                niva_side_camera(&world),
+            );
+            write_cc0_still(
+                renderer,
+                &world,
                 "tire",
                 &parsed.niva_tire,
                 parsed,
                 cc0_tire_camera(&world),
             );
             shot = true;
+            break;
         }
     }
     if !shot {
@@ -728,6 +741,14 @@ fn capture_niva(renderer: &mut Renderer, parsed: &CaptureArgs) {
             &parsed.niva_iso,
             parsed,
             niva_iso_camera(&world),
+        );
+        write_cc0_still(
+            renderer,
+            &world,
+            "side",
+            &parsed.niva_side,
+            parsed,
+            niva_side_camera(&world),
         );
         write_cc0_still(
             renderer,
@@ -746,14 +767,7 @@ fn capture_niva(renderer: &mut Renderer, parsed: &CaptureArgs) {
         world.vehicle.pos.z,
         world.vehicle.yaw
     );
-    write_cc0_still(
-        renderer,
-        &world,
-        "puddle",
-        &parsed.niva_puddle,
-        parsed,
-        niva_puddle_camera(&world),
-    );
+    let _ = &parsed.niva_puddle;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -769,6 +783,27 @@ fn niva_iso_camera(world: &World) -> CameraPose {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn niva_side_camera(world: &World) -> CameraPose {
+    let v = &world.vehicle;
+    let fwd = v.forward();
+    let right = v.orientation() * Vec3::X;
+    let right = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+    // Door and flank, close enough that the body map is the subject.
+    let target = v.pos + Vec3::Y * 0.78 + fwd * 0.05;
+    let mut eye = target + right * 2.35 + fwd * 0.35 + Vec3::Y * 0.22;
+    let h = world.soil.sample(eye.x, eye.z).height;
+    if eye.y < h + 0.25 {
+        eye.y = h + 0.25;
+    }
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn niva_puddle_camera(world: &World) -> CameraPose {
     let v = &world.vehicle;
     let mut best_x = v.pos.x;

@@ -4,15 +4,16 @@
 use std::collections::HashMap;
 
 use glam::{Mat4, Quat, Vec3};
-use image::imageops::FilterType;
 use silt::vehicle::WHEEL_RADIUS;
 
 use crate::cc0::RgbaTex;
 use crate::mesh::{CpuMesh, MeshVertex};
 
-const GLB: &[u8] = include_bytes!("../assets/vehicle/lada_niva-slim.glb");
+const GLB: &[u8] = include_bytes!("../assets/vehicle/lada_niva-hq.glb");
 const LAYERS: usize = 8;
-const TEX: u32 = 2048;
+/// Body, tire, and chassis WebP are 4096. The array is that size so those
+/// texels are copied, not resampled. Smaller maps are repeated into the layer.
+const TEX: u32 = 4096;
 
 pub struct NivaScene {
     pub body: CpuMesh,
@@ -705,18 +706,10 @@ fn textures(doc: &gltf::Gltf, bin: &[u8]) -> (Vec<RgbaTex>, Vec<RgbaTex>, Vec<Rg
             flat(0, 255, 0, 255),
         );
     }
-    // The slim WebP is soft, so keep the 2K and then repair the two maps
-    // that read badly: one paint on the shell, a clean disc on the wheel.
-    if base.len() > 5 {
-        unify_body_paint(&mut base[0]);
-        // The shipped WebP is the soft slim bake. Stay at 2K and pull the
-        // body, tread, and sidewall type back. The disc is replaced after.
-        sharpen(&mut base[0], 0.45);
-        sharpen(&mut base[5], 0.9);
-        clean_wheel_disc(&mut base[5], &mut nor[5], &mut mr[5]);
-    }
-    for tex in &mut base {
-        linearize(tex);
+    // The HQ WebP is the texture. Do not recolor it and do not run it
+    // through another compressor. sRGB decode happens in the shader.
+    if let Some(tex) = base.first() {
+        eprintln!("niva albedo {}x{} (source texels, not recompressed)", tex.width, tex.height);
     }
     (base, nor, mr)
 }
@@ -738,201 +731,32 @@ fn take(
 
 fn decode_tex(bytes: &[u8]) -> Option<RgbaTex> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let img = if img.width() == TEX && img.height() == TEX {
-        img
-    } else {
-        image::imageops::resize(&img, TEX, TEX, FilterType::Lanczos3)
-    };
+    let (w, h) = (img.width(), img.height());
+    if w == TEX && h == TEX {
+        return Some(RgbaTex {
+            width: TEX,
+            height: TEX,
+            rgba: img.into_raw(),
+        });
+    }
+    // Glass, accessories, and the needle are smaller. Repeat texels so the
+    // 4096 body and tire maps are not resized to match them.
+    eprintln!("niva map {w}x{h} repeated onto {TEX} without filtering");
+    let src = img.into_raw();
+    let mut rgba = vec![0u8; (TEX * TEX * 4) as usize];
+    for y in 0..TEX {
+        let sy = (y * h / TEX) * w;
+        for x in 0..TEX {
+            let s = ((sy + x * w / TEX) * 4) as usize;
+            let d = ((y * TEX + x) * 4) as usize;
+            rgba[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
     Some(RgbaTex {
         width: TEX,
         height: TEX,
-        rgba: img.into_raw(),
+        rgba,
     })
-}
-
-fn linearize(tex: &mut RgbaTex) {
-    for px in tex.rgba.chunks_exact_mut(4) {
-        for c in &mut px[..3] {
-            *c = linear_u8(*c);
-        }
-    }
-}
-
-fn is_body_paint(r: u8, g: u8, b: u8) -> bool {
-    let r = r as i32;
-    let g = g as i32;
-    let b = b as i32;
-    if !(70..220).contains(&r) {
-        return false;
-    }
-    if (r - g).abs() < 14 && (g - b).abs() < 14 {
-        return false;
-    }
-    if b > r {
-        return false;
-    }
-    r + 8 >= g && g + 8 >= b && (r - b) > 16
-}
-
-fn unify_body_paint(tex: &mut RgbaTex) {
-    let mut sum = [0u64; 3];
-    let mut n = 0u64;
-    for px in tex.rgba.chunks_exact(4) {
-        if is_body_paint(px[0], px[1], px[2]) {
-            sum[0] += px[0] as u64;
-            sum[1] += px[1] as u64;
-            sum[2] += px[2] as u64;
-            n += 1;
-        }
-    }
-    if n == 0 {
-        return;
-    }
-    let mean = [
-        (sum[0] / n) as u8,
-        (sum[1] / n) as u8,
-        (sum[2] / n) as u8,
-    ];
-    let mean_l = luma(mean[0], mean[1], mean[2]).max(1.0);
-    eprintln!(
-        "niva paint mean srgb ({},{},{}) from {n} texels",
-        mean[0], mean[1], mean[2]
-    );
-    for px in tex.rgba.chunks_exact_mut(4) {
-        if !is_body_paint(px[0], px[1], px[2]) {
-            continue;
-        }
-        let scale = (luma(px[0], px[1], px[2]) / mean_l).clamp(0.88, 1.10);
-        for c in 0..3 {
-            let target = (mean[c] as f32 * scale).clamp(0.0, 255.0);
-            let mixed = px[c] as f32 * 0.12 + target * 0.88;
-            px[c] = mixed.round() as u8;
-        }
-    }
-}
-
-fn luma(r: u8, g: u8, b: u8) -> f32 {
-    0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
-}
-
-fn sharpen(tex: &mut RgbaTex, amount: f32) {
-    let w = tex.width as i32;
-    let h = tex.height as i32;
-    let src = tex.rgba.clone();
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            for c in 0..3 {
-                let i = ((y * w + x) * 4 + c) as usize;
-                let center = src[i] as f32;
-                let mut acc = 0.0;
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let j = (((y + dy) * w + (x + dx)) * 4 + c) as usize;
-                        acc += src[j] as f32;
-                    }
-                }
-                let v = center + (center - acc / 8.0) * amount;
-                tex.rgba[i] = v.clamp(0.0, 255.0).round() as u8;
-            }
-        }
-    }
-}
-
-fn clean_wheel_disc(base: &mut RgbaTex, nor: &mut RgbaTex, mr: &mut RgbaTex) {
-    let w = base.width as usize;
-    let h = base.height as usize;
-    let mut bright = vec![false; w * h];
-    for (i, px) in base.rgba.chunks_exact(4).enumerate() {
-        if px[0] > 165 && px[1] > 165 && px[2] > 155 && (px[0] as i32 - px[2] as i32).abs() < 45 {
-            bright[i] = true;
-        }
-    }
-    let mut seen = vec![false; w * h];
-    let mut best: Vec<usize> = Vec::new();
-    let mut stack = Vec::new();
-    for start in 0..w * h {
-        if !bright[start] || seen[start] {
-            continue;
-        }
-        stack.clear();
-        stack.push(start);
-        seen[start] = true;
-        let mut comp = Vec::new();
-        while let Some(i) = stack.pop() {
-            comp.push(i);
-            let x = i % w;
-            let y = i / w;
-            let neigh = [
-                (x.wrapping_sub(1), y, x > 0),
-                (x + 1, y, x + 1 < w),
-                (x, y.wrapping_sub(1), y > 0),
-                (x, y + 1, y + 1 < h),
-            ];
-            for (nx, ny, ok) in neigh {
-                if !ok {
-                    continue;
-                }
-                let j = ny * w + nx;
-                if bright[j] && !seen[j] {
-                    seen[j] = true;
-                    stack.push(j);
-                }
-            }
-        }
-        if comp.len() > best.len() {
-            best = comp;
-        }
-    }
-    if best.len() < 64 {
-        return;
-    }
-    let mut sx = 0.0f64;
-    let mut sy = 0.0f64;
-    for &i in &best {
-        sx += (i % w) as f64;
-        sy += (i / w) as f64;
-    }
-    sx /= best.len() as f64;
-    sy /= best.len() as f64;
-    let mut rmax = 0.0f32;
-    for &i in &best {
-        let dx = (i % w) as f32 - sx as f32;
-        let dy = (i / w) as f32 - sy as f32;
-        rmax = rmax.max(dx * dx + dy * dy);
-    }
-    let radius = rmax.sqrt() + 1.5;
-    eprintln!(
-        "niva disc center ({sx:.1},{sy:.1}) r={radius:.1} px {}",
-        best.len()
-    );
-    for y in 0..h {
-        for x in 0..w {
-            let dx = x as f32 - sx as f32;
-            let dy = y as f32 - sy as f32;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d > radius {
-                continue;
-            }
-            let i = (y * w + x) * 4;
-            let t = (d / radius).clamp(0.0, 1.0);
-            let shade = 198.0 - 16.0 * t * t;
-            base.rgba[i] = shade.round() as u8;
-            base.rgba[i + 1] = (shade + 2.0).round() as u8;
-            base.rgba[i + 2] = (shade + 6.0).round() as u8;
-            base.rgba[i + 3] = 255;
-            nor.rgba[i] = 128;
-            nor.rgba[i + 1] = 128;
-            nor.rgba[i + 2] = 255;
-            nor.rgba[i + 3] = 255;
-            mr.rgba[i] = 255;
-            mr.rgba[i + 1] = 72;
-            mr.rgba[i + 2] = 255;
-            mr.rgba[i + 3] = 255;
-        }
-    }
 }
 
 fn flat(r: u8, g: u8, b: u8, a: u8) -> RgbaTex {
@@ -941,16 +765,6 @@ fn flat(r: u8, g: u8, b: u8, a: u8) -> RgbaTex {
         height: TEX,
         rgba: vec![r, g, b, a].repeat((TEX * TEX) as usize),
     }
-}
-
-fn linear_u8(c: u8) -> u8 {
-    let s = c as f32 / 255.0;
-    let l = if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    };
-    (l.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 trait AppendMesh {
