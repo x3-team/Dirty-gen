@@ -22,6 +22,8 @@ pub struct SoilSample {
     pub softness: f32,
     /// Metres carved out of the original surface. Feeds slip-sinkage drag.
     pub rut: f32,
+    /// Spoil piled above the original surface. The berm beside a rut.
+    pub berm: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +139,82 @@ pub fn sink_drag_coeff(depth: f32) -> f32 {
 pub fn sink_hold(depth: f32, normal: f32) -> f32 {
     let t = smooth01(SINK_HUB, SINK_FRAME, depth.max(0.0));
     t * normal.max(0.0) * 1.05
+}
+
+/// Horizontal shove from a rut wall, plus the lift on a berm.
+///
+/// `sideways` is in the world XZ plane. `up` is vertical. On a berm
+/// `lifts` is set and `up` replaces the flat Bekker load, so the same
+/// contact force is what pushes the tire up and out.
+#[derive(Clone, Copy, Debug)]
+pub struct LateralPush {
+    pub sideways: Vec3,
+    pub up: f32,
+    pub lifts: bool,
+}
+
+impl LateralPush {
+    fn none() -> Self {
+        Self {
+            sideways: Vec3::ZERO,
+            up: 0.0,
+            lifts: false,
+        }
+    }
+}
+
+/// Soil-face reaction under one tire.
+///
+/// `grad_x` / `grad_z` are the height slope, uphill positive. `load` is the
+/// vertical Bekker force (N). `rut` is metres cut below the original surface
+/// and `berm` is metres of spoil above it.
+///
+/// The contact normal is `normalize((-slope, 1))`. On a rut wall the
+/// downhill part of that normal is a sideways pull into the groove, and the
+/// Bekker load stays vertical. On a berm the face climbs up and away from
+/// the cut, so the tire is pushed uphill — up and out — and that push
+/// replaces the flat load. Undisturbed ground, including the launch crest,
+/// is left alone. Burial still scales tread grip, and this shove is not
+/// multiplied by that grip.
+pub fn lateral_push(grad_x: f32, grad_z: f32, load: f32, rut: f32, berm: f32) -> LateralPush {
+    if load <= 1.0 {
+        return LateralPush::none();
+    }
+    let slope = (grad_x * grad_x + grad_z * grad_z).sqrt();
+    // Flatter than a mild shoulder. Noise and the open pad do not shove.
+    if slope < 0.03 {
+        return LateralPush::none();
+    }
+    let on_wall = rut >= 0.012 && rut >= berm;
+    let on_berm = berm >= 0.006 && berm > rut;
+    if !on_wall && !on_berm {
+        return LateralPush::none();
+    }
+    let hypot = (1.0 + slope * slope).sqrt();
+    let mut sin_t = slope / hypot;
+    let down_x = -grad_x / slope;
+    let down_z = -grad_z / slope;
+    if on_wall {
+        // A cliff must not throw the chassis. The pull stays sideways.
+        sin_t = sin_t.min(0.72);
+        let f = load * sin_t;
+        LateralPush {
+            sideways: Vec3::new(down_x * f, 0.0, down_z * f),
+            up: 0.0,
+            lifts: false,
+        }
+    } else {
+        // Uphill is out of the groove. Keep the lift larger than the
+        // sideways part so a steep pile still reads as a push up.
+        sin_t = sin_t.min(0.50);
+        let cos_t = (1.0 - sin_t * sin_t).sqrt();
+        let f = load * sin_t;
+        LateralPush {
+            sideways: Vec3::new(-down_x * f, 0.0, -down_z * f),
+            up: load * cos_t,
+            lifts: true,
+        }
+    }
 }
 
 /// Wetness alone makes the ground heavy. Standing water and loose spoil
@@ -379,6 +457,7 @@ impl SoilField {
                 roughness: 0.9,
                 softness: softness_of(0.18, 0.0, 0.0),
                 rut: 0.0,
+                berm: 0.0,
             };
         }
         let i = u.floor() as usize;
@@ -396,6 +475,7 @@ impl SoilField {
         let darken = bilerp(s00.4, s10.4, s01.4, s11.4, tx, ty);
         let roughness = bilerp(s00.5, s10.5, s01.5, s11.5, tx, ty);
         let rut = bilerp(s00.6, s10.6, s01.6, s11.6, tx, ty).max(0.0);
+        let berm = bilerp(s00.7, s10.7, s01.7, s11.7, tx, ty).max(0.0);
         SoilSample {
             height,
             wetness,
@@ -405,11 +485,29 @@ impl SoilField {
             roughness,
             softness: softness_with_rut(wetness, loose, water, rut),
             rut,
+            berm,
         }
     }
 
-    fn raw(&self, i: usize, j: usize) -> (f32, f32, f32, f32, f32, f32, f32) {
+    /// Height slope (dh/dx, dh/dz), uphill positive. Wide enough to see a
+    /// shoulder that is only a cell or two across.
+    pub fn height_grad(&self, x: f32, z: f32) -> (f32, f32) {
+        let e = (self.cell * 0.65).clamp(0.08, 0.16);
+        let dx = (self.sample(x + e, z).height - self.sample(x - e, z).height) / (2.0 * e);
+        let dz = (self.sample(x, z + e).height - self.sample(x, z - e).height) / (2.0 * e);
+        (dx, dz)
+    }
+
+    /// Face reaction at a tire standing on `load` newtons.
+    pub fn lateral_push_at(&self, x: f32, z: f32, load: f32) -> LateralPush {
+        let s = self.sample(x, z);
+        let (gx, gz) = self.height_grad(x, z);
+        lateral_push(gx, gz, load, s.rut, s.berm)
+    }
+
+    fn raw(&self, i: usize, j: usize) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
         let idx = j * self.res + i;
+        let cut = self.initial_height[idx] - self.height[idx];
         (
             self.height[idx],
             self.wetness[idx],
@@ -417,7 +515,8 @@ impl SoilField {
             self.loose[idx],
             self.darken[idx],
             self.roughness[idx],
-            self.initial_height[idx] - self.height[idx],
+            cut,
+            (-cut).max(0.0),
         )
     }
 
@@ -1184,7 +1283,10 @@ mod tests {
         let second = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
         let after_second = height_sum(&soil);
         let floor = soil.sample(1.0, 0.0);
-        let berm = soil.sample(1.0, 0.45).height.max(soil.sample(1.0, -0.45).height);
+        let berm = soil
+            .sample(1.0, 0.45)
+            .height
+            .max(soil.sample(1.0, -0.45).height);
         eprintln!(
             "pass depths {first:.4} -> {second:.4}  berm {berm:.4} floor {:.4}  volume {before:.4} {after_first:.4} {after_second:.4}",
             floor.height
@@ -1211,7 +1313,9 @@ mod tests {
             floor.height
         );
         assert!(
-            soil.darken.iter().all(|d| (*d - 1.0).abs() < 1.0e-5 || *d <= 1.0),
+            soil.darken
+                .iter()
+                .all(|d| (*d - 1.0).abs() < 1.0e-5 || *d <= 1.0),
             "darken left the 0..1 range"
         );
     }
@@ -1335,5 +1439,107 @@ mod tests {
             (grip_from_sink(SINK_HUB) - buried).abs() < 1.0e-5,
             "a hub-deep rut should count even when the floor is firm"
         );
+    }
+
+    #[test]
+    fn rut_wall_pulls_in_and_berm_pushes_up_and_out() {
+        // +X wall: height rises toward +X, so the groove is toward -X.
+        let wall = lateral_push(0.55, 0.0, 2_000.0, 0.08, 0.0);
+        // Opposite wall, groove toward +X.
+        let other = lateral_push(-0.55, 0.0, 2_000.0, 0.08, 0.0);
+        // Berm climb: spoil rises toward +X, up and away from the groove.
+        let berm = lateral_push(0.35, 0.0, 2_000.0, 0.0, 0.05);
+        let crest = lateral_push(0.40, 0.10, 3_000.0, 0.0, 0.0);
+        let floor = lateral_push(0.0, 0.0, 3_000.0, 0.20, 0.0);
+        let deep = lateral_push(0.55, 0.0, 2_000.0, SINK_HUB, 0.0);
+        eprintln!(
+            "wall into groove {:.1} N   other wall {:.1} N   berm up {:.1} N out {:.1} N",
+            wall.sideways.x, other.sideways.x, berm.up, berm.sideways.x
+        );
+        assert!(
+            wall.sideways.x < -500.0,
+            "rut wall should pull into the groove, got {:.1}",
+            wall.sideways.x
+        );
+        assert!(
+            wall.up.abs() < 1.0 && !wall.lifts,
+            "rut wall push should stay sideways"
+        );
+        assert!(
+            other.sideways.x > 500.0,
+            "the far wall should pull the other way, got {:.1}",
+            other.sideways.x
+        );
+        assert!(
+            berm.sideways.x > 200.0,
+            "berm should push out, got {:.1}",
+            berm.sideways.x
+        );
+        assert!(
+            berm.lifts && berm.up > berm.sideways.length(),
+            "berm should push up and out, up {:.1} out {:.1}",
+            berm.up,
+            berm.sideways.length()
+        );
+        assert!(
+            crest.sideways.length() < 1.0 && crest.up.abs() < 1.0,
+            "an undisturbed slope should not shove"
+        );
+        assert!(
+            floor.sideways.length() < 1.0 && floor.up.abs() < 1.0,
+            "a flat rut floor should not shove"
+        );
+        assert!(
+            (deep.sideways.x - wall.sideways.x).abs() < 1.0,
+            "hub-deep burial should not scale the wall pull"
+        );
+        assert!(
+            grip_from_sink(SINK_HUB) < 0.35,
+            "sink-depth grip should still collapse at the hub"
+        );
+
+        let mut soil = SoilField::flat(0.2);
+        soil.roll_pass(Vec3::new(-2.2, 0.0, 0.0), Vec3::X, 6.0, 0.10, 0.0);
+        let x = 0.8;
+        let mut wall_hit: Option<(f32, LateralPush)> = None;
+        let mut berm_hit: Option<(f32, LateralPush)> = None;
+        for k in 0..28 {
+            let z = 0.04 + k as f32 * 0.05;
+            let s = soil.sample(x, z);
+            let push = soil.lateral_push_at(x, z, 2_000.0);
+            eprintln!(
+                "stamp z {z:.2} h {:.3} rut {:.3} berm {:.3} side {:+.1} up {:.1}",
+                s.height, s.rut, s.berm, push.sideways.z, push.up
+            );
+            // +Z shoulder: into the groove is -Z.
+            if s.rut >= 0.012 && push.sideways.z < -80.0 {
+                let replace = wall_hit
+                    .map(|(_, p)| push.sideways.z < p.sideways.z)
+                    .unwrap_or(true);
+                if replace {
+                    wall_hit = Some((z, push));
+                }
+            }
+            if s.berm >= 0.006 && push.sideways.z > 40.0 && push.up > push.sideways.z {
+                let replace = berm_hit
+                    .map(|(_, p)| push.sideways.z > p.sideways.z)
+                    .unwrap_or(true);
+                if replace {
+                    berm_hit = Some((z, push));
+                }
+            }
+        }
+        let (zw, wall_s) = wall_hit.expect("stamped rut wall did not pull into the groove");
+        let (zb, berm_s) = berm_hit.expect("stamped berm did not push up and out");
+        eprintln!(
+            "stamped wall z {zw:.2} into groove {:.1} N   berm z {zb:.2} up {:.1} N out {:.1} N",
+            wall_s.sideways.z, berm_s.up, berm_s.sideways.z
+        );
+        assert!(
+            wall_s.up.abs() < 1.0,
+            "stamped wall should stay sideways, up {:.1}",
+            wall_s.up
+        );
+        assert!(berm_s.lifts, "stamped berm should lift");
     }
 }

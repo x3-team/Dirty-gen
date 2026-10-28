@@ -1,5 +1,6 @@
 //! Off-road buggy: suspension, AWD torque, and a tire model that hands off
-//! to terramechanics once the rut is deep.
+//! to terramechanics once the rut is deep. A rut wall pulls the tire sideways
+//! into the groove. A berm pushes it up and out. Sink depth still sets grip.
 
 use glam::{EulerRot, Quat, Vec3};
 
@@ -138,6 +139,10 @@ pub struct Contact {
     pub sample: SoilSample,
     pub speed: f32,
     pub fling: f32,
+    /// World XZ force from the rut wall or the berm. Independent of tread grip.
+    pub face_side: Vec3,
+    /// Upward berm force. Zero on a rut wall, where the Bekker load stays put.
+    pub face_up: f32,
 }
 
 impl Vehicle {
@@ -271,6 +276,9 @@ impl Vehicle {
             wheel_torque += brake_torque(brake, omega, v_long);
             let mut stuck = false;
             let mut fling = 0.0;
+            let mut face_side = Vec3::ZERO;
+            let mut face_up = 0.0;
+            let mut support = normal;
 
             if active {
                 let tm = terramech_at(sample.softness, sample.rut, sample.water);
@@ -358,6 +366,18 @@ impl Vehicle {
                 // Shear reacts on the wheel even if Bingham holds the chassis still.
                 wheel_torque -= blended_long * WHEEL_RADIUS;
 
+                // Geometry, not tread shear. A wall slopes down into the groove
+                // and pulls sideways. Climbing the berm pushes the tire up and
+                // out. Hub-deep grip still kills the tread; it does not cancel this.
+                let push = soil.lateral_push_at(wheel_center.x, wheel_center.z, normal);
+                chassis_long += push.sideways.x * fwd.x + push.sideways.z * fwd.z;
+                chassis_lat += push.sideways.x * right.x + push.sideways.z * right.z;
+                face_side = push.sideways;
+                face_up = push.up;
+                if push.lifts {
+                    support = push.up;
+                }
+
                 let peripheral = omega.abs() * WHEEL_RADIUS;
                 fling = 0.62
                     * self.wheels[i].mud
@@ -371,7 +391,7 @@ impl Vehicle {
                 stuck,
                 compression: compression.clamp(0.0, SUSP_TRAVEL),
                 sinkage,
-                normal: if active { normal } else { 0.0 },
+                normal: if active { support } else { 0.0 },
                 chassis_long,
                 chassis_lat,
                 wheel_torque,
@@ -383,6 +403,8 @@ impl Vehicle {
                 sample,
                 speed: self.speed(),
                 fling,
+                face_side,
+                face_up,
             };
         }
         out
@@ -661,9 +683,12 @@ impl Default for Contact {
                 roughness: 0.8,
                 softness: 0.0,
                 rut: 0.0,
+                berm: 0.0,
             },
             speed: 0.0,
             fling: 0.0,
+            face_side: Vec3::ZERO,
+            face_up: 0.0,
         }
     }
 }

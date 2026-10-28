@@ -199,9 +199,7 @@ fn both_stay_on_the_loop() {
             samples += 1;
         }
     }
-    eprintln!(
-        "samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}"
-    );
+    eprintln!("samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}");
     assert!(samples > 10, "lap was not sampled");
     assert!(buggy_far < 3, "buggy left the loop");
     assert!(bike_far < 3, "bike left the loop");
@@ -261,7 +259,10 @@ fn rolling_tires_leave_a_pair_of_grooves() {
         prev2 = prev;
         prev = rut;
     }
-    eprintln!("groove peaks at z={z}: {peaks:?} pos {:?}", world.vehicle.pos);
+    eprintln!(
+        "groove peaks at z={z}: {peaks:?} pos {:?}",
+        world.vehicle.pos
+    );
     assert!(
         peaks.len() >= 2,
         "expected a pair of tire grooves behind the buggy, got {peaks:?}"
@@ -490,4 +491,150 @@ fn impact_chunks_land_on_the_heightfield() {
         grounded >= 3,
         "large clumps should be sitting on the soil, grounded {grounded} airborne {airborne}"
     );
+}
+
+/// Right-side tires sit on a rut wall, then on a berm. The wall pulls them
+/// sideways into the groove. The berm pushes them up and out. Tread grip is
+/// not what steers either shove.
+#[test]
+fn tire_is_pulled_into_the_rut_and_pushed_up_the_berm() {
+    use silt::soil::SoilField;
+
+    let mut wall_soil = SoilField::flat(0.12);
+    // Groove floor toward -Z, wall rising toward +Z. Into the groove is -Z.
+    paint_z(&mut wall_soil, |z| {
+        if z < 0.35 {
+            -0.16
+        } else if z < 1.70 {
+            let t = (z - 0.35) / 1.35;
+            -0.16 * (1.0 - t)
+        } else {
+            0.0
+        }
+    });
+    let mut berm_soil = SoilField::flat(0.12);
+    // Berm climb: the spoil rises toward +Z, up and away from the groove.
+    paint_z(&mut berm_soil, |z| {
+        if (0.90..2.30).contains(&z) {
+            let t = ((z - 0.90) / 1.40).clamp(0.0, 1.0);
+            0.14 * t
+        } else {
+            0.0
+        }
+    });
+
+    let wall = right_side_push(&mut wall_soil, 1.00);
+    let berm = right_side_push(&mut berm_soil, 1.85);
+    eprintln!(
+        "wall into groove {:.1} N (up {:.1})   berm up {:.1} N out {:.1} N",
+        wall.0, wall.1, berm.1, berm.0
+    );
+    assert!(
+        wall.0 < -150.0,
+        "rut wall should pull the tires into the groove, side {:.1}",
+        wall.0
+    );
+    assert!(
+        wall.1.abs() < 1.0,
+        "rut wall should not add lift, up {:.1}",
+        wall.1
+    );
+    assert!(
+        berm.0 > 80.0,
+        "berm should push the tires out, side {:.1}",
+        berm.0
+    );
+    assert!(
+        berm.1 > berm.0,
+        "berm should push up and out, up {:.1} out {:.1}",
+        berm.1,
+        berm.0
+    );
+}
+
+/// Sum of the right-tire face push. `wheel_z` is where those tires should stand.
+/// Returns (sideways Z, up).
+fn right_side_push(soil: &silt::soil::SoilField, wheel_z: f32) -> (f32, f32) {
+    use glam::Vec3;
+    use silt::vehicle::Vehicle;
+
+    let mut vehicle = Vehicle::new();
+    vehicle.pos = Vec3::new(0.0, 0.42, wheel_z + 0.74);
+    vehicle.yaw = std::f32::consts::FRAC_PI_2;
+    vehicle.vel = Vec3::ZERO;
+    vehicle.pitch = 0.0;
+    vehicle.roll = 0.0;
+    vehicle.yaw_rate = 0.0;
+    vehicle.pitch_rate = 0.0;
+    vehicle.roll_rate = 0.0;
+    vehicle.jump_hold = 0.0;
+    for w in &mut vehicle.wheels {
+        w.omega = 0.0;
+        w.slip = 0.0;
+        w.sinkage = 0.0;
+    }
+    let contacts = vehicle.compute_contacts(soil, 0.0, 0.0, 1.0 / 60.0);
+    let mut side_z = 0.0;
+    let mut up = 0.0;
+    let mut n = 0;
+    for c in &contacts {
+        if c.index % 2 != 1 {
+            continue;
+        }
+        let wx = c.forward.x * c.chassis_long + c.right.x * c.chassis_lat;
+        let wz = c.forward.z * c.chassis_long + c.right.z * c.chassis_lat;
+        eprintln!(
+            "wheel {} at ({:.2},{:.2}) active {} side {:+.1} stored {:+.1} up {:.1} normal {:.1} rut {:.3} berm {:.3}",
+            c.index,
+            c.wheel_center.x,
+            c.wheel_center.z,
+            c.active,
+            wz,
+            c.face_side.z,
+            c.face_up,
+            c.normal,
+            c.sample.rut,
+            c.sample.berm
+        );
+        assert!(
+            c.active,
+            "right tire {} never loaded the face at z {:.2}",
+            c.index, c.wheel_center.z
+        );
+        assert!(
+            (c.wheel_center.z - wheel_z).abs() < 0.25,
+            "right tire landed at z {:.2}, wanted {wheel_z:.2}",
+            c.wheel_center.z
+        );
+        assert!(
+            (wx - c.face_side.x).abs() < 1.5 && (wz - c.face_side.z).abs() < 1.5,
+            "chassis force does not carry the face push"
+        );
+        if c.face_up > 1.0 {
+            assert!(
+                (c.normal - c.face_up).abs() < 1.5,
+                "berm lift did not become the vertical force"
+            );
+        }
+        side_z += c.face_side.z;
+        up += c.face_up;
+        n += 1;
+    }
+    assert!(n == 2, "expected both right tires, got {n}");
+    (side_z, up)
+}
+
+fn paint_z(soil: &mut silt::soil::SoilField, profile: impl Fn(f32) -> f32) {
+    let half = soil.size * 0.5;
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            if x.abs() > 8.0 {
+                continue;
+            }
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            let idx = j * soil.res + i;
+            soil.height[idx] = profile(z);
+        }
+    }
 }
