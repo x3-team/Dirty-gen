@@ -237,6 +237,10 @@ fn disp_scale(kind: u32) -> f32 {
     if (kind == 6u) { return 0.16; }
     if (kind == 2u || kind == 3u) { return 0.006; }
     if (kind == 8u) { return 0.05; }
+    // Packed clay and the fresh cut keep their map relief, so a film
+    // and a slurry sit in the groove instead of on a flat card.
+    if (kind == 9u) { return 0.08; }
+    if (kind == 5u) { return 0.055; }
     if (kind == 1u) { return 0.03; }
     return 0.018;
 }
@@ -410,6 +414,10 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     else if (layer == 3) { disp = d3; }
     else if (layer == 4) { disp = d4; }
     if (kind == 6u) { disp = d0; }
+    // Clay has no height map. Packed tread in a cut keeps the mud it was pressed from.
+    if (kind == 9u && -stamp_bilinear(in.xz) > 0.012) {
+        disp = d0;
+    }
     let h = terrain_height(in.xz) + (disp - 0.5) * disp_scale(kind);
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     var o: TerrOut;
@@ -472,6 +480,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (kind == 2u || kind == 3u) { n_gain = 0.28; }
     else if (kind == 6u) { n_gain = 1.7; }
     else if (kind == 8u) { n_gain = 1.35; }
+    else if (kind == 5u) { n_gain = 1.35; }
+    else if (kind == 9u) { n_gain = 1.7; }
     ts = vec3<f32>(ts.xy * n_gain, ts.z);
     n = normalize(tng * ts.x + btg * ts.y + n * ts.z);
     var albedo = diff * mix(1.0, ao, 0.75);
@@ -480,6 +490,13 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     albedo = mix(albedo, albedo * vec3<f32>(0.66, 0.58, 0.48), smoothstep(0.18, 0.92, wet) * wet_amt);
     if (kind == 9u) {
         albedo *= mix(1.0, 0.8, smoothstep(0.35, 0.9, darken));
+        // The clay color is almost one tone. In the cut, the mud under it shows.
+        if (-stamp_bilinear(xz) > 0.012) {
+            // Clay's color is one tone. Sample the mud without the grazing mip
+            // so the grain stays on the floor of the cut.
+            let mud = textureSampleLevel(ground_diff, ground_samp, uv0, 0, 0.0).rgb;
+            albedo = mud * vec3<f32>(1.08, 0.78, 0.52);
+        }
     } else if (kind == 7u) {
         // Placed spoil reads drier and lighter than the torn lip beside it.
         albedo = mix(albedo, albedo * vec3<f32>(1.14, 1.05, 0.86), 0.62);
@@ -491,16 +508,38 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
 
     let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
     let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(rough_map, 0.16, shore * (1.0 - drowned)), max(rough_map, 0.72), drowned);
+    // Film and slurry live on this mesh. A glossy sheet over the cut is a flat card.
+    let dug = max(-stamp_bilinear(xz), 0.0);
+    let in_cut = dug > 0.012 && water > 0.008;
+    var depth_t = 0.0;
+    if (in_cut) {
+        // A 3 cm film stays a tint on the clay. Only the deep end murks the mesh.
+        depth_t = smoothstep(0.04, 0.12, water);
+        let bed_muddy = kind == 4u || kind == 5u || kind == 6u || kind == 8u || kind == 9u;
+        let film_tint = select(vec3<f32>(0.90, 0.86, 0.78), vec3<f32>(0.74, 0.56, 0.40), bed_muddy);
+        let deep_tint = select(vec3<f32>(0.42, 0.36, 0.28), vec3<f32>(0.16, 0.07, 0.03), bed_muddy);
+        let tint = mix(film_tint, deep_tint, depth_t);
+        let murk = mix(select(0.05, 0.1, bed_muddy), select(0.55, 0.88, bed_muddy), depth_t);
+        albedo = mix(albedo, albedo * tint, murk);
+    }
+    var rough_out = mix(mix(rough_map, 0.16, shore * (1.0 - drowned)), max(rough_map, 0.72), drowned);
+    if (in_cut) {
+        // Keep the clay and mud grain. The shore roughness was the card.
+        rough_out = mix(rough_map, max(rough_map, 0.58), depth_t);
+    }
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
-    // A wide lobe on the shore is the wet sheen.
+    // A wide lobe on the shore is the wet sheen. Inside the cut it stays small
+    // so the bed texture is what you see.
     let view = normalize(frame.cam_pos.xyz - in.world);
     let ndotv = clamp(dot(n, view), 0.0, 1.0);
     let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
     let facing = pow(1.0 - ndotv, 2.0);
     let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
-    let wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
+    var wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
+    if (in_cut) {
+        wet_spec *= mix(0.28, 0.05, depth_t);
+    }
     lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
     return present(lit);
 }
@@ -550,14 +589,19 @@ fn water_bed(xz: vec2<f32>) -> f32 {
 
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
-    let bed = water_bed(in.xz);
+    let local = height_bilinear(in.xz);
+    let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
-    // cut the tire like a clip plane.
-    let cover = height_bilinear(in.xz) + 0.01;
-    let y = max(bed + 0.016 + rip, cover) + smoothstep(0.02, 0.16, depth) * 0.012;
+    // cut the tire like a clip plane. The pond stays that blurred surface.
+    // A cut holds its own sheet down in the groove.
+    let cover = local + 0.01;
+    let pond = max(water_bed(in.xz) + 0.016 + rip, cover) + smoothstep(0.02, 0.16, depth) * 0.012;
+    let fill = smoothstep(0.04, 0.12, depth) * min(dug * 0.5, 0.032);
+    let in_rut = local + 0.01 + rip + fill;
+    let y = select(pond, in_rut, dug > 0.018 && depth > 0.004);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
@@ -584,10 +628,21 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         textureSample(ground_diff, ground_samp, uv3, 3),
         textureSample(ground_diff, ground_samp, uv4, 4),
     ).rgb;
-    if (in.depth < 0.006) {
+    let own = mat_bilinear(xz).g * 0.34;
+    let dug = max(-stamp_bilinear(xz), 0.0);
+    // A cut keeps film and slurry on the soil mesh. Dilated water on the lip
+    // was drawing flat cards in the pockets beside the floor.
+    let e = vec2<f32>(0.45, 0.0);
+    let ez = vec2<f32>(0.0, 0.45);
+    let near_cut = dug > 0.008
+        || -stamp_bilinear(xz + e) > 0.02
+        || -stamp_bilinear(xz - e) > 0.02
+        || -stamp_bilinear(xz + ez) > 0.02
+        || -stamp_bilinear(xz - ez) > 0.02;
+    if (near_cut || own < 0.008 || in.depth < 0.008) {
         discard;
     }
-    let n = ripple_normal(in.world.xz, frame.misc.x);
+    let n = ripple_normal(xz, frame.misc.x);
     // Keep the surface facing up. A bowed normal is what made the gray metal disc.
     let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
     let view = normalize(frame.cam_pos.xyz - in.world);
@@ -611,11 +666,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let spec_col = mix(bed, vec3<f32>(0.04, 0.016, 0.005), 0.65);
     col += spec_col * spec * shadow_factor(in.world, nrm);
     let shore = smoothstep(0.002, 0.07, in.depth);
-    let dug = max(-stamp_bilinear(in.world.xz), 0.0);
     let reveal = smoothstep(0.016, 0.034, dug);
     let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
     let cover = select(mix(0.34, 0.58, depth_t), mix(0.55, 0.97, depth_t), muddy);
-    let alpha = shore * cover * mix(1.0, open, reveal);
+    // A damp speck still opens the groove. A film and a slurry keep the
+    // opacity of the bed under them.
+    let skim = 1.0 - smoothstep(0.012, 0.028, in.depth);
+    let alpha = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);

@@ -4,8 +4,8 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech_for, SoilField,
-    SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
+    terramech_for, wheel_buoyancy, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -230,6 +230,7 @@ impl Vehicle {
                     up_y,
                     self.wheels[i].slip,
                     terramech_for(sample.kind(), sample.softness, sample.water),
+                    sample.water,
                 )
             };
 
@@ -341,7 +342,7 @@ impl Vehicle {
                     let dir_a = v_lat / speed_h;
                     chassis_long = blended_long - dir_l * (breakaway + f_visc);
                     chassis_lat = blended_lat - dir_a * (breakaway + f_visc);
-                    let rr = 0.025 * normal;
+                    let rr = rolling_resistance(normal, sample.water);
                     chassis_long -= v_long.signum() * rr;
                 }
 
@@ -671,33 +672,43 @@ fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, tm: crate::soil::Terramech) -> (f32, f32, f32) {
+fn solve_suspension(
+    z0: f32,
+    up_y: f32,
+    slip: f32,
+    tm: crate::soil::Terramech,
+    water: f32,
+) -> (f32, f32, f32) {
     // Slip-sinkage: a spinning tire sees a softer modulus and sinks further.
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;
     let z_of = |c: f32| (z0 - up_y * c).max(0.0);
     let soil_n = |c: f32| bekker_load(z_of(c), WHEEL_RADIUS, WHEEL_WIDTH, k_eq, tm.n);
+    // The spring balances soil plus the water the tread displaces, so a
+    // deeper sheet rides the tire higher.
+    let buoy = wheel_buoyancy(water, WHEEL_RADIUS, WHEEL_WIDTH);
+    let support = |c: f32| soil_n(c) + buoy;
 
     let at_droop = soil_n(0.0);
-    if at_droop <= 1.0 {
+    if at_droop <= 1.0 && buoy <= 1.0 {
         return (0.0, 0.0, 0.0);
     }
     // Droop stop: the ground is softer than the preloaded spring, so the arm
     // stays extended and only the soil force is passed into the chassis.
-    if at_droop < spring(0.0) {
-        return (0.0, z_of(0.0), at_droop.min(22_000.0));
+    if support(0.0) < spring(0.0) {
+        return (0.0, z_of(0.0), support(0.0).min(22_000.0));
     }
     // Bump stop: full compression and the soil is still harder than the spring.
-    if soil_n(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
+    if support(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
         let z = z_of(SUSP_TRAVEL);
-        return (SUSP_TRAVEL, z, soil_n(SUSP_TRAVEL).min(22_000.0));
+        return (SUSP_TRAVEL, z, support(SUSP_TRAVEL).min(22_000.0));
     }
 
     let mut lo = 0.0;
     let mut hi = SUSP_TRAVEL;
     for _ in 0..14 {
         let mid = 0.5 * (lo + hi);
-        if spring(mid) > soil_n(mid) {
+        if spring(mid) > support(mid) {
             hi = mid;
         } else {
             lo = mid;

@@ -746,9 +746,11 @@ fn states_grip_camera(world: &World) -> CameraPose {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn states_water_camera() -> CameraPose {
+    // Down into the groove, so the film and the slurry are the floor mesh
+    // and not an edge-on plane. Clay film nearer, fresh-cut slurry beyond.
     CameraPose {
-        eye: Vec3::new(-6.15, 1.55, -1.35),
-        target: Vec3::new(-4.35, 0.02, 0.2),
+        eye: Vec3::new(-0.42, 2.05, -1.72),
+        target: Vec3::new(0.02, -0.08, -1.22),
         ortho_width: None,
     }
 }

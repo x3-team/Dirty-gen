@@ -263,6 +263,29 @@ pub fn softness_of(wetness: f32, loose: f32, water: f32) -> f32 {
     (wetness.clamp(0.0, 1.0) * 0.48 + depth * 0.34 + loose_n * 0.22).clamp(0.0, 1.0)
 }
 
+/// Upward force from the water the tire is sitting in. A film barely lifts.
+/// Deeper slurry displaces more, so the wheel floats higher.
+pub fn wheel_buoyancy(depth: f32, radius: f32, width: f32) -> f32 {
+    let radius = radius.max(1.0e-3);
+    let d = depth.clamp(0.0, radius * 1.85);
+    if d <= 1.0e-4 || width <= 0.0 {
+        return 0.0;
+    }
+    // Circular segment of the tire cross-section, times the tread width.
+    let c = ((radius - d) / radius).clamp(-1.0, 1.0);
+    let area = radius * radius * c.acos() - (radius - d) * (2.0 * radius * d - d * d).max(0.0).sqrt();
+    // Muddy water, not clear. Capped so a flooded cell cannot throw the chassis.
+    (area.max(0.0) * width * 1_150.0 * 9.81).min(4_500.0)
+}
+
+/// Longitudinal drag. Dry ground keeps the old 2.5% of the load. Standing
+/// water adds drag in proportion to depth, so a film and a slurry do not roll
+/// the same.
+pub fn rolling_resistance(normal: f32, depth: f32) -> f32 {
+    let n = normal.max(0.0);
+    n * (0.025 + 0.70 * depth.max(0.0))
+}
+
 pub fn contact_length(radius: f32, sinkage: f32) -> f32 {
     let z = sinkage.clamp(0.0, radius * 0.98);
     2.0 * (2.0 * radius * z - z * z).max(0.0).sqrt()
@@ -484,9 +507,10 @@ impl SoilField {
         field
     }
 
-    /// Flat pad with a torn rut, a grip boundary, and film beside deep slurry.
-    /// The pictures are this field. The rut is stamped by the same wheel path
-    /// the lap uses, so the lip is the solver's lip.
+    /// Flat pad with a torn rut and a grip boundary. Film and deep slurry
+    /// sit in that rut, on the soil the tire cut. The pictures are this field.
+    /// The rut is stamped by the same wheel path the lap uses, so the lip is
+    /// the solver's lip.
     pub fn gallery() -> Self {
         let mut field = Self::flat(0.16);
         let res = field.res;
@@ -512,30 +536,6 @@ impl SoilField {
                         field.water[idx] = 0.0;
                         field.loose[idx] = 0.03;
                         field.roughness[idx] = 0.42;
-                    }
-                }
-                if (-5.5..-3.25).contains(&x) {
-                    if z < -0.15 {
-                        field.kind[idx] = SurfaceKind::PackedClay as u8;
-                        field.wetness[idx] = 0.55;
-                        field.base_wetness[idx] = 0.5;
-                        field.water[idx] = 0.036;
-                        field.loose[idx] = 0.0;
-                        field.roughness[idx] = 0.28;
-                        field.darken[idx] = 0.8;
-                    } else if z > 0.4 {
-                        field.kind[idx] = SurfaceKind::WetMud as u8;
-                        field.wetness[idx] = 1.0;
-                        field.base_wetness[idx] = 0.95;
-                        field.water[idx] = 0.16;
-                        field.loose[idx] = 0.05;
-                        field.roughness[idx] = 0.22;
-                    } else {
-                        field.kind[idx] = SurfaceKind::DryCrust as u8;
-                        field.wetness[idx] = 0.22;
-                        field.base_wetness[idx] = 0.2;
-                        field.water[idx] = 0.022;
-                        field.roughness[idx] = 0.9;
                     }
                 }
                 if x < -6.2 && hash2(i as f32, j as f32) > 0.55 {
@@ -589,6 +589,43 @@ impl SoilField {
                 if x.abs() < 0.5 {
                     field.kind[idx] = SurfaceKind::FreshCut as u8;
                     field.darken[idx] = field.darken[idx].min(0.4);
+                }
+            }
+        }
+        // Pour into the groove only. A rectangle on the pad reads as a lid.
+        // The near stretch is a film on packed clay. Past it, the fresh cut
+        // holds a deep slurry. The lip and the berm stay dry.
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let dug = (field.initial_height[idx] - field.bed[idx]).max(0.0);
+                if dug < 0.02 || x.abs() > 0.30 {
+                    continue;
+                }
+                let floor = SurfaceKind::from_u8(field.kind[idx]);
+                if !matches!(
+                    floor,
+                    SurfaceKind::FreshCut | SurfaceKind::PackedClay | SurfaceKind::WetMud
+                ) {
+                    continue;
+                }
+                // The seam bends with the groove so the two regimes are not a
+                // straight card edge. Every wet cell is one or the other.
+                // High frequency across the groove, so the seam is not one straight cut.
+                let seam = -1.18 + (noise2(x * 5.5, z * 1.7) - 0.5) * 0.55;
+                if z > -2.4 && z < seam {
+                    field.kind[idx] = SurfaceKind::PackedClay as u8;
+                    field.water[idx] = 0.034;
+                    field.wetness[idx] = 0.55;
+                    field.darken[idx] = 0.32;
+                    field.roughness[idx] = 0.72;
+                } else if z >= seam && z < -0.15 {
+                    field.kind[idx] = SurfaceKind::FreshCut as u8;
+                    field.water[idx] = 0.15;
+                    field.wetness[idx] = 1.0;
+                    field.darken[idx] = field.darken[idx].min(0.45);
                 }
             }
         }
@@ -1618,6 +1655,20 @@ mod tests {
         assert!(water_hold(SurfaceKind::PackedClay) > water_hold(SurfaceKind::Gravel));
         assert!(water_conduct(SurfaceKind::Gravel) > water_conduct(SurfaceKind::PackedClay));
         assert_eq!(SURFACE_STATE_COUNT, 12);
+        let load = 4_000.0;
+        let dry_rr = rolling_resistance(load, 0.0);
+        let film_rr = rolling_resistance(load, 0.03);
+        let slurry_rr = rolling_resistance(load, 0.15);
+        assert!(film_rr > dry_rr * 1.4, "a film should drag more than dry ground");
+        assert!(slurry_rr > film_rr * 2.0, "slurry should drag more than a film");
+        let float_film = wheel_buoyancy(0.03, 0.38, 0.28);
+        let float_slurry = wheel_buoyancy(0.15, 0.38, 0.28);
+        assert!(wheel_buoyancy(0.0, 0.38, 0.28) < 1.0);
+        assert!(float_film > 5.0, "a film should lift the tire a little, {float_film}");
+        assert!(
+            float_slurry > float_film * 3.0,
+            "deeper water should float the tire more, {float_film} -> {float_slurry}"
+        );
     }
 
     #[test]
@@ -1770,5 +1821,26 @@ mod tests {
             "gallery berm is too flat to sit beside the lip, {}",
             berm.placed
         );
+        let film = gallery.sample(0.0, -1.7);
+        assert_eq!(film.kind(), SurfaceKind::PackedClay);
+        assert_eq!(
+            liquid_regime(film.kind(), film.water),
+            LiquidRegime::Film,
+            "clay in the rut should hold a film, water {}",
+            film.water
+        );
+        let slurry = gallery.sample(0.0, -0.7);
+        assert_eq!(slurry.kind(), SurfaceKind::FreshCut);
+        assert_eq!(
+            liquid_regime(slurry.kind(), slurry.water),
+            LiquidRegime::Slurry,
+            "the fresh cut should hold slurry, water {}",
+            slurry.water
+        );
+        assert!(
+            gallery.sample(-4.2, 0.2).water < 0.004,
+            "water left the rut"
+        );
+        assert!(gallery.sample(0.7, -1.0).water < 0.004, "the berm is wet");
     }
 }
