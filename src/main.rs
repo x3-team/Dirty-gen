@@ -15,10 +15,24 @@ use web_time::Instant;
 use glam::Vec3;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+/// Chase-camera distance. Scroll multiplies this; the wheel cannot pass the ends.
+const ORBIT_DIST_MIN: f32 = 2.6;
+const ORBIT_DIST_MAX: f32 = 24.0;
+const ORBIT_DIST_DEFAULT: f32 = 8.4;
+/// Same pitch stops R and F already used.
+const ORBIT_PITCH_MIN: f32 = -0.35;
+const ORBIT_PITCH_MAX: f32 = 1.1;
+/// CSS pixels, so a high-DPI canvas does not orbit faster.
+const ORBIT_YAW_PER_PX: f32 = 0.0045;
+const ORBIT_PITCH_PER_PX: f32 = 0.0038;
+/// One mouse notch. Positive is scroll-up, which moves the camera closer.
+const ORBIT_ZOOM_PER_LINE: f32 = 0.16;
 
 use render::Renderer;
 #[cfg(not(target_arch = "wasm32"))]
@@ -86,7 +100,13 @@ struct App {
     keys: Keys,
     orbit_yaw: f32,
     orbit_pitch: f32,
+    orbit_dist: f32,
     chase_cam: bool,
+    /// Left button is down. A click with no travel only focuses the canvas.
+    dragging: bool,
+    /// Set once the drag is long enough to count as an orbit, not a click.
+    drag_orbit: bool,
+    last_cursor: Option<(f64, f64)>,
     drive_bike: bool,
     /// Set once the player presses a drive key. Until then both vehicles run
     /// the scripted lap. After that, the selected one takes the keys and the
@@ -167,6 +187,14 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::KeyF) => self.keys.orbit_down = down,
                     _ => {}
                 }
+            }
+            WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
+            WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
+            WindowEvent::MouseWheel { delta, .. } => self.on_scroll(delta),
+            WindowEvent::CursorLeft { .. } => self.last_cursor = None,
+            WindowEvent::Focused(false) => {
+                self.dragging = false;
+                self.drag_orbit = false;
             }
             WindowEvent::RedrawRequested => self.frame(),
             _ => {}
@@ -249,10 +277,12 @@ impl App {
             self.orbit_yaw += dt * 0.9;
         }
         if self.keys.orbit_up {
-            self.orbit_pitch = (self.orbit_pitch + dt * 0.7).min(1.1);
+            self.orbit_pitch =
+                (self.orbit_pitch + dt * 0.7).clamp(ORBIT_PITCH_MIN, ORBIT_PITCH_MAX);
         }
         if self.keys.orbit_down {
-            self.orbit_pitch = (self.orbit_pitch - dt * 0.7).max(-0.35);
+            self.orbit_pitch =
+                (self.orbit_pitch - dt * 0.7).clamp(ORBIT_PITCH_MIN, ORBIT_PITCH_MAX);
         }
         self.acc += dt;
         let step = 1.0 / 60.0;
@@ -286,7 +316,13 @@ impl App {
             (self.world.vehicle.pos, self.world.vehicle.yaw)
         };
         let pose = if self.chase_cam {
-            chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
+            chase(
+                cam_pos,
+                cam_yaw,
+                self.orbit_yaw,
+                self.orbit_pitch,
+                self.orbit_dist,
+            )
         } else {
             demo_camera(
                 self.world.time,
@@ -356,20 +392,101 @@ impl App {
         self.renderer = Some(ready.renderer);
         true
     }
+
+    fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if button != MouseButton::Left {
+            return;
+        }
+        self.dragging = state == ElementState::Pressed;
+        if !self.dragging {
+            self.drag_orbit = false;
+        }
+    }
+
+    fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor())
+            .unwrap_or(1.0)
+            .max(0.1);
+        let x = position.x / scale;
+        let y = position.y / scale;
+        if self.dragging {
+            if let Some((lx, ly)) = self.last_cursor {
+                let dx = (x - lx) as f32;
+                let dy = (y - ly) as f32;
+                // A plain click focuses the page. Orbit starts once the pointer travels.
+                if !self.drag_orbit && (dx.abs() > 2.0 || dy.abs() > 2.0) {
+                    self.drag_orbit = true;
+                    self.chase_cam = true;
+                }
+                if self.drag_orbit {
+                    let (yaw, pitch) = orbit_from_drag(self.orbit_yaw, self.orbit_pitch, dx, dy);
+                    self.orbit_yaw = yaw;
+                    self.orbit_pitch = pitch;
+                }
+            }
+        }
+        self.last_cursor = Some((x, y));
+    }
+
+    fn on_scroll(&mut self, delta: MouseScrollDelta) {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor())
+            .unwrap_or(1.0)
+            .max(0.1);
+        let lines = scroll_lines(delta, scale);
+        if lines.abs() < 1.0e-4 {
+            return;
+        }
+        self.chase_cam = true;
+        self.orbit_dist = orbit_distance(self.orbit_dist, lines);
+    }
 }
 
-fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
+/// Third-person orbit around the selected vehicle. `yaw` is the vehicle heading,
+/// so the camera stays on the same side of the machine as it steers. `orbit_yaw`
+/// and `orbit_pitch` are the Q / E / R / F offsets. `distance` is the scroll zoom.
+fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32, distance: f32) -> CameraPose {
     let yaw = yaw + orbit_yaw;
+    let elevation = orbit_elevation(orbit_pitch);
+    let distance = distance.clamp(ORBIT_DIST_MIN, ORBIT_DIST_MAX);
+    let horizontal = elevation.cos() * distance;
+    let height = elevation.sin() * distance;
     let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
-    let right = Vec3::new(forward.z, 0.0, -forward.x);
-    let dist = 7.4;
-    let height = 2.7 + orbit_pitch * 2.4;
-    let eye = pos - forward * dist + Vec3::Y * height + right * 0.85;
-    let target = pos + forward * 1.8 + Vec3::Y * 0.55;
+    let target = pos + Vec3::Y * 0.55;
+    let eye = target - forward * horizontal + Vec3::Y * height;
     CameraPose {
         eye,
         target,
         ortho_width: None,
+    }
+}
+
+fn orbit_elevation(pitch: f32) -> f32 {
+    (0.35 + pitch * 0.72).clamp(0.08, 1.20)
+}
+
+/// Drag right looks right. Drag up raises the camera. Pitch stays on the key stops.
+fn orbit_from_drag(yaw: f32, pitch: f32, dx: f32, dy: f32) -> (f32, f32) {
+    let yaw = yaw + dx * ORBIT_YAW_PER_PX;
+    let pitch = (pitch - dy * ORBIT_PITCH_PER_PX).clamp(ORBIT_PITCH_MIN, ORBIT_PITCH_MAX);
+    (yaw, pitch)
+}
+
+/// `lines` is positive when the wheel scrolls up. That shortens the radius.
+fn orbit_distance(current: f32, lines: f32) -> f32 {
+    (current * (-lines * ORBIT_ZOOM_PER_LINE).exp()).clamp(ORBIT_DIST_MIN, ORBIT_DIST_MAX)
+}
+
+fn scroll_lines(delta: MouseScrollDelta, scale: f64) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        // winit reports wheel pixels in physical pixels. A notch is about a hundred CSS pixels.
+        MouseScrollDelta::PixelDelta(pos) => (pos.y / scale / 100.0) as f32,
     }
 }
 
@@ -403,7 +520,11 @@ fn run_window() {
         },
         orbit_yaw: 0.0,
         orbit_pitch: 0.0,
+        orbit_dist: ORBIT_DIST_DEFAULT,
         chase_cam: false,
+        dragging: false,
+        drag_orbit: false,
+        last_cursor: None,
         drive_bike: false,
         player_drove: false,
         acc: 0.0,
@@ -798,4 +919,68 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
         srgb: format.is_srgb(),
         label,
     })
+}
+
+#[cfg(test)]
+mod orbit_tests {
+    use super::*;
+
+    #[test]
+    fn orbit_stays_on_the_selected_vehicle() {
+        let pos = Vec3::new(3.0, 0.7, -4.0);
+        let pose = chase(pos, 0.4, 0.0, 0.0, ORBIT_DIST_DEFAULT);
+        assert!((pose.target.x - pos.x).abs() < 1.0e-4);
+        assert!((pose.target.z - pos.z).abs() < 1.0e-4);
+        assert!(pose.target.y > pos.y);
+        assert!(pose.ortho_width.is_none());
+
+        let forward = Vec3::new(0.4_f32.sin(), 0.0, 0.4_f32.cos());
+        let behind = Vec3::new(pose.eye.x - pose.target.x, 0.0, pose.eye.z - pose.target.z);
+        assert!(
+            behind.dot(forward) < -1.0,
+            "the default eye sits behind the nose"
+        );
+        assert!(pose.eye.y > pose.target.y);
+
+        let swung = chase(
+            pos,
+            0.4,
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+            ORBIT_DIST_DEFAULT,
+        );
+        assert!((swung.target - pose.target).length() < 1.0e-4);
+        assert!(swung.eye.distance(pose.eye) > 2.0);
+
+        let far = chase(pos, 0.4, 0.0, 0.0, 16.0);
+        assert!(far.eye.distance(far.target) > pose.eye.distance(pose.target) + 4.0);
+        assert!((far.target - pose.target).length() < 1.0e-4);
+    }
+
+    #[test]
+    fn drag_and_wheel_share_the_chase_orbit() {
+        let (yaw, pitch) = orbit_from_drag(0.0, 0.0, 40.0, 0.0);
+        assert!(yaw > 0.1, "drag right looks right");
+        assert!(pitch.abs() < 1.0e-5);
+
+        let (_yaw, raised) = orbit_from_drag(0.0, 0.0, 0.0, -30.0);
+        assert!(raised > 0.05, "drag up raises the camera");
+        let (_yaw, capped) = orbit_from_drag(0.0, ORBIT_PITCH_MAX, 0.0, -80.0);
+        assert!((capped - ORBIT_PITCH_MAX).abs() < 1.0e-5);
+
+        let closer = orbit_distance(ORBIT_DIST_DEFAULT, 1.0);
+        let farther = orbit_distance(ORBIT_DIST_DEFAULT, -1.0);
+        assert!(closer < ORBIT_DIST_DEFAULT);
+        assert!(farther > ORBIT_DIST_DEFAULT);
+        assert!((orbit_distance(ORBIT_DIST_MIN, 4.0) - ORBIT_DIST_MIN).abs() < 1.0e-4);
+        assert!((orbit_distance(ORBIT_DIST_MAX, -4.0) - ORBIT_DIST_MAX).abs() < 1.0e-4);
+
+        let lines = scroll_lines(MouseScrollDelta::LineDelta(0.0, 1.0), 1.0);
+        assert!((lines - 1.0).abs() < 1.0e-5);
+        let pixels = scroll_lines(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 200.0)),
+            2.0,
+        );
+        assert!((pixels - 1.0).abs() < 1.0e-5);
+    }
 }

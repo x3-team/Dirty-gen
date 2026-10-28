@@ -42,15 +42,17 @@ cargo test
 | C | Toggle the chase camera. The default is a fixed isometric view of the loop. Chase follows whichever vehicle V selected |
 | Q / E | Orbit the chase camera |
 | R / F | Raise / lower the chase camera |
+| Mouse drag | Orbit that camera around the vehicle V selected. The drag leaves the isometric view |
+| Wheel | Zoom the chase camera in and out |
 | Esc | Quit |
 
-The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V.
+The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V. Dragging the mouse walks around that vehicle, and the wheel sets how far the camera sits. Q, E, R and F move the same orbit. C returns to the isometric view.
 
 Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
 
 ## Браузер
 
-Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. Пока не нажата педаль, багги и мотоцикл сами едут круг. Первая клавиша газа, тормоза или руля забирает выбранную машину; вторая продолжает круг. V переключает, кого ведёте. Скорость на западной прямой (справа в этом виде) по-прежнему срывает машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.
+Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. Тяните мышь, чтобы обойти выбранную машину по орбите, колесо приближает и отдаляет; C возвращает изометрию. Q, E, R и F крутят ту же погоню. Пока не нажата педаль, багги и мотоцикл сами едут круг. Первая клавиша газа, тормоза или руля забирает выбранную машину; вторая продолжает круг. V переключает, кого ведёте. Скорость на западной прямой (справа в этом виде) по-прежнему срывает машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.
 
 Нужен [trunk](https://trunkrs.dev/). Из корня репозитория:
 
@@ -69,6 +71,8 @@ trunk serve --release
 | C | камера погони. По умолчанию изометрия. Погоня следует за выбранной машиной |
 | Q / E | орбита камеры погони |
 | R / F | выше / ниже |
+| Тянуть мышь | орбита вокруг машины, которую выбрал V. Жест уходит с изометрии на погоню |
+| Колесо | ближе и дальше |
 | Esc | выход |
 
 Адрес с `?gl` принудительно включает WebGL2.
