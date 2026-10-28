@@ -4,7 +4,7 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
     terramech_for, wheel_buoyancy, SoilField, SoilSample,
 };
 
@@ -551,7 +551,7 @@ impl Vehicle {
         for c in contacts.iter() {
             let w = &mut self.wheels[c.index];
             if c.active {
-                let wet = c.sample.wetness;
+                let wet = c.sample.wetness * stick_scale(c.sample.kind(), c.sample.wetness);
                 let loose = c.sample.loose;
                 let pressure = (c.normal / 1_500.0).clamp(0.0, 2.5);
                 let room = (1.0 - w.mud / WHEEL_MUD_CAP).clamp(0.0, 1.0);

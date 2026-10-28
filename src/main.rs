@@ -444,6 +444,7 @@ struct CaptureArgs {
     cc0: bool,
     states: bool,
     volume: bool,
+    moisture: bool,
     video: PathBuf,
     still_start: PathBuf,
     still_puddle: PathBuf,
@@ -457,6 +458,8 @@ struct CaptureArgs {
     volume_berm: PathBuf,
     volume_slope: PathBuf,
     volume_second: PathBuf,
+    moisture_wet: PathBuf,
+    moisture_dry: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -488,6 +491,10 @@ fn capture(args: &[String]) {
     }
     if parsed.volume {
         capture_volume(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.moisture {
+        capture_moisture(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -625,6 +632,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut cc0 = false;
     let mut states = false;
     let mut volume = false;
+    let mut moisture = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -638,6 +646,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut volume_berm = PathBuf::from(format!("{MEDIA}/volume-berm.png"));
     let mut volume_slope = PathBuf::from(format!("{MEDIA}/volume-slope.png"));
     let mut volume_second = PathBuf::from(format!("{MEDIA}/volume-second.png"));
+    let mut moisture_wet = PathBuf::from(format!("{MEDIA}/moisture-wet.png"));
+    let mut moisture_dry = PathBuf::from(format!("{MEDIA}/moisture-dry.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -657,6 +667,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--cc0" => cc0 = true,
             "--states" => states = true,
             "--volume" => volume = true,
+            "--moisture" => moisture = true,
+            "--moisture-wet" => moisture_wet = PathBuf::from(val(&mut i)),
+            "--moisture-dry" => moisture_dry = PathBuf::from(val(&mut i)),
             "--volume-berm" => volume_berm = PathBuf::from(val(&mut i)),
             "--volume-slope" => volume_slope = PathBuf::from(val(&mut i)),
             "--volume-second" => volume_second = PathBuf::from(val(&mut i)),
@@ -685,6 +698,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         cc0,
         states,
         volume,
+        moisture,
         video,
         still_start,
         still_puddle,
@@ -698,6 +712,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         volume_berm,
         volume_slope,
         volume_second,
+        moisture_wet,
+        moisture_dry,
     }
 }
 
@@ -847,6 +863,97 @@ fn print_volumes(label: &str, soil: &silt::soil::SoilField) {
         "{label} cut {:.4} m3  placed {:.4} m3  berm {:.4} m3  clods {:.4} m3  rut {:.4} m  berm height {:.4} m",
         v.cut, v.placed, v.berm, v.clods, v.max_rut, v.max_berm
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_moisture(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::SoilField;
+
+    let mut world = World::flat(0.2);
+    world.bike.pos = Vec3::new(14.0, 0.4, -14.0);
+    park_off(&mut world);
+    world.soil = SoilField::moisture_scene();
+    let wet = moisture_clay(&world.soil);
+    print_moisture("wet", &wet);
+    print_volumes("wet", &world.soil);
+    write_cc0_still(
+        renderer,
+        &world,
+        "wet",
+        &parsed.moisture_wet,
+        parsed,
+        moisture_camera(),
+    );
+
+    let cut = world.soil.cut_volume();
+    let placed = world.soil.placed_volume();
+    world.soil.advance_weather(150.0, 0.0);
+    let dry = moisture_clay(&world.soil);
+    print_moisture("dry", &dry);
+    print_volumes("dry", &world.soil);
+    println!(
+        "grip mu {:+.3}  ({:.3} -> {:.3})  phi {:.3} -> {:.3}  sink {:+.4} m  stick {:+.0} Pa",
+        dry.mu - wet.mu,
+        wet.mu,
+        dry.mu,
+        wet.phi,
+        dry.phi,
+        dry.sink - wet.sink,
+        dry.stick - wet.stick
+    );
+    let cut_after = world.soil.cut_volume();
+    let placed_after = world.soil.placed_volume();
+    println!(
+        "volume cut {cut:.4} -> {cut_after:.4}  placed {placed:.4} -> {placed_after:.4}"
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "dry",
+        &parsed.moisture_dry,
+        parsed,
+        moisture_camera(),
+    );
+}
+
+struct ClayRead {
+    mu: f32,
+    phi: f32,
+    sink: f32,
+    stick: f32,
+    kind: silt::soil::SurfaceKind,
+    wetness: f32,
+}
+
+fn moisture_clay(soil: &silt::soil::SoilField) -> ClayRead {
+    use silt::soil::{grip_mu, sinkage_on, stickiness, terramech_for};
+    let s = soil.sample(0.78, 0.0);
+    let kind = s.kind();
+    ClayRead {
+        mu: grip_mu(kind, s.wetness, s.loose, s.water),
+        phi: terramech_for(kind, s.softness, s.water).phi,
+        sink: sinkage_on(1_600.0, kind, s.wetness, s.loose, s.water, 0.38, 0.28),
+        stick: stickiness(kind, s.wetness, s.loose, s.water),
+        kind,
+        wetness: s.wetness,
+    }
+}
+
+fn print_moisture(label: &str, c: &ClayRead) {
+    println!(
+        "{label} kind {:?}  wetness {:.3}  grip mu {:.3}  phi {:.3}  sink {:.4} m  stick {:.0} Pa",
+        c.kind, c.wetness, c.mu, c.phi, c.sink, c.stick
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn moisture_camera() -> CameraPose {
+    // Silt in the left foreground, the clay rut in the middle, sand and gravel to the right.
+    CameraPose {
+        eye: Vec3::new(-2.15, 1.02, 2.25),
+        target: Vec3::new(0.28, 0.0, 0.05),
+        ortho_width: None,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

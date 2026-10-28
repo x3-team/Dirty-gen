@@ -225,17 +225,19 @@ fn kind_of(ij: vec2<i32>) -> u32 {
 }
 
 // 0 mud_forest, 1 brown_mud_dry, 2 clay, 3 grass, 4 gravel.
+// Sand (10) and silt (11) start from the dry map and get their own tint.
 fn layer_of(kind: u32) -> i32 {
     if (kind == 1u) { return 3; }
     if (kind == 2u) { return 4; }
     if (kind == 9u) { return 2; }
-    if (kind == 0u || kind == 3u || kind == 7u) { return 1; }
+    if (kind == 0u || kind == 3u || kind == 7u || kind == 10u || kind == 11u) { return 1; }
     return 0;
 }
 
 fn disp_scale(kind: u32) -> f32 {
     if (kind == 6u) { return 0.16; }
-    if (kind == 2u || kind == 3u) { return 0.006; }
+    if (kind == 2u || kind == 3u || kind == 11u) { return 0.006; }
+    if (kind == 10u) { return 0.02; }
     if (kind == 8u) { return 0.05; }
     // Packed clay and the fresh cut keep their map relief, so a film
     // and a slurry sit in the groove instead of on a flat card.
@@ -479,7 +481,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     var ts = ntex * 2.0 - vec3<f32>(1.0);
     // Dry crust and gravel stay flatter. The torn lip keeps the mud normal.
     var n_gain = 1.0;
-    if (kind == 2u || kind == 3u) { n_gain = 0.28; }
+    if (kind == 2u || kind == 3u || kind == 10u || kind == 11u) { n_gain = 0.28; }
     else if (kind == 6u) { n_gain = 1.7; }
     else if (kind == 8u) { n_gain = 1.35; }
     else if (kind == 5u) { n_gain = 1.35; }
@@ -506,6 +508,17 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         albedo = mix(albedo, albedo * vec3<f32>(0.72, 0.58, 0.42), 0.28);
     } else if (kind == 5u) {
         albedo = mix(albedo, albedo * vec3<f32>(0.62, 0.5, 0.38), 0.22);
+    } else if (kind == 3u) {
+        // Baked crust: pale and matte, not the dark lane it dried out of.
+        albedo = mix(albedo, albedo * vec3<f32>(1.22, 1.1, 0.9), 0.7);
+    } else if (kind == 10u) {
+        // Sand stays a warm grain. Moisture darkens it a little. It does not turn into clay.
+        albedo = albedo * vec3<f32>(1.28, 1.08, 0.7);
+        albedo = mix(albedo, albedo * vec3<f32>(0.82, 0.74, 0.58), smoothstep(0.15, 0.55, wet) * 0.55);
+    } else if (kind == 11u) {
+        // Silt is a gray flour. Wet silt goes dark. Dry silt stays lighter than clay.
+        albedo = albedo * vec3<f32>(0.98, 0.94, 0.82);
+        albedo = mix(albedo, albedo * vec3<f32>(0.52, 0.48, 0.42), smoothstep(0.2, 0.85, wet));
     }
 
     let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
@@ -529,6 +542,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         // Keep the clay and mud grain. The shore roughness was the card.
         rough_out = mix(rough_map, max(rough_map, 0.58), depth_t);
     }
+    if (kind == 3u) { rough_out = max(rough_out, 0.8); }
+    if (kind == 10u) { rough_out = max(rough_out, 0.74); }
+    if (kind == 11u) { rough_out = mix(rough_out, 0.2, smoothstep(0.35, 0.85, wet)); }
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
     // A wide lobe on the shore is the wet sheen. Inside the cut it stays small

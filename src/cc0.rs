@@ -597,7 +597,7 @@ fn place_props() -> CpuMesh {
         }
         // Keep the surface-state stills clear of blades: the rut, the grip
         // stripe, and the film/slurry patch.
-        let on_still = (x.abs() < 1.7 && z.abs() < 3.3)
+        let on_still = (x.abs() < 2.5 && z.abs() < 3.4)
             || ((2.4..6.4).contains(&x) && (-1.6..2.0).contains(&z))
             || ((-6.6..-2.6).contains(&x) && (-2.4..1.8).contains(&z));
         if on_still {

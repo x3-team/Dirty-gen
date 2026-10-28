@@ -31,6 +31,10 @@ pub enum SurfaceKind {
     Berm = 7,
     PlacedClod = 8,
     PackedClay = 9,
+    /// Loose grains. They drain, they do not crust, and they do not slurry.
+    Sand = 10,
+    /// Fine flour. It holds water, goes slick, and stays silt.
+    Silt = 11,
 }
 
 /// How standing water sits on a soil kind.
@@ -42,7 +46,8 @@ pub enum LiquidRegime {
 }
 
 /// Soil kinds plus the two liquid regimes the solver treats as states.
-pub const SURFACE_STATE_COUNT: usize = 12;
+/// Sand and silt are their own soils, so this is twelve soils and two liquids.
+pub const SURFACE_STATE_COUNT: usize = 14;
 
 /// Crest chunks stay lumps. Later passes put the rest of the cut on the berm.
 const CREST_CLOD_CAP: f32 = 0.04;
@@ -59,6 +64,8 @@ impl SurfaceKind {
             7 => Self::Berm,
             8 => Self::PlacedClod,
             9 => Self::PackedClay,
+            10 => Self::Sand,
+            11 => Self::Silt,
             _ => Self::Undisturbed,
         }
     }
@@ -68,7 +75,7 @@ impl SurfaceKind {
         match self {
             Self::Grass => 3,
             Self::Gravel => 4,
-            Self::DryCrust | Self::Undisturbed | Self::Berm => 1,
+            Self::DryCrust | Self::Undisturbed | Self::Berm | Self::Sand | Self::Silt => 1,
             Self::PackedClay => 2,
             Self::WetMud | Self::FreshCut | Self::CutLip | Self::PlacedClod => 0,
         }
@@ -81,8 +88,11 @@ pub fn liquid_regime(kind: SurfaceKind, water: f32) -> LiquidRegime {
     }
     let slurry_at = match kind {
         SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay => 0.045,
+        SurfaceKind::Silt => 0.06,
         SurfaceKind::CutLip | SurfaceKind::PlacedClod | SurfaceKind::Berm => 0.11,
-        _ => 10.0,
+        // Sand and gravel drain. A film can sit for a moment. It does not bog.
+        SurfaceKind::Sand | SurfaceKind::Gravel | SurfaceKind::DryCrust | SurfaceKind::Grass
+        | SurfaceKind::Undisturbed => 10.0,
     };
     if water >= slurry_at {
         LiquidRegime::Slurry
@@ -96,6 +106,7 @@ pub fn water_hold(kind: SurfaceKind) -> f32 {
     match kind {
         SurfaceKind::Gravel => 0.0,
         SurfaceKind::CutLip => 0.001,
+        SurfaceKind::Sand => 0.002,
         SurfaceKind::DryCrust => 0.002,
         SurfaceKind::Undisturbed => 0.003,
         SurfaceKind::PlacedClod => 0.003,
@@ -103,6 +114,7 @@ pub fn water_hold(kind: SurfaceKind) -> f32 {
         SurfaceKind::Berm => 0.004,
         SurfaceKind::PackedClay => 0.009,
         SurfaceKind::WetMud => 0.012,
+        SurfaceKind::Silt => 0.014,
         SurfaceKind::FreshCut => 0.02,
     }
 }
@@ -111,6 +123,7 @@ pub fn water_hold(kind: SurfaceKind) -> f32 {
 pub fn water_conduct(kind: SurfaceKind) -> f32 {
     match kind {
         SurfaceKind::Gravel => 2.4,
+        SurfaceKind::Sand => 1.85,
         SurfaceKind::CutLip => 1.7,
         SurfaceKind::Berm => 1.35,
         SurfaceKind::DryCrust => 1.25,
@@ -119,6 +132,7 @@ pub fn water_conduct(kind: SurfaceKind) -> f32 {
         SurfaceKind::Grass => 0.85,
         SurfaceKind::WetMud => 0.9,
         SurfaceKind::FreshCut => 0.5,
+        SurfaceKind::Silt => 0.36,
         SurfaceKind::PackedClay => 0.32,
     }
 }
@@ -200,7 +214,31 @@ pub fn terramech_for(kind: SurfaceKind, softness: f32, water: f32) -> Terramech 
         SurfaceKind::Undisturbed => scale_mech(base, 1.12, 1.05, 0.52, 0.040, 0.9, 0.85),
         SurfaceKind::Grass => scale_mech(base, 1.28, 1.65, 0.46, 0.055, 1.05, 0.7),
         SurfaceKind::Gravel => scale_mech(base, 1.55, 0.22, 0.74, 0.016, 0.3, 0.18),
-        SurfaceKind::DryCrust => scale_mech(base, 1.32, 1.35, 0.60, 0.012, 0.5, 0.32),
+        SurfaceKind::DryCrust => {
+            // A damper crust still grips less than a baked one. The modulus stays high.
+            let mut tm = scale_mech(base, 1.32, 1.35, 0.60, 0.012, 0.5, 0.32);
+            tm.phi = lerp(0.66, 0.46, softness);
+            tm
+        }
+        SurfaceKind::Sand => {
+            // Dry sand is loose and frictional. Damp sand picks up a little
+            // capillary stick, then saturated sand weakens again. It never
+            // reaches a clay crust.
+            let mut tm = scale_mech(base, 0.92, 0.32, 0.64, 0.024, 0.32, 0.22);
+            let capillary = (1.0 - ((softness - 0.34) / 0.34).abs()).clamp(0.0, 1.0);
+            tm.phi = lerp(0.72, 0.36, softness);
+            tm.cohesion *= lerp(0.55, 1.6, capillary);
+            tm.k_eq *= lerp(1.08, 0.82, softness);
+            tm
+        }
+        SurfaceKind::Silt => {
+            // Dry silt is dusty. Wet silt is slick, sticky, and it sinks.
+            let mut tm = scale_mech(base, 0.70, 0.90, 0.28, 0.020, 0.85, 1.05);
+            tm.phi = lerp(0.50, 0.12, softness);
+            tm.cohesion *= lerp(0.45, 1.35, softness);
+            tm.k_eq *= lerp(1.15, 0.75, softness);
+            tm
+        }
         SurfaceKind::FreshCut => scale_mech(base, 0.78, 0.9, 0.17, 0.014, 1.2, 1.3),
         SurfaceKind::CutLip => scale_mech(base, 1.08, 0.62, 0.40, 0.022, 0.65, 0.55),
         SurfaceKind::Berm => scale_mech(base, 0.58, 0.38, 0.50, 0.070, 0.5, 0.65),
@@ -257,6 +295,62 @@ pub fn terramech(softness: f32) -> Terramech {
         yield_stress: lerp(140.0, 3_600.0, s_yield),
         viscosity: lerp(18.0, 150.0, s),
     }
+}
+
+/// How willingly mud cakes onto a tire. Wet clay is the old curve (scale 1).
+/// A crust, sand, and gravel barely stick. Silt sticks only while it is wet.
+pub fn stick_scale(kind: SurfaceKind, wetness: f32) -> f32 {
+    let w = wetness.clamp(0.0, 1.0);
+    match kind {
+        SurfaceKind::WetMud
+        | SurfaceKind::FreshCut
+        | SurfaceKind::PackedClay
+        | SurfaceKind::CutLip
+        | SurfaceKind::Berm
+        | SurfaceKind::PlacedClod => 1.0,
+        SurfaceKind::Silt => lerp(0.28, 1.3, w),
+        SurfaceKind::Sand => lerp(0.08, 0.32, w),
+        SurfaceKind::DryCrust => lerp(0.12, 0.38, w),
+        SurfaceKind::Gravel => 0.06,
+        SurfaceKind::Grass => 0.25,
+        SurfaceKind::Undisturbed => lerp(0.4, 0.75, w),
+    }
+}
+
+/// Friction coefficient the tire uses, `tan φ`, at this pore moisture.
+pub fn grip_mu(kind: SurfaceKind, wetness: f32, loose: f32, water: f32) -> f32 {
+    let tm = terramech_for(kind, softness_of(wetness, loose, water), water);
+    tm.phi.tan()
+}
+
+/// Cohesion (Pa). Wet clay sticks. A dry crust shears instead of smearing.
+pub fn stickiness(kind: SurfaceKind, wetness: f32, loose: f32, water: f32) -> f32 {
+    terramech_for(kind, softness_of(wetness, loose, water), water).cohesion
+}
+
+/// Sinkage (m) under `load` for this kind and pore moisture.
+pub fn sinkage_on(
+    load: f32,
+    kind: SurfaceKind,
+    wetness: f32,
+    loose: f32,
+    water: f32,
+    radius: f32,
+    width: f32,
+) -> f32 {
+    let tm = terramech_for(kind, softness_of(wetness, loose, water), water);
+    let mut lo = 0.0;
+    let mut hi = radius * 0.9;
+    for _ in 0..18 {
+        let mid = 0.5 * (lo + hi);
+        let w = bekker_load(mid, radius, width, tm.k_eq, tm.n);
+        if w < load {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 /// Wetness alone makes the ground heavy. Standing water and loose spoil
@@ -975,7 +1069,11 @@ impl SoilField {
                     // because a tire crossed it. Standing water keeps the cut slick.
                     self.kind[idx] = if matches!(
                         prev,
-                        SurfaceKind::Gravel | SurfaceKind::Grass | SurfaceKind::DryCrust
+                        SurfaceKind::Gravel
+                            | SurfaceKind::Grass
+                            | SurfaceKind::DryCrust
+                            | SurfaceKind::Sand
+                            | SurfaceKind::Silt
                     ) {
                         prev as u8
                     } else if self.water[idx] > 0.03 {
@@ -1173,8 +1271,17 @@ impl SoilField {
         }
     }
 
-    /// Virtual-pipe shallow water. Dry cells are skipped.
+    /// Virtual-pipe shallow water, then pore moisture. `rain` is metres per
+    /// second landing on the field. Nothing here moves the bed or the berm.
     pub fn step_water(&mut self, dt: f32) {
+        self.step_surface(dt, 0.0);
+    }
+
+    /// One weather step. Infiltration and the pipe move standing water.
+    /// [`step_moisture`](Self::step_moisture) dries clay toward a crust and
+    /// wets that crust again when rain or a pond is on it.
+    pub fn step_surface(&mut self, dt: f32, rain: f32) {
+        self.infiltrate(dt);
         let res = self.res;
         let dx = self.cell;
         let area = dx * dx;
@@ -1220,14 +1327,100 @@ impl SoilField {
             *w = w.clamp(0.0, 0.34);
         }
         self.water = next;
+        self.step_moisture(dt, rain);
+    }
 
-        let n = res * res;
+    /// Advance weather in quarter-second bites so a long dry spell stays stable.
+    pub fn advance_weather(&mut self, seconds: f32, rain: f32) {
+        if seconds <= 0.0 {
+            return;
+        }
+        let steps = (seconds / 0.25).ceil().max(1.0) as u32;
+        let dt = seconds / steps as f32;
+        for _ in 0..steps {
+            self.step_surface(dt, rain);
+        }
+    }
+
+    /// Gravel and sand lose standing water downward. Silt and clay do not.
+    fn infiltrate(&mut self, dt: f32) {
+        let n = self.water.len();
         for idx in 0..n {
-            if self.water[idx] > 0.004 {
-                self.wetness[idx] = (self.wetness[idx] + dt * 0.55).min(1.0);
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            let rate = match kind {
+                SurfaceKind::Gravel => 0.09,
+                SurfaceKind::Sand => 0.028,
+                _ => 0.0,
+            };
+            if rate <= 0.0 || self.water[idx] <= 0.0 {
+                continue;
+            }
+            let lost = (rate * dt).min(self.water[idx]);
+            self.water[idx] -= lost;
+            if kind == SurfaceKind::Sand {
+                self.wetness[idx] = (self.wetness[idx] + lost * 2.5).min(0.48);
             } else {
-                let base = self.base_wetness[idx];
-                self.wetness[idx] += (base - self.wetness[idx]) * (dt * 0.12).min(0.25);
+                self.wetness[idx] = (self.wetness[idx] - lost * 3.0).max(0.02);
+            }
+        }
+    }
+
+    /// Pore moisture over time. Wet clay dries toward a crust. Rain or
+    /// standing water turns that crust back into wet clay. Gravel stays a
+    /// draining gravel. Sand and silt keep their kinds and follow their own
+    /// wetness. The cut and the placed pile are not touched.
+    pub fn step_moisture(&mut self, dt: f32, rain: f32) {
+        let dt = dt.max(0.0);
+        let rain = rain.max(0.0);
+        let n = self.wetness.len();
+        for idx in 0..n {
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            if rain > 0.0 {
+                let catch = match kind {
+                    SurfaceKind::Gravel => 0.2,
+                    SurfaceKind::Sand => 0.5,
+                    SurfaceKind::Silt => 0.85,
+                    _ => 1.0,
+                };
+                self.water[idx] = (self.water[idx] + rain * catch * dt).min(0.34);
+            }
+            let hold = water_hold(kind);
+            let standing = self.water[idx] > hold + 0.004;
+            let wetting = standing || rain > 1.0e-6;
+            let target = if wetting {
+                wet_target(kind)
+            } else {
+                dry_target(kind, self.base_wetness[idx])
+            };
+            let rate = if wetting {
+                wet_rate(kind)
+            } else {
+                dry_rate(kind)
+            };
+            let a = 1.0 - (-rate * dt).exp();
+            self.wetness[idx] =
+                (self.wetness[idx] + (target - self.wetness[idx]) * a).clamp(0.0, 1.0);
+            if rain <= 0.0 && self.water[idx] > hold && !matches!(kind, SurfaceKind::Gravel | SurfaceKind::Sand)
+            {
+                let depth = self.water[idx] - hold;
+                // A film dries off. A deep pond only loses a skin, so a lap
+                // does not empty the infield.
+                let skin = if depth < 0.05 { 1.0 } else { 0.12 };
+                let exposed = depth.min(0.04) / 0.04;
+                let evap = film_evap(kind) * skin * exposed * dt;
+                self.water[idx] = (self.water[idx] - evap).max(0.0);
+            }
+            let next = evolve_kind(kind, self.wetness[idx], self.water[idx]);
+            if next != kind {
+                self.kind[idx] = next as u8;
+            }
+            if matches!(
+                next,
+                SurfaceKind::DryCrust | SurfaceKind::WetMud | SurfaceKind::Sand | SurfaceKind::Silt
+            ) {
+                let goal = lerp(0.94, 0.28, self.wetness[idx]);
+                let blend = 1.0 - (-0.35 * dt).exp();
+                self.roughness[idx] = lerp(self.roughness[idx], goal, blend);
             }
         }
     }
@@ -1519,6 +1712,83 @@ impl SoilField {
         field
     }
 
+    /// Clay pad with a rut, sand on the right, silt on the left, gravel at the
+    /// far corner. The wet picture is this field. Drying it is the dry picture.
+    /// The flanks sit outside the berm so the stamp does not turn them into spoil.
+    pub fn moisture_scene() -> Self {
+        let mut field = Self::flat(0.2);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if x.abs() > 2.35 || z.abs() > 2.7 {
+                    continue;
+                }
+                let idx = j * res + i;
+                field.kind[idx] = SurfaceKind::WetMud as u8;
+                field.wetness[idx] = 0.88;
+                field.base_wetness[idx] = 0.84;
+                field.water[idx] = 0.0;
+                field.loose[idx] = 0.02;
+                field.roughness[idx] = 0.4;
+                field.darken[idx] = 0.1;
+            }
+        }
+        field.roll_lane(
+            Vec3::new(0.0, 0.0, -1.2),
+            Vec3::new(0.0, 0.0, 1.2),
+            0.085,
+            0.32,
+        );
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                if (1.2..2.3).contains(&x) && (-2.5..1.25).contains(&z) {
+                    field.kind[idx] = SurfaceKind::Sand as u8;
+                    field.wetness[idx] = 0.22;
+                    field.base_wetness[idx] = 0.1;
+                    field.water[idx] = 0.0;
+                    field.loose[idx] = 0.01;
+                    field.roughness[idx] = 0.92;
+                    field.darken[idx] = 0.02;
+                } else if (-2.3..-1.2).contains(&x) && (-2.5..2.5).contains(&z) {
+                    field.kind[idx] = SurfaceKind::Silt as u8;
+                    field.wetness[idx] = 0.86;
+                    field.base_wetness[idx] = 0.3;
+                    field.water[idx] = 0.0;
+                    field.loose[idx] = 0.015;
+                    field.roughness[idx] = 0.48;
+                    field.darken[idx] = 0.06;
+                } else if (1.2..2.3).contains(&x) && (1.4..2.6).contains(&z) {
+                    field.kind[idx] = SurfaceKind::Gravel as u8;
+                    field.wetness[idx] = 0.05;
+                    field.base_wetness[idx] = 0.05;
+                    field.water[idx] = 0.0;
+                    field.loose[idx] = 0.0;
+                    field.roughness[idx] = 0.96;
+                    field.darken[idx] = 0.02;
+                }
+            }
+        }
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let dug = (field.initial_height[idx] - field.bed[idx]).max(0.0);
+                if dug > 0.02 && x.abs() < 0.28 {
+                    field.water[idx] = field.water[idx].max(0.03);
+                    field.wetness[idx] = field.wetness[idx].max(0.92);
+                }
+            }
+        }
+        field
+    }
+
     /// Two grooves on the lower face of a 0.42 ramp. The upper face is untouched.
     pub fn slope_scene() -> Self {
         let mut field = Self::sloped(0.42);
@@ -1601,8 +1871,16 @@ fn born_kind(x: f32, z: f32, wet: f32, water: f32) -> SurfaceKind {
     let far = (x * x + z * z).sqrt();
     let n = fbm2(x * 0.16, z * 0.16);
     let n2 = fbm2(x * 0.07 + 4.2, z * 0.07);
-    if far > 10.5 || (off > 4.8 && n2 > 0.58) {
+    if far > 13.2 || (off > 6.4 && n2 > 0.62) {
         return SurfaceKind::Gravel;
+    }
+    // Sand apron outside the gravel. It drains and does not become the lane.
+    if far > 10.4 && n2 > 0.34 {
+        return SurfaceKind::Sand;
+    }
+    // Silt sits off the racing line, in the pockets that hold a damp flour.
+    if off > 3.5 && off < 5.5 && n < 0.42 && wet < 0.58 {
+        return SurfaceKind::Silt;
     }
     if off > 2.5 && n > 0.46 && wet < 0.48 {
         return SurfaceKind::Grass;
@@ -1611,6 +1889,91 @@ fn born_kind(x: f32, z: f32, wet: f32, water: f32) -> SurfaceKind {
         return SurfaceKind::DryCrust;
     }
     SurfaceKind::Undisturbed
+}
+
+fn wet_target(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::Gravel => 0.07,
+        SurfaceKind::Sand => 0.4,
+        SurfaceKind::Silt => 0.9,
+        SurfaceKind::DryCrust
+        | SurfaceKind::WetMud
+        | SurfaceKind::PackedClay
+        | SurfaceKind::FreshCut => 0.93,
+        SurfaceKind::Grass => 0.42,
+        _ => 0.72,
+    }
+}
+
+fn dry_target(kind: SurfaceKind, base: f32) -> f32 {
+    match kind {
+        SurfaceKind::Gravel => 0.04,
+        SurfaceKind::Sand => 0.06,
+        SurfaceKind::Silt => 0.16,
+        // Clay ignores the authored base and bakes toward a crust.
+        SurfaceKind::WetMud | SurfaceKind::PackedClay | SurfaceKind::FreshCut | SurfaceKind::DryCrust => {
+            0.05
+        }
+        SurfaceKind::Grass => base.clamp(0.12, 0.4),
+        _ => base.clamp(0.1, 0.7),
+    }
+}
+
+fn wet_rate(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::Gravel => 0.12,
+        SurfaceKind::Sand => 0.4,
+        SurfaceKind::Silt => 0.48,
+        SurfaceKind::DryCrust
+        | SurfaceKind::WetMud
+        | SurfaceKind::PackedClay
+        | SurfaceKind::FreshCut => 0.62,
+        _ => 0.3,
+    }
+}
+
+fn dry_rate(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::Gravel => 1.4,
+        SurfaceKind::Sand => 0.28,
+        SurfaceKind::Silt => 0.014,
+        SurfaceKind::WetMud | SurfaceKind::PackedClay | SurfaceKind::FreshCut | SurfaceKind::DryCrust => {
+            0.026
+        }
+        SurfaceKind::Grass => 0.01,
+        // Undisturbed ground keeps the map's authored wetness.
+        _ => 0.006,
+    }
+}
+
+fn film_evap(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::WetMud | SurfaceKind::PackedClay | SurfaceKind::FreshCut | SurfaceKind::DryCrust => {
+            0.012
+        }
+        SurfaceKind::Silt => 0.0014,
+        _ => 0.001,
+    }
+}
+
+/// Wet clay below this pore moisture, with no pond, becomes a crust.
+const CRUST_AT: f32 = 0.34;
+/// A crust above this, or under standing water, is wet clay again.
+const REWET_AT: f32 = 0.44;
+
+fn evolve_kind(kind: SurfaceKind, wetness: f32, water: f32) -> SurfaceKind {
+    // Pore water the soil is allowed to hold is not a pond. A film thicker
+    // than that keeps the clay wet; once it is gone the crust can form.
+    let standing = water > water_hold(kind) + 0.012;
+    match kind {
+        SurfaceKind::WetMud | SurfaceKind::PackedClay | SurfaceKind::FreshCut
+            if wetness < CRUST_AT && !standing =>
+        {
+            SurfaceKind::DryCrust
+        }
+        SurfaceKind::DryCrust if wetness > REWET_AT || standing => SurfaceKind::WetMud,
+        other => other,
+    }
 }
 
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -1868,7 +2231,30 @@ mod tests {
         assert!(water_hold(SurfaceKind::FreshCut) > water_hold(SurfaceKind::CutLip));
         assert!(water_hold(SurfaceKind::PackedClay) > water_hold(SurfaceKind::Gravel));
         assert!(water_conduct(SurfaceKind::Gravel) > water_conduct(SurfaceKind::PackedClay));
-        assert_eq!(SURFACE_STATE_COUNT, 12);
+        let sand = terramech_for(SurfaceKind::Sand, s, 0.0);
+        let silt = terramech_for(SurfaceKind::Silt, s, 0.0);
+        assert!(
+            gravel.k_eq > sand.k_eq * 1.4,
+            "gravel should not sink like sand"
+        );
+        assert!(sand.k_eq > silt.k_eq, "wet-leaning silt sinks more than sand");
+        assert!(sand.phi > silt.phi + 0.15, "sand grips where silt is slick");
+        assert!(silt.cohesion > sand.cohesion, "silt sticks more than sand");
+        assert_eq!(liquid_regime(SurfaceKind::Sand, 0.1), LiquidRegime::Film);
+        assert_eq!(liquid_regime(SurfaceKind::Silt, 0.1), LiquidRegime::Slurry);
+        assert!(water_conduct(SurfaceKind::Gravel) > water_conduct(SurfaceKind::Sand));
+        assert!(water_conduct(SurfaceKind::Sand) > water_conduct(SurfaceKind::Silt));
+        assert!(water_hold(SurfaceKind::Silt) > water_hold(SurfaceKind::Sand));
+        assert!(water_hold(SurfaceKind::Sand) > water_hold(SurfaceKind::Gravel));
+        let dry_sand = terramech_for(SurfaceKind::Sand, 0.08, 0.0);
+        let wet_sand = terramech_for(SurfaceKind::Sand, 0.9, 0.0);
+        let dry_silt = terramech_for(SurfaceKind::Silt, 0.08, 0.0);
+        let wet_silt = terramech_for(SurfaceKind::Silt, 0.9, 0.0);
+        assert!(dry_sand.phi > wet_sand.phi, "sand loses grip as it wets");
+        assert!(dry_silt.phi > wet_silt.phi + 0.2, "silt goes slick when wet");
+        assert!(wet_silt.cohesion > dry_silt.cohesion, "wet silt sticks");
+        assert!(dry_sand.k_eq > wet_sand.k_eq, "saturated sand sinks more");
+        assert_eq!(SURFACE_STATE_COUNT, 14);
         let load = 4_000.0;
         let dry_rr = rolling_resistance(load, 0.0);
         let film_rr = rolling_resistance(load, 0.03);
@@ -2196,5 +2582,233 @@ mod tests {
         assert!(upper_rut > 0.02, "the upper pass did not cut");
         let after = volumes_match(&soil, "slope-after");
         assert!(after.cut > v.cut, "the upper pass added no volume");
+    }
+
+    fn clay_response(soil: &SoilField) -> (f32, f32, f32, SurfaceKind) {
+        let s = soil.sample(0.78, 0.0);
+        let mu = grip_mu(s.kind(), s.wetness, s.loose, s.water);
+        let sink = sinkage_on(1_600.0, s.kind(), s.wetness, s.loose, s.water, 0.38, 0.28);
+        let stick = stickiness(s.kind(), s.wetness, s.loose, s.water);
+        (mu, sink, stick, s.kind())
+    }
+
+    #[test]
+    fn wet_clay_dries_to_a_crust_and_rain_wets_it_again() {
+        let mut soil = SoilField::moisture_scene();
+        let bed = soil.bed.clone();
+        let placed = soil.placed.clone();
+        let before = soil.volumes();
+        assert!(before.cut > 1.0e-3, "scene did not cut");
+        let (wet_mu, wet_sink, wet_stick, wet_kind) = clay_response(&soil);
+        assert_eq!(wet_kind, SurfaceKind::WetMud, "shoulder should start as wet clay");
+        eprintln!(
+            "moisture wet  mu {wet_mu:.3}  sink {wet_sink:.4} m  stick {wet_stick:.0} Pa  kind {wet_kind:?}"
+        );
+
+        soil.advance_weather(150.0, 0.0);
+        for (a, b) in bed.iter().zip(soil.bed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "drying moved the bed");
+        }
+        for (a, b) in placed.iter().zip(soil.placed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "drying moved the berm");
+        }
+        let after = soil.volumes();
+        assert!((after.cut - before.cut).abs() < 1.0e-4, "cut volume changed");
+        assert!(
+            (after.placed - before.placed).abs() < 1.0e-4,
+            "placed volume changed"
+        );
+
+        let mut floor_cells = 0;
+        let mut floor_crust = 0;
+        let half = soil.size * 0.5;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if x.abs() > 0.22 || z.abs() > 1.0 {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                if soil.initial_height[idx] - soil.bed[idx] < 0.02 {
+                    continue;
+                }
+                floor_cells += 1;
+                if SurfaceKind::from_u8(soil.kind[idx]) == SurfaceKind::DryCrust {
+                    floor_crust += 1;
+                }
+            }
+        }
+        assert!(
+            floor_cells > 0 && floor_crust * 2 > floor_cells,
+            "the rut floor should dry, crust {floor_crust} of {floor_cells}"
+        );
+        let (dry_mu, dry_sink, dry_stick, dry_kind) = clay_response(&soil);
+        eprintln!(
+            "moisture dry  mu {dry_mu:.3}  sink {dry_sink:.4} m  stick {dry_stick:.0} Pa  kind {dry_kind:?}"
+        );
+        eprintln!(
+            "grip change wet {wet_mu:.3} -> dry {dry_mu:.3}  delta {:+.3}",
+            dry_mu - wet_mu
+        );
+        assert_eq!(dry_kind, SurfaceKind::DryCrust, "wet clay should bake to a crust");
+        assert!(
+            dry_mu > wet_mu * 1.25,
+            "grip should rise as clay dries, {wet_mu} -> {dry_mu}"
+        );
+        assert!(
+            dry_sink < wet_sink * 0.85,
+            "a crust should sink less, {wet_sink} -> {dry_sink}"
+        );
+        assert!(
+            dry_stick < wet_stick,
+            "a crust should stick less, {wet_stick} -> {dry_stick}"
+        );
+        assert_eq!(soil.sample(1.6, 0.0).kind(), SurfaceKind::Sand);
+        assert_eq!(soil.sample(-1.7, 0.0).kind(), SurfaceKind::Silt);
+        assert_eq!(soil.sample(1.7, 1.9).kind(), SurfaceKind::Gravel);
+        let sand_w = soil.sample(1.6, 0.0).wetness;
+        let silt_w = soil.sample(-1.7, 0.0).wetness;
+        assert!(
+            silt_w > sand_w + 0.12,
+            "silt should stay damper than sand, sand {sand_w} silt {silt_w}"
+        );
+
+        let gravel_mu = grip_mu(SurfaceKind::Gravel, 0.05, 0.0, 0.0);
+        soil.advance_weather(10.0, 0.008);
+        let (rain_mu, rain_sink, rain_stick, rain_kind) = clay_response(&soil);
+        eprintln!(
+            "moisture rain mu {rain_mu:.3}  sink {rain_sink:.4} m  stick {rain_stick:.0} Pa  kind {rain_kind:?}"
+        );
+        assert_eq!(rain_kind, SurfaceKind::WetMud, "rain should wet the crust");
+        assert!(
+            rain_mu < dry_mu * 0.85,
+            "grip should fall again in the rain, {dry_mu} -> {rain_mu}"
+        );
+        assert!(rain_stick > dry_stick, "wet clay sticks more than the crust");
+        assert!(rain_sink > dry_sink, "wet clay sinks more than the crust");
+        for (a, b) in bed.iter().zip(soil.bed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "rain moved the bed");
+        }
+        for (a, b) in placed.iter().zip(soil.placed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "rain moved the berm");
+        }
+        assert_eq!(soil.sample(1.7, 1.9).kind(), SurfaceKind::Gravel);
+        let g = soil.sample(1.7, 1.9);
+        assert!(g.water < 0.02, "gravel held the rain, water {}", g.water);
+        assert!(g.wetness < 0.16, "gravel pore water climbed, {}", g.wetness);
+        let g_mu = grip_mu(g.kind(), g.wetness, g.loose, g.water);
+        assert!(
+            (g_mu - gravel_mu).abs() < 0.05,
+            "gravel grip moved, {gravel_mu} -> {g_mu}"
+        );
+        assert_eq!(soil.sample(1.6, 0.0).kind(), SurfaceKind::Sand);
+        assert_eq!(soil.sample(-1.7, 0.0).kind(), SurfaceKind::Silt);
+    }
+
+    #[test]
+    fn gravel_drains_and_sand_and_silt_keep_their_states() {
+        let mut soil = SoilField::flat(0.2);
+        let half = soil.size * 0.5;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let idx = j * soil.res + i;
+                if (-1.2..-0.4).contains(&x) {
+                    soil.kind[idx] = SurfaceKind::Gravel as u8;
+                    soil.wetness[idx] = 0.08;
+                    soil.water[idx] = 0.12;
+                } else if (-0.2..0.6).contains(&x) {
+                    soil.kind[idx] = SurfaceKind::Sand as u8;
+                    soil.wetness[idx] = 0.12;
+                    soil.water[idx] = 0.1;
+                } else if (0.8..1.6).contains(&x) {
+                    soil.kind[idx] = SurfaceKind::Silt as u8;
+                    soil.wetness[idx] = 0.4;
+                    soil.water[idx] = 0.1;
+                    // A shallow bowl, counted in the original bed, so the
+                    // pond has a low spot. The weather step must not move it.
+                    soil.bed[idx] -= 0.02;
+                    soil.height[idx] -= 0.02;
+                    soil.initial_height[idx] -= 0.02;
+                }
+            }
+        }
+        let bed = soil.bed.clone();
+        let placed = soil.placed.clone();
+        soil.advance_weather(4.0, 0.0);
+        let gravel = soil.sample(-0.8, 0.0);
+        let sand = soil.sample(0.2, 0.0);
+        let silt = soil.sample(1.2, 0.0);
+        assert_eq!(gravel.kind(), SurfaceKind::Gravel);
+        assert!(
+            gravel.water < 0.015,
+            "gravel should have drained, water {}",
+            gravel.water
+        );
+        assert!(gravel.wetness < 0.12, "gravel pores filled, {}", gravel.wetness);
+        assert_eq!(sand.kind(), SurfaceKind::Sand);
+        assert_eq!(silt.kind(), SurfaceKind::Silt);
+        assert!(
+            silt.water > sand.water + 0.01,
+            "sand should drain ahead of silt, sand {} silt {}",
+            sand.water,
+            silt.water
+        );
+        assert!(
+            silt.wetness > sand.wetness + 0.1,
+            "silt should stay damper than sand, sand {} silt {}",
+            sand.wetness,
+            silt.wetness
+        );
+        assert!(
+            grip_mu(sand.kind(), sand.wetness, sand.loose, sand.water)
+                > grip_mu(silt.kind(), silt.wetness, silt.loose, silt.water)
+        );
+        for (a, b) in bed.iter().zip(soil.bed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "drainage moved the bed");
+        }
+        for (a, b) in placed.iter().zip(soil.placed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "drainage moved the pile");
+        }
+
+        // Standing water on a crust, with no rainfall, is enough to rewet it.
+        let dry_mu = grip_mu(SurfaceKind::DryCrust, 0.12, 0.0, 0.0);
+        let dry_stick = stickiness(SurfaceKind::DryCrust, 0.12, 0.0, 0.0);
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                let idx = j * soil.res + i;
+                soil.kind[idx] = SurfaceKind::DryCrust as u8;
+                soil.wetness[idx] = 0.12;
+                soil.water[idx] = 0.0;
+                soil.loose[idx] = 0.0;
+                if x.abs() < 0.55 && z.abs() < 0.55 {
+                    soil.water[idx] = 0.05;
+                }
+            }
+        }
+        soil.advance_weather(4.0, 0.0);
+        let cell = soil.sample(0.0, 0.0);
+        assert_eq!(
+            cell.kind(),
+            SurfaceKind::WetMud,
+            "standing water should wet the crust"
+        );
+        assert!(
+            cell.wetness > 0.2,
+            "the pond should soak the crust, {}",
+            cell.wetness
+        );
+        let soaked = grip_mu(cell.kind(), cell.wetness, cell.loose, cell.water);
+        assert!(
+            soaked < dry_mu,
+            "standing water should drop grip, {dry_mu} -> {soaked}"
+        );
+        assert!(
+            stickiness(cell.kind(), cell.wetness, cell.loose, cell.water) > dry_stick,
+            "standing water should make the clay sticky again"
+        );
     }
 }

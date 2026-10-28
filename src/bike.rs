@@ -9,7 +9,7 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::particles::Particles;
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
     terramech_for, wheel_buoyancy, SoilField, Terramech,
 };
 use crate::vehicle::{
@@ -422,7 +422,7 @@ fn stick_mud(bike: &mut Bike, soil: &SoilField) {
     for panel in spots {
         let sample = soil.sample(bike.pos.x, bike.pos.z);
         let p = &mut bike.panels[panel];
-        let add = 0.2 + 0.16 * sample.wetness;
+        let add = (0.2 + 0.16 * sample.wetness) * stick_scale(sample.kind(), sample.wetness);
         p.mass = (p.mass + add).min(PANEL_MUD_CAP);
         p.wet = (p.wet + 0.7).min(1.0);
         p.streak = (p.streak + 0.4).min(1.0);
