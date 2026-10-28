@@ -1,10 +1,12 @@
 //! Off-road buggy: suspension, AWD torque, and a tire model that hands off
-//! to terramechanics once the rut is deep.
+//! to terramechanics once the rut is deep. A rut wall pulls the tire sideways
+//! into the groove. A berm pushes it up and out. Sink depth still sets grip.
 
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField, SoilSample,
+    bekker_load, contact_length, contact_sink, grip_from_sink, janosi_hanamoto, on_launch_crest,
+    sink_drag_coeff, sink_hold, terramech_at, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -15,6 +17,8 @@ pub const SUSP_TRAVEL: f32 = 0.30;
 pub const SUSP_K: f32 = 17_500.0;
 pub const SUSP_PRELOAD: f32 = 280.0;
 pub const HARD_Y: f32 = 0.22;
+/// Lowest belly skin in body space. Frame-deep sink is this skin against the soil.
+pub const BELLY_Y: f32 = -0.18;
 pub const PANEL_COUNT: usize = 12;
 
 pub const PANEL_CAGE: usize = 0;
@@ -135,6 +139,10 @@ pub struct Contact {
     pub sample: SoilSample,
     pub speed: f32,
     pub fling: f32,
+    /// World XZ force from the rut wall or the berm. Independent of tread grip.
+    pub face_side: Vec3,
+    /// Upward berm force. Zero on a rut wall, where the Bekker load stays put.
+    pub face_up: f32,
 }
 
 impl Vehicle {
@@ -224,7 +232,14 @@ impl Vehicle {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
                 ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
+                solve_suspension(
+                    z0,
+                    up_y,
+                    self.wheels[i].slip,
+                    sample.softness,
+                    sample.rut,
+                    sample.water,
+                )
             };
 
             let wheel_center = wc0 + up * compression;
@@ -261,9 +276,12 @@ impl Vehicle {
             wheel_torque += brake_torque(brake, omega, v_long);
             let mut stuck = false;
             let mut fling = 0.0;
+            let mut face_side = Vec3::ZERO;
+            let mut face_up = 0.0;
+            let mut support = normal;
 
             if active {
-                let tm = terramech(sample.softness);
+                let tm = terramech_at(sample.softness, sample.rut, sample.water);
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -287,8 +305,12 @@ impl Vehicle {
                 let soil_w = smoothstep(0.03, 0.09, sinkage);
                 let pace_long = pacejka_long(slip, normal);
                 let pace_lat = pacejka_lat(slip_angle, normal);
-                let mut blended_long = lerp(pace_long, prop_long, soil_w);
-                let blended_lat = lerp(pace_lat, prop_lat, soil_w);
+                // Burial, not a wet/dry flag. Ankle-deep keeps the shear.
+                // Hub-deep cuts it so the tread spins. Frame-deep cannot pull.
+                let depth = contact_sink(sinkage, sample.rut);
+                let grip = grip_from_sink(depth);
+                let mut blended_long = lerp(pace_long, prop_long, soil_w) * grip;
+                let blended_lat = lerp(pace_lat, prop_lat, soil_w) * grip;
                 // Climbing the lip of a rut. A hole is uphill in both directions,
                 // so the centred slope cancels and has to be measured along the push.
                 if blended_long.abs() > 1.0 {
@@ -318,14 +340,16 @@ impl Vehicle {
                 // breakaway fraction has to be beaten, unless the rut is deep.
                 let speed_gate = smoothstep(0.25, 1.2, speed_h);
                 let breakaway = f_yield * (0.50 + 0.50 * speed_gate);
+                let f_sink = sink_drag_coeff(depth) * speed_h;
+                let hold = sink_hold(depth, normal);
 
                 if speed_h < 0.12 {
-                    if prop_mag <= breakaway {
+                    if prop_mag <= breakaway + hold {
                         stuck = true;
                         chassis_long = 0.0;
                         chassis_lat = 0.0;
                     } else {
-                        let excess = prop_mag - breakaway;
+                        let excess = prop_mag - breakaway - hold;
                         let inv = excess / prop_mag.max(1.0);
                         chassis_long = prop.x * inv;
                         chassis_lat = prop.y * inv;
@@ -333,14 +357,26 @@ impl Vehicle {
                 } else {
                     let dir_l = v_long / speed_h;
                     let dir_a = v_lat / speed_h;
-                    chassis_long = blended_long - dir_l * (breakaway + f_visc);
-                    chassis_lat = blended_lat - dir_a * (breakaway + f_visc);
+                    chassis_long = blended_long - dir_l * (breakaway + f_visc + f_sink);
+                    chassis_lat = blended_lat - dir_a * (breakaway + f_visc + f_sink);
                     let rr = 0.025 * normal;
                     chassis_long -= v_long.signum() * rr;
                 }
 
                 // Shear reacts on the wheel even if Bingham holds the chassis still.
                 wheel_torque -= blended_long * WHEEL_RADIUS;
+
+                // Geometry, not tread shear. A wall slopes down into the groove
+                // and pulls sideways. Climbing the berm pushes the tire up and
+                // out. Hub-deep grip still kills the tread; it does not cancel this.
+                let push = soil.lateral_push_at(wheel_center.x, wheel_center.z, normal);
+                chassis_long += push.sideways.x * fwd.x + push.sideways.z * fwd.z;
+                chassis_lat += push.sideways.x * right.x + push.sideways.z * right.z;
+                face_side = push.sideways;
+                face_up = push.up;
+                if push.lifts {
+                    support = push.up;
+                }
 
                 let peripheral = omega.abs() * WHEEL_RADIUS;
                 fling = 0.62
@@ -355,7 +391,7 @@ impl Vehicle {
                 stuck,
                 compression: compression.clamp(0.0, SUSP_TRAVEL),
                 sinkage,
-                normal: if active { normal } else { 0.0 },
+                normal: if active { support } else { 0.0 },
                 chassis_long,
                 chassis_lat,
                 wheel_torque,
@@ -367,6 +403,8 @@ impl Vehicle {
                 sample,
                 speed: self.speed(),
                 fling,
+                face_side,
+                face_up,
             };
         }
         out
@@ -511,10 +549,10 @@ impl Vehicle {
         let ori = self.orientation();
         // Clearance stays above a normal rut. Deep high-centering still drags.
         let points = [
-            Vec3::new(-0.30, -0.18, 0.9),
-            Vec3::new(0.30, -0.18, 0.9),
-            Vec3::new(-0.30, -0.18, -0.8),
-            Vec3::new(0.30, -0.18, -0.8),
+            Vec3::new(-0.30, BELLY_Y, 0.9),
+            Vec3::new(0.30, BELLY_Y, 0.9),
+            Vec3::new(-0.30, BELLY_Y, -0.8),
+            Vec3::new(0.30, BELLY_Y, -0.8),
         ];
         let mut pen_max = 0.0_f32;
         for p in points {
@@ -645,9 +683,12 @@ impl Default for Contact {
                 roughness: 0.8,
                 softness: 0.0,
                 rut: 0.0,
+                berm: 0.0,
             },
             speed: 0.0,
             fling: 0.0,
+            face_side: Vec3::ZERO,
+            face_up: 0.0,
         }
     }
 }
@@ -663,8 +704,15 @@ fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {
-    let tm = terramech(softness);
+fn solve_suspension(
+    z0: f32,
+    up_y: f32,
+    slip: f32,
+    softness: f32,
+    rut: f32,
+    water: f32,
+) -> (f32, f32, f32) {
+    let tm = terramech_at(softness, rut, water);
     // Slip-sinkage: a spinning tire sees a softer modulus and sinks further.
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;

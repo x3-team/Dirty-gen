@@ -199,9 +199,7 @@ fn both_stay_on_the_loop() {
             samples += 1;
         }
     }
-    eprintln!(
-        "samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}"
-    );
+    eprintln!("samples {samples} buggy_far {buggy_far} bike_far {bike_far} max sep {max_sep:.1}");
     assert!(samples > 10, "lap was not sampled");
     assert!(buggy_far < 3, "buggy left the loop");
     assert!(bike_far < 3, "bike left the loop");
@@ -261,7 +259,10 @@ fn rolling_tires_leave_a_pair_of_grooves() {
         prev2 = prev;
         prev = rut;
     }
-    eprintln!("groove peaks at z={z}: {peaks:?} pos {:?}", world.vehicle.pos);
+    eprintln!(
+        "groove peaks at z={z}: {peaks:?} pos {:?}",
+        world.vehicle.pos
+    );
     assert!(
         peaks.len() >= 2,
         "expected a pair of tire grooves behind the buggy, got {peaks:?}"
@@ -290,6 +291,183 @@ fn rolling_tires_leave_a_pair_of_grooves() {
 }
 
 #[test]
+fn slow_tire_sinks_and_slips_more_in_the_wet_rut() {
+    let input = Input {
+        throttle: 0.42,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    let mut dry = World::flat(0.08);
+    park(&mut dry);
+    let (dry_sink, dry_slip, dry_speed) = slow_roll(&mut dry, input);
+
+    let mut wet = World::flat(0.08);
+    lay_wet_rut(&mut wet.soil);
+    park(&mut wet);
+    let (wet_sink, wet_slip, wet_speed) = slow_roll(&mut wet, input);
+    eprintln!(
+        "dry sink {dry_sink:.4} slip {dry_slip:.3} speed {dry_speed:.2}   wet rut sink {wet_sink:.4} slip {wet_slip:.3} speed {wet_speed:.2}"
+    );
+    assert!(
+        wet_sink > dry_sink * 1.25,
+        "slow tire did not sink more in the wet rut: dry {dry_sink:.4} wet {wet_sink:.4}"
+    );
+    assert!(
+        wet_slip > dry_slip + 0.15,
+        "slow tire did not slip more in the wet rut: dry {dry_slip:.3} wet {wet_slip:.3}"
+    );
+    assert!(
+        wet_speed < dry_speed * 0.75,
+        "wet rut did not slow the tire: dry {dry_speed:.2} wet {wet_speed:.2}"
+    );
+}
+
+fn park(world: &mut World) {
+    use glam::Vec3;
+    let h = world.soil.sample(0.0, 0.5).height;
+    world.vehicle.pos = Vec3::new(0.0, h + 0.62, 0.5);
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.pitch_rate = 0.0;
+    world.vehicle.roll_rate = 0.0;
+    world.vehicle.jump_hold = 0.0;
+    for w in &mut world.vehicle.wheels {
+        w.omega = 0.0;
+        w.slip = 0.0;
+        w.sinkage = 0.0;
+    }
+}
+
+/// A trench under the whole buggy, cut below the surrounding pad and filled
+/// so the water stays in the rut.
+fn lay_wet_rut(soil: &mut silt::soil::SoilField) {
+    let res = soil.res;
+    let half = soil.size * 0.5;
+    let cell = soil.cell;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            if x.abs() < 1.2 && (-2.0..18.0).contains(&z) {
+                let idx = j * res + i;
+                soil.height[idx] = -0.07;
+                soil.water[idx] = 0.06;
+                soil.wetness[idx] = 1.0;
+                soil.base_wetness[idx] = 1.0;
+                soil.loose[idx] = (soil.loose[idx]).max(0.08);
+            }
+        }
+    }
+}
+
+#[test]
+fn sink_depth_sets_three_speeds() {
+    use silt::soil::{SINK_FRAME, SINK_HUB};
+    use silt::vehicle::{BELLY_Y, HARD_Y, REST_LEN, WHEEL_RADIUS};
+
+    let clearance = BELLY_Y - (HARD_Y - REST_LEN - WHEEL_RADIUS);
+    assert!(
+        (SINK_HUB - WHEEL_RADIUS).abs() < 1.0e-5,
+        "hub sink should be the wheel radius"
+    );
+    assert!(
+        (SINK_FRAME - clearance).abs() < 1.0e-5,
+        "frame sink {SINK_FRAME:.3} should meet the belly at droop, clearance {clearance:.3}"
+    );
+
+    let input = Input {
+        throttle: 0.7,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    // One damp pad. The only change is how deep the tread sits.
+    let (ankle_sink, ankle_slip, ankle_speed) = roll_at_depth(0.0, input);
+    let (hub_sink, hub_slip, hub_speed) = roll_at_depth(SINK_HUB, input);
+    let (frame_sink, frame_slip, frame_speed) = roll_at_depth(SINK_FRAME, input);
+    eprintln!(
+        "ankle sink {ankle_sink:.3} slip {ankle_slip:.3} speed {ankle_speed:.2}   \
+         hub sink {hub_sink:.3} slip {hub_slip:.3} speed {hub_speed:.2}   \
+         frame sink {frame_sink:.3} slip {frame_slip:.3} speed {frame_speed:.2}"
+    );
+    assert!(
+        ankle_speed > 2.0,
+        "ankle-deep tread should still drive, speed {ankle_speed:.2}"
+    );
+    assert!(
+        ankle_slip < 0.35,
+        "ankle-deep tread should hook up, slip {ankle_slip:.3}"
+    );
+    assert!(
+        hub_slip > 0.45,
+        "hub-deep tread should slip hard, slip {hub_slip:.3}"
+    );
+    assert!(
+        hub_speed > frame_speed + 0.35,
+        "hub speed {hub_speed:.2} should stay above the frame bog {frame_speed:.2}"
+    );
+    assert!(
+        ankle_speed > hub_speed + 1.0,
+        "ankle speed {ankle_speed:.2} and hub speed {hub_speed:.2} are not distinct"
+    );
+    assert!(
+        frame_speed < 0.25,
+        "frame-deep tread should bog, speed {frame_speed:.2}"
+    );
+}
+
+/// Flat damp ground lowered by `depth` metres, so the rut — not the wetness —
+/// is what the tire is buried in.
+fn roll_at_depth(depth: f32, input: Input) -> (f32, f32, f32) {
+    let mut world = World::flat(0.08);
+    if depth > 0.0 {
+        for h in &mut world.soil.height {
+            *h = -depth;
+        }
+    }
+    park(&mut world);
+    if depth > 0.0 {
+        let z = -12.0;
+        let h = world.soil.sample(0.0, z).height;
+        world.vehicle.pos.y = h + 0.62;
+        world.vehicle.pos.z = z;
+    }
+    slow_roll(&mut world, input)
+}
+
+fn slow_roll(world: &mut World, input: Input) -> (f32, f32, f32) {
+    let mut sink = 0.0_f32;
+    let mut slip = 0.0_f32;
+    let mut speed = 0.0_f32;
+    let mut n = 0.0_f32;
+    for frame in 0..(3.0 * 60.0) as u32 {
+        world.step(1.0 / 60.0, &input);
+        if frame > 100 {
+            let mut s = 0.0_f32;
+            let mut sl = 0.0_f32;
+            let mut c = 0.0_f32;
+            for w in &world.vehicle.wheels {
+                if w.normal > 1.0 {
+                    s += w.sinkage;
+                    sl += w.slip.abs();
+                    c += 1.0;
+                }
+            }
+            if c > 0.0 {
+                sink += s / c;
+                slip += sl / c;
+                speed += world.vehicle.speed();
+                n += 1.0;
+            }
+        }
+    }
+    assert!(n > 10.0, "the slow tire never loaded the ground");
+    (sink / n, slip / n, speed / n)
+}
+
+#[test]
 fn impact_chunks_land_on_the_heightfield() {
     let mut world = World::demo();
     world.run_seconds_with(6.4, silt::demo_drive);
@@ -313,4 +491,150 @@ fn impact_chunks_land_on_the_heightfield() {
         grounded >= 3,
         "large clumps should be sitting on the soil, grounded {grounded} airborne {airborne}"
     );
+}
+
+/// Right-side tires sit on a rut wall, then on a berm. The wall pulls them
+/// sideways into the groove. The berm pushes them up and out. Tread grip is
+/// not what steers either shove.
+#[test]
+fn tire_is_pulled_into_the_rut_and_pushed_up_the_berm() {
+    use silt::soil::SoilField;
+
+    let mut wall_soil = SoilField::flat(0.12);
+    // Groove floor toward -Z, wall rising toward +Z. Into the groove is -Z.
+    paint_z(&mut wall_soil, |z| {
+        if z < 0.35 {
+            -0.16
+        } else if z < 1.70 {
+            let t = (z - 0.35) / 1.35;
+            -0.16 * (1.0 - t)
+        } else {
+            0.0
+        }
+    });
+    let mut berm_soil = SoilField::flat(0.12);
+    // Berm climb: the spoil rises toward +Z, up and away from the groove.
+    paint_z(&mut berm_soil, |z| {
+        if (0.90..2.30).contains(&z) {
+            let t = ((z - 0.90) / 1.40).clamp(0.0, 1.0);
+            0.14 * t
+        } else {
+            0.0
+        }
+    });
+
+    let wall = right_side_push(&mut wall_soil, 1.00);
+    let berm = right_side_push(&mut berm_soil, 1.85);
+    eprintln!(
+        "wall into groove {:.1} N (up {:.1})   berm up {:.1} N out {:.1} N",
+        wall.0, wall.1, berm.1, berm.0
+    );
+    assert!(
+        wall.0 < -150.0,
+        "rut wall should pull the tires into the groove, side {:.1}",
+        wall.0
+    );
+    assert!(
+        wall.1.abs() < 1.0,
+        "rut wall should not add lift, up {:.1}",
+        wall.1
+    );
+    assert!(
+        berm.0 > 80.0,
+        "berm should push the tires out, side {:.1}",
+        berm.0
+    );
+    assert!(
+        berm.1 > berm.0,
+        "berm should push up and out, up {:.1} out {:.1}",
+        berm.1,
+        berm.0
+    );
+}
+
+/// Sum of the right-tire face push. `wheel_z` is where those tires should stand.
+/// Returns (sideways Z, up).
+fn right_side_push(soil: &silt::soil::SoilField, wheel_z: f32) -> (f32, f32) {
+    use glam::Vec3;
+    use silt::vehicle::Vehicle;
+
+    let mut vehicle = Vehicle::new();
+    vehicle.pos = Vec3::new(0.0, 0.42, wheel_z + 0.74);
+    vehicle.yaw = std::f32::consts::FRAC_PI_2;
+    vehicle.vel = Vec3::ZERO;
+    vehicle.pitch = 0.0;
+    vehicle.roll = 0.0;
+    vehicle.yaw_rate = 0.0;
+    vehicle.pitch_rate = 0.0;
+    vehicle.roll_rate = 0.0;
+    vehicle.jump_hold = 0.0;
+    for w in &mut vehicle.wheels {
+        w.omega = 0.0;
+        w.slip = 0.0;
+        w.sinkage = 0.0;
+    }
+    let contacts = vehicle.compute_contacts(soil, 0.0, 0.0, 1.0 / 60.0);
+    let mut side_z = 0.0;
+    let mut up = 0.0;
+    let mut n = 0;
+    for c in &contacts {
+        if c.index % 2 != 1 {
+            continue;
+        }
+        let wx = c.forward.x * c.chassis_long + c.right.x * c.chassis_lat;
+        let wz = c.forward.z * c.chassis_long + c.right.z * c.chassis_lat;
+        eprintln!(
+            "wheel {} at ({:.2},{:.2}) active {} side {:+.1} stored {:+.1} up {:.1} normal {:.1} rut {:.3} berm {:.3}",
+            c.index,
+            c.wheel_center.x,
+            c.wheel_center.z,
+            c.active,
+            wz,
+            c.face_side.z,
+            c.face_up,
+            c.normal,
+            c.sample.rut,
+            c.sample.berm
+        );
+        assert!(
+            c.active,
+            "right tire {} never loaded the face at z {:.2}",
+            c.index, c.wheel_center.z
+        );
+        assert!(
+            (c.wheel_center.z - wheel_z).abs() < 0.25,
+            "right tire landed at z {:.2}, wanted {wheel_z:.2}",
+            c.wheel_center.z
+        );
+        assert!(
+            (wx - c.face_side.x).abs() < 1.5 && (wz - c.face_side.z).abs() < 1.5,
+            "chassis force does not carry the face push"
+        );
+        if c.face_up > 1.0 {
+            assert!(
+                (c.normal - c.face_up).abs() < 1.5,
+                "berm lift did not become the vertical force"
+            );
+        }
+        side_z += c.face_side.z;
+        up += c.face_up;
+        n += 1;
+    }
+    assert!(n == 2, "expected both right tires, got {n}");
+    (side_z, up)
+}
+
+fn paint_z(soil: &mut silt::soil::SoilField, profile: impl Fn(f32) -> f32) {
+    let half = soil.size * 0.5;
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            if x.abs() > 8.0 {
+                continue;
+            }
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            let idx = j * soil.res + i;
+            soil.height[idx] = profile(z);
+        }
+    }
 }
