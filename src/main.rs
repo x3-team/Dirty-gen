@@ -46,6 +46,10 @@ fn main() {
                 let rest: Vec<String> = args.collect();
                 capture_rut(&rest);
             }
+            Some("capture-tread") => {
+                let rest: Vec<String> = args.collect();
+                capture_tread(&rest);
+            }
             _ => run_window(),
         }
     }
@@ -695,6 +699,121 @@ fn capture_rut(args: &[String]) {
         water_path.display(),
         world.soil.rut_near(0.2, 0.74),
         world.soil.sample(2.6, 0.0).water
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn floor_band(soil: &silt::soil::SoilField) -> (f32, f32) {
+    let half = soil.size * 0.5;
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for i in 0..soil.res {
+        let x = (i as f32 + 0.5) * soil.cell - half;
+        if !(0.4..3.4).contains(&x) {
+            continue;
+        }
+        let h = soil.sample(x, 0.0).height;
+        lo = lo.min(h);
+        hi = hi.max(h);
+    }
+    (lo, hi)
+}
+
+/// One rolling pass with tread ribs, then the same lane again after a gap.
+/// The second frame is the planed, deeper groove.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_tread(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut first_path = PathBuf::from(format!("{MEDIA}/tread-first-pass.png"));
+    let mut second_path = PathBuf::from(format!("{MEDIA}/tread-second-pass.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--first" => first_path = PathBuf::from(val(&mut i)),
+            "--second" => second_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-tread flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::flat(0.4);
+    // The settle parked a tire on the origin. Start from a clean pad.
+    world.soil = silt::soil::SoilField::flat(0.4);
+    world.particles.clear();
+    let origin = Vec3::new(-1.2, 0.0, 0.0);
+    let depth1 = world.soil.roll_pass(origin, Vec3::X, 5.4, 0.09, 0.0);
+    let (lo1, hi1) = floor_band(&world.soil);
+    world.bike.pos = Vec3::new(16.0, 2.0, 16.0);
+    let park_h = world.soil.sample(12.0, 10.0).height;
+    world.vehicle.pos = Vec3::new(12.0, park_h + 0.6, 10.0);
+    world.vehicle.yaw = 0.6;
+    world.vehicle.vel = Vec3::ZERO;
+    for w in &mut world.vehicle.wheels {
+        w.compression = 0.12;
+    }
+    // Three-quarter view down the lane. The bars cross the floor, and the
+    // second pass is deep enough that the berm still reads beside it.
+    let pose = CameraPose {
+        eye: Vec3::new(1.55, 1.7, 2.15),
+        target: Vec3::new(1.85, -0.02, 0.0),
+        ortho_width: Some(3.8),
+    };
+    let rgba = renderer
+        .draw(&world, pose, None, true)
+        .expect("first readback");
+    write_png(&first_path, width, height, &rgba).expect("first png");
+    println!(
+        "first {} depth {:.3} floor {:.4}..{:.4} relief {:.4}",
+        first_path.display(),
+        depth1,
+        lo1,
+        hi1,
+        hi1 - lo1
+    );
+
+    world.soil.age_water(0.55);
+    let depth2 = world.soil.roll_pass(origin, Vec3::X, 5.4, 0.09, 0.0);
+    let (lo2, hi2) = floor_band(&world.soil);
+    let rgba = renderer
+        .draw(&world, pose, None, true)
+        .expect("second readback");
+    write_png(&second_path, width, height, &rgba).expect("second png");
+    println!(
+        "second {} depth {:.3} floor {:.4}..{:.4} relief {:.4} berm {:.4}",
+        second_path.display(),
+        depth2,
+        lo2,
+        hi2,
+        hi2 - lo2,
+        world
+            .soil
+            .sample(1.6, 0.45)
+            .height
+            .max(world.soil.sample(1.6, -0.45).height)
     );
 }
 

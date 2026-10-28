@@ -392,10 +392,12 @@ impl SoilField {
     ///
     /// `lane` is the visible groove, stamped once per side of the axle along
     /// the path the chassis drove. Front and rear share that slot. The cut is
-    /// a flat ribbon wider than one heightfield cell: a thinner kernel
-    /// stair-steps into a row of pits, and those pits read as a nest of scars
-    /// on the berm. The per-tire call is only a scuff under the tread, plus
-    /// the slow dig when a tire spins in place.
+    /// a ribbon wider than one heightfield cell: a thinner kernel stair-steps
+    /// into a row of pits, and those pits read as a nest of scars on the berm.
+    /// The first rolling pass leaves tread ribs in that floor, a bar on every
+    /// other cell along the roll. A later pass of the same lane planes the bars off
+    /// and cuts the whole floor deeper. The per-tire call is only a scuff
+    /// under the tread, plus the slow dig when a tire spins in place.
     pub fn stamp_wheel(
         &mut self,
         center: Vec3,
@@ -502,8 +504,18 @@ impl SoilField {
                     // pair is the lane call. Spinning still reaches `want`.
                     let fast = if lane { groove } else { groove.min(0.008) };
                     let already = (self.initial_height[idx] - self.height[idx]).max(0.0);
+                    // Ribs sit in the flat floor only. The shoulder stays a
+                    // smooth wall, and a spinning tire churns the bars out
+                    // instead of printing a new set.
+                    let travel = cx * forward.x + cz * forward.z;
+                    let on_floor = ax <= half_w;
+                    let stand = if lane && passes == 1 && slip.abs() < 0.55 && on_floor {
+                        tread_stand(travel, self.cell, groove)
+                    } else {
+                        0.0
+                    };
                     let local_want = if lane {
-                        want * across
+                        (want * across - stand).max(0.0)
                     } else if spun > one_pass {
                         want * across
                     } else {
@@ -891,6 +903,25 @@ fn transfer(height: &[f32], water: &[f32], next: &mut [f32], a: usize, b: usize,
     }
 }
 
+/// Share of the first-pass bite that stays standing as a tread rib.
+/// The neighbouring cell takes the full bite, so the floor is a bar and a
+/// void. A later pass asks for none of this and cuts both to the same depth.
+const TREAD_RIB_FRACTION: f32 = 0.62;
+
+fn tread_is_rib(travel: f32, cell: f32) -> bool {
+    let n = (travel / cell.max(1.0e-4)).floor() as i32;
+    n.rem_euclid(2) == 0
+}
+
+/// Metres the rib stands above the lug void. Zero on the void cells.
+fn tread_stand(travel: f32, cell: f32, groove: f32) -> f32 {
+    if groove <= 1.0e-4 || !tread_is_rib(travel, cell) {
+        0.0
+    } else {
+        groove * TREAD_RIB_FRACTION
+    }
+}
+
 /// Rolling depth after `passes` visits. Pass 1 is the fresh bite; each
 /// later pass of the same slot is deeper, with a cap so the chassis is not
 /// swallowed.
@@ -1167,6 +1198,117 @@ mod tests {
         assert!(
             soil.darken.iter().all(|d| (*d - 1.0).abs() < 1.0e-5 || *d <= 1.0),
             "darken left the 0..1 range"
+        );
+    }
+
+    /// Mean height of rib cells and lug cells on the flat floor of a rut
+    /// rolled along +X through the origin.
+    fn tread_bands(soil: &SoilField, x0: f32, x1: f32) -> (f32, f32) {
+        let half = soil.size * 0.5;
+        let mut rib = 0.0;
+        let mut rib_n = 0.0;
+        let mut lug = 0.0;
+        let mut lug_n = 0.0;
+        for j in 0..soil.res {
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            if z.abs() > soil.cell * 1.15 {
+                continue;
+            }
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                if x < x0 || x > x1 {
+                    continue;
+                }
+                let h = soil.height[j * soil.res + i];
+                if tread_is_rib(x, soil.cell) {
+                    rib += h;
+                    rib_n += 1.0;
+                } else {
+                    lug += h;
+                    lug_n += 1.0;
+                }
+            }
+        }
+        assert!(rib_n > 4.0 && lug_n > 4.0, "floor cells rib {rib_n} lug {lug_n}");
+        (rib / rib_n, lug / lug_n)
+    }
+
+    #[test]
+    fn first_pass_leaves_tread_ribs_second_pass_wipes_them() {
+        let mut soil = SoilField::flat(0.25);
+        let origin = Vec3::new(-2.2, 0.0, 0.0);
+        let dir = Vec3::X;
+        let before = height_sum(&soil);
+        let first = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
+        let after_first = height_sum(&soil);
+        let (rib1, lug1) = tread_bands(&soil, 0.4, 3.6);
+        let berm1 = soil
+            .sample(1.2, 0.45)
+            .height
+            .max(soil.sample(1.2, -0.45).height);
+        eprintln!(
+            "tread pass1 depth {first:.4}  rib {rib1:.4}  lug {lug1:.4}  relief {:.4}  berm {berm1:.4}",
+            rib1 - lug1
+        );
+        assert!(
+            first > 0.035,
+            "first pass did not cut a rut, depth {first:.4}"
+        );
+        assert!(
+            rib1 > lug1 + 0.025,
+            "tread ribs are not standing in the groove: rib {rib1:.4} lug {lug1:.4}"
+        );
+        assert!(
+            berm1 > 0.01,
+            "first pass did not raise a berm, height {berm1:.4}"
+        );
+        assert!(
+            (after_first - before).abs() < 5.0e-3,
+            "first pass deleted soil: height sum {before:.5} -> {after_first:.5}"
+        );
+
+        soil.age_water(0.55);
+        let second = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
+        let after_second = height_sum(&soil);
+        let (rib2, lug2) = tread_bands(&soil, 0.4, 3.6);
+        let floor = soil.sample(1.2, 0.0);
+        let berm2 = soil
+            .sample(1.2, 0.45)
+            .height
+            .max(soil.sample(1.2, -0.45).height);
+        eprintln!(
+            "tread pass2 depth {second:.4}  rib {rib2:.4}  lug {lug2:.4}  relief {:.4}  berm {berm2:.4} floor {:.4}",
+            rib2 - lug2,
+            floor.height
+        );
+        assert!(
+            second > first + 0.015,
+            "second pass did not deepen the rut: {first:.4} -> {second:.4}"
+        );
+        assert!(
+            (rib2 - lug2).abs() < 0.006,
+            "second pass left the tread pattern: rib {rib2:.4} lug {lug2:.4}"
+        );
+        assert!(
+            rib2 < rib1 - 0.04,
+            "second pass did not plane the ribs down: {rib1:.4} -> {rib2:.4}"
+        );
+        assert!(
+            lug2 < lug1 - 0.04,
+            "second pass did not cut the lug floor deeper: {lug1:.4} -> {lug2:.4}"
+        );
+        assert!(
+            berm2 > floor.height + 0.02,
+            "berm did not stay above the wiped floor: berm {berm2:.4} floor {:.4}",
+            floor.height
+        );
+        assert!(
+            berm2 + 1.0e-4 >= berm1,
+            "second pass shaved the berm: {berm1:.4} -> {berm2:.4}"
+        );
+        assert!(
+            (after_second - before).abs() < 8.0e-3,
+            "second pass deleted soil: height sum {before:.5} -> {after_second:.5}"
         );
     }
 
