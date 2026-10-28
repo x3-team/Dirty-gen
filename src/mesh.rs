@@ -4,7 +4,7 @@
 //! into paint, rubber or mud. Wheel and shock meshes stay in the spaces the
 //! vehicle solver already uses, so the picture matches the contact model.
 
-use glam::{Quat, Vec3};
+use glam::Vec3;
 
 use silt::bike::Bike;
 use silt::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
@@ -19,8 +19,13 @@ pub const PANEL_ROCK: f32 = 42.0;
 pub const PANEL_REED: f32 = 43.0;
 pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
-/// Wet mud clod. Not body paint, and not a camera-facing card.
+/// Legacy id. Flying soil is clay, mud, gravel, or dust.
+#[allow(dead_code)]
 pub const PANEL_CLOD: f32 = 46.0;
+pub const PANEL_CLAY: f32 = 50.0;
+pub const PANEL_MUD: f32 = 51.0;
+pub const PANEL_GRAVEL: f32 = 52.0;
+pub const PANEL_DUST: f32 = 53.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -52,7 +57,7 @@ pub struct CpuMesh {
 }
 
 impl CpuMesh {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -838,7 +843,12 @@ pub fn environment_mesh() -> CpuMesh {
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
     // sits on the ground instead of floating as boxes.
     add_horizon(&mut m);
+    m
+}
 
+/// A few pines for the course. Spray stills leave this mesh undrawn.
+pub fn tree_mesh() -> CpuMesh {
+    let mut m = CpuMesh::new();
     let trees = [
         Vec3::new(-16.0, 0.0, 14.0),
         Vec3::new(18.0, 0.0, -16.0),
@@ -849,7 +859,6 @@ pub fn environment_mesh() -> CpuMesh {
     for (k, p) in trees.iter().enumerate() {
         let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
         add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
-        // Stacked cones so the crown has volume instead of a flat card.
         let layers = [
             (trunk_h * 0.42, 1.25, 1.45),
             (trunk_h * 0.85, 1.0, 1.2),
@@ -882,228 +891,423 @@ fn chunk_hash(seed: u32, n: u32) -> f32 {
     (x & 0xFFFF) as f32 / 65535.0
 }
 
-fn push_smooth(mesh: &mut CpuMesh, p: Vec3, n: Vec3, panel: f32) {
-    mesh.vertices.push(MeshVertex {
-        pos: p.to_array(),
-        nrm: n.normalize_or_zero().to_array(),
-        uv: uv_of(p),
-        panel,
-    });
+/// Torn soil. Extents come from the piece volume, so a ribbon is not a ball
+/// and a clod is not a sprite.
+
+fn soil_panel(p: &silt::particles::Particle) -> f32 {
+    if p.shape == silt::particles::SHAPE_DUST {
+        PANEL_DUST
+    } else if p.face == silt::particles::FACE_MUD {
+        PANEL_MUD
+    } else if p.face == silt::particles::FACE_GRAVEL {
+        PANEL_GRAVEL
+    } else {
+        PANEL_CLAY
+    }
 }
 
-fn add_tri_smooth(
+fn soil_uv(p: &silt::particles::Particle) -> [f32; 2] {
+    [p.wet.clamp(0.0, 1.0), p.dark.clamp(0.0, 1.0)]
+}
+
+fn add_tri_tint(
     mesh: &mut CpuMesh,
     a: Vec3,
-    na: Vec3,
     b: Vec3,
-    nb: Vec3,
     c: Vec3,
-    nc: Vec3,
     panel: f32,
-    center: Vec3,
+    uv: [f32; 2],
+    outward_from: Vec3,
 ) {
-    let face = (b - a).cross(c - a);
-    if face.length_squared() < 1.0e-10 {
+    let mut b = b;
+    let mut c = c;
+    let n = (b - a).cross(c - a);
+    if n.length_squared() < 1.0e-12 {
         return;
     }
+    let mid = (a + b + c) / 3.0;
+    if n.dot(mid - outward_from) < 0.0 {
+        std::mem::swap(&mut b, &mut c);
+    }
+    let n = (b - a).cross(c - a).normalize_or_zero();
     let base = mesh.vertices.len() as u32;
-    if face.dot(a - center) < 0.0 {
-        push_smooth(mesh, a, na, panel);
-        push_smooth(mesh, c, nc, panel);
-        push_smooth(mesh, b, nb, panel);
-    } else {
-        push_smooth(mesh, a, na, panel);
-        push_smooth(mesh, b, nb, panel);
-        push_smooth(mesh, c, nc, panel);
+    for p in [a, b, c] {
+        mesh.vertices.push(MeshVertex {
+            pos: p.to_array(),
+            nrm: n.to_array(),
+            uv,
+            panel,
+        });
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+fn add_tri_double(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32, uv: [f32; 2]) {
+    let n = (b - a).cross(c - a);
+    if n.length_squared() < 1.0e-12 {
+        return;
+    }
+    let n = n.normalize_or_zero();
+    let base = mesh.vertices.len() as u32;
+    for (p, normal) in [(a, n), (b, n), (c, n), (a, -n), (c, -n), (b, -n)] {
+        mesh.vertices.push(MeshVertex {
+            pos: p.to_array(),
+            nrm: normal.to_array(),
+            uv,
+            panel,
+        });
     }
     mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+        .extend_from_slice(&[base, base + 1, base + 2, base + 3, base + 4, base + 5]);
 }
 
-/// Soft mud blob. Normals stay smooth so the silhouette is a clod, not a gem.
-/// `slump` flattens a piece that has already landed.
-fn add_lump(
-    mesh: &mut CpuMesh,
-    center: Vec3,
-    rot: Quat,
-    radius: f32,
-    seed: u32,
-    stacks: usize,
-    slices: usize,
-    slump: bool,
-) {
-    let axis = Vec3::new(
-        0.88 + chunk_hash(seed, 1) * 0.22,
-        0.80 + chunk_hash(seed, 2) * 0.24,
-        0.86 + chunk_hash(seed, 3) * 0.22,
-    );
-    // Landed mud spreads and sinks. A tall axis reads as a stone sitting on the soil.
-    let squash = if slump {
-        Vec3::new(1.48, 0.36, 1.48)
+fn world_of(p: &silt::particles::Particle, local: Vec3) -> Vec3 {
+    let mut q = local;
+    if p.grounded {
+        q.y *= match p.shape {
+            silt::particles::SHAPE_RIBBON => 0.84,
+            silt::particles::SHAPE_DUST => 0.35,
+            _ => 0.62,
+        };
     } else {
-        Vec3::ONE
-    };
-    let center = if slump {
-        center - Vec3::Y * radius * 0.16
-    } else {
-        center
-    };
-    let mut pts = Vec::with_capacity(2 + stacks * slices);
-    let mut nrm = Vec::with_capacity(pts.capacity());
-    let place = |dir: Vec3, rad: f32| {
-        let shaped = Vec3::new(
-            dir.x * rad * axis.x * squash.x,
-            dir.y * rad * axis.y * squash.y,
-            dir.z * rad * axis.z * squash.z,
-        );
-        let n = Vec3::new(
-            dir.x / squash.x.max(0.05),
-            dir.y / squash.y.max(0.05),
-            dir.z / squash.z.max(0.05),
-        );
-        (center + rot * shaped, (rot * n).normalize_or_zero())
-    };
-    let (p, n) = place(Vec3::Y, radius * (0.92 + chunk_hash(seed, 4) * 0.12));
-    pts.push(p);
-    nrm.push(n);
-    for s in 1..stacks {
-        let phi = s as f32 / stacks as f32 * std::f32::consts::PI;
-        for i in 0..slices {
-            let th = i as f32 / slices as f32 * std::f32::consts::TAU;
-            let dir = Vec3::new(th.cos() * phi.sin(), phi.cos(), th.sin() * phi.sin());
-            // Mild swell. A wide jitter makes spikes, and spikes read as broken rock.
-            let j = 0.90 + chunk_hash(seed, (s * 16 + i) as u32) * 0.18;
-            let (p, n) = place(dir, radius * j);
-            pts.push(p);
-            nrm.push(n);
+        // The mesh trails along the throw. Centering it put half the ribbon
+        // back through the tire.
+        let shift = match p.shape {
+            // The ribbon mesh itself starts at the tread and runs along the throw.
+            silt::particles::SHAPE_RIBBON => 0.0,
+            silt::particles::SHAPE_DROP => 0.35,
+            silt::particles::SHAPE_CLOD => 0.22,
+            _ => 0.18,
+        };
+        q.x += p.span.x * shift;
+    }
+    p.pos + p.rot * q
+}
+
+fn add_torn_clod(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    // Radii. A lumpy torn clod along the throw: pinched ends, a bitten side.
+    // Enough sides that it is not a gem, long enough that it is not a ball.
+    let length = p.span.x.max(0.012) * 2.0;
+    let ry = p.span.y.max(0.01);
+    let rz = p.span.z.max(0.01);
+    let n = 8usize;
+    let segs = 5usize;
+    let panel = soil_panel(p);
+    let uv = soil_uv(p);
+    let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let envelope = (t * (1.0 - t) * 4.0).sqrt();
+        let end = 0.42 + 0.58 * envelope;
+        let x = (t - 0.42) * length;
+        let mut ring = Vec::with_capacity(n);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU + 0.4;
+            let jag = 0.7 + chunk_hash(p.seed, (i * 8 + k) as u32) * 0.45;
+            let bite = if i == 2 && k % 3 == 0 {
+                0.5
+            } else {
+                1.0
+            };
+            ring.push(Vec3::new(
+                x,
+                a.sin() * ry * end * jag * bite,
+                a.cos() * rz * end * jag,
+            ));
         }
+        rings.push(ring);
     }
-    let (p, n) = place(-Vec3::Y, radius * (0.88 + chunk_hash(seed, 5) * 0.14));
-    pts.push(p);
-    nrm.push(n);
-    let ring = |s: usize, i: usize| 1 + (s - 1) * slices + (i % slices);
-    for i in 0..slices {
-        let a = ring(1, i);
-        let b = ring(1, i + 1);
-        add_tri_smooth(
-            mesh,
-            pts[0],
-            nrm[0],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
-        );
-    }
-    for s in 1..stacks.saturating_sub(1) {
-        for i in 0..slices {
-            let a = ring(s, i);
-            let b = ring(s, i + 1);
-            let c = ring(s + 1, i);
-            let d = ring(s + 1, i + 1);
-            add_tri_smooth(
+    let origin = world_of(p, Vec3::ZERO);
+    for i in 0..segs {
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            add_tri_tint(
                 mesh,
-                pts[a],
-                nrm[a],
-                pts[c],
-                nrm[c],
-                pts[b],
-                nrm[b],
-                PANEL_CLOD,
-                center,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i][k2]),
+                world_of(p, rings[i + 1][k2]),
+                panel,
+                uv,
+                origin,
             );
-            add_tri_smooth(
+            add_tri_tint(
                 mesh,
-                pts[b],
-                nrm[b],
-                pts[c],
-                nrm[c],
-                pts[d],
-                nrm[d],
-                PANEL_CLOD,
-                center,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i + 1][k2]),
+                world_of(p, rings[i + 1][k]),
+                panel,
+                uv,
+                origin,
             );
         }
     }
-    let bot = pts.len() - 1;
-    let last = stacks - 1;
-    for i in 0..slices {
-        let a = ring(last, i + 1);
-        let b = ring(last, i);
-        add_tri_smooth(
-            mesh,
-            pts[bot],
-            nrm[bot],
-            pts[a],
-            nrm[a],
-            pts[b],
-            nrm[b],
-            PANEL_CLOD,
-            center,
-        );
+    for ring in [rings[0].clone(), rings[segs].clone()] {
+        let mut cap = Vec3::ZERO;
+        for pnt in &ring {
+            cap += *pnt;
+        }
+        cap /= ring.len() as f32;
+        let cap_w = world_of(p, cap);
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            add_tri_tint(
+                mesh,
+                cap_w,
+                world_of(p, ring[k]),
+                world_of(p, ring[k2]),
+                panel,
+                uv,
+                origin,
+            );
+        }
     }
 }
 
-fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
-    add_lump(
-        mesh,
-        p.pos,
-        p.rot,
-        p.size,
-        p.seed,
-        stacks,
-        slices,
-        p.grounded,
-    );
+fn add_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    // Span is the full box. Half-width and half-thickness are halves, or the
+    // strap draws as a wall in front of the tread.
+    let length = p.span.x.max(0.05) * 3.2;
+    let half_w = p.span.y.max(0.02) * 0.58;
+    let half_t = p.span.z.max(0.016) * 1.45;
+    let segs = 12usize;
+    let panel = soil_panel(p);
+    let uv = soil_uv(p);
+    // A thick torn strap. The section is wide, with a bitten edge, so the
+    // side view is a ribbon and not a sheet or a gem.
+    let profile = [
+        (0.2_f32, 0.9_f32),
+        (0.85, 0.4),
+        (1.0, 0.0),
+        (0.8, -0.45),
+        (0.15, -0.95),
+        (-0.65, -0.5),
+        (-1.0, 0.05),
+        (-0.5, 0.7),
+    ];
+    let n = profile.len();
+    let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let edge = if i == 0 {
+            0.72
+        } else if i == segs {
+            0.4
+        } else {
+            1.0
+        };
+        let chew = 0.58 + 0.42 * chunk_hash(p.seed, 40 + i as u32);
+        let belly = (0.84 + 0.16 * (t * (1.0 - t) * 4.0).sqrt()) * edge * chew;
+        let x = (t - 0.74) * length;
+        let bow = ((t - 0.35) * std::f32::consts::PI).sin() * half_w * 0.3;
+        // Peel up off the tread, then the torn tail drops.
+        let sag = -((t * std::f32::consts::PI).sin()) * half_w * 2.1 + t * t * half_t * 0.35;
+        let twist = (t - 0.15) * 0.85 + (chunk_hash(p.seed, 6) - 0.5) * 0.2;
+        let (s, c) = twist.sin_cos();
+        let mut ring = Vec::with_capacity(n);
+        for k in 0..n {
+            let bite = if k == 4 && i % 3 == 1 {
+                0.45
+            } else if k == 6 && i % 4 == 2 {
+                0.6
+            } else {
+                1.0
+            };
+            let jag = 0.8 + chunk_hash(p.seed, (i * 8 + k) as u32) * 0.35;
+            let (py, pz) = profile[k];
+            let y = py * half_w * belly * bite * jag;
+            let z = pz * half_t * belly * jag;
+            ring.push(Vec3::new(x, y * c - z * s + bow - sag, y * s + z * c));
+        }
+        rings.push(ring);
+    }
+    for i in 0..segs {
+        let mut axis = Vec3::ZERO;
+        for k in 0..n {
+            axis += rings[i][k] + rings[i + 1][k];
+        }
+        axis /= (n * 2) as f32;
+        let axis_w = world_of(p, axis);
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            let a = world_of(p, rings[i][k]);
+            let b = world_of(p, rings[i][k2]);
+            let c = world_of(p, rings[i + 1][k2]);
+            let d = world_of(p, rings[i + 1][k]);
+            add_tri_tint(mesh, a, b, c, panel, uv, axis_w);
+            add_tri_tint(mesh, a, c, d, panel, uv, axis_w);
+        }
+    }
+    let hub = world_of(p, Vec3::ZERO);
+    for ring in [rings[0].clone(), rings[segs].clone()] {
+        let mut cap = Vec3::ZERO;
+        for pnt in &ring {
+            cap += *pnt;
+        }
+        cap /= ring.len() as f32;
+        let cap_w = world_of(p, cap);
+        for k in 0..ring.len() {
+            let k2 = (k + 1) % ring.len();
+            add_tri_tint(
+                mesh,
+                cap_w,
+                world_of(p, ring[k]),
+                world_of(p, ring[k2]),
+                panel,
+                uv,
+                hub,
+            );
+        }
+    }
 }
 
-/// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+fn add_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let rx = p.span.x.max(0.008);
+    let ry = p.span.y.max(0.004);
+    let rz = p.span.z.max(0.003);
+    let panel = soil_panel(p);
+    let uv = soil_uv(p);
+    // A droplet: thin tail, round head. A spindle reads as a diamond.
+    let n = 8usize;
+    let stations = [0.0_f32, 0.1, 0.24, 0.4, 0.56, 0.72, 0.86, 1.0];
+    let scales = [0.08_f32, 0.14, 0.28, 0.55, 0.86, 1.0, 0.7, 0.38];
+    let mut rings: Vec<Vec<Vec3>> = Vec::new();
+    for (i, (t, scale)) in stations.iter().zip(scales).enumerate() {
+        let s = scale * (0.9 + chunk_hash(p.seed, i as u32) * 0.15);
+        let x = (t - 0.42) * 2.0 * rx;
+        let mut ring = Vec::with_capacity(n);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            ring.push(Vec3::new(x, a.sin() * ry * s, a.cos() * rz * s));
+        }
+        rings.push(ring);
+    }
+    for i in 0..rings.len() - 1 {
+        for k in 0..n {
+            let k2 = (k + 1) % n;
+            add_tri_double(
+                mesh,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i][k2]),
+                world_of(p, rings[i + 1][k2]),
+                panel,
+                uv,
+            );
+            add_tri_double(
+                mesh,
+                world_of(p, rings[i][k]),
+                world_of(p, rings[i + 1][k2]),
+                world_of(p, rings[i + 1][k]),
+                panel,
+                uv,
+            );
+        }
+    }
+    let mut cap = |ring: &[Vec3]| {
+        let mut c = Vec3::ZERO;
+        for pnt in ring {
+            c += *pnt;
+        }
+        c /= ring.len() as f32;
+        let cw = world_of(p, c);
+        for k in 0..ring.len() {
+            let k2 = (k + 1) % ring.len();
+            add_tri_double(mesh, cw, world_of(p, ring[k]), world_of(p, ring[k2]), panel, uv);
+        }
+    };
+    cap(&rings[0]);
+    cap(rings.last().unwrap());
+}
+
+fn add_dust(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    // A loose puff. One wafer reads as a stone, so this is a few thin ragged flakes.
+    let rx = p.span.x.max(0.008) * 0.55;
+    let hy = p.span.y.max(0.001) * 0.28;
+    let rz = p.span.z.max(0.006) * 0.55;
+    let panel = soil_panel(p);
+    let uv = soil_uv(p);
+    let n = 7usize;
+    for flake in 0..3u32 {
+        let ox = (chunk_hash(p.seed, flake) - 0.5) * rx * 1.1;
+        let oz = (chunk_hash(p.seed, 20 + flake) - 0.5) * rz * 1.1;
+        let oy = (flake as f32 - 1.0) * hy * 2.2;
+        let spin = chunk_hash(p.seed, 40 + flake) * 1.4;
+        let mut top = Vec::with_capacity(n);
+        let mut bot = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU + spin;
+            let j = 0.35 + chunk_hash(p.seed, flake * 8 + i as u32) * 0.85;
+            let x = ox + a.cos() * rx * j;
+            let z = oz + a.sin() * rz * j * (0.6 + chunk_hash(p.seed, 80 + i as u32) * 0.5);
+            top.push(Vec3::new(x, oy + hy, z));
+            bot.push(Vec3::new(x * 0.94, oy - hy, z * 0.94));
+        }
+        for i in 1..n - 1 {
+            add_tri_double(
+                mesh,
+                world_of(p, top[0]),
+                world_of(p, top[i]),
+                world_of(p, top[i + 1]),
+                panel,
+                uv,
+            );
+            add_tri_double(
+                mesh,
+                world_of(p, bot[0]),
+                world_of(p, bot[i + 1]),
+                world_of(p, bot[i]),
+                panel,
+                uv,
+            );
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            add_tri_double(
+                mesh,
+                world_of(p, top[i]),
+                world_of(p, bot[i]),
+                world_of(p, top[j]),
+                panel,
+                uv,
+            );
+            add_tri_double(
+                mesh,
+                world_of(p, top[j]),
+                world_of(p, bot[i]),
+                world_of(p, bot[j]),
+                panel,
+                uv,
+            );
+        }
+    }
+}
+
+/// Irregular chunks, ribbons, drops, and dust. Nothing here is a sphere or a
+/// camera-facing card.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
-    const MAX_VERTS: usize = 14000;
-    // Draw the big clumps first so a full splash cannot crowd them out.
-    for kind in [3u8, 1, 4, 0, 2] {
-        for p in items {
-            if !p.alive || p.life <= 0.0 || p.kind != kind {
-                continue;
-            }
-            if mesh.vertices.len() + 700 > MAX_VERTS {
-                return mesh;
-            }
-            if p.kind == 3 {
-                add_piece(&mut mesh, p, 8, 16);
-                // Two side lobes so the clump is a soft mass, not one pebble.
-                for (slot, scale, dist) in [(8u32, 0.74, 0.26), (13u32, 0.52, 0.20)] {
-                    let dir = Vec3::new(
-                        chunk_hash(p.seed, slot) * 2.0 - 1.0,
-                        chunk_hash(p.seed, slot + 1) * 0.28,
-                        chunk_hash(p.seed, slot + 2) * 2.0 - 1.0,
-                    )
-                    .normalize_or_zero();
-                    let lobe = silt::particles::Particle {
-                        pos: p.pos + p.rot * dir * p.size * dist,
-                        size: p.size * scale,
-                        seed: p.seed ^ 0xA5A5_5A5Au32.wrapping_mul(slot | 1),
-                        ..*p
-                    };
-                    add_piece(&mut mesh, &lobe, 6, 12);
-                }
-            } else if p.kind == 1 {
-                let mut q = *p;
-                q.size = p.size.max(0.08);
-                add_piece(&mut mesh, &q, 4, 6);
-            } else {
-                let mut q = *p;
-                q.size = if p.kind == 2 {
-                    p.size.max(0.045)
-                } else {
-                    p.size.max(0.07)
-                };
-                add_piece(&mut mesh, &q, 4, 7);
-            }
+    const MAX_VERTS: usize = 15000;
+    let mut order: Vec<usize> = (0..items.len())
+        .filter(|&i| items[i].alive && items[i].life > 0.0)
+        .collect();
+    order.sort_by(|&a, &b| {
+        let pa = &items[a];
+        let pb = &items[b];
+        (pa.grounded as u8).cmp(&(pb.grounded as u8)).then(
+            pb.volume
+                .partial_cmp(&pa.volume)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    for i in order {
+        let p = &items[i];
+        if mesh.vertices.len() + 360 > MAX_VERTS {
+            break;
+        }
+        match p.shape {
+            silt::particles::SHAPE_RIBBON => add_ribbon(&mut mesh, p),
+            silt::particles::SHAPE_DROP => add_drop(&mut mesh, p),
+            silt::particles::SHAPE_DUST => add_dust(&mut mesh, p),
+            _ => add_torn_clod(&mut mesh, p),
         }
     }
     mesh

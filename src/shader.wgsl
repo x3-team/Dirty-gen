@@ -41,6 +41,11 @@ struct Model {
 
 @group(2) @binding(0) var<uniform> model: Model;
 
+@group(3) @binding(0) var niva_base: texture_2d_array<f32>;
+@group(3) @binding(1) var niva_nor: texture_2d_array<f32>;
+@group(3) @binding(2) var niva_mr: texture_2d_array<f32>;
+@group(3) @binding(3) var niva_samp: sampler;
+
 fn hash12(p: vec2<f32>) -> f32 {
     let h = dot(p, vec2<f32>(127.1, 311.7));
     return fract(sin(h) * 43758.5453);
@@ -71,6 +76,21 @@ fn mud_of(panel: i32) -> vec4<f32> {
     else if (panel == 10) { return model.mud10; }
     else if (panel == 11) { return model.mud11; }
     return vec4<f32>(0.0);
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
+fn tbn_normal(n_in: vec3<f32>, nm: vec3<f32>) -> vec3<f32> {
+    let n = normalize(n_in);
+    var t = vec3<f32>(1.0, 0.0, 0.0);
+    t = normalize(t - n * dot(n, t));
+    let b = cross(n, t);
+    let ts = nm * 2.0 - vec3<f32>(1.0);
+    return normalize(t * ts.x + b * ts.y + n * ts.z);
 }
 
 fn present(c: vec3<f32>) -> vec4<f32> {
@@ -617,11 +637,42 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     } else if (panel < 45.5) {
         let g = noise(world.xz * 3.0 + vec2<f32>(world.y * 2.0, 0.0));
         return vec4<f32>(vec3<f32>(0.10, 0.058, 0.032) * (0.8 + g * 0.35), 0.92);
-    } else if (panel < 46.5) {
-        // Wet clod. Dark saturated mud. The orange frame stays on panel 1.
-        let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
-        let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
-        return vec4<f32>(col, 0.06);
+    } else if (panel < 50.5) {
+        // Clay torn off the tire. Redder than gravel, smoother as it wets.
+        let wet = clamp(uv.x, 0.0, 1.0);
+        let dark = clamp(uv.y, 0.0, 1.0);
+        let g = noise(world.xz * 6.0 + vec2<f32>(world.y * 4.0, 1.7));
+        let dry = vec3<f32>(0.34, 0.14, 0.05);
+        let soaked = vec3<f32>(0.16, 0.06, 0.022);
+        var col = mix(dry, soaked, smoothstep(0.12, 0.82, wet));
+        col *= 0.84 + g * 0.32;
+        col *= mix(1.0, 0.76, dark);
+        return vec4<f32>(col, mix(0.8, 0.16, wet));
+    } else if (panel < 51.5) {
+        // Mud and slurry. Darker and wetter than clay, still readable off the tire.
+        let wet = clamp(uv.x, 0.0, 1.0);
+        let dark = clamp(uv.y, 0.0, 1.0);
+        let g = noise(world.xy * 8.0 + vec2<f32>(world.z, 0.4));
+        let body = vec3<f32>(0.20, 0.09, 0.032);
+        let slurry = vec3<f32>(0.11, 0.045, 0.016);
+        var col = mix(body, slurry, smoothstep(0.15, 0.88, wet));
+        col *= 0.86 + g * 0.28;
+        col *= mix(1.0, 0.78, dark);
+        return vec4<f32>(col, mix(0.55, 0.12, wet));
+    } else if (panel < 52.5) {
+        // Gravel chip. Gray stone with a tan fracture, not clay.
+        let g = noise(world.xz * 9.0 + vec2<f32>(world.y * 5.0, uv.y));
+        let stone = vec3<f32>(0.30, 0.28, 0.24);
+        let grit = vec3<f32>(0.18, 0.12, 0.07);
+        var col = mix(grit, stone, smoothstep(0.25, 0.8, g));
+        col *= mix(1.0, 0.8, clamp(uv.y, 0.0, 1.0));
+        return vec4<f32>(col, 0.94);
+    } else if (panel < 53.5) {
+        // Dry dust. Lighter than the clod it left with.
+        let g = noise(world.xz * 3.2 + vec2<f32>(world.y, uv.x));
+        let dust = vec3<f32>(0.42, 0.30, 0.16);
+        let col = dust * (0.82 + g * 0.32) * mix(1.0, 0.86, clamp(uv.y, 0.0, 1.0));
+        return vec4<f32>(col, 0.97);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -635,7 +686,30 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     var emit = vec3<f32>(0.0);
 
     var nrm = in.nrm;
-    if (model.extra.x > 0.5) {
+    if (in.panel > 79.5 && in.panel < 88.5) {
+        // Lada Niva materials. Panel 80 + material index. Authored WebP is sRGB.
+        let layer = i32(in.panel + 0.5) - 80;
+        let base = textureSampleLevel(niva_base, niva_samp, in.uv, layer, 0.0);
+        if (layer == 7 && base.a < 0.35) {
+            discard;
+        }
+        albedo = srgb_to_linear(base.rgb);
+        let mr = textureSampleLevel(niva_mr, niva_samp, in.uv, layer, 0.0);
+        let nm = textureSampleLevel(niva_nor, niva_samp, in.uv, layer, 0.0).rgb;
+        rough = clamp(mr.g, 0.045, 1.0);
+        nrm = tbn_normal(in.nrm, nm);
+        if (layer == 3) {
+            albedo = mix(albedo, vec3<f32>(0.55, 0.72, 0.78), 0.28);
+            rough = 0.06;
+        } else if (layer != 7) {
+            let mud = clamp(model.extra.y, 0.0, 1.2);
+            let cover = max(mud, max(model.mud5.x, max(model.mud1.x, max(model.mud4.x, max(model.mud2.x, model.mud3.x)))));
+            let down = smoothstep(0.55, -0.15, nrm.y);
+            let mask = smoothstep(0.08, 0.55, cover) * (0.22 + 0.78 * down);
+            albedo = mix(albedo, vec3<f32>(0.11, 0.045, 0.018), mask * 0.75);
+            rough = mix(rough, 0.18, mask);
+        }
+    } else if (model.extra.x > 0.5) {
         let ang = in.uv.x * 6.2831853;
         let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
         let sidewall = select(0.0, 1.0, in.uv.y > 1.5);
@@ -690,38 +764,24 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
-    // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
-    if (in.panel > 45.5 && in.panel < 46.5) {
-        var n = normalize(nrm);
-        // Soft skin. A strong bump turns the highlight into gravel.
-        let e = 0.06;
-        let h0 = noise(in.world.xz * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        let hx = noise((in.world.xz + vec2<f32>(e, 0.0)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        let hz = noise((in.world.xz + vec2<f32>(0.0, e)) * 3.4 + vec2<f32>(in.world.y * 2.4, 0.2));
-        n = normalize(n + vec3<f32>(h0 - hx, 0.04, h0 - hz) * 0.28);
+    // Flying soil. The sky fill turned the last clods blue-gray, so this
+    // light stays warm. Clay and slurry pick up a short wet streak.
+    if (in.panel > 49.5 && in.panel < 53.5) {
+        let n = normalize(nrm);
         let sun = normalize(frame.sun_dir.xyz);
-        let view = normalize(frame.cam_pos.xyz - in.world);
-        let ndl = clamp(dot(n, sun), 0.0, 1.0);
-        let ndotv = clamp(dot(n, view), 0.0, 1.0);
+        let ndl = clamp(dot(n, sun) * 0.65 + 0.35, 0.0, 1.0);
         let shadow = shadow_factor(in.world + n * 0.02, n);
-        // Darker than the berm. A crown in the soil's own brown reads as a dry stone.
-        let tone = clamp((albedo.r - 0.016) / 0.018, 0.0, 1.0);
-        let body = mix(vec3<f32>(0.0090, 0.0031, 0.0011), vec3<f32>(0.0155, 0.0052, 0.0018), tone);
-        let wrap = ndl * 0.28 + 0.72;
-        lit = body * (0.85 + wrap * shadow * 0.22);
-        // The flat top has almost one normal from this camera, so a Phong lobe
-        // paints the whole crown the color of a dry stone. Gloss is short streaks.
-        let streak = noise(in.world.xz * 6.5 + vec2<f32>(in.world.y * 4.0, 0.4));
-        let wetspot = smoothstep(0.80, 0.94, streak);
-        let facing = pow(ndotv, 16.0);
-        let fres = pow(1.0 - ndotv, 3.0);
-        let gloss = vec3<f32>(0.22, 0.08, 0.026);
-        let shine = 0.45 + shadow * 0.55;
-        lit += gloss * facing * 0.65 * shine;
-        lit += gloss * wetspot * clamp(n.y, 0.0, 1.0) * shine;
-        lit += gloss * fres * 0.08;
-        let belly = smoothstep(0.2, -0.45, n.y);
-        lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+        let hemi = vec3<f32>(0.20, 0.11, 0.05);
+        lit = albedo * (hemi + frame.sun_color.rgb * ndl * shadow * 0.85);
+        if (in.panel < 51.5) {
+            let view = normalize(frame.cam_pos.xyz - in.world);
+            let ndotv = clamp(dot(n, view), 0.0, 1.0);
+            let wet = clamp(in.uv.x, 0.0, 1.0);
+            let fres = pow(1.0 - ndotv, 2.4);
+            let streak = noise(in.world.xz * 5.5 + vec2<f32>(in.world.y * 3.2, in.uv.y));
+            let gloss = vec3<f32>(0.22, 0.09, 0.03) * wet * (0.25 + fres) * smoothstep(0.4, 0.92, streak);
+            lit += gloss * shadow;
+        }
     }
     return present(lit);
 }

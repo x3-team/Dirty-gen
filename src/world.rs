@@ -3,11 +3,12 @@
 use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
-use crate::particles::Particles;
+use crate::particles::{Particles, TreadThrow};
 use crate::soil::{on_launch_crest, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS};
 use crate::vehicle::{
-    hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
+    hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
     PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
+    WHEEL_WIDTH,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +76,9 @@ struct LaneAccum {
     sink: f32,
     slip: f32,
     n: u32,
+    emit_index: usize,
+    speed: f32,
+    contact: Vec3,
 }
 
 impl Default for LaneAccum {
@@ -86,25 +90,31 @@ impl Default for LaneAccum {
             sink: 0.0,
             slip: 0.0,
             n: 0,
+            emit_index: 0,
+            speed: 0.0,
+            contact: Vec3::ZERO,
         }
     }
 }
 
 impl LaneAccum {
-    fn add(&mut self, center: Vec3, forward: Vec3, right: Vec3, sink: f32, slip: f32) {
-        if self.n == 0 || sink >= self.sink {
-            self.forward = forward;
-            self.right = right;
-            self.sink = sink;
+    fn add(&mut self, c: &Contact, slip: f32) {
+        if self.n == 0 || c.sinkage >= self.sink {
+            self.forward = c.forward;
+            self.right = c.right;
+            self.sink = c.sinkage;
             self.slip = slip.abs();
+            self.emit_index = c.index;
+            self.speed = c.speed;
+            self.contact = c.contact_point;
         }
-        self.center += center;
+        self.center += c.wheel_center;
         self.n += 1;
     }
 
-    fn stamp(&self, soil: &mut SoilField, radius: f32, width: f32, dt: f32) {
+    fn stamp(&self, soil: &mut SoilField, radius: f32, width: f32, dt: f32) -> f32 {
         if self.n == 0 || self.sink < 0.004 {
-            return;
+            return 0.0;
         }
         soil.stamp_wheel(
             self.center / self.n as f32,
@@ -116,7 +126,7 @@ impl LaneAccum {
             self.slip,
             dt,
             true,
-        );
+        )
     }
 }
 
@@ -224,7 +234,8 @@ impl World {
                         continue;
                     }
                     let slip = if crawling { c.slip } else { 0.0 };
-                    self.soil.stamp_wheel(
+                    let sample = self.soil.sample(c.contact_point.x, c.contact_point.z);
+                    let ejected = self.soil.stamp_wheel(
                         c.wheel_center,
                         BIKE_RADIUS,
                         BIKE_WIDTH,
@@ -235,6 +246,20 @@ impl World {
                         h,
                         false,
                     );
+                    if ejected > 1.0e-6 {
+                        self.particles.throw_tread(&TreadThrow {
+                            origin: c.contact_point,
+                            forward: c.forward,
+                            right: c.right,
+                            speed: self.bike.speed(),
+                            slip: c.slip,
+                            sample,
+                            volume: ejected,
+                            wheel_radius: BIKE_RADIUS,
+                            wheel_width: BIKE_WIDTH,
+                            outward: if c.index % 2 == 0 { -1.0 } else { 1.0 },
+                        });
+                    }
                 }
             }
             let planted = contacts.iter().filter(|c| c.active).count();
@@ -251,6 +276,7 @@ impl World {
             .compute_contacts(&self.soil, input.throttle, input.brake, dt);
 
         let mut sides = [LaneAccum::default(), LaneAccum::default()];
+        let mut scuff = [0.0_f32; 4];
         // At speed the visible cut is the lane ribbon. The per-tire slip dig
         // is for a tire that is spinning in place, not a second slot per wheel.
         let crawling = self.vehicle.speed() < 1.1;
@@ -259,10 +285,10 @@ impl World {
                 continue;
             }
             let slip_stamp = if crawling { c.slip } else { 0.0 };
-            self.soil.stamp_wheel(
+            scuff[c.index] = self.soil.stamp_wheel(
                 c.wheel_center,
                 WHEEL_RADIUS,
-                crate::vehicle::WHEEL_WIDTH,
+                WHEEL_WIDTH,
                 c.forward,
                 c.right,
                 c.sinkage,
@@ -272,7 +298,7 @@ impl World {
             );
             // One groove per side of the axle. Front and rear share it, so a
             // turn does not chew a second slot into the berm.
-            sides[c.index % 2].add(c.wheel_center, c.forward, c.right, c.sinkage, slip_stamp);
+            sides[c.index % 2].add(c, slip_stamp);
             if c.sample.water > 0.008 {
                 let speed = c.speed.max(0.2);
                 self.soil.displace_water(
@@ -283,9 +309,9 @@ impl World {
                 );
             }
         }
-        let width = crate::vehicle::WHEEL_WIDTH;
-        for side in &sides {
-            side.stamp(&mut self.soil, WHEEL_RADIUS, width, dt);
+        let mut side_ej = [0.0_f32; 2];
+        for (i, side) in sides.iter().enumerate() {
+            side_ej[i] = side.stamp(&mut self.soil, WHEEL_RADIUS, WHEEL_WIDTH, dt);
         }
 
         let planted = contacts.iter().filter(|c| c.active).count();
@@ -295,26 +321,33 @@ impl World {
 
         let speed = self.vehicle.speed();
         for c in &contacts {
-            if !c.active {
+            if !c.active || c.index >= scuff.len() {
                 continue;
             }
-            if c.sample.water > 0.012 && speed > 0.35 {
-                self.particles
-                    .spray(c.contact_point, c.forward, c.right, speed, c.sample.water);
-                self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(1);
-            } else if c.sample.wetness > 0.62 && speed > 1.1 && c.sinkage > 0.02 {
-                if (self.particles.alive_count() as u32 + self.time.to_bits()) % 3 == 0 {
-                    self.particles
-                        .clod(c.contact_point, c.forward, c.right, speed);
-                }
+            let mut volume = scuff[c.index];
+            let side = c.index % 2;
+            if sides[side].n > 0 && sides[side].emit_index == c.index {
+                volume += side_ej[side];
             }
-            if c.fling > 0.15 && c.slip.abs() > 0.25 {
-                self.particles.clod(
-                    c.wheel_center + Vec3::Y * 0.05,
-                    c.forward,
-                    c.right,
-                    speed.max(1.0),
-                );
+            if volume <= 1.0e-6 {
+                continue;
+            }
+            let before = self.particles.alive_count();
+            self.particles.throw_tread(&TreadThrow {
+                origin: c.contact_point,
+                forward: c.forward,
+                right: c.right,
+                speed: c.speed,
+                slip: c.slip,
+                sample: c.sample,
+                volume,
+                wheel_radius: WHEEL_RADIUS,
+                wheel_width: WHEEL_WIDTH,
+                outward: if c.index % 2 == 0 { -1.0 } else { 1.0 },
+            });
+            let spawned = self.particles.alive_count().saturating_sub(before) as u32;
+            if spawned > 0 {
+                self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(spawned);
             }
         }
 
@@ -431,12 +464,15 @@ impl World {
         let z = self.vehicle.pos.z;
         let vy = self.vehicle.vel.y.abs();
         let depth = (vy * 0.024).clamp(0.10, 0.22);
+        let sample = self.soil.sample(x, z);
         let dug = self.soil.stamp_impact(x, z, 1.35, depth);
         self.soil.shock_ring(x, z);
         let h = self.soil.sample(x, z).height;
-        let spawned = self.particles.impact_burst(Vec3::new(x, h + 0.15, z));
+        let spawned = self
+            .particles
+            .impact_from_cut(Vec3::new(x, h + 0.15, z), sample, dug.ejected);
         stick_impact_mud(&mut self.vehicle, &self.soil);
-        self.telemetry.impact_depth = self.telemetry.impact_depth.max(dug);
+        self.telemetry.impact_depth = self.telemetry.impact_depth.max(dug.depth);
         self.telemetry.impact_sprays = self.telemetry.impact_sprays.saturating_add(spawned);
         self.telemetry.splash_bursts = self.telemetry.splash_bursts.saturating_add(spawned);
         if self.telemetry.impact_time <= 0.0 {
@@ -630,6 +666,77 @@ pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
     }
 }
 
+/// A short pass for the tread-spray stills. The left tires are in slurry and
+/// the right tires are on dry broken ground, so the throw is not one brown.
+pub struct SprayFrame {
+    pub world: World,
+    pub tire: CameraPose,
+    pub side: CameraPose,
+}
+
+pub fn spray_frame() -> SprayFrame {
+    let mut world = World::flat(0.82);
+    let half = world.soil.size * 0.5;
+    let res = world.soil.res;
+    let cell = world.soil.cell;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            if x > 0.15 {
+                let idx = j * res + i;
+                world.soil.wetness[idx] = 0.14;
+                world.soil.base_wetness[idx] = 0.14;
+                world.soil.water[idx] = 0.0;
+                world.soil.roughness[idx] = 0.92;
+                world.soil.loose[idx] = 0.0;
+                world.soil.darken[idx] = 0.04;
+            }
+        }
+    }
+    world.particles.clear();
+    // The settle pass parks a second vehicle in the shot. Keep it out of frame.
+    world.bike.pos = Vec3::new(0.0, -40.0, 0.0);
+    world.vehicle.pos = Vec3::new(0.0, 1.05, -2.6);
+    world.vehicle.vel = Vec3::new(0.0, 0.0, 3.5);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.pitch_rate = 0.0;
+    world.vehicle.roll_rate = 0.0;
+    for w in &mut world.vehicle.wheels {
+        w.omega = 16.0;
+    }
+    world.place_on_soil();
+    let input = Input {
+        throttle: 1.0,
+        brake: 0.28,
+        steer: 0.0,
+    };
+    for _ in 0..10 {
+        world.step(1.0 / 60.0, &input);
+    }
+    let v = &world.vehicle;
+    let ori = v.orientation();
+    let fwd = ori * Vec3::Z;
+    let right = ori * Vec3::X;
+    let rl = v.pos + ori * v.wheel_center_local(2);
+    // The rear tire's strap leaves the tread and runs back about a metre.
+    // Both cameras sit on that run. The ribbon between the axles stays under
+    // the body.
+    let tire = CameraPose {
+        eye: rl - right * 2.15 + Vec3::Y * 0.82 - fwd * 1.85,
+        target: rl - right * 0.04 - fwd * 0.78 + Vec3::Y * 0.2,
+        ortho_width: None,
+    };
+    let side = CameraPose {
+        eye: rl - right * 2.25 + Vec3::Y * 0.72 - fwd * 1.95,
+        target: rl - right * 0.02 - fwd * 0.72 + Vec3::Y * 0.1,
+        ortho_width: None,
+    };
+    SprayFrame { world, tire, side }
+}
+
 fn track_perimeter() -> f32 {
     let straight = TRACK_ZN - TRACK_ZS;
     let half = std::f32::consts::PI * TRACK_R;
@@ -709,4 +816,81 @@ fn wrap_pi(mut a: f32) -> f32 {
         a += pi * 2.0;
     }
     a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::particles::{FACE_GRAVEL, FACE_MUD, SHAPE_CLOD, SHAPE_DROP, SHAPE_DUST, SHAPE_RIBBON};
+
+    #[test]
+    fn spray_pass_throws_slurry_and_gravel() {
+        let frame = spray_frame();
+        let mut mud_ribbon = 0;
+        let mut mud_drop = 0;
+        let mut mud_clod = 0;
+        let mut gravel_clod = 0;
+        let mut gravel_dust = 0;
+        let mut gravel_ribbon = 0;
+        let mut air = 0.0_f32;
+        for p in frame.world.particles.items.iter().filter(|p| p.alive) {
+            if !p.grounded {
+                air += p.volume;
+            }
+            if p.face == FACE_MUD && p.shape == SHAPE_RIBBON {
+                mud_ribbon += 1;
+            }
+            if p.face == FACE_MUD && p.shape == SHAPE_DROP {
+                mud_drop += 1;
+            }
+            if p.face == FACE_MUD && p.shape == SHAPE_CLOD {
+                mud_clod += 1;
+            }
+            if p.face == FACE_GRAVEL && p.shape == SHAPE_CLOD {
+                gravel_clod += 1;
+            }
+            if p.face == FACE_GRAVEL && p.shape == SHAPE_DUST {
+                gravel_dust += 1;
+            }
+            if p.face == FACE_GRAVEL && p.shape == SHAPE_RIBBON {
+                gravel_ribbon += 1;
+            }
+        }
+        let v = &frame.world.vehicle;
+        let ori = v.orientation();
+        let rl = v.pos + ori * v.wheel_center_local(2);
+        eprintln!(
+            "speed {:.2} pos {:?} ribbons {mud_ribbon} drops {mud_drop} clods {gravel_clod} dust {gravel_dust} air {air:.5}",
+            v.speed(),
+            v.pos
+        );
+        for p in frame
+            .world
+            .particles
+            .items
+            .iter()
+            .filter(|p| p.alive && p.face == FACE_MUD && p.shape == SHAPE_RIBBON)
+        {
+            let axis = (p.rot * glam::Vec3::X).normalize_or_zero();
+            assert!(
+                axis.y.abs() < 0.4,
+                "ribbon stood on end at {:?} axis {axis:?}",
+                p.pos - rl
+            );
+            let travel = glam::Vec3::new(p.vel.x, 0.0, p.vel.z);
+            if !p.grounded && travel.length() > 0.4 {
+                assert!(
+                    axis.dot(travel.normalize()) > 0.7,
+                    "ribbon axis {axis:?} left the throw {travel:?}"
+                );
+            }
+        }
+        assert!(mud_ribbon >= 2, "slurry ribbons {mud_ribbon}");
+        assert!(mud_drop > 2, "slurry drops {mud_drop}");
+        assert_eq!(mud_clod, 0, "wet clods {mud_clod}");
+        assert_eq!(gravel_ribbon, 0, "dry ribbons {gravel_ribbon}");
+        assert!(gravel_clod > 2, "gravel clods {gravel_clod}");
+        assert!(gravel_dust > 2, "gravel dust {gravel_dust}");
+        assert!(air > 1.0e-4, "nothing in the air");
+    }
 }

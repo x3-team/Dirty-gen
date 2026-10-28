@@ -3,6 +3,7 @@
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
 mod mesh;
+mod niva;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,7 +14,9 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
-use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
+use silt::world::{
+    demo_camera, demo_drive, demo_drive_bike, spray_frame, CameraPose, Input, World,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -309,7 +312,7 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
+        renderer.draw(&self.world, pose, Some((&view, self.srgb)), false, true, false);
         frame.present();
     }
 
@@ -434,6 +437,9 @@ struct CaptureArgs {
     still_start: PathBuf,
     still_puddle: PathBuf,
     still_ruts: PathBuf,
+    spray_stills: bool,
+    still_tire: PathBuf,
+    still_side: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -452,6 +458,54 @@ fn capture(args: &[String]) {
         parsed.height,
         formats,
     );
+    if parsed.spray_stills {
+        let frame = spray_frame();
+        let world = &frame.world;
+        let mut shapes = [0u32; 4];
+        let mut faces = [0u32; 3];
+        let mut airborne = 0.0_f32;
+        let mut biggest = [0.0_f32; 4];
+        for p in &world.particles.items {
+            if p.alive && !p.grounded {
+                shapes[p.shape as usize] += 1;
+                faces[(p.face as usize).min(2)] += 1;
+                airborne += p.volume;
+                biggest[p.shape as usize] = biggest[p.shape as usize].max(p.span.max_element());
+            }
+        }
+        println!(
+            "spray t={:.2} speed={:.2} pos=({:.2},{:.2}) airborne clod {} ribbon {} drop {} dust {} faces clay {} mud {} gravel {} vol {:.5} span {:.3} {:.3} {:.3} {:.3}",
+            world.time,
+            world.vehicle.speed(),
+            world.vehicle.pos.x,
+            world.vehicle.pos.z,
+            shapes[0],
+            shapes[1],
+            shapes[2],
+            shapes[3],
+            faces[0],
+            faces[1],
+            faces[2],
+            airborne,
+            biggest[0],
+            biggest[1],
+            biggest[2],
+            biggest[3]
+        );
+        for (pose, dest) in [
+            (frame.tire, &parsed.still_tire),
+            (frame.side, &parsed.still_side),
+        ] {
+            let pose = lift_camera(world, pose);
+            let rgba = renderer.draw(world, pose, None, true, false, true).expect("readback");
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            write_png(dest, parsed.width, parsed.height, &rgba).expect("still");
+            println!("still {}", dest.display());
+        }
+        return;
+    }
     let mut world = World::demo();
     let frames = (parsed.seconds * parsed.fps as f32).round() as u32;
     let steps = (60.0 / parsed.fps as f32).round().max(1.0) as u32;
@@ -478,7 +532,7 @@ fn capture(args: &[String]) {
                     &world,
                     demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
                 );
-                let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+                let rgba = renderer.draw(&world, pose, None, true, true, false).expect("readback");
                 write_png(dest, parsed.width, parsed.height, &rgba).expect("still");
                 println!(
                     "still {} at t={:.2} pos=({:.1},{:.1}) mud={:.2} rut={:.3}",
@@ -510,7 +564,7 @@ fn capture(args: &[String]) {
             &world,
             demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw),
         );
-        let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+        let rgba = renderer.draw(&world, pose, None, true, true, false).expect("readback");
         let path = dir.join(format!("frame_{frame:04}.png"));
         write_png(&path, parsed.width, parsed.height, &rgba).expect("png");
         for (i, (when, dest)) in stills.iter().enumerate() {
@@ -588,6 +642,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
     let mut still_ruts = PathBuf::from(format!("{MEDIA}/mud-demo-ruts.png"));
+    let mut spray_stills = false;
+    let mut still_tire = PathBuf::from(format!("{MEDIA}/spray-tire.png"));
+    let mut still_side = PathBuf::from(format!("{MEDIA}/spray-side.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -608,6 +665,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--still-start" => still_start = PathBuf::from(val(&mut i)),
             "--still-puddle" => still_puddle = PathBuf::from(val(&mut i)),
             "--still-ruts" => still_ruts = PathBuf::from(val(&mut i)),
+            "--spray-stills" => spray_stills = true,
+            "--still-tire" => still_tire = PathBuf::from(val(&mut i)),
+            "--still-side" => still_side = PathBuf::from(val(&mut i)),
             other => panic!("unknown capture flag {other}"),
         }
         i += 1;
@@ -624,6 +684,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         still_start,
         still_puddle,
         still_ruts,
+        spray_stills,
+        still_tire,
+        still_side,
     }
 }
 
