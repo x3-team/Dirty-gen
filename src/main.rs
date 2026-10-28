@@ -762,32 +762,21 @@ fn capture_water(args: &[String]) {
     let away = world.soil.sample(-16.0, -14.0).height;
     world.bike.pos = Vec3::new(-16.0, away + 0.7, -14.0);
     world.bike.vel = Vec3::ZERO;
-    // Droplets already on the arc, so the still shows water leaving the tire
-    // instead of a clump sitting on the rubber. Nothing here writes the soil.
-    for i in 0..14 {
-        let t = i as f32 / 13.0;
-        let along = 0.35 + t * 1.05;
-        let side = ((i % 5) as f32 - 2.0) * 0.11;
-        let height = 0.2 + (t * (1.0 - t)) * 1.35;
-        world.particles.spawn(
-            wheel + Vec3::new(-along, height, side + (t - 0.5) * 0.55),
-            Vec3::new(-1.2, 1.4, side),
-            1.6,
-            0.06,
-            0,
-        );
-    }
+    // One marker at the tread facing the camera. The mesh is one brown sheet.
+    let tread = wheel + Vec3::new(-0.3, 0.02, 0.08);
+    world.particles.spawn(tread, Vec3::ZERO, 2.0, 0.1, 5);
     let bowl = world.soil.sample(rut_x, 2.2);
     println!(
         "film water {:.3} height {:.3}  slurry water {:.3} height {:.3}",
         lip.water, lip.height, bowl.water, bowl.height
     );
-    // Above the thin end of the outer groove, so the clay shows through the film.
+    // Above the thin end of the outer groove. The film and the sheet
+    // leaving the tire are the subject, not the near berm.
     let shallow_pose = lift_camera(
         &world,
         CameraPose {
-            eye: Vec3::new(4.15, 2.05, 0.15),
-            target: Vec3::new(rut_x, -0.02, 1.12),
+            eye: Vec3::new(8.15, 3.35, 0.55),
+            target: Vec3::new(rut_x - 0.2, -0.04, 1.3),
             ortho_width: None,
         },
     );
@@ -805,12 +794,13 @@ fn capture_water(args: &[String]) {
     let parked = world.soil.sample(-14.0, -12.0).height;
     world.vehicle.pos = Vec3::new(-14.0, parked + 0.62, -12.0);
     world.vehicle.yaw = 0.2;
-    // The filled bowl, where the slurry covers the clay and can mirror the sky.
+    // From the south end of the grooves, looking along them. Both ruts
+    // run away through the frame, with the dry centre as the shoulder.
     let deep_pose = lift_camera(
         &world,
         CameraPose {
-            eye: Vec3::new(3.9, 2.35, 0.55),
-            target: Vec3::new(silt::soil::TRACK_R + 0.15, -0.06, 2.35),
+            eye: Vec3::new(6.55, 3.7, 0.15),
+            target: Vec3::new(silt::soil::TRACK_R - 0.05, -0.08, 3.15),
             ortho_width: None,
         },
     );

@@ -1251,11 +1251,74 @@ fn add_lump(
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
-    // Tire spray is a bright sheet of water. Clods stay wet mud.
-    let panel = if p.kind == 0 || p.kind == 4 { 47.0 } else { PANEL_CLOD };
     add_lump(
-        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded, panel,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded, PANEL_CLOD,
     );
+}
+
+/// One continuous sheet of muddy water leaving a tire. Kind 5 marks the contact.
+fn append_splash_sheet(mesh: &mut CpuMesh, origin: Vec3) {
+    // Up and along the rut, so the sheet sits beside the tire instead of
+    // filling the lens.
+    let dir = Vec3::new(-0.15, 0.46, 0.88).normalize();
+    let side = Vec3::new(-dir.z, 0.0, dir.x);
+    let along_n = 16;
+    let across_n = 8;
+    let mut grid = Vec::with_capacity((along_n + 1) * (across_n + 1));
+    for i in 0..=along_n {
+        let t = i as f32 / along_n as f32;
+        let arc = 0.03 + t * 0.72;
+        let lift = (t * std::f32::consts::PI).sin() * 0.4;
+        let wob = chunk_hash(i as u32, 4);
+        let half_w = (0.08 + t * 0.22) * (0.9 + wob * 0.2);
+        for j in 0..=across_n {
+            let s = j as f32 / across_n as f32 * 2.0 - 1.0;
+            let droop = s * s * t * 0.1;
+            grid.push(
+                origin + dir * arc + side * (s * half_w) + Vec3::Y * (lift - droop),
+            );
+        }
+    }
+    let at = |i: usize, j: usize| i * (across_n + 1) + j;
+    for i in 0..along_n {
+        for j in 0..across_n {
+            let t = i as f32 / along_n as f32;
+            let s = j as f32 / across_n as f32;
+            let n = chunk_hash((i * 19 + j * 3) as u32, 7);
+            if t > 0.92 && n < 0.35 {
+                continue;
+            }
+            let a = grid[at(i, j)];
+            let b = grid[at(i, j + 1)];
+            let c = grid[at(i + 1, j)];
+            let d = grid[at(i + 1, j + 1)];
+            let uv_a = [s, t];
+            let uv_b = [s + 1.0 / across_n as f32, t];
+            let uv_c = [s, t + 1.0 / along_n as f32];
+            let uv_d = [s + 1.0 / across_n as f32, t + 1.0 / along_n as f32];
+            add_sheet_tri(mesh, a, c, b, uv_a, uv_c, uv_b);
+            add_sheet_tri(mesh, b, c, d, uv_b, uv_c, uv_d);
+            add_sheet_tri(mesh, a, b, c, uv_a, uv_b, uv_c);
+            add_sheet_tri(mesh, b, d, c, uv_b, uv_d, uv_c);
+        }
+    }
+}
+
+fn add_sheet_tri(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, ua: [f32; 2], ub: [f32; 2], uc: [f32; 2]) {
+    let n = (b - a).cross(c - a).normalize_or_zero();
+    if n.length_squared() < 1.0e-8 {
+        return;
+    }
+    let base = mesh.vertices.len() as u32;
+    for (p, uv) in [(a, ua), (b, ub), (c, uc)] {
+        mesh.vertices.push(MeshVertex {
+            pos: p.to_array(),
+            nrm: n.to_array(),
+            uv,
+            panel: 48.0,
+        });
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
 }
 
 /// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
@@ -1303,6 +1366,12 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
                 };
                 add_piece(&mut mesh, &q, 4, 7);
             }
+        }
+    }
+    for p in items {
+        if p.alive && p.life > 0.0 && p.kind == 5 {
+            append_splash_sheet(&mut mesh, p.pos);
+            break;
         }
     }
     mesh

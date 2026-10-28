@@ -584,17 +584,17 @@ fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
     let sz = (y_d - y_u) / (e * 2.0);
     let wave = ripple_wave(xz, t);
     let amp = smoothstep(0.004, 0.02, standing_depth(xz));
-    // A broad wobble breaks the sky mirror. The ridge tilt stays small so it
-    // does not draw a comb across the pool.
-    let q = xz * 1.35;
+    // A broad wobble breaks a flat mirror. The ridge tilt stays small so the
+    // pool does not grow a comb of streaks along the rut.
+    let q = xz * 0.85;
     let n0 = noise(q);
     let nx = noise(q + vec2<f32>(0.37, 0.08));
     let nz = noise(q + vec2<f32>(0.06, 0.37));
-    let wobble = amp * 0.16;
+    let wobble = amp * 0.028;
     return normalize(vec3<f32>(
-        sx + wave.grad.x * amp * 0.35 + (n0 - nx) * wobble,
+        sx + wave.grad.x * amp * 0.12 + (n0 - nx) * wobble,
         1.0,
-        sz + wave.grad.y * amp * 0.35 + (n0 - nz) * wobble,
+        sz + wave.grad.y * amp * 0.12 + (n0 - nz) * wobble,
     ));
 }
 
@@ -753,17 +753,28 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Local column, not the dilated sheet depth. The dilation fills holes;
     // it must not turn a 2 cm film into the deep pool.
     let local = standing_depth(xz);
-    let jag = noise(xz * 1.6 + vec2<f32>(0.4, 1.3)) * 0.55 + noise(xz * 4.4 + 2.1) * 0.45;
-    let walked = local + (jag - 0.5) * 0.035;
+    let jag = noise(xz * 1.6 + vec2<f32>(0.2, 1.1)) * 0.55 + noise(xz * 4.4 + 1.7) * 0.45;
+    let walked = local + (jag - 0.48) * 0.04;
     // A dry speck inside a filled bowl keeps the column. A real 2 cm film does not.
-    let interior = smoothstep(0.014, 0.0, local) * step(0.05, in.depth);
+    let interior = smoothstep(0.02, 0.0, local) * step(0.05, in.depth);
     let depth = mix(max(walked, 0.0), max(walked, in.depth), interior);
     if (depth < 0.004) {
         discard;
     }
-    // Broken shoreline only. A thin spot inside a filled bowl stays capped.
-    let edge_n = noise(xz * 3.2 + vec2<f32>(0.6, 1.8));
-    if (in.depth < 0.03 && local < 0.016 && edge_n < (1.0 - local / 0.016) * 0.55) {
+    // Ragged shoulder only where a pool meets dry mud. A broad 2 cm film has
+    // no dry neighbour, and a thin speck inside the pool has no dry side,
+    // so neither one is eaten into holes.
+    let edge = noise(xz * 0.55 + vec2<f32>(0.4, 2.2)) * 0.65
+        + noise(xz * 1.7 + vec2<f32>(1.7, 0.3)) * 0.35;
+    let shore_cut = 0.006 + edge * 0.03;
+    let se = 0.46;
+    let px = standing_depth(xz + vec2<f32>(se, 0.0));
+    let nx = standing_depth(xz - vec2<f32>(se, 0.0));
+    let pz = standing_depth(xz + vec2<f32>(0.0, se));
+    let nz = standing_depth(xz - vec2<f32>(0.0, se));
+    let near_deep = max(max(px, nx), max(pz, nz));
+    let near_dry = min(min(px, nx), min(pz, nz));
+    if (near_dry < 0.005 && near_deep > 0.06 && local < shore_cut) {
         discard;
     }
     let t = frame.misc.x;
@@ -775,37 +786,31 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = clamp(dot(n, sun), 0.0, 1.0);
     let shadow = shadow_factor(in.world + n * 0.02, n);
-    // Brown wrap. shade() folds the blue zenith into the hemi.
-    let wrap = 0.72 + 0.5 * ndl * shadow;
-    // A thin film is brown and open, so the clay reads through it. The pool
-    // is milky and shut by about 18 cm.
-    let u = clamp(depth / 0.18, 0.0, 1.0);
-    let cover = pow(u, 1.15);
-    let shallow_c = vec3<f32>(0.14, 0.062, 0.026);
-    let deep_c = vec3<f32>(0.22, 0.15, 0.092);
-    let q = xz + vec2<f32>(t * 0.012, -t * 0.008);
-    let murk = noise(q * 1.6) * 0.6 + noise(q * 3.8 + 2.0) * 0.4;
-    let body = mix(shallow_c, deep_c, cover) * (0.88 + murk * 0.22);
+    // Warm wrap. shade() folds the blue zenith into the hemi, which turned
+    // the pool into a gray sheet.
+    let wrap = 0.9 + 0.08 * ndl * shadow;
+    // Film stays a brown tint. The filled rut is an opaque tan pool.
+    // The step is tight so the pool meets the mud on a line, not a soft halo.
+    let cover = smoothstep(0.03, 0.075, depth);
+    let shallow_c = vec3<f32>(0.09, 0.042, 0.02);
+    let deep_c = vec3<f32>(0.172, 0.112, 0.058);
+    let q = xz + vec2<f32>(t * 0.006, -t * 0.004);
+    let murk = noise(q * 0.45) * 0.55 + noise(q * 1.15 + 1.3) * 0.45;
+    let grit = noise(q * 4.2 + vec2<f32>(2.0, 0.4));
+    var body = mix(shallow_c, deep_c, cover);
+    body *= 0.9 + murk * 0.16;
+    body = mix(body, body * vec3<f32>(0.82, 0.76, 0.64), smoothstep(0.84, 0.96, grit) * cover * 0.25);
     var col = body * wrap;
-    // Soft silt clouds in the column. Not a field of black clots.
-    let cloud = smoothstep(0.58, 0.86, noise(q * 2.8 + vec2<f32>(4.0, 1.1)));
-    col = mix(col, col * vec3<f32>(0.78, 0.74, 0.68), cloud * cover * 0.35);
     let ndotv = clamp(dot(n, view), 0.0, 1.0);
-    let flat = smoothstep(0.42, 0.86, n.y);
-    let pool = smoothstep(0.035, 0.08, depth);
-    // Patches of sky on the standing pool. Pale, not the saturated zenith,
-    // and broken up so the slurry stays brown between the mirrors.
-    let refl = reflect(-view, n);
-    let sky = sky_dome(refl);
-    let haze = vec3<f32>(0.16, 0.185, 0.24);
-    let mirrored = mix(haze, sky, 0.35);
-    let fres = mix(0.2, 1.0, pow(1.0 - ndotv, 1.35));
-    let mirror = smoothstep(0.42, 0.78, noise(xz * 0.9 + vec2<f32>(1.4, 2.7)));
-    let amt = fres * flat * pool * mirror;
-    col = mix(col, mirrored, amt * 0.4);
-    let shore = smoothstep(0.003, 0.012, depth);
-    // About 0.22 at 2 cm, shut at 18 cm. The sheet stays continuous.
-    var alpha = mix(0.1, 0.99, cover) * shore;
+    let flat = smoothstep(0.78, 0.97, n.y);
+    let pool = smoothstep(0.06, 0.12, depth);
+    // Dull warm lift on the flat of the pool. Kept small so it is not a gloss.
+    let fres = pow(1.0 - ndotv, 3.0);
+    let broken = smoothstep(0.4, 0.75, noise(xz * 0.42 + vec2<f32>(1.2, 0.4)));
+    col += vec3<f32>(0.12, 0.10, 0.07) * fres * flat * pool * broken * 0.05;
+    let shore = smoothstep(0.002, 0.008, depth);
+    // About 0.22 at 2 cm. Opaque once the rut is a real pool.
+    var alpha = mix(0.2, 0.99, cover) * shore;
     alpha = clamp(alpha, 0.0, 0.99);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
@@ -997,19 +1002,22 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
     // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
-    if (in.panel > 46.5 && in.panel < 47.5) {
-        // Water thrown off a tire. Bright, not a mud clod.
+    if (in.panel > 47.5 && in.panel < 48.5) {
+        // Continuous muddy sheet thrown off a tire. Brown, not a white ball.
+        let fray = noise(in.world.xz * 2.4 + vec2<f32>(in.world.y * 1.4, 0.4));
+        if (in.uv.y > 0.93 && fray < 0.42) {
+            discard;
+        }
         let n = normalize(nrm);
         let sun = normalize(frame.sun_dir.xyz);
-        let view = normalize(frame.cam_pos.xyz - in.world);
-        let halfv = normalize(sun + view);
         let ndl = clamp(dot(n, sun), 0.0, 1.0);
-        let shadow = shadow_factor(in.world + n * 0.015, n);
-        let spec = pow(clamp(dot(n, halfv), 0.0, 1.0), 18.0);
-        // Lit even in the berm shadow. The splash in the reference is the bright thing.
-        var spray = vec3<f32>(0.58, 0.66, 0.74) * (0.7 + ndl * 0.8);
-        spray += vec3<f32>(0.95, 0.97, 1.0) * spec * max(shadow, 0.55) * 0.45;
-        return present(spray);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        let grit = noise(in.world.xz * 6.0 + vec2<f32>(in.world.y * 2.2, 1.0));
+        var sheet = vec3<f32>(0.145, 0.068, 0.028) * (0.88 + grit * 0.2);
+        sheet *= 0.72 + ndl * max(shadow, 0.5) * 0.5;
+        let lip = smoothstep(0.62, 0.96, in.uv.y);
+        sheet = mix(sheet, vec3<f32>(0.2, 0.12, 0.055), lip * 0.28);
+        return present(sheet);
     }
     if (in.panel > 45.5 && in.panel < 46.5) {
         var n = normalize(nrm);
