@@ -5,12 +5,10 @@ use std::collections::HashMap;
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 use image::imageops::FilterType;
-use silt::soil::{track_offset, MAP_SIZE};
+use silt::soil::track_offset;
 use silt::world::World;
 
 use crate::mesh::{CpuMesh, MeshVertex};
-
-pub const GROUND_RES: u32 = 2048;
 
 const SRC_DIM: u32 = 512;
 const BUGGY_DIM: u32 = 1024;
@@ -96,6 +94,7 @@ const GROUND: &[MapSpec] = &[
     },
 ];
 
+#[derive(Debug)]
 pub struct RgbaTex {
     pub width: u32,
     pub height: u32,
@@ -107,9 +106,10 @@ pub struct Cc0Scene {
     pub glass: CpuMesh,
     pub wheels: [CpuMesh; 4],
     pub props: CpuMesh,
-    pub ground_diff: RgbaTex,
-    pub ground_nor: RgbaTex,
-    pub ground_pack: RgbaTex,
+    /// Five CC0 grounds, unmixed: mud_forest, brown_mud_dry, clay, grass, gravel.
+    pub ground_diff: [RgbaTex; 5],
+    pub ground_nor: [RgbaTex; 5],
+    pub ground_pack: [RgbaTex; 5],
     pub buggy_base: RgbaTex,
     pub buggy_nor: RgbaTex,
     pub buggy_mr: RgbaTex,
@@ -279,7 +279,7 @@ impl Tex {
 }
 
 fn build(maps: Vec<GroundMaps>) -> Cc0Scene {
-    let (ground_diff, ground_nor, ground_pack) = bake_ground(&maps);
+    let (ground_diff, ground_nor, ground_pack) = pack_layers(&maps);
     let (body, glass, wheels) = load_buggy();
     let props = place_props();
     let (buggy_base, buggy_nor, buggy_mr, tire_base, tire_nor) = buggy_textures();
@@ -311,114 +311,6 @@ fn build(maps: Vec<GroundMaps>) -> Cc0Scene {
     }
 }
 
-fn bake_ground(maps: &[GroundMaps]) -> (RgbaTex, RgbaTex, RgbaTex) {
-    let n = (GROUND_RES * GROUND_RES) as usize;
-    let mut diff = vec![0u8; n * 4];
-    let mut nor = vec![0u8; n * 4];
-    let mut pack = vec![0u8; n * 4];
-    let mut sum_w = [0.0f32; 5];
-    let tiles = [3.2f32, 2.7, 3.5, 2.3, 3.3];
-    for j in 0..GROUND_RES {
-        for i in 0..GROUND_RES {
-            let x = (i as f32 + 0.5) / GROUND_RES as f32 * MAP_SIZE - MAP_SIZE * 0.5;
-            let z = (j as f32 + 0.5) / GROUND_RES as f32 * MAP_SIZE - MAP_SIZE * 0.5;
-            let w = weights(x, z);
-            for k in 0..5 {
-                sum_w[k] += w[k];
-            }
-            let mut alb = [0.0f32; 3];
-            let mut nrm = [0.0f32; 3];
-            let mut rough = 0.0f32;
-            let mut ao = 0.0f32;
-            let mut disp = 0.0f32;
-            let mut metal = 0.0f32;
-            let mut wn = 0.0f32;
-            for (k, map) in maps.iter().enumerate() {
-                let wk = w[k];
-                if wk < 0.02 {
-                    continue;
-                }
-                wn += wk;
-                let u = x / tiles[k];
-                let v = z / tiles[k];
-                let d = map.diff.sample(u, v);
-                alb[0] += d[0] * wk;
-                alb[1] += d[1] * wk;
-                alb[2] += d[2] * wk;
-                let ns = map.nor.sample(u, v);
-                nrm[0] += (ns[0] * 2.0 - 1.0) * wk;
-                nrm[1] += (ns[1] * 2.0 - 1.0) * wk;
-                nrm[2] += (ns[2] * 2.0 - 1.0) * wk;
-                let r = map.rough.sample(u, v)[0];
-                let a = map.ao.sample(u, v)[0];
-                let (arm_r, arm_g, arm_b) = match &map.arm {
-                    Some(arm) => {
-                        let s = arm.sample(u, v);
-                        (s[0], s[1], s[2])
-                    }
-                    None => (a, r, 0.0),
-                };
-                rough += (r * 0.65 + arm_g * 0.35) * wk;
-                ao += (a * arm_r).sqrt() * wk;
-                let dv = match &map.disp {
-                    Some(disp) => disp.sample(u, v)[0],
-                    None => 0.5,
-                };
-                disp += dv * wk;
-                metal += arm_b * wk;
-            }
-            if wn < 1e-4 {
-                alb = [0.15, 0.12, 0.08];
-                nrm = [0.0, 0.0, 1.0];
-                rough = 0.9;
-                ao = 1.0;
-                disp = 0.5;
-                metal = 0.0;
-            } else {
-                let inv = 1.0 / wn;
-                alb[0] *= inv;
-                alb[1] *= inv;
-                alb[2] *= inv;
-                nrm[0] *= inv;
-                nrm[1] *= inv;
-                nrm[2] *= inv;
-                rough *= inv;
-                ao *= inv;
-                disp *= inv;
-                metal *= inv;
-            }
-            let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-5);
-            let o = ((j * GROUND_RES + i) * 4) as usize;
-            diff[o] = u8f(alb[0]);
-            diff[o + 1] = u8f(alb[1]);
-            diff[o + 2] = u8f(alb[2]);
-            diff[o + 3] = 255;
-            nor[o] = u8f(nrm[0] / nl * 0.5 + 0.5);
-            nor[o + 1] = u8f(nrm[1] / nl * 0.5 + 0.5);
-            nor[o + 2] = u8f(nrm[2] / nl * 0.5 + 0.5);
-            nor[o + 3] = 255;
-            pack[o] = u8f(rough);
-            pack[o + 1] = u8f(ao);
-            pack[o + 2] = u8f(disp);
-            pack[o + 3] = u8f(metal);
-        }
-    }
-    let pixels = (GROUND_RES * GROUND_RES) as f32;
-    eprintln!(
-        "cc0 weights mud {:.2} dry {:.2} clay {:.2} grass {:.2} rock {:.2}",
-        sum_w[0] / pixels,
-        sum_w[1] / pixels,
-        sum_w[2] / pixels,
-        sum_w[3] / pixels,
-        sum_w[4] / pixels
-    );
-    (
-        rgba_tex(GROUND_RES, GROUND_RES, diff),
-        rgba_tex(GROUND_RES, GROUND_RES, nor),
-        rgba_tex(GROUND_RES, GROUND_RES, pack),
-    )
-}
-
 fn rgba_tex(width: u32, height: u32, rgba: Vec<u8>) -> RgbaTex {
     RgbaTex { width, height, rgba }
 }
@@ -427,59 +319,51 @@ fn u8f(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-fn weights(x: f32, z: f32) -> [f32; 5] {
-    let off = track_offset(x, z);
-    let lane = smooth(1.55, 0.15, off.abs());
-    let berm = smooth(0.45, 1.55, off.abs()) * smooth(3.8, 2.05, off.abs());
-    let infield = smooth(0.2, -2.6, off);
-    let outside = smooth(2.15, 5.2, off.abs());
-    let far = smooth(7.2, 13.5, (x * x + z * z).sqrt());
-    let bog = {
-        let d = (x * x + (z - 1.05).powi(2)).sqrt() / 4.2;
-        smooth(1.2, 0.35, d)
-    };
-    let mut puddle = 0.0f32;
-    for (cx, cz, rx, rz) in [(-6.15, 5.05, 2.35, 2.55), (6.35, 2.4, 2.3, 1.8), (1.15, 9.25, 2.15, 2.05)]
-    {
-        let d = (((x - cx) / rx).powi(2) + ((z - cz) / rz).powi(2)).sqrt();
-        puddle = puddle.max(smooth(1.25, 0.35, d));
+fn pack_layers(maps: &[GroundMaps]) -> ([RgbaTex; 5], [RgbaTex; 5], [RgbaTex; 5]) {
+    assert_eq!(maps.len(), 5, "five CC0 grounds");
+    let mut diff = Vec::with_capacity(5);
+    let mut nor = Vec::with_capacity(5);
+    let mut pack = Vec::with_capacity(5);
+    for map in maps {
+        assert_eq!(map.diff.w, map.nor.w);
+        assert_eq!(map.diff.h, map.nor.h);
+        diff.push(rgba_tex(map.diff.w, map.diff.h, map.diff.rgba.clone()));
+        nor.push(rgba_tex(map.nor.w, map.nor.h, map.nor.rgba.clone()));
+        let n = (map.rough.w * map.rough.h) as usize;
+        let mut bytes = vec![0u8; n * 4];
+        for i in 0..n {
+            let r = map.rough.rgba[i * 4] as f32 / 255.0;
+            let a = map.ao.rgba[i * 4] as f32 / 255.0;
+            let (arm_r, arm_g, arm_b) = match &map.arm {
+                Some(arm) => {
+                    let s = i * 4;
+                    (
+                        arm.rgba[s] as f32 / 255.0,
+                        arm.rgba[s + 1] as f32 / 255.0,
+                        arm.rgba[s + 2] as f32 / 255.0,
+                    )
+                }
+                None => (a, r, 0.0),
+            };
+            let rough = r * 0.65 + arm_g * 0.35;
+            let ao = (a * arm_r).sqrt();
+            let disp = match &map.disp {
+                Some(d) => d.rgba[i * 4] as f32 / 255.0,
+                None => 0.5,
+            };
+            let o = i * 4;
+            bytes[o] = u8f(rough);
+            bytes[o + 1] = u8f(ao);
+            bytes[o + 2] = u8f(disp);
+            bytes[o + 3] = u8f(arm_b);
+        }
+        pack.push(rgba_tex(map.rough.w, map.rough.h, bytes));
     }
-    let wet_soil = lane.max(bog).max(puddle);
-    let n = value_noise(x * 0.16, z * 0.16);
-    let n2 = value_noise(x * 0.07 + 4.2, z * 0.07 - 1.5);
-    let clay_n = smooth(0.54, 0.74, n);
-    let rock_n = smooth(0.50, 0.72, n2);
-    let mud = wet_soil;
-    let dry = berm * (1.0 - clay_n * 0.8) * (1.0 - wet_soil);
-    let clay = (berm * 0.95 + infield * 0.4 + outside * 0.28) * clay_n * (1.0 - wet_soil * 0.9);
-    let grass = (infield * 0.95 + outside * 0.9) * (1.0 - clay_n * 0.5) * (1.0 - wet_soil) * (1.0 - far * 0.55);
-    let mut rock = (far * 0.95 + outside * rock_n * 0.7 + berm * rock_n * 0.2) * (1.0 - wet_soil);
-    rock = rock.max(smooth(8.5, 13.0, x.abs().max((z - 1.2).abs())) * 0.85 * (1.0 - wet_soil));
-    let sum = (mud + dry + clay + grass + rock).max(1e-4);
-    [mud / sum, dry / sum, clay / sum, grass / sum, rock / sum]
-}
-
-fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn value_noise(x: f32, z: f32) -> f32 {
-    let x0 = x.floor();
-    let z0 = z.floor();
-    let fx = x - x0;
-    let fz = z - z0;
-    let ux = fx * fx * (3.0 - 2.0 * fx);
-    let uz = fz * fz * (3.0 - 2.0 * fz);
-    let h = |x: f32, z: f32| -> f32 {
-        let s = (x * 127.1 + z * 311.7).sin() * 43758.5453;
-        s - s.floor()
-    };
-    let a = h(x0, z0);
-    let b = h(x0 + 1.0, z0);
-    let c = h(x0, z0 + 1.0);
-    let d = h(x0 + 1.0, z0 + 1.0);
-    a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz
+    (
+        diff.try_into().unwrap(),
+        nor.try_into().unwrap(),
+        pack.try_into().unwrap(),
+    )
 }
 
 fn load_buggy() -> (CpuMesh, CpuMesh, [CpuMesh; 4]) {
@@ -709,6 +593,14 @@ fn place_props() -> CpuMesh {
         let off = track_offset(x, z);
         let bog = (x * x + (z - 1.05).powi(2)).sqrt();
         if off.abs() < 1.85 || off.abs() > 8.2 || bog < 3.5 {
+            continue;
+        }
+        // Keep the surface-state stills clear of blades: the rut, the grip
+        // stripe, and the film/slurry patch.
+        let on_still = (x.abs() < 1.7 && z.abs() < 3.3)
+            || ((2.4..6.4).contains(&x) && (-1.6..2.0).contains(&z))
+            || ((-6.6..-2.6).contains(&x) && (-2.4..1.8).contains(&z));
+        if on_still {
             continue;
         }
         let h = soil.sample(x, z).height;

@@ -442,6 +442,7 @@ struct CaptureArgs {
     seconds: f32,
     stills_only: bool,
     cc0: bool,
+    states: bool,
     video: PathBuf,
     still_start: PathBuf,
     still_puddle: PathBuf,
@@ -449,6 +450,9 @@ struct CaptureArgs {
     cc0_iso: PathBuf,
     cc0_tire: PathBuf,
     cc0_puddle: PathBuf,
+    states_edge: PathBuf,
+    states_grip: PathBuf,
+    states_water: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -472,6 +476,10 @@ fn capture(args: &[String]) {
     );
     if parsed.cc0 {
         capture_cc0(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.states {
+        capture_states(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -607,6 +615,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut seconds = 12.0f32;
     let mut stills_only = false;
     let mut cc0 = false;
+    let mut states = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -614,6 +623,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut cc0_iso = PathBuf::from(format!("{MEDIA}/cc0-iso.png"));
     let mut cc0_tire = PathBuf::from(format!("{MEDIA}/cc0-tire.png"));
     let mut cc0_puddle = PathBuf::from(format!("{MEDIA}/cc0-puddle.png"));
+    let mut states_edge = PathBuf::from(format!("{MEDIA}/states-edge.png"));
+    let mut states_grip = PathBuf::from(format!("{MEDIA}/states-grip.png"));
+    let mut states_water = PathBuf::from(format!("{MEDIA}/states-water.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -631,6 +643,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--seconds" => seconds = val(&mut i).parse().expect("seconds"),
             "--stills-only" => stills_only = true,
             "--cc0" => cc0 = true,
+            "--states" => states = true,
+            "--states-edge" => states_edge = PathBuf::from(val(&mut i)),
+            "--states-grip" => states_grip = PathBuf::from(val(&mut i)),
+            "--states-water" => states_water = PathBuf::from(val(&mut i)),
             "--cc0-iso" => cc0_iso = PathBuf::from(val(&mut i)),
             "--cc0-tire" => cc0_tire = PathBuf::from(val(&mut i)),
             "--cc0-puddle" => cc0_puddle = PathBuf::from(val(&mut i)),
@@ -651,6 +667,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         seconds,
         stills_only,
         cc0,
+        states,
         video,
         still_start,
         still_puddle,
@@ -658,6 +675,81 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         cc0_iso,
         cc0_tire,
         cc0_puddle,
+        states_edge,
+        states_grip,
+        states_water,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_states(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::SoilField;
+    let mut world = World::flat(0.16);
+    world.soil = SoilField::gallery();
+    world.vehicle.pos = Vec3::new(14.0, 0.4, 14.0);
+    write_cc0_still(
+        renderer,
+        &world,
+        "edge",
+        &parsed.states_edge,
+        parsed,
+        states_edge_camera(),
+    );
+    // Right-rear tire straddles gravel and wet mud.
+    world.vehicle.pos = Vec3::new(3.16, 0.62, 1.18);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    let h = world.soil.sample(world.vehicle.pos.x, world.vehicle.pos.z).height;
+    world.vehicle.pos.y = h + 0.62;
+    write_cc0_still(
+        renderer,
+        &world,
+        "grip",
+        &parsed.states_grip,
+        parsed,
+        states_grip_camera(&world),
+    );
+    world.vehicle.pos = Vec3::new(14.0, 0.4, 14.0);
+    write_cc0_still(
+        renderer,
+        &world,
+        "water",
+        &parsed.states_water,
+        parsed,
+        states_water_camera(),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn states_edge_camera() -> CameraPose {
+    // Across the rut: near berm, torn lip, cut floor, far berm.
+    CameraPose {
+        eye: Vec3::new(-1.35, 0.55, 1.25),
+        target: Vec3::new(0.12, -0.01, 0.05),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn states_grip_camera(world: &World) -> CameraPose {
+    let local = world.vehicle.wheel_center_local(3);
+    let center = world.vehicle.pos + world.vehicle.orientation() * local;
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    CameraPose {
+        eye: center + right * 1.35 + Vec3::Y * 0.48 - fwd * 0.42,
+        target: center - Vec3::Y * 0.16,
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn states_water_camera() -> CameraPose {
+    CameraPose {
+        eye: Vec3::new(-6.15, 1.55, -1.35),
+        target: Vec3::new(-4.35, 0.02, 0.2),
+        ortho_width: None,
     }
 }
 

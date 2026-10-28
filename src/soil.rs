@@ -1,9 +1,123 @@
 //! Heightfield soil: Bekker sinkage, plastic ruts, wetness and shallow water.
+//!
+//! The cut and the spoil are different layers. `bed` is the ground the tire
+//! carved. `placed` is soil that has already been put somewhere else (berm,
+//! crest clod, impact ring). The visible height is their sum, and a cell's
+//! kind says which one the tire is on.
 
 use glam::Vec3;
 
 pub const MAP_SIZE: f32 = 40.0;
 pub const MAP_RES: usize = 192;
+
+/// Soil the tire can stand on. Liquid film and slurry sit on top of these
+/// and are not stored as a second height.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceKind {
+    Undisturbed = 0,
+    Grass = 1,
+    Gravel = 2,
+    DryCrust = 3,
+    WetMud = 4,
+    FreshCut = 5,
+    /// Exposed edge of a rut. A broken step, not the pile beside it.
+    CutLip = 6,
+    /// Spoil placed beside the cut.
+    Berm = 7,
+    PlacedClod = 8,
+    PackedClay = 9,
+}
+
+/// How standing water sits on a soil kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiquidRegime {
+    Dry = 0,
+    Film = 1,
+    Slurry = 2,
+}
+
+/// Soil kinds plus the two liquid regimes the solver treats as states.
+pub const SURFACE_STATE_COUNT: usize = 12;
+
+/// Crest chunks stay lumps. Later passes put the rest of the cut on the berm.
+const CREST_CLOD_CAP: f32 = 0.04;
+
+impl SurfaceKind {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Grass,
+            2 => Self::Gravel,
+            3 => Self::DryCrust,
+            4 => Self::WetMud,
+            5 => Self::FreshCut,
+            6 => Self::CutLip,
+            7 => Self::Berm,
+            8 => Self::PlacedClod,
+            9 => Self::PackedClay,
+            _ => Self::Undisturbed,
+        }
+    }
+
+    /// CC0 layer: 0 mud_forest, 1 brown_mud_dry, 2 clay, 3 grass, 4 gravel.
+    pub fn map_layer(self) -> u32 {
+        match self {
+            Self::Grass => 3,
+            Self::Gravel => 4,
+            Self::DryCrust | Self::Undisturbed | Self::Berm => 1,
+            Self::PackedClay => 2,
+            Self::WetMud | Self::FreshCut | Self::CutLip | Self::PlacedClod => 0,
+        }
+    }
+}
+
+pub fn liquid_regime(kind: SurfaceKind, water: f32) -> LiquidRegime {
+    if water <= 0.004 {
+        return LiquidRegime::Dry;
+    }
+    let slurry_at = match kind {
+        SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay => 0.045,
+        SurfaceKind::CutLip | SurfaceKind::PlacedClod | SurfaceKind::Berm => 0.11,
+        _ => 10.0,
+    };
+    if water >= slurry_at {
+        LiquidRegime::Slurry
+    } else {
+        LiquidRegime::Film
+    }
+}
+
+/// Metres of water that stay in the pores and do not enter the pipe.
+pub fn water_hold(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::Gravel => 0.0,
+        SurfaceKind::CutLip => 0.001,
+        SurfaceKind::DryCrust => 0.002,
+        SurfaceKind::Undisturbed => 0.003,
+        SurfaceKind::PlacedClod => 0.003,
+        SurfaceKind::Grass => 0.004,
+        SurfaceKind::Berm => 0.004,
+        SurfaceKind::PackedClay => 0.009,
+        SurfaceKind::WetMud => 0.012,
+        SurfaceKind::FreshCut => 0.02,
+    }
+}
+
+/// Multiplier on the shallow-water pipe. Gravel drains. Packed clay holds a film.
+pub fn water_conduct(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::Gravel => 2.4,
+        SurfaceKind::CutLip => 1.7,
+        SurfaceKind::Berm => 1.35,
+        SurfaceKind::DryCrust => 1.25,
+        SurfaceKind::PlacedClod => 1.15,
+        SurfaceKind::Undisturbed => 1.0,
+        SurfaceKind::Grass => 0.85,
+        SurfaceKind::WetMud => 0.9,
+        SurfaceKind::FreshCut => 0.5,
+        SurfaceKind::PackedClay => 0.32,
+    }
+}
 
 /// Stadium centerline. South cap sits on `TRACK_ZS`, north cap on `TRACK_ZN`.
 /// The scripted buggy and the heightfield share these so the lap stays on the mud.
@@ -20,8 +134,17 @@ pub struct SoilSample {
     pub darken: f32,
     pub roughness: f32,
     pub softness: f32,
-    /// Metres carved out of the original surface. Feeds slip-sinkage drag.
+    /// Metres carved out of the original bed. The berm's pile is not a rut.
     pub rut: f32,
+    pub kind: u8,
+    /// Spoil thickness on this cell. Separate from the cut.
+    pub placed: f32,
+}
+
+impl SoilSample {
+    pub fn kind(self) -> SurfaceKind {
+        SurfaceKind::from_u8(self.kind)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +162,11 @@ pub struct SoilField {
     pub darken: Vec<f32>,
     /// Linear roughness, 0 smooth / wet, 1 dry and broken.
     pub roughness: Vec<f32>,
+    /// Carved surface. Cutting lowers this and does not touch `placed`.
+    pub bed: Vec<f32>,
+    /// Soil put down after it was cut: berm, crest clods, impact ring.
+    pub placed: Vec<f32>,
+    pub kind: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +178,65 @@ pub struct Terramech {
     pub shear_k: f32,
     pub yield_stress: f32,
     pub viscosity: f32,
+}
+
+/// Grip, sink and shear for one surface state.
+///
+/// Wet mud with no standing water is the old softness curve, so a lap on the
+/// lane does not change character. Every other kind has its own modulus,
+/// friction and shear length. Film slicks the surface. Slurry only forms on
+/// soils that hold water.
+pub fn terramech_for(kind: SurfaceKind, softness: f32, water: f32) -> Terramech {
+    // Start from the wetness curve the lap already drives, then move each
+    // kind. Exponents stay near that curve: a high n looks stiff on paper
+    // and collapses under a light tire.
+    let base = terramech(softness);
+    let mut tm = match kind {
+        SurfaceKind::WetMud => base,
+        SurfaceKind::Undisturbed => scale_mech(base, 1.12, 1.05, 0.52, 0.040, 0.9, 0.85),
+        SurfaceKind::Grass => scale_mech(base, 1.28, 1.65, 0.46, 0.055, 1.05, 0.7),
+        SurfaceKind::Gravel => scale_mech(base, 1.55, 0.22, 0.74, 0.016, 0.3, 0.18),
+        SurfaceKind::DryCrust => scale_mech(base, 1.32, 1.35, 0.60, 0.012, 0.5, 0.32),
+        SurfaceKind::FreshCut => scale_mech(base, 0.78, 0.9, 0.17, 0.014, 1.2, 1.3),
+        SurfaceKind::CutLip => scale_mech(base, 1.08, 0.62, 0.40, 0.022, 0.65, 0.55),
+        SurfaceKind::Berm => scale_mech(base, 0.58, 0.38, 0.50, 0.070, 0.5, 0.65),
+        SurfaceKind::PlacedClod => scale_mech(base, 0.84, 0.48, 0.33, 0.034, 0.72, 0.75),
+        SurfaceKind::PackedClay => scale_mech(base, 1.22, 1.4, 0.24, 0.009, 1.1, 1.2),
+    };
+    match liquid_regime(kind, water) {
+        LiquidRegime::Dry => {}
+        LiquidRegime::Film => {
+            tm.phi *= 0.9;
+            tm.cohesion *= 1.06;
+            tm.viscosity *= 1.12;
+        }
+        LiquidRegime::Slurry => {
+            tm.k_eq *= 0.7;
+            tm.phi *= 0.62;
+            tm.shear_k *= 0.8;
+            tm.viscosity *= 1.45;
+            tm.yield_stress *= 1.18;
+        }
+    }
+    tm
+}
+
+fn scale_mech(
+    mut tm: Terramech,
+    k_mul: f32,
+    c_mul: f32,
+    phi: f32,
+    shear_k: f32,
+    y_mul: f32,
+    v_mul: f32,
+) -> Terramech {
+    tm.k_eq *= k_mul;
+    tm.cohesion *= c_mul;
+    tm.phi = phi;
+    tm.shear_k = shear_k;
+    tm.yield_stress *= y_mul;
+    tm.viscosity *= v_mul;
+    tm
 }
 
 /// Soil constants blended by `softness` in 0 (firm damp ground) ..= 1 (deep mud).
@@ -131,8 +318,17 @@ impl SoilField {
         } else {
             0.0
         };
+        let kind = if w > 0.6 {
+            SurfaceKind::WetMud
+        } else if w < 0.28 {
+            SurfaceKind::DryCrust
+        } else {
+            SurfaceKind::Undisturbed
+        };
         for i in 0..field.height.len() {
             field.height[i] = 0.0;
+            field.bed[i] = 0.0;
+            field.placed[i] = 0.0;
             field.initial_height[i] = 0.0;
             field.base_wetness[i] = w;
             field.wetness[i] = w;
@@ -140,6 +336,7 @@ impl SoilField {
             field.loose[i] = if w > 0.6 { 0.02 } else { 0.0 };
             field.darken[i] = 0.06;
             field.roughness[i] = lerp(0.9, 0.45, w);
+            field.kind[i] = kind as u8;
         }
         field
     }
@@ -160,6 +357,9 @@ impl SoilField {
             water: vec![0.0; n],
             darken: vec![0.0; n],
             roughness: vec![0.0; n],
+            bed: vec![0.0; n],
+            placed: vec![0.0; n],
+            kind: vec![SurfaceKind::Undisturbed as u8; n],
         }
     }
 
@@ -222,6 +422,8 @@ impl SoilField {
                 }
                 let idx = j * res + i;
                 field.height[idx] = h;
+                field.bed[idx] = h;
+                field.placed[idx] = 0.0;
                 field.initial_height[idx] = h;
             }
         }
@@ -276,6 +478,118 @@ impl SoilField {
                 field.roughness[idx] =
                     lerp(0.93, 0.38, wet) * lerp(0.85, 1.1, fbm2(x * 0.5, z * 0.4));
                 field.roughness[idx] = field.roughness[idx].clamp(0.18, 1.0);
+                field.kind[idx] = born_kind(x, z, field.wetness[idx], water) as u8;
+            }
+        }
+        field
+    }
+
+    /// Flat pad with a torn rut, a grip boundary, and film beside deep slurry.
+    /// The pictures are this field. The rut is stamped by the same wheel path
+    /// the lap uses, so the lip is the solver's lip.
+    pub fn gallery() -> Self {
+        let mut field = Self::flat(0.16);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                if (2.2..6.4).contains(&x) && z.abs() < 2.4 {
+                    if x < 3.9 {
+                        field.kind[idx] = SurfaceKind::Gravel as u8;
+                        field.wetness[idx] = 0.06;
+                        field.base_wetness[idx] = 0.06;
+                        field.water[idx] = 0.0;
+                        field.loose[idx] = 0.0;
+                        field.roughness[idx] = 0.96;
+                    } else {
+                        field.kind[idx] = SurfaceKind::WetMud as u8;
+                        field.wetness[idx] = 0.94;
+                        field.base_wetness[idx] = 0.9;
+                        field.water[idx] = 0.0;
+                        field.loose[idx] = 0.03;
+                        field.roughness[idx] = 0.42;
+                    }
+                }
+                if (-5.5..-3.25).contains(&x) {
+                    if z < -0.15 {
+                        field.kind[idx] = SurfaceKind::PackedClay as u8;
+                        field.wetness[idx] = 0.55;
+                        field.base_wetness[idx] = 0.5;
+                        field.water[idx] = 0.036;
+                        field.loose[idx] = 0.0;
+                        field.roughness[idx] = 0.28;
+                        field.darken[idx] = 0.8;
+                    } else if z > 0.4 {
+                        field.kind[idx] = SurfaceKind::WetMud as u8;
+                        field.wetness[idx] = 1.0;
+                        field.base_wetness[idx] = 0.95;
+                        field.water[idx] = 0.16;
+                        field.loose[idx] = 0.05;
+                        field.roughness[idx] = 0.22;
+                    } else {
+                        field.kind[idx] = SurfaceKind::DryCrust as u8;
+                        field.wetness[idx] = 0.22;
+                        field.base_wetness[idx] = 0.2;
+                        field.water[idx] = 0.022;
+                        field.roughness[idx] = 0.9;
+                    }
+                }
+                if x < -6.2 && hash2(i as f32, j as f32) > 0.55 {
+                    field.kind[idx] = SurfaceKind::Grass as u8;
+                    field.wetness[idx] = 0.16;
+                    field.water[idx] = 0.0;
+                }
+                // The gallery rut is cut through mud. A dry-crust pad would
+                // stay crust under the tire, and the lip would have nothing
+                // to tear against.
+                if x.abs() < 0.42 && z.abs() < 3.05 {
+                    field.kind[idx] = SurfaceKind::WetMud as u8;
+                    field.wetness[idx] = 0.9;
+                    field.base_wetness[idx] = 0.86;
+                    field.water[idx] = 0.0;
+                    field.darken[idx] = 0.12;
+                    field.loose[idx] = 0.02;
+                }
+            }
+        }
+        let forward = Vec3::Z;
+        let right = Vec3::X;
+        let mut z = -2.55;
+        while z <= 2.55 {
+            field.stamp_wheel(
+                Vec3::new(0.0, 0.0, z),
+                0.38,
+                0.28,
+                forward,
+                right,
+                0.08,
+                0.35,
+                0.12,
+                true,
+            );
+            z += 0.1;
+        }
+        // Overlapping passes pack the floor into clay, which paints the cut
+        // as a smooth plank. One torn pass leaves a fresh cut. Put that back
+        // so the lip is mud torn out of mud, and the berm stays the placed pile.
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let idx = j * res + i;
+                if field.kind[idx] != SurfaceKind::PackedClay as u8 {
+                    continue;
+                }
+                let x = (i as f32 + 0.5) * cell - half;
+                if x.abs() < 0.5 {
+                    field.kind[idx] = SurfaceKind::FreshCut as u8;
+                    field.darken[idx] = field.darken[idx].min(0.4);
+                }
             }
         }
         field
@@ -295,6 +609,8 @@ impl SoilField {
                 roughness: 0.9,
                 softness: softness_of(0.18, 0.0, 0.0),
                 rut: 0.0,
+                kind: SurfaceKind::Undisturbed as u8,
+                placed: 0.0,
             };
         }
         let i = u.floor() as usize;
@@ -311,7 +627,12 @@ impl SoilField {
         let loose = bilerp(s00.3, s10.3, s01.3, s11.3, tx, ty);
         let darken = bilerp(s00.4, s10.4, s01.4, s11.4, tx, ty);
         let roughness = bilerp(s00.5, s10.5, s01.5, s11.5, tx, ty);
-        let rut = bilerp(s00.6, s10.6, s01.6, s11.6, tx, ty).max(0.0);
+        let ni = u.round().clamp(0.0, (self.res - 1) as f32) as usize;
+        let nj = v.round().clamp(0.0, (self.res - 1) as f32) as usize;
+        let nidx = nj * self.res + ni;
+        let kind = self.kind[nidx];
+        let placed = self.placed[nidx];
+        let rut = (self.initial_height[nidx] - self.bed[nidx]).max(0.0);
         SoilSample {
             height,
             wetness,
@@ -321,6 +642,8 @@ impl SoilField {
             roughness,
             softness: softness_of(wetness, loose, water),
             rut,
+            kind,
+            placed,
         }
     }
 
@@ -333,8 +656,116 @@ impl SoilField {
             self.loose[idx],
             self.darken[idx],
             self.roughness[idx],
-            self.initial_height[idx] - self.height[idx],
+            (self.initial_height[idx] - self.bed[idx]).max(0.0),
         )
+    }
+
+    fn sync(&mut self, idx: usize) {
+        self.height[idx] = self.bed[idx] + self.placed[idx];
+    }
+
+    /// Remove `drop` metres. Placed spoil comes off before the bed is cut.
+    /// The returned thickness is volume that has to be put down somewhere else.
+    fn excavate(&mut self, idx: usize, drop: f32) -> f32 {
+        if drop <= 0.0 {
+            return 0.0;
+        }
+        let from_placed = drop.min(self.placed[idx]);
+        self.placed[idx] -= from_placed;
+        self.bed[idx] -= drop - from_placed;
+        self.sync(idx);
+        drop
+    }
+
+    pub fn cut_volume(&self) -> f32 {
+        let area = self.cell * self.cell;
+        self.initial_height
+            .iter()
+            .zip(self.bed.iter())
+            .map(|(h0, bed)| (h0 - bed).max(0.0))
+            .sum::<f32>()
+            * area
+    }
+
+    pub fn placed_volume(&self) -> f32 {
+        let area = self.cell * self.cell;
+        self.placed.iter().sum::<f32>() * area
+    }
+
+    /// Move already-placed spoil onto a landing cell. Does not mint soil.
+    pub fn land_clod(&mut self, x: f32, z: f32, volume: f32) {
+        let Some(dst) = self.idx_at(x, z) else {
+            return;
+        };
+        let here = SurfaceKind::from_u8(self.kind[dst]);
+        if matches!(here, SurfaceKind::FreshCut | SurfaceKind::PackedClay) {
+            self.wetness[dst] = (self.wetness[dst] + 0.08).min(1.0);
+            return;
+        }
+        let moved = self.take_placed_near(dst, volume.max(0.0));
+        if moved <= 0.0 {
+            if self.placed[dst] > 0.004 {
+                self.kind[dst] = SurfaceKind::PlacedClod as u8;
+            }
+            return;
+        }
+        let dh = moved / (self.cell * self.cell);
+        self.placed[dst] += dh;
+        self.kind[dst] = SurfaceKind::PlacedClod as u8;
+        self.loose[dst] = (self.loose[dst] + dh * 0.4).min(0.18);
+        self.roughness[dst] = lerp(self.roughness[dst], 0.9, 0.35);
+        self.wetness[dst] = (self.wetness[dst] + 0.08).min(1.0);
+        self.sync(dst);
+    }
+
+    fn take_placed_near(&mut self, dst: usize, volume: f32) -> f32 {
+        if volume <= 0.0 {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let res = self.res;
+        let di = (dst % res) as isize;
+        let dj = (dst / res) as isize;
+        let mut left = volume;
+        let mut taken = 0.0;
+        for radius in 1isize..5 {
+            for dj2 in -radius..=radius {
+                for di2 in -radius..=radius {
+                    if di2.abs() != radius && dj2.abs() != radius {
+                        continue;
+                    }
+                    let i = di + di2;
+                    let j = dj + dj2;
+                    if i < 0 || j < 0 || i >= res as isize || j >= res as isize {
+                        continue;
+                    }
+                    let idx = j as usize * res + i as usize;
+                    if idx == dst || self.placed[idx] <= 0.002 {
+                        continue;
+                    }
+                    let kind = SurfaceKind::from_u8(self.kind[idx]);
+                    if !matches!(kind, SurfaceKind::Berm | SurfaceKind::PlacedClod) {
+                        continue;
+                    }
+                    let room = (self.placed[idx] - 0.002).max(0.0) * area;
+                    let grab = left.min(room);
+                    if grab <= 0.0 {
+                        continue;
+                    }
+                    self.placed[idx] -= grab / area;
+                    if self.placed[idx] <= 0.002 {
+                        self.placed[idx] = 0.0;
+                    }
+                    self.sync(idx);
+                    taken += grab;
+                    left -= grab;
+                    if left <= 1.0e-8 {
+                        return taken;
+                    }
+                }
+            }
+        }
+        taken
     }
 
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {
@@ -388,10 +819,13 @@ impl SoilField {
         // The visible pair is the `lane` call. Spinning still reaches `want`.
         let fast = if lane { groove } else { groove.min(0.008) };
         let sigma = (width * 0.42).max(self.cell * 0.34);
-        // Flat floor, about two cells wide, then a short shoulder. A gaussian
-        // narrower than the grid left a dotted scar beside every tire.
+        // Flat floor, then a broken step. A ramped shoulder smeared the cut
+        // lip and the placed berm into one slope.
         let half_w = if lane { self.cell * 1.15 } else { sigma * 1.6 };
-        let shoulder = if lane { self.cell * 0.7 } else { 0.0 };
+        let lip_band = if lane { self.cell * 1.05 } else { 0.0 };
+        // Spoil sits in the cell against the lip. A wider band flattened
+        // the pile into the crust, so the berm disappeared beside the step.
+        let berm_band = self.cell * 0.9;
         let half_l = if lane {
             (len * 0.5).max(self.cell * 2.2)
         } else {
@@ -403,9 +837,9 @@ impl SoilField {
             half_l + self.cell * 0.35
         };
         let lateral_reach = if lane {
-            half_w + shoulder + self.cell * 1.2
+            half_w + lip_band + berm_band + self.cell * 0.4
         } else {
-            sigma * 3.0
+            sigma * 3.2
         };
         let reach = along_reach + lateral_reach;
         let half = self.size * 0.5;
@@ -416,13 +850,11 @@ impl SoilField {
         let res = self.res as isize;
 
         let mut vol = 0.0_f32;
-        let mut left_cells = [0usize; 96];
-        let mut right_cells = [0usize; 96];
-        let mut n_left = 0;
-        let mut n_right = 0;
+        let mut clods = [0usize; 128];
+        let mut n_clod = 0usize;
+        let mut berms = [0usize; 192];
+        let mut n_berm = 0usize;
         let area = self.cell * self.cell;
-        let lip_in = half_w + shoulder * 0.85;
-        let lip_out = half_w + shoulder + self.cell * 0.75;
 
         for j in j0.max(1)..j1.min(res - 1) {
             for i in i0.max(1)..i1.min(res - 1) {
@@ -450,8 +882,6 @@ impl SoilField {
                 let across = if lane {
                     if ax <= half_w {
                         1.0
-                    } else if shoulder > 0.0 && ax <= half_w + shoulder {
-                        1.0 - (ax - half_w) / shoulder
                     } else {
                         0.0
                     }
@@ -460,7 +890,7 @@ impl SoilField {
                 };
 
                 if across > 0.2 {
-                    let already = (self.initial_height[idx] - self.height[idx]).max(0.0);
+                    let already = (self.initial_height[idx] - self.bed[idx]).max(0.0);
                     let local_want = if lane {
                         want * across
                     } else if spun > groove {
@@ -473,9 +903,9 @@ impl SoilField {
                         let room = (local_want - already).min(0.40 - already).max(0.0);
                         let rate = if already < local_groove { 48.0 } else { 2.2 };
                         let drop = room * (1.0 - (-dt * rate).exp()) * along;
-                        self.height[idx] -= drop;
-                        self.loose[idx] = (self.loose[idx] + drop * 0.45).min(0.16);
-                        vol += drop * area;
+                        let removed = self.excavate(idx, drop);
+                        self.loose[idx] = (self.loose[idx] + removed * 0.45).min(0.16);
+                        vol += removed * area;
                     }
                     let wet = self.wetness[idx];
                     self.darken[idx] =
@@ -483,38 +913,135 @@ impl SoilField {
                     let target_r = lerp(0.62, 0.16, wet);
                     let blend = (5.0 * dt * across * along).min(0.45);
                     self.roughness[idx] = lerp(self.roughness[idx], target_r, blend);
-                } else if lane && ax > lip_in && ax < lip_out {
-                    if lx > 0.0 {
-                        if n_right < right_cells.len() {
-                            right_cells[n_right] = idx;
-                            n_right += 1;
+                    let prev = SurfaceKind::from_u8(self.kind[idx]);
+                    // Firm covers stay themselves. A dry crust does not become mud
+                    // because a tire crossed it. Standing water keeps the cut slick.
+                    self.kind[idx] = if matches!(
+                        prev,
+                        SurfaceKind::Gravel | SurfaceKind::Grass | SurfaceKind::DryCrust
+                    ) {
+                        prev as u8
+                    } else if self.water[idx] > 0.03 {
+                        SurfaceKind::FreshCut as u8
+                    } else if self.darken[idx] > 0.72 {
+                        SurfaceKind::PackedClay as u8
+                    } else {
+                        SurfaceKind::FreshCut as u8
+                    };
+                } else if lane && ax > half_w && ax <= half_w + lip_band && along > 0.35 {
+                    let piled = SurfaceKind::from_u8(self.kind[idx]);
+                    if matches!(piled, SurfaceKind::Berm) && self.placed[idx] > 0.012 {
+                        continue;
+                    }
+                    // A later pass must not stack another lump on the same chunk,
+                    // and must not shave that chunk back into the lip.
+                    if piled == SurfaceKind::PlacedClod {
+                        if self.placed[idx] < CREST_CLOD_CAP - 1.0e-4 && n_clod < clods.len() {
+                            clods[n_clod] = idx;
+                            n_clod += 1;
                         }
-                    } else if n_left < left_cells.len() {
-                        left_cells[n_left] = idx;
-                        n_left += 1;
+                        continue;
+                    }
+                    let h = hash2(i as f32 * 1.7 + 0.2, j as f32 * 1.3);
+                    self.kind[idx] = SurfaceKind::CutLip as u8;
+                    self.roughness[idx] = lerp(self.roughness[idx], 0.84, 0.35);
+                    // A notch in the crest. The step is broken, not a ramp.
+                    if h < 0.42 {
+                        let bite = (0.55 + h) * groove.min(0.055);
+                        let already = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                        let drop = (bite - already).max(0.0).min(0.06) * along;
+                        if drop > 0.001 {
+                            let removed = self.excavate(idx, drop);
+                            self.loose[idx] = (self.loose[idx] + removed * 0.3).min(0.16);
+                            vol += removed * area;
+                        }
+                    } else if h > 0.66 && n_clod < clods.len() {
+                        clods[n_clod] = idx;
+                        n_clod += 1;
+                    }
+                } else if ax > half_w + lip_band && ax <= half_w + lip_band + berm_band && along > 0.25
+                {
+                    if n_berm < berms.len() {
+                        berms[n_berm] = idx;
+                        n_berm += 1;
                     }
                 }
             }
         }
 
-        // A thin lip on the lane ribbon only. Per-tire scuffs do not pile a
-        // second ridge, or the berm reads as extra grooves.
-        if !lane || n_left + n_right == 0 {
+        if vol <= 1.0e-8 {
             return;
         }
-        let berm_vol = vol * 0.85;
-        let n_berm = (n_left + n_right) as f32;
-        let dh = berm_vol / (n_berm * area);
-        for idx in left_cells.iter().take(n_left).chain(right_cells.iter().take(n_right)) {
-            let pile = (self.height[*idx] - self.initial_height[*idx]).max(0.0);
-            let add = dh.min((0.032 - pile).max(0.0));
-            if add <= 0.0 {
+        self.deposit_spoil(vol, &clods[..n_clod], &berms[..n_berm]);
+    }
+
+    /// Put every cubic metre of cut soil onto crest clods and then the berm.
+    /// Nothing is discarded when a cell is full.
+    fn deposit_spoil(&mut self, vol: f32, clods: &[usize], berms: &[usize]) {
+        let area = self.cell * self.cell;
+        let mut left = vol;
+        for (n, idx) in clods.iter().copied().enumerate() {
+            if left <= 1.0e-8 {
+                break;
+            }
+            let room = (CREST_CLOD_CAP - self.placed[idx]).max(0.0);
+            if room <= 1.0e-4 {
                 continue;
             }
-            self.height[*idx] += add;
-            self.roughness[*idx] = lerp(self.roughness[*idx], 0.96, 0.25);
-            self.darken[*idx] = lerp(self.darken[*idx], 0.28, 0.15);
-            self.loose[*idx] = (self.loose[*idx] + add * 0.4).min(0.18);
+            let h = hash2(n as f32 * 2.1, idx as f32 * 0.17);
+            let lump = 0.014 + 0.02 * h;
+            let add = lump.min(room).min(left / area);
+            self.placed[idx] += add;
+            self.kind[idx] = SurfaceKind::PlacedClod as u8;
+            self.loose[idx] = (self.loose[idx] + add * 0.55).min(0.18);
+            self.roughness[idx] = lerp(self.roughness[idx], 0.94, 0.45);
+            self.sync(idx);
+            left -= add * area;
+        }
+        if berms.is_empty() {
+            if left > 1.0e-8 && !clods.is_empty() {
+                let add = left / (clods.len() as f32 * area);
+                for idx in clods {
+                    self.placed[*idx] += add;
+                    self.kind[*idx] = SurfaceKind::PlacedClod as u8;
+                    self.sync(*idx);
+                }
+            }
+            return;
+        }
+        let mut open: Vec<usize> = berms.to_vec();
+        let cap = 0.08_f32;
+        for _ in 0..6 {
+            if left <= 1.0e-8 || open.is_empty() {
+                break;
+            }
+            let share = left / (open.len() as f32 * area);
+            let mut next = Vec::with_capacity(open.len());
+            for idx in open {
+                let room = (cap - self.placed[idx]).max(0.0);
+                let add = share.min(room);
+                if add > 0.0 {
+                    self.placed[idx] += add;
+                    self.kind[idx] = SurfaceKind::Berm as u8;
+                    self.loose[idx] = (self.loose[idx] + add * 0.35).min(0.18);
+                    self.roughness[idx] = lerp(self.roughness[idx], 0.9, 0.3);
+                    self.darken[idx] = lerp(self.darken[idx], 0.22, 0.12);
+                    self.sync(idx);
+                    left -= add * area;
+                }
+                if self.placed[idx] < cap - 1.0e-4 {
+                    next.push(idx);
+                }
+            }
+            open = next;
+        }
+        if left > 1.0e-8 {
+            let add = left / (berms.len() as f32 * area);
+            for idx in berms {
+                self.placed[*idx] += add;
+                self.kind[*idx] = SurfaceKind::Berm as u8;
+                self.sync(*idx);
+            }
         }
     }
 
@@ -562,6 +1089,7 @@ impl SoilField {
                     transfer(
                         &self.height,
                         &self.water,
+                        &self.kind,
                         &mut next,
                         a,
                         b,
@@ -576,6 +1104,7 @@ impl SoilField {
                     transfer(
                         &self.height,
                         &self.water,
+                        &self.kind,
                         &mut next,
                         a,
                         b,
@@ -628,19 +1157,26 @@ impl SoilField {
                 if d < 1.0 {
                     let w = (1.0 - d).powf(1.35);
                     let drop = depth * w;
-                    self.height[idx] -= drop;
-                    self.loose[idx] = (self.loose[idx] + drop * 0.55).min(0.2);
+                    let removed = self.excavate(idx, drop);
+                    self.loose[idx] = (self.loose[idx] + removed * 0.55).min(0.2);
                     self.wetness[idx] = self.wetness[idx].max(0.9);
                     self.darken[idx] = (self.darken[idx] + 0.35 * w).min(1.0);
-                    vol += drop * area;
-                    dug_max = dug_max.max(drop);
+                    self.kind[idx] = if d > 0.82 {
+                        SurfaceKind::CutLip as u8
+                    } else if self.darken[idx] > 0.72 {
+                        SurfaceKind::PackedClay as u8
+                    } else {
+                        SurfaceKind::FreshCut as u8
+                    };
+                    vol += removed * area;
+                    dug_max = dug_max.max(removed);
                 } else if d < 1.5 {
                     ring_n += 1.0;
                 }
             }
         }
         if ring_n > 0.0 && vol > 0.0 {
-            let dh = vol * 0.7 / (ring_n * area);
+            let mut weights = Vec::new();
             for j in j0.max(1)..j1.min(res - 1) {
                 for i in i0.max(1)..i1.min(res - 1) {
                     let cx = (i as f32 + 0.5) * self.cell - half;
@@ -649,8 +1185,18 @@ impl SoilField {
                     if (1.0..1.5).contains(&d) {
                         let idx = j as usize * self.res + i as usize;
                         let lip = 1.0 - (d - 1.0) / 0.5;
-                        self.height[idx] += dh * lip;
+                        weights.push((idx, lip));
                     }
+                }
+            }
+            let wsum: f32 = weights.iter().map(|(_, w)| *w).sum();
+            if wsum > 1.0e-5 {
+                for (idx, w) in weights {
+                    let add = vol * (w / wsum) / area;
+                    self.placed[idx] += add;
+                    self.kind[idx] = SurfaceKind::Berm as u8;
+                    self.loose[idx] = (self.loose[idx] + add * 0.3).min(0.18);
+                    self.sync(idx);
                 }
             }
         }
@@ -705,8 +1251,8 @@ impl SoilField {
 
     pub fn max_rut_depth(&self) -> f32 {
         let mut m = 0.0_f32;
-        for (h0, h) in self.initial_height.iter().zip(self.height.iter()) {
-            m = m.max(h0 - h);
+        for (h0, bed) in self.initial_height.iter().zip(self.bed.iter()) {
+            m = m.max(h0 - bed);
         }
         m
     }
@@ -751,6 +1297,7 @@ impl SoilField {
 fn transfer(
     height: &[f32],
     water: &[f32],
+    kind: &[u8],
     next: &mut [f32],
     a: usize,
     b: usize,
@@ -759,7 +1306,11 @@ fn transfer(
     area: f32,
     cond: f32,
 ) {
-    if water[a] < 1.0e-5 && water[b] < 1.0e-5 {
+    let ka = SurfaceKind::from_u8(kind[a]);
+    let kb = SurfaceKind::from_u8(kind[b]);
+    let mobile_a = (water[a] - water_hold(ka)).max(0.0);
+    let mobile_b = (water[b] - water_hold(kb)).max(0.0);
+    if mobile_a < 1.0e-5 && mobile_b < 1.0e-5 {
         return;
     }
     let sa = height[a] + water[a];
@@ -768,17 +1319,47 @@ fn transfer(
     if dh.abs() < 1.0e-5 {
         return;
     }
-    // Volume across the shared face. Limited so one pass cannot drain a cell.
-    let mut vol = dh * cond * dt * dx * 0.35;
+    // The donor's soil decides how willingly the water leaves.
+    let face = if dh > 0.0 {
+        cond * water_conduct(ka)
+    } else {
+        cond * water_conduct(kb)
+    };
+    // Volume across the shared face. Limited so one pass cannot drain a cell,
+    // and pore water below the hold stays put.
+    let mut vol = dh * face * dt * dx * 0.35;
     if vol > 0.0 {
-        vol = vol.min(water[a] * area * 0.22);
+        vol = vol.min(mobile_a * area * 0.22);
         next[a] -= vol / area;
         next[b] += vol / area;
     } else {
-        vol = (-vol).min(water[b] * area * 0.22);
+        vol = (-vol).min(mobile_b * area * 0.22);
         next[b] -= vol / area;
         next[a] += vol / area;
     }
+}
+
+fn born_kind(x: f32, z: f32, wet: f32, water: f32) -> SurfaceKind {
+    if water > 0.02 || wet > 0.72 {
+        return SurfaceKind::WetMud;
+    }
+    if launch_runup(x, z) {
+        return SurfaceKind::DryCrust;
+    }
+    let off = track_offset(x, z).abs();
+    let far = (x * x + z * z).sqrt();
+    let n = fbm2(x * 0.16, z * 0.16);
+    let n2 = fbm2(x * 0.07 + 4.2, z * 0.07);
+    if far > 10.5 || (off > 4.8 && n2 > 0.58) {
+        return SurfaceKind::Gravel;
+    }
+    if off > 2.5 && n > 0.46 && wet < 0.48 {
+        return SurfaceKind::Grass;
+    }
+    if wet < 0.36 || (off > 1.45 && off < 3.3 && wet < 0.55) {
+        return SurfaceKind::DryCrust;
+    }
+    SurfaceKind::Undisturbed
 }
 
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -995,6 +1576,199 @@ mod tests {
         assert!(
             after > total * 0.85,
             "water drained too fast {total} -> {after}"
+        );
+    }
+
+    #[test]
+    fn states_differ_in_grip_sink_and_shear() {
+        let s = 0.45;
+        let mud = terramech_for(SurfaceKind::WetMud, s, 0.0);
+        let gravel = terramech_for(SurfaceKind::Gravel, s, 0.0);
+        let crust = terramech_for(SurfaceKind::DryCrust, s, 0.0);
+        let grass = terramech_for(SurfaceKind::Grass, s, 0.0);
+        let cut = terramech_for(SurfaceKind::FreshCut, s, 0.0);
+        let lip = terramech_for(SurfaceKind::CutLip, s, 0.0);
+        let berm = terramech_for(SurfaceKind::Berm, s, 0.0);
+        let clod = terramech_for(SurfaceKind::PlacedClod, s, 0.0);
+        let packed = terramech_for(SurfaceKind::PackedClay, s, 0.0);
+        assert!(gravel.k_eq > berm.k_eq * 1.8, "gravel should not sink like a berm");
+        assert!(crust.k_eq > cut.k_eq * 1.3, "crust should not sink like a fresh cut");
+        assert!(packed.k_eq > cut.k_eq, "packed clay is stiffer than the fresh cut");
+        assert!(
+            (lip.k_eq - berm.k_eq).abs() / lip.k_eq > 0.25,
+            "cut lip and placed berm must not share a modulus"
+        );
+        assert!(berm.shear_k > lip.shear_k + 0.02, "loose berm shears longer than the lip");
+        assert!(gravel.phi > cut.phi + 0.3, "gravel grips, a fresh cut is slick");
+        assert!(grass.cohesion > berm.cohesion * 2.0, "roots hold more than spoil");
+        assert!((clod.shear_k - berm.shear_k).abs() > 0.01);
+        assert!(
+            (mud.k_eq - terramech(s).k_eq).abs() < 1.0,
+            "dry wet-mud stays the lane curve"
+        );
+        let film = terramech_for(SurfaceKind::PackedClay, s, 0.02);
+        let slurry = terramech_for(SurfaceKind::WetMud, 0.9, 0.12);
+        let dry_mud = terramech_for(SurfaceKind::WetMud, 0.9, 0.0);
+        assert!(film.phi < packed.phi);
+        assert!(slurry.k_eq < dry_mud.k_eq);
+        assert!(liquid_regime(SurfaceKind::Gravel, 0.08) == LiquidRegime::Film);
+        assert!(liquid_regime(SurfaceKind::WetMud, 0.1) == LiquidRegime::Slurry);
+        assert!(liquid_regime(SurfaceKind::DryCrust, 0.012) == LiquidRegime::Film);
+        assert!(water_hold(SurfaceKind::FreshCut) > water_hold(SurfaceKind::CutLip));
+        assert!(water_hold(SurfaceKind::PackedClay) > water_hold(SurfaceKind::Gravel));
+        assert!(water_conduct(SurfaceKind::Gravel) > water_conduct(SurfaceKind::PackedClay));
+        assert_eq!(SURFACE_STATE_COUNT, 12);
+    }
+
+    #[test]
+    fn placed_spoil_is_not_the_cut_and_volume_holds() {
+        let mut soil = SoilField::flat(0.7);
+        let before_cut = soil.cut_volume();
+        let before_placed = soil.placed_volume();
+        soil.stamp_wheel(
+            Vec3::new(0.2, 0.0, -0.4),
+            0.38,
+            0.28,
+            Vec3::Z,
+            Vec3::X,
+            0.08,
+            0.4,
+            0.12,
+            true,
+        );
+        let cut = soil.cut_volume() - before_cut;
+        let placed = soil.placed_volume() - before_placed;
+        assert!(cut > 1.0e-4, "stamp did not cut, {cut}");
+        assert!(
+            (cut - placed).abs() < cut * 0.02 + 1.0e-5,
+            "volume drifted cut {cut} placed {placed}"
+        );
+        let mut lip = 0;
+        let mut berm = 0;
+        let mut clod = 0;
+        let mut lip_placed = 0.0;
+        let mut berm_placed = 0.0;
+        let mut step = 0.0_f32;
+        for j in 1..soil.res - 1 {
+            for i in 1..soil.res - 1 {
+                let idx = j * soil.res + i;
+                match SurfaceKind::from_u8(soil.kind[idx]) {
+                    SurfaceKind::CutLip => {
+                        lip += 1;
+                        lip_placed += soil.placed[idx];
+                        let floor = idx - 1;
+                        if SurfaceKind::from_u8(soil.kind[floor]) == SurfaceKind::FreshCut
+                            || SurfaceKind::from_u8(soil.kind[floor]) == SurfaceKind::PackedClay
+                        {
+                            step = step.max(soil.height[idx] - soil.height[floor]);
+                        }
+                    }
+                    SurfaceKind::Berm => {
+                        berm += 1;
+                        berm_placed += soil.placed[idx];
+                    }
+                    SurfaceKind::PlacedClod => clod += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(lip > 0, "no cut lip");
+        assert!(berm > 0, "no placed berm");
+        assert!(clod > 0, "no crest clods");
+        assert!(berm_placed > lip_placed, "the berm should hold the spoil");
+        assert!(step > 0.02, "shoulder was smoothed, step {step}");
+    }
+
+    #[test]
+    fn repeated_passes_leave_a_step_and_keep_the_volume() {
+        let mut soil = SoilField::flat(0.7);
+        let mut z = -1.4;
+        while z <= 1.4 {
+            soil.stamp_wheel(
+                Vec3::new(0.0, 0.0, z),
+                0.38,
+                0.28,
+                Vec3::Z,
+                Vec3::X,
+                0.08,
+                0.35,
+                0.12,
+                true,
+            );
+            z += 0.1;
+        }
+        let cut = soil.cut_volume();
+        let placed = soil.placed_volume();
+        assert!(
+            (cut - placed).abs() < cut * 0.02 + 1.0e-5,
+            "volume drifted cut {cut} placed {placed}"
+        );
+        let mut max_clod = 0.0_f32;
+        let mut max_berm = 0.0_f32;
+        let mut step = 0.0_f32;
+        let mut lip = 0;
+        let mut notches = 0;
+        for j in 1..soil.res - 1 {
+            for i in 1..soil.res - 1 {
+                let idx = j * soil.res + i;
+                match SurfaceKind::from_u8(soil.kind[idx]) {
+                    SurfaceKind::PlacedClod => max_clod = max_clod.max(soil.placed[idx]),
+                    SurfaceKind::Berm => max_berm = max_berm.max(soil.placed[idx]),
+                    SurfaceKind::CutLip => {
+                        lip += 1;
+                        let floor = idx.saturating_sub(1);
+                        let floor_kind = SurfaceKind::from_u8(soil.kind[floor]);
+                        if matches!(
+                            floor_kind,
+                            SurfaceKind::FreshCut | SurfaceKind::PackedClay | SurfaceKind::WetMud
+                        ) {
+                            let rise = soil.height[idx] - soil.height[floor];
+                            step = step.max(rise);
+                            if soil.bed[idx] < soil.initial_height[idx] - 0.02 {
+                                notches += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(lip > 0, "the lip was smoothed away");
+        assert!(notches > 0, "the crest was not broken");
+        assert!(max_clod > 0.01 && max_clod <= CREST_CLOD_CAP + 1.0e-3, "clod {max_clod}");
+        assert!(max_berm > 0.01, "berm did not take the spoil, {max_berm}");
+        assert!(step > 0.02, "shoulder was smoothed, step {step}");
+        let gallery = SoilField::gallery();
+        let gcut = gallery.cut_volume();
+        let gplaced = gallery.placed_volume();
+        assert!(
+            (gcut - gplaced).abs() < gcut * 0.02 + 1.0e-4,
+            "gallery volume drifted cut {gcut} placed {gplaced}"
+        );
+        assert_eq!(
+            gallery.sample(0.0, 0.0).kind(),
+            SurfaceKind::FreshCut,
+            "gallery floor should stay a fresh cut"
+        );
+        let mut saw_lip = false;
+        let mut saw_berm = false;
+        let mut saw_clod = false;
+        for x100 in -120..120 {
+            let s = gallery.sample(x100 as f32 * 0.01, 0.05);
+            match s.kind() {
+                SurfaceKind::CutLip => saw_lip = true,
+                SurfaceKind::Berm => saw_berm = true,
+                SurfaceKind::PlacedClod => saw_clod = true,
+                _ => {}
+            }
+        }
+        assert!(saw_lip && saw_berm && saw_clod, "gallery cross-section lost the lip");
+        let berm = gallery.sample(0.55, 0.0);
+        assert_eq!(berm.kind(), SurfaceKind::Berm);
+        assert!(
+            berm.placed > 0.05,
+            "gallery berm is too flat to sit beside the lip, {}",
+            berm.placed
         );
     }
 }

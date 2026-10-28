@@ -9,7 +9,8 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::particles::Particles;
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech_for, SoilField,
+    Terramech,
 };
 use crate::vehicle::{
     PanelMud, Wheel, PANEL_BELLY, PANEL_COUNT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_SEAT,
@@ -138,7 +139,12 @@ impl Bike {
             let (compression, sinkage, normal) = if z0 <= 0.004 {
                 ((self.wheels[i].compression - dt * 3.4).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
+                solve_suspension(
+                    z0,
+                    up_y,
+                    self.wheels[i].slip,
+                    terramech_for(sample.kind(), sample.softness, sample.water),
+                )
             };
             let wheel_center = wc0 + up * compression;
             let mut fwd = ori * (Quat::from_rotation_y(self.wheels[i].steer) * Vec3::Z);
@@ -175,7 +181,7 @@ impl Bike {
             let mut long_f = 0.0;
             let mut lat_f = 0.0;
             if active {
-                let tm = terramech(sample.softness);
+                let tm = terramech_for(sample.kind(), sample.softness, sample.water);
                 let length = contact_length(BIKE_RADIUS, sinkage).max(0.05);
                 let area = (BIKE_WIDTH * length).max(0.008);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -420,8 +426,7 @@ fn stick_mud(bike: &mut Bike, soil: &SoilField) {
     }
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {
-    let tm = terramech(softness);
+fn solve_suspension(z0: f32, up_y: f32, slip: f32, tm: Terramech) -> (f32, f32, f32) {
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;
     let z_of = |c: f32| (z0 - up_y * c).max(0.0);

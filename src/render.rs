@@ -279,9 +279,9 @@ impl Renderer {
                     },
                     count: None,
                 },
-                filter_tex(4, wgpu::ShaderStages::FRAGMENT),
-                filter_tex(5, wgpu::ShaderStages::FRAGMENT),
-                filter_tex(6, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                filter_array(4, wgpu::ShaderStages::FRAGMENT),
+                filter_array(5, wgpu::ShaderStages::FRAGMENT),
+                filter_array(6, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 filter_samp(7, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
@@ -446,9 +446,9 @@ impl Renderer {
         });
         let ground_samp = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ground"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
@@ -464,9 +464,12 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let (ground_diff, ground_diff_view) = upload_rgba(&device, &queue, "ground-diff", &cc0.ground_diff);
-        let (ground_nor, ground_nor_view) = upload_rgba(&device, &queue, "ground-nor", &cc0.ground_nor);
-        let (ground_pack, ground_pack_view) = upload_rgba(&device, &queue, "ground-pack", &cc0.ground_pack);
+        let (ground_diff, ground_diff_view) =
+            upload_array(&device, &queue, "ground-diff", &cc0.ground_diff);
+        let (ground_nor, ground_nor_view) =
+            upload_array(&device, &queue, "ground-nor", &cc0.ground_nor);
+        let (ground_pack, ground_pack_view) =
+            upload_array(&device, &queue, "ground-pack", &cc0.ground_pack);
         let (buggy_base, buggy_base_view) = upload_rgba(&device, &queue, "buggy-base", &cc0.buggy_base);
         let (buggy_nor, buggy_nor_view) = upload_rgba(&device, &queue, "buggy-nor", &cc0.buggy_nor);
         let (buggy_mr, buggy_mr_view) = upload_rgba(&device, &queue, "buggy-mr", &cc0.buggy_mr);
@@ -1265,7 +1268,7 @@ impl Renderer {
             px[0] = (soil.wetness[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[1] = ((soil.water[i] / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
-            px[3] = (soil.roughness[i].clamp(0.0, 1.0) * 255.0) as u8;
+            px[3] = soil.kind[i];
         }
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -1435,6 +1438,19 @@ fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
     pass.draw_indexed(0..mesh.count, 0, 0..1);
 }
 
+fn filter_array(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 fn filter_tex(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -1455,6 +1471,79 @@ fn filter_samp(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupL
         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
     }
+}
+
+fn upload_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    layers: &[crate::cc0::RgbaTex; 5],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let width = layers[0].width;
+    let height = layers[0].height;
+    for layer in layers {
+        assert_eq!(layer.width, width);
+        assert_eq!(layer.height, height);
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 5,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = stride.div_ceil(align) * align;
+    for (i, layer) in layers.iter().enumerate() {
+        let data: Vec<u8> = if padded == stride {
+            layer.rgba.clone()
+        } else {
+            let mut out = vec![0u8; (padded * height) as usize];
+            for y in 0..height as usize {
+                let src = y * stride as usize;
+                let dst = y * padded as usize;
+                out[dst..dst + stride as usize]
+                    .copy_from_slice(&layer.rgba[src..src + stride as usize]);
+            }
+            out
+        };
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: i as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
 }
 
 fn upload_rgba(
