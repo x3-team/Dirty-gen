@@ -359,7 +359,7 @@ fn build_field() -> SoilField {
             let mut h = land(x, z);
             let outer_w = smooth(OUTER_HALF + 2.5, OUTER_HALF - 0.25, o.lat.abs());
             let inner_w = smooth(INNER_HALF + 2.1, INNER_HALF - 0.2, inn.lat.abs());
-            let track = outer_surface(o, hole, pool);
+            let track = outer_surface(o, pool);
             // Outside the ribbon, ease the hillside down from the racing line
             // so the climb is a slope, not a curb around a floating oval.
             if o.lat > 0.6 {
@@ -373,7 +373,10 @@ fn build_field() -> SoilField {
                 h = lerp(h, inner_surface(inn), inner_w);
                 h += inner_berm(inn);
             }
-            h = h.clamp(-0.55, 2.25);
+            // The bowl is cut in world space so the bank rings the hole.
+            // A ribbon-only dip read as a flat quad.
+            h -= bowl_drop(x, z, hole);
+            h = h.clamp(-0.95, 2.25);
             let idx = j * res + i;
             field.height[idx] = h;
             field.initial_height[idx] = h;
@@ -396,9 +399,10 @@ fn build_field() -> SoilField {
             };
             let mut water = water;
             let mut wet = wet;
-            let hole_d = (x - hole.0).hypot(z - hole.1);
-            if hole_d < 3.6 && h < 0.0 {
-                water = (0.02 - h).clamp(0.05, 0.18);
+            let drop = bowl_drop(x, z, hole);
+            if drop > 0.02 {
+                // Shallow at the bank, deeper in the middle. The rim is the shoreline.
+                water = (drop * 0.22).clamp(0.012, 0.20);
                 wet = 1.0;
             }
             let pool_d = (x - pool.x).hypot(z - pool.z);
@@ -497,6 +501,18 @@ pub fn blend(x: f32, z: f32) -> [f32; 5] {
     [mud / sum, dry / sum, clay / sum, grass / sum, rock / sum]
 }
 
+/// Round pit. Zero on the rim, deepest at the hole center.
+fn bowl_drop(x: f32, z: f32, hole: (f32, f32)) -> f32 {
+    let dx = (x - hole.0) / 3.85;
+    let dz = (z - hole.1) / 3.45;
+    let d = (dx * dx + dz * dz).sqrt();
+    if d >= 1.0 {
+        return 0.0;
+    }
+    let t = 1.0 - d;
+    t * t * (3.0 - 2.0 * t) * 0.86
+}
+
 fn land(x: f32, z: f32) -> f32 {
     let n = fbm(x * 0.09, z * 0.09);
     let n2 = fbm(x * 0.31 + 4.0, z * 0.28);
@@ -506,26 +522,10 @@ fn land(x: f32, z: f32) -> f32 {
     0.20 + (n - 0.5) * 0.12 + (n2 - 0.5) * 0.04 + hill * 1.9
 }
 
-fn outer_surface(o: Hit, hole: (f32, f32), pool: Hit) -> f32 {
+fn outer_surface(o: Hit, pool: Hit) -> f32 {
     let mut h = elev(o.u);
     h += whoops(o);
     h += table_bump(o.u);
-    let hd = (o.x - hole.0).hypot(o.z - hole.1);
-    // The hole is authored in world space so the bowl stays round on the turn.
-    let hx = hole.0 + (o.x - hole.0) * 0.0;
-    let _ = hx;
-    let bowl = {
-        let dx = (o.x - hole.0) / 3.55;
-        let dz = (o.z - hole.1) / 3.15;
-        let d = (dx * dx + dz * dz).sqrt();
-        if d < 1.15 {
-            let t = (1.0 - d / 1.05).clamp(0.0, 1.0);
-            t * t * 0.88
-        } else {
-            0.0
-        }
-    };
-    h -= bowl;
     let pd = (o.x - pool.x).hypot(o.z - pool.z);
     if pd < 2.4 {
         let t = (1.0 - pd / 2.4).clamp(0.0, 1.0);
@@ -536,7 +536,6 @@ fn outer_surface(o: Hit, hole: (f32, f32), pool: Hit) -> f32 {
         let side = (1.0 - (o.lat.abs() / (OUTER_HALF - 0.15)).clamp(0.0, 1.0)).powf(0.8);
         h += rut_delta(o.lat) * depth * side;
     }
-    let _ = hd;
     h
 }
 

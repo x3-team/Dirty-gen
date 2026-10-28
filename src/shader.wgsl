@@ -346,7 +346,10 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     let map_size = max(frame.params.z * frame.params.w, 1.0);
     let guv = in.xz / map_size + vec2<f32>(0.5);
     let disp = textureSampleLevel(ground_pack, ground_samp, guv, 0.0).b;
-    let h = terrain_height(in.xz) + (disp - 0.5) * 0.05;
+    // Standing water sits on the smooth bed. Gravel displacement reads as a sticker.
+    let wet = mat_bilinear(in.xz).g * 0.34;
+    let disp_scale = mix(0.05, 0.0, smoothstep(0.008, 0.03, wet));
+    let h = terrain_height(in.xz) + (disp - 0.5) * disp_scale;
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     var o: TerrOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
@@ -399,15 +402,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Loose soil on the shoulder. Lighter than the lane, only where the stamp piled it.
     albedo = mix(albedo, vec3<f32>(0.15, 0.078, 0.034), lip * 0.92);
 
-    // Standing water is the bed itself. A second sheet left a jagged lip.
-    let pond_d = smooth_water(xz);
-    let pond = smoothstep(0.02, 0.10, pond_d);
-    let muted = mix(diff, vec3<f32>(dot(diff, vec3<f32>(0.30, 0.50, 0.20))), 0.4);
-    var film = muted * vec3<f32>(0.92, 0.62, 0.34);
-    film = film * mix(1.0, 0.78, smoothstep(0.06, 0.15, pond_d));
+    // Opaque tan water on the bed. Depth darkens the middle. The bank is the rim.
+    let pond_d = mat_bilinear(xz).g * 0.34;
+    let pond = smoothstep(0.006, 0.028, pond_d);
+    let depth_t = smoothstep(0.02, 0.16, pond_d);
+    let shallow = vec3<f32>(0.20, 0.11, 0.040);
+    let deep = vec3<f32>(0.035, 0.016, 0.007);
+    let film = mix(shallow, deep, depth_t);
     albedo = mix(albedo, film, pond);
-    // Keep most of the bed normal. A full replace turned the bowl into steps.
-    n = normalize(mix(n, bed_normal(xz), pond * 0.35));
+    n = normalize(mix(n, bed_normal(xz), pond));
 
     // The lane stays matte. Shine is the soil ringing a puddle. The same lobe
     // on the tire cut turned the groove into a tan stripe, so the floor stays dark.
@@ -415,10 +418,11 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let drowned = smoothstep(0.012, 0.05, water) * (1.0 - pond);
     let rough_out = mix(mix(rough_map, 0.16, shore), max(rough_map, 0.9), max(drowned, pond));
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
-    // Sky fill turns a flat bowl purple. The pond keeps the bed's tan.
+    // Warm light on the bowl slope. Sky fill turned the water purple.
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = clamp(dot(n, sun), 0.0, 1.0);
-    let warm = film * (vec3<f32>(0.62, 0.46, 0.30) + frame.sun_color.rgb * ndl * 0.2);
+    let wrap = ndl * 0.72 + 0.28;
+    let warm = film * (vec3<f32>(0.70, 0.50, 0.30) * wrap + frame.sun_color.rgb * ndl * 0.18);
     lit = mix(lit, warm, pond);
     // The sun sits low, so a tight Phong highlight misses this camera.
     // A wide lobe on the shore is the wet sheen. It stays off the pond.
@@ -430,17 +434,6 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let wet_spec = (facing * 0.75 + wide * 1.15) * shore;
     lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
     return present(lit);
-}
-
-fn smooth_water(xz: vec2<f32>) -> f32 {
-    var acc = 0.0;
-    let r = 0.75;
-    for (var j: i32 = -2; j <= 2; j = j + 1) {
-        for (var i: i32 = -2; i <= 2; i = i + 1) {
-            acc = acc + mat_bilinear(xz + vec2<f32>(f32(i), f32(j)) * r).g;
-        }
-    }
-    return acc / 25.0 * 0.34;
 }
 
 struct MeshIn {

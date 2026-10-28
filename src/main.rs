@@ -435,9 +435,9 @@ fn track_puddle_camera(world: &World) -> CameraPose {
         }
     }
     CameraPose {
-        // Back and above the near shore so the bowl reads as a pond, not a fill.
-        eye: Vec3::new(lip_x, lip_h + 3.6, lip_z) + out * 2.8,
-        target: Vec3::new(x, (bed + 0.55).max(0.15), z),
+        // Across the near bank, wide enough that the whole rim is the shoreline.
+        eye: Vec3::new(lip_x, lip_h + 2.05, lip_z) + out * 2.6,
+        target: Vec3::new(x, bed + 0.12, z),
         ortho_width: None,
     }
 }
