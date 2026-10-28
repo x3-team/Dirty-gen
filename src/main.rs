@@ -751,25 +751,43 @@ fn capture_water(args: &[String]) {
     let (first, second) = world.soil.cut_east_straight();
     world.particles.clear();
     world.time = 1.7;
-    let park = world.soil.sample(-14.0, -12.0).height;
-    world.vehicle.pos = Vec3::new(-14.0, park + 0.62, -12.0);
-    world.vehicle.vel = Vec3::ZERO;
-    world.vehicle.yaw = 0.2;
-    world.bike.pos = Vec3::new(-12.0, park + 0.7, -14.0);
-    world.bike.vel = Vec3::ZERO;
     let rut_x = silt::soil::TRACK_R + 0.74;
     let lip = world.soil.sample(rut_x, 1.05);
+    // Rear wheel in the film. The body sits up the bank so the sheet stays visible.
+    world.vehicle.yaw = -0.45;
+    let wheel_local = world.vehicle.wheel_center_local(2);
+    let wheel = Vec3::new(rut_x + 0.02, lip.height + 0.4, 1.12);
+    world.vehicle.pos = wheel - world.vehicle.orientation() * wheel_local;
+    world.vehicle.vel = Vec3::ZERO;
+    let away = world.soil.sample(-16.0, -14.0).height;
+    world.bike.pos = Vec3::new(-16.0, away + 0.7, -14.0);
+    world.bike.vel = Vec3::ZERO;
+    // Droplets already on the arc, so the still shows water leaving the tire
+    // instead of a clump sitting on the rubber. Nothing here writes the soil.
+    for i in 0..14 {
+        let t = i as f32 / 13.0;
+        let along = 0.35 + t * 1.05;
+        let side = ((i % 5) as f32 - 2.0) * 0.11;
+        let height = 0.2 + (t * (1.0 - t)) * 1.35;
+        world.particles.spawn(
+            wheel + Vec3::new(-along, height, side + (t - 0.5) * 0.55),
+            Vec3::new(-1.2, 1.4, side),
+            1.6,
+            0.06,
+            0,
+        );
+    }
     let bowl = world.soil.sample(rut_x, 2.2);
     println!(
         "film water {:.3} height {:.3}  slurry water {:.3} height {:.3}",
         lip.water, lip.height, bowl.water, bowl.height
     );
-    // Above the thin end of the outer groove, so the clay floor is the subject.
+    // Above the thin end of the outer groove, so the clay shows through the film.
     let shallow_pose = lift_camera(
         &world,
         CameraPose {
-            eye: Vec3::new(3.7, 2.25, -0.05),
-            target: Vec3::new(rut_x - 0.05, -0.04, 1.12),
+            eye: Vec3::new(4.15, 2.05, 0.15),
+            target: Vec3::new(rut_x, -0.02, 1.12),
             ortho_width: None,
         },
     );
@@ -783,13 +801,16 @@ fn capture_water(args: &[String]) {
         first,
         second
     );
-    // Same grooves where the east puddle fills them. The column is deep enough
-    // that the slurry covers the clay.
+    world.particles.clear();
+    let parked = world.soil.sample(-14.0, -12.0).height;
+    world.vehicle.pos = Vec3::new(-14.0, parked + 0.62, -12.0);
+    world.vehicle.yaw = 0.2;
+    // The filled bowl, where the slurry covers the clay and can mirror the sky.
     let deep_pose = lift_camera(
         &world,
         CameraPose {
-            eye: Vec3::new(3.45, 2.65, 0.45),
-            target: Vec3::new(rut_x - 0.1, -0.14, 2.25),
+            eye: Vec3::new(3.9, 2.35, 0.55),
+            target: Vec3::new(silt::soil::TRACK_R + 0.15, -0.06, 2.35),
             ortho_width: None,
         },
     );

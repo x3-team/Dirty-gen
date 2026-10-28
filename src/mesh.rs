@@ -1166,6 +1166,7 @@ fn add_lump(
     stacks: usize,
     slices: usize,
     slump: bool,
+    panel: f32,
 ) {
     let axis = Vec3::new(
         0.88 + chunk_hash(seed, 1) * 0.22,
@@ -1221,7 +1222,7 @@ fn add_lump(
         let a = ring(1, i);
         let b = ring(1, i + 1);
         add_tri_smooth(
-            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
+            mesh, pts[0], nrm[0], pts[a], nrm[a], pts[b], nrm[b], panel, center,
         );
     }
     for s in 1..stacks.saturating_sub(1) {
@@ -1231,10 +1232,10 @@ fn add_lump(
             let c = ring(s + 1, i);
             let d = ring(s + 1, i + 1);
             add_tri_smooth(
-                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center,
+                mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], panel, center,
             );
             add_tri_smooth(
-                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center,
+                mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], panel, center,
             );
         }
     }
@@ -1244,14 +1245,16 @@ fn add_lump(
         let a = ring(last, i + 1);
         let b = ring(last, i);
         add_tri_smooth(
-            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], PANEL_CLOD, center,
+            mesh, pts[bot], nrm[bot], pts[a], nrm[a], pts[b], nrm[b], panel, center,
         );
     }
 }
 
 fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, slices: usize) {
+    // Tire spray is a bright sheet of water. Clods stay wet mud.
+    let panel = if p.kind == 0 || p.kind == 4 { 47.0 } else { PANEL_CLOD };
     add_lump(
-        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded,
+        mesh, p.pos, p.rot, p.size, p.seed, stacks, slices, p.grounded, panel,
     );
 }
 
