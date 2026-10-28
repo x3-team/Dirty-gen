@@ -905,6 +905,104 @@ impl SoilField {
         taken
     }
 
+    /// Mean moisture across the contact chord. The center cell still owns the
+    /// kind: a patch that straddles a lip should not average that into mud.
+    pub fn sample_patch(
+        &self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        length: f32,
+        width: f32,
+    ) -> SoilSample {
+        let along_n = 5;
+        let across_n = 3;
+        let mut wetness = 0.0;
+        let mut water = 0.0;
+        let mut loose = 0.0;
+        let mut darken = 0.0;
+        let mut n = 0.0_f32;
+        for j in 0..across_n {
+            for i in 0..along_n {
+                let u = (i as f32 + 0.5) / along_n as f32 - 0.5;
+                let v = (j as f32 + 0.5) / across_n as f32 - 0.5;
+                let p = center + forward * (length * u) + right * (width * v);
+                let s = self.sample(p.x, p.z);
+                wetness += s.wetness;
+                water += s.water;
+                loose += s.loose;
+                darken += s.darken;
+                n += 1.0;
+            }
+        }
+        let inv = 1.0 / n.max(1.0);
+        let mid = self.sample(center.x, center.z);
+        SoilSample {
+            height: mid.height,
+            wetness: wetness * inv,
+            water: water * inv,
+            loose: loose * inv,
+            darken: darken * inv,
+            roughness: mid.roughness,
+            softness: softness_of(wetness * inv, loose * inv, water * inv),
+            rut: mid.rut,
+            kind: mid.kind,
+            placed: mid.placed,
+        }
+    }
+
+    /// Take loose smear from the footprint and hand it to the tread.
+    /// The bed and the placed pile stay where they are.
+    pub fn skim_loose(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        length: f32,
+        width: f32,
+        depth: f32,
+    ) -> f32 {
+        if depth <= 1.0e-6 {
+            return 0.0;
+        }
+        let half_l = (length * 0.5).max(self.cell * 0.4);
+        let half_w = (width * 0.5).max(self.cell * 0.25);
+        let reach = half_l + half_w + self.cell;
+        let half = self.size * 0.5;
+        let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        let mut taken = 0.0;
+        let mut cells = 0.0;
+        for j in j0.max(0)..j1.min(res - 1) {
+            for i in i0.max(0)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - center.x;
+                let rel_z = cz - center.z;
+                let lx = rel_x * right.x + rel_z * right.z;
+                let lz = rel_x * forward.x + rel_z * forward.z;
+                if lx.abs() > half_w || lz.abs() > half_l {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let bite = (self.loose[idx] * 0.45).min(depth);
+                if bite > 0.0 {
+                    self.loose[idx] -= bite;
+                    taken += bite;
+                    cells += 1.0;
+                }
+            }
+        }
+        if cells > 0.0 {
+            taken / cells
+        } else {
+            0.0
+        }
+    }
+
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {
         let half = self.size * 0.5;
         if x < -half || z < -half || x >= half || z >= half {

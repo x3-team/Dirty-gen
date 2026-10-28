@@ -8,6 +8,7 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::particles::Particles;
+use crate::patch::{contact_patch, step_tread, TreadCoat};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
     terramech_for, wheel_buoyancy, SoilField, Terramech,
@@ -203,10 +204,37 @@ impl Bike {
                     * (1.0 - (-slip_angle.abs() / 0.14).exp());
                 long_f = lerp(pace_long, prop_long, soil_w);
                 lat_f = lerp(pace_lat, prop_lat, soil_w);
+                let patch_len = length;
+                let foot = soil.sample_patch(wheel_center, fwd, right, patch_len, BIKE_WIDTH);
+                let coat = TreadCoat {
+                    groove: self.wheels[i].groove,
+                    smear: self.wheels[i].smear,
+                };
+                let patch = contact_patch(
+                    BIKE_RADIUS,
+                    BIKE_WIDTH,
+                    sinkage,
+                    slip,
+                    normal,
+                    sample.kind(),
+                    foot.wetness,
+                    foot.loose,
+                    foot.water,
+                    coat,
+                );
+                let spun = ((slip.abs() - 0.75) / 0.20).clamp(0.0, 1.0);
+                let coated = ((coat.smear - 0.72) / 0.20).clamp(0.0, 1.0);
+                let patch_scale = lerp(1.0, patch.scale, spun.max(coated) * soil_w);
+                long_f *= patch_scale;
+                lat_f *= patch_scale;
                 if v_long.abs() > 0.12 {
                     long_f -= v_long.signum() * rolling_resistance(normal, sample.water);
                 }
                 drive -= long_f * BIKE_RADIUS;
+                let mut next = coat;
+                let _thrown = step_tread(&mut next, slip, patch.squeeze, patch.pull, dt);
+                self.wheels[i].groove = next.groove;
+                self.wheels[i].smear = next.smear;
                 let _ = tm;
             }
             let held = self.jump_hold > 0.0;

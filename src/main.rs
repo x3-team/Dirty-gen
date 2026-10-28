@@ -460,6 +460,9 @@ struct CaptureArgs {
     volume_second: PathBuf,
     moisture_wet: PathBuf,
     moisture_dry: PathBuf,
+    patch: bool,
+    patch_roll: PathBuf,
+    patch_spin: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -495,6 +498,10 @@ fn capture(args: &[String]) {
     }
     if parsed.moisture {
         capture_moisture(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.patch {
+        capture_patch(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -633,6 +640,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut states = false;
     let mut volume = false;
     let mut moisture = false;
+    let mut patch = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -648,6 +656,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut volume_second = PathBuf::from(format!("{MEDIA}/volume-second.png"));
     let mut moisture_wet = PathBuf::from(format!("{MEDIA}/moisture-wet.png"));
     let mut moisture_dry = PathBuf::from(format!("{MEDIA}/moisture-dry.png"));
+    let mut patch_roll = PathBuf::from(format!("{MEDIA}/patch-roll.png"));
+    let mut patch_spin = PathBuf::from(format!("{MEDIA}/patch-spin.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -668,6 +678,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--states" => states = true,
             "--volume" => volume = true,
             "--moisture" => moisture = true,
+            "--patch" => patch = true,
+            "--patch-roll" => patch_roll = PathBuf::from(val(&mut i)),
+            "--patch-spin" => patch_spin = PathBuf::from(val(&mut i)),
             "--moisture-wet" => moisture_wet = PathBuf::from(val(&mut i)),
             "--moisture-dry" => moisture_dry = PathBuf::from(val(&mut i)),
             "--volume-berm" => volume_berm = PathBuf::from(val(&mut i)),
@@ -699,6 +712,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         states,
         volume,
         moisture,
+        patch,
         video,
         still_start,
         still_puddle,
@@ -714,6 +728,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         volume_second,
         moisture_wet,
         moisture_dry,
+        patch_roll,
+        patch_spin,
     }
 }
 
@@ -863,6 +879,146 @@ fn print_volumes(label: &str, soil: &silt::soil::SoilField) {
         "{label} cut {:.4} m3  placed {:.4} m3  berm {:.4} m3  clods {:.4} m3  rut {:.4} m  berm height {:.4} m",
         v.cut, v.placed, v.berm, v.clods, v.max_rut, v.max_berm
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_patch(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    let mut world = World::flat(0.72);
+    world.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+    world.bike.vel = Vec3::ZERO;
+    // Standing water hides the tread. The clay stays wet, so it still sticks.
+    for w in &mut world.soil.water {
+        *w = 0.0;
+    }
+    for loose in &mut world.soil.loose {
+        *loose = loose.max(0.04);
+    }
+    let dt = 1.0 / 60.0;
+    let roll = Input {
+        throttle: 0.36,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    for _ in 0..360 {
+        world.step(dt, &roll);
+    }
+    print_patch("roll", &world);
+    // The roll still is the tread. Flying chunks belong to the spin frame.
+    let hidden: Vec<bool> = world.particles.items.iter().map(|p| p.alive).collect();
+    for p in &mut world.particles.items {
+        p.alive = false;
+    }
+    write_cc0_still(
+        renderer,
+        &world,
+        "roll",
+        &parsed.patch_roll,
+        parsed,
+        patch_camera(&world, 3),
+    );
+    for (p, was) in world.particles.items.iter_mut().zip(hidden) {
+        p.alive = was;
+    }
+
+    // Hold the chassis and let the tread spin. The patch, not a scripted
+    // force, is what drops the grip and pulls the mud back out.
+    for _ in 0..30 {
+        world.step(
+            dt,
+            &Input {
+                throttle: 0.0,
+                brake: 1.0,
+                steer: 0.0,
+            },
+        );
+        world.vehicle.vel.x = 0.0;
+        world.vehicle.vel.z = 0.0;
+    }
+    let spin = Input {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    for _ in 0..70 {
+        world.step(dt, &spin);
+        world.vehicle.vel.x = 0.0;
+        world.vehicle.vel.z = 0.0;
+        world.vehicle.yaw_rate *= 0.2;
+    }
+    print_patch("spin", &world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "spin",
+        &parsed.patch_spin,
+        parsed,
+        patch_camera(&world, 3),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn print_patch(label: &str, world: &World) {
+    use silt::patch::{contact_patch, TreadCoat};
+    use silt::vehicle::{WHEEL_RADIUS, WHEEL_WIDTH};
+    let w = world.vehicle.wheels[3];
+    let center = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(3);
+    let sample = world.soil.sample(center.x, center.z);
+    let patch = contact_patch(
+        WHEEL_RADIUS,
+        WHEEL_WIDTH,
+        w.sinkage.max(0.02),
+        w.slip,
+        w.normal.max(800.0),
+        sample.kind(),
+        sample.wetness,
+        sample.loose,
+        sample.water,
+        TreadCoat {
+            groove: w.groove,
+            smear: w.smear,
+        },
+    );
+    let mut kinds = [0u32; 5];
+    for p in &world.particles.items {
+        if p.alive && (p.kind as usize) < kinds.len() {
+            kinds[p.kind as usize] += 1;
+        }
+    }
+    let thrown = (kinds[0] + kinds[1]) as usize;
+    println!(
+        "{label} slip {:.2}  speed {:.2}  sink {:.3}  groove {:.2}  smear {:.2}  mud {:.2}  \
+         grip {:.0} N  mu {:.3}  scale {:.2}  len {:.3} m  pull {:.2}  clods {thrown}  \
+         kinds {kinds:?}  soil {:?}",
+        w.slip,
+        world.vehicle.speed(),
+        w.sinkage,
+        w.groove,
+        w.smear,
+        w.mud,
+        patch.grip,
+        patch.mu,
+        patch.scale,
+        patch.length,
+        patch.pull,
+        sample.kind()
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn patch_camera(world: &World, wheel: usize) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let local = vehicle.wheel_center_local(wheel);
+    let center = vehicle.pos + vehicle.orientation() * local;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let side = if local.x >= 0.0 { 1.0 } else { -1.0 };
+    // Rear quarter on the crown, low enough that the fender stays off the grooves.
+    let eye = center - fwd * 0.90 + right * side * 0.50 + Vec3::Y * 0.14;
+    CameraPose {
+        eye,
+        target: center - Vec3::Y * 0.02 + right * side * 0.08,
+        ortho_width: Some(1.18),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -294,6 +294,19 @@ impl World {
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
         self.vehicle.step_adhesion(&contacts, dt);
+        for c in &contacts {
+            if c.active && c.squeeze > 0.02 {
+                // Loose smear only. The cut still lands on the berm.
+                self.soil.skim_loose(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    c.patch_length.max(0.08),
+                    crate::vehicle::WHEEL_WIDTH,
+                    c.squeeze * 0.0025 * dt,
+                );
+            }
+        }
 
         let speed = self.vehicle.speed();
         for c in &contacts {

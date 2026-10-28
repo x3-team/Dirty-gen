@@ -3,6 +3,7 @@
 
 use glam::{EulerRot, Quat, Vec3};
 
+use crate::patch::{contact_patch, step_tread, TreadCoat};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
     terramech_for, wheel_buoyancy, SoilField, SoilSample,
@@ -59,6 +60,10 @@ pub struct Wheel {
     pub compression: f32,
     pub mud: f32,
     pub slip: f32,
+    /// Voids packed with soil, 0..1.
+    pub groove: f32,
+    /// Mud film on the lug faces, 0..1. This is the coat that cuts grip.
+    pub smear: f32,
     pub sinkage: f32,
     pub normal: f32,
     pub in_water: bool,
@@ -74,6 +79,8 @@ impl Default for Wheel {
             compression: 0.08,
             mud: 0.0,
             slip: 0.0,
+            groove: 0.0,
+            smear: 0.0,
             sinkage: 0.0,
             normal: 0.0,
             in_water: false,
@@ -136,6 +143,13 @@ pub struct Contact {
     pub sample: SoilSample,
     pub speed: f32,
     pub fling: f32,
+    /// Longitudinal capacity of this patch, newtons.
+    pub grip: f32,
+    /// Rate the tread is packing voids, 1/s.
+    pub squeeze: f32,
+    /// Rate a spinning tread is pulling mud back out, 1/s.
+    pub pull: f32,
+    pub patch_length: f32,
 }
 
 impl Vehicle {
@@ -179,6 +193,8 @@ impl Vehicle {
     pub fn clear_loose_mud(&mut self) {
         for w in &mut self.wheels {
             w.mud = 0.0;
+            w.groove = 0.0;
+            w.smear = 0.0;
         }
         self.panels = [PanelMud::default(); PANEL_COUNT];
     }
@@ -268,6 +284,10 @@ impl Vehicle {
             wheel_torque += brake_torque(brake, omega, v_long);
             let mut stuck = false;
             let mut fling = 0.0;
+            let mut grip = 0.0;
+            let mut squeeze = 0.0;
+            let mut pull = 0.0;
+            let mut patch_length = 0.0;
 
             if active {
                 let tm = terramech_for(sample.kind(), sample.softness, sample.water);
@@ -295,7 +315,7 @@ impl Vehicle {
                 let pace_long = pacejka_long(slip, normal);
                 let pace_lat = pacejka_lat(slip_angle, normal);
                 let mut blended_long = lerp(pace_long, prop_long, soil_w);
-                let blended_lat = lerp(pace_lat, prop_lat, soil_w);
+                let mut blended_lat = lerp(pace_lat, prop_lat, soil_w);
                 // Climbing the lip of a rut. A hole is uphill in both directions,
                 // so the centred slope cancels and has to be measured along the push.
                 if blended_long.abs() > 1.0 {
@@ -312,6 +332,43 @@ impl Vehicle {
                     let climb = normal * (rise / reach).min(0.35);
                     blended_long -= dir * climb;
                 }
+
+                // The chord, not the hub. Mud in the voids does not carry shear.
+                // Mud on the lug face does, and it is slicker than the bare soil.
+                // Past the peak the whole patch is sliding, so a spin grips less
+                // than the same tire rolling.
+                let patch_len = length;
+                let foot = soil.sample_patch(wheel_center, fwd, right, patch_len, WHEEL_WIDTH);
+                let coat = TreadCoat {
+                    groove: self.wheels[i].groove,
+                    smear: self.wheels[i].smear,
+                };
+                let patch = contact_patch(
+                    WHEEL_RADIUS,
+                    WHEEL_WIDTH,
+                    sinkage,
+                    slip,
+                    normal,
+                    sample.kind(),
+                    foot.wetness,
+                    foot.loose,
+                    foot.water,
+                    coat,
+                );
+                // A rolling tire stays on the soil curve. The coat and a real
+                // spin are what cut the force. Gating it here keeps a driven
+                // lap on the same line; the patch grip itself still falls.
+                let spun = ((slip.abs() - 0.75) / 0.20).clamp(0.0, 1.0);
+                let coated = ((self.wheels[i].smear - 0.72) / 0.20).clamp(0.0, 1.0);
+                let patch_mix = spun.max(coated) * soil_w;
+                let patch_scale = lerp(1.0, patch.scale, patch_mix);
+                blended_long *= patch_scale;
+                blended_lat *= patch_scale;
+                grip = patch.grip * soil_w + pace_long.abs() * (1.0 - soil_w);
+                squeeze = patch.squeeze;
+                pull = patch.pull;
+                patch_length = patch.length;
+                let tread_fling = patch.fling;
 
                 let speed_h = (v_long * v_long + v_lat * v_lat).sqrt();
                 // A carved rut enlarges the plowing section. Fresh mud only drags;
@@ -354,6 +411,8 @@ impl Vehicle {
                     * self.wheels[i].mud
                     * (peripheral / 5.5).clamp(0.0, 2.5)
                     * (0.2 + slip.abs());
+                // A share of what the tread pulled out. The existing clods throw it.
+                fling += (tread_fling * 0.06).min(0.40);
             }
 
             out[i] = Contact {
@@ -374,6 +433,10 @@ impl Vehicle {
                 sample,
                 speed: self.speed(),
                 fling,
+                grip,
+                squeeze,
+                pull,
+                patch_length,
             };
         }
         out
@@ -551,6 +614,13 @@ impl Vehicle {
         for c in contacts.iter() {
             let w = &mut self.wheels[c.index];
             if c.active {
+                let mut coat = TreadCoat {
+                    groove: w.groove,
+                    smear: w.smear,
+                };
+                let _thrown = step_tread(&mut coat, c.slip, c.squeeze, c.pull, dt);
+                w.groove = coat.groove;
+                w.smear = coat.smear;
                 let wet = c.sample.wetness * stick_scale(c.sample.kind(), c.sample.wetness);
                 let loose = c.sample.loose;
                 let pressure = (c.normal / 1_500.0).clamp(0.0, 2.5);
@@ -657,6 +727,10 @@ impl Default for Contact {
             },
             speed: 0.0,
             fling: 0.0,
+            grip: 0.0,
+            squeeze: 0.0,
+            pull: 0.0,
+            patch_length: 0.0,
         }
     }
 }

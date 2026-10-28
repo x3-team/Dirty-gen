@@ -29,7 +29,7 @@ struct Model {
     mud9: vec4<f32>,
     mud10: vec4<f32>,
     mud11: vec4<f32>,
-    extra: vec4<f32>, // is_wheel, wheel mud 0..1, _, _
+    extra: vec4<f32>, // is_wheel, wheel mud 0..1, groove fill, lug smear
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -709,17 +709,66 @@ struct MeshOut {
     @location(1) nrm: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) panel: f32,
+    @location(4) recess: f32,
+}
+
+// 1 inside a tread void, 0 on a lug face. uv.x winds around the tire,
+// uv.y runs from bead to bead with the crown at 0.5.
+fn tread_void(uv: vec2<f32>) -> f32 {
+    // The CC0 carcass is three rings: beads at v = 0 and 1, shoulders near
+    // 0.12 and 0.88, and one crown ring at v = 0.5. The crown is the groove.
+    let from_crown = abs(uv.y - 0.5);
+    let on_tread = 1.0 - smoothstep(0.36, 0.47, from_crown);
+    let center = 1.0 - smoothstep(0.04, 0.20, from_crown);
+    let lug = abs(fract(uv.x * 0.5) - 0.5);
+    let gaps = smoothstep(0.34, 0.08, lug);
+    let ribs = abs(fract(from_crown * 6.0) - 0.5);
+    let channel = smoothstep(0.28, 0.06, ribs);
+    return clamp(on_tread * max(center * gaps, channel * 0.85), 0.0, 1.0);
+}
+
+fn displace_tread(pos: vec3<f32>, uv: vec2<f32>, panel: f32) -> vec3<f32> {
+    if (panel < 60.5 || panel > 61.5) {
+        return pos;
+    }
+    let void = tread_void(uv);
+    let fill = clamp(model.extra.z, 0.0, 1.0);
+    // An empty void sits under the lug. Mud packed by a rolling tire rises
+    // back toward the crown, so the groove reads full instead of as a hole.
+    let depth = 0.026 * void * (1.0 - 0.94 * fill);
+    let radial = vec3<f32>(0.0, pos.y, pos.z);
+    let len = length(radial);
+    if (len < 1e-4) {
+        return pos;
+    }
+    return pos - radial / len * depth;
+}
+
+fn tread_recess(pos: vec3<f32>, panel: f32) -> f32 {
+    // Procedural tire only. Its grooves are cut into the mesh. The CC0 tire
+    // is a smooth barrel; its voids come from the uv, not the radius.
+    if (panel < 19.5 || panel > 20.5) {
+        return 0.0;
+    }
+    let radial = length(pos.yz);
+    let axle = abs(pos.x);
+    let drop = 0.374 - radial;
+    let tread = 1.0 - smoothstep(0.10, 0.145, axle);
+    let band = smoothstep(0.004, 0.012, drop) * (1.0 - smoothstep(0.055, 0.09, drop));
+    return band * tread;
 }
 
 @vertex
 fn vs_mesh(in: MeshIn) -> MeshOut {
-    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let pos = displace_tread(in.pos, in.uv, in.panel);
+    let world = model.world * vec4<f32>(pos, 1.0);
     var o: MeshOut;
     o.clip = frame.view_proj * world;
     o.world = world.xyz;
     o.nrm = normalize((model.world * vec4<f32>(in.nrm, 0.0)).xyz);
     o.uv = in.uv;
     o.panel = in.panel;
+    o.recess = tread_recess(pos, in.panel);
     return o;
 }
 
@@ -741,7 +790,8 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
 
 @vertex
 fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
-    let world = model.world * vec4<f32>(in.pos, 1.0);
+    let pos = displace_tread(in.pos, in.uv, in.panel);
+    let world = model.world * vec4<f32>(pos, 1.0);
     let clip = frame.light_vp * world;
     var o: ShadowOut;
     o.clip = clip;
@@ -862,10 +912,23 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let nm = textureSampleLevel(tire_nor, paint_samp, in.uv, 0.0).rgb;
         nrm = tbn_normal(in.nrm, nm);
         rough = 0.86;
-        let mud = clamp(model.extra.y, 0.0, 1.2);
-        let load = smoothstep(0.03, 0.38, mud);
-        albedo = mix(albedo, vec3<f32>(0.10, 0.05, 0.022), load * 0.82);
-        rough = mix(rough, 0.2, load * 0.65);
+        let void = tread_void(in.uv);
+        let fill = clamp(model.extra.z, 0.0, 1.0);
+        let smear = clamp(model.extra.w, 0.0, 1.0);
+        let from_crown = abs(in.uv.y - 0.5);
+        let on_tread = 1.0 - smoothstep(0.36, 0.47, from_crown);
+        let grit = noise(in.uv * vec2<f32>(1.7, 9.0) + vec2<f32>(in.world.y, 0.3));
+        // Rolling leaves the mud in the grooves. The lug faces stay rubber
+        // until a spin smears them. Beads (v near 0 and 1) stay clean.
+        let groove_mask = void * on_tread * smoothstep(0.28, 0.62, fill) * (0.90 + 0.10 * grit);
+        let face_mask = (1.0 - void) * on_tread * smoothstep(0.35, 0.85, smear) * 0.35;
+        let mask = clamp(max(groove_mask, face_mask), 0.0, 1.0);
+        let packed = vec3<f32>(0.74, 0.32, 0.08);
+        let film = vec3<f32>(0.11, 0.045, 0.016);
+        albedo = mix(albedo, mix(film, packed, smoothstep(0.15, 0.7, void * fill)), mask);
+        rough = mix(rough, mix(0.42, 0.08, groove_mask), mask);
+        // The rear face of the carcass points away from the low sun.
+        emit = vec3<f32>(0.42, 0.16, 0.04) * groove_mask;
     } else if (in.panel > 61.5 && in.panel < 62.5) {
         albedo = vec3<f32>(0.69, 0.73, 0.78);
         rough = 0.25;
@@ -876,21 +939,17 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         albedo = vec3<f32>(0.045, 0.050, 0.068);
         rough = 0.55;
     } else if (model.extra.x > 0.5) {
-        let ang = in.uv.x * 6.2831853;
-        let groove = smoothstep(0.15, 0.8, 0.5 + 0.5 * sin(ang * 14.0));
         let sidewall = select(0.0, 1.0, in.uv.y > 1.5);
         let mud = clamp(model.extra.y, 0.0, 1.2);
-        // Existing adhesion. ~0.4 of the cap already cakes the tread.
-        let load = smoothstep(0.04, 0.28, mud);
-        let wp = in.world;
-        let n = noise(wp.xy * 9.0 + vec2<f32>(wp.z * 4.0, ang));
-        let n2 = noise(wp.yz * 16.0 + vec2<f32>(ang, 2.0));
-        let clump = smoothstep(0.48, 0.82, n * 0.65 + n2 * 0.35);
-        var mask = load * (0.88 + 0.12 * clump);
-        mask = mask * mix(0.94 + 0.06 * groove, 0.7 + 0.25 * clump, sidewall);
-        mask = clamp(mask, 0.0, 1.0);
-        albedo = mix(vec3<f32>(0.02, 0.018, 0.016), vec3<f32>(0.12, 0.058, 0.028), mask);
-        rough = mix(0.92, mix(0.28, 0.07, groove * (1.0 - sidewall)), mask);
+        let fill = max(clamp(model.extra.z, 0.0, 1.0), smoothstep(0.05, 0.45, mud));
+        let smear = clamp(model.extra.w, 0.0, 1.0);
+        let void = clamp(in.recess, 0.0, 1.0);
+        let grit = noise(in.world.xy * 9.0 + vec2<f32>(in.world.z * 4.0, in.uv.x));
+        let groove_mask = void * fill * (0.84 + 0.16 * grit) * (1.0 - sidewall);
+        let face_mask = (1.0 - void) * smear * 0.7 * (1.0 - sidewall);
+        let mask = clamp(max(groove_mask, face_mask), 0.0, 1.0);
+        albedo = mix(vec3<f32>(0.02, 0.018, 0.016), vec3<f32>(0.20, 0.085, 0.028), mask);
+        rough = mix(0.92, mix(0.36, 0.08, groove_mask), mask);
         nrm = mud_normal(in.nrm, in.world, mask);
     } else if (panel >= 0 && panel < 12) {
         let m = mud_of(panel);
