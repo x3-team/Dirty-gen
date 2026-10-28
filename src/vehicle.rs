@@ -4,8 +4,8 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech_at, SoilField,
-    SoilSample,
+    bekker_load, contact_length, contact_sink, grip_from_sink, janosi_hanamoto, on_launch_crest,
+    sink_drag_coeff, sink_hold, terramech_at, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -16,6 +16,8 @@ pub const SUSP_TRAVEL: f32 = 0.30;
 pub const SUSP_K: f32 = 17_500.0;
 pub const SUSP_PRELOAD: f32 = 280.0;
 pub const HARD_Y: f32 = 0.22;
+/// Lowest belly skin in body space. Frame-deep sink is this skin against the soil.
+pub const BELLY_Y: f32 = -0.18;
 pub const PANEL_COUNT: usize = 12;
 
 pub const PANEL_CAGE: usize = 0;
@@ -295,8 +297,12 @@ impl Vehicle {
                 let soil_w = smoothstep(0.03, 0.09, sinkage);
                 let pace_long = pacejka_long(slip, normal);
                 let pace_lat = pacejka_lat(slip_angle, normal);
-                let mut blended_long = lerp(pace_long, prop_long, soil_w);
-                let blended_lat = lerp(pace_lat, prop_lat, soil_w);
+                // Burial, not a wet/dry flag. Ankle-deep keeps the shear.
+                // Hub-deep cuts it so the tread spins. Frame-deep cannot pull.
+                let depth = contact_sink(sinkage, sample.rut);
+                let grip = grip_from_sink(depth);
+                let mut blended_long = lerp(pace_long, prop_long, soil_w) * grip;
+                let blended_lat = lerp(pace_lat, prop_lat, soil_w) * grip;
                 // Climbing the lip of a rut. A hole is uphill in both directions,
                 // so the centred slope cancels and has to be measured along the push.
                 if blended_long.abs() > 1.0 {
@@ -326,14 +332,16 @@ impl Vehicle {
                 // breakaway fraction has to be beaten, unless the rut is deep.
                 let speed_gate = smoothstep(0.25, 1.2, speed_h);
                 let breakaway = f_yield * (0.50 + 0.50 * speed_gate);
+                let f_sink = sink_drag_coeff(depth) * speed_h;
+                let hold = sink_hold(depth, normal);
 
                 if speed_h < 0.12 {
-                    if prop_mag <= breakaway {
+                    if prop_mag <= breakaway + hold {
                         stuck = true;
                         chassis_long = 0.0;
                         chassis_lat = 0.0;
                     } else {
-                        let excess = prop_mag - breakaway;
+                        let excess = prop_mag - breakaway - hold;
                         let inv = excess / prop_mag.max(1.0);
                         chassis_long = prop.x * inv;
                         chassis_lat = prop.y * inv;
@@ -341,8 +349,8 @@ impl Vehicle {
                 } else {
                     let dir_l = v_long / speed_h;
                     let dir_a = v_lat / speed_h;
-                    chassis_long = blended_long - dir_l * (breakaway + f_visc);
-                    chassis_lat = blended_lat - dir_a * (breakaway + f_visc);
+                    chassis_long = blended_long - dir_l * (breakaway + f_visc + f_sink);
+                    chassis_lat = blended_lat - dir_a * (breakaway + f_visc + f_sink);
                     let rr = 0.025 * normal;
                     chassis_long -= v_long.signum() * rr;
                 }
@@ -519,10 +527,10 @@ impl Vehicle {
         let ori = self.orientation();
         // Clearance stays above a normal rut. Deep high-centering still drags.
         let points = [
-            Vec3::new(-0.30, -0.18, 0.9),
-            Vec3::new(0.30, -0.18, 0.9),
-            Vec3::new(-0.30, -0.18, -0.8),
-            Vec3::new(0.30, -0.18, -0.8),
+            Vec3::new(-0.30, BELLY_Y, 0.9),
+            Vec3::new(0.30, BELLY_Y, 0.9),
+            Vec3::new(-0.30, BELLY_Y, -0.8),
+            Vec3::new(0.30, BELLY_Y, -0.8),
         ];
         let mut pen_max = 0.0_f32;
         for p in points {

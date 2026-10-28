@@ -362,6 +362,80 @@ fn lay_wet_rut(soil: &mut silt::soil::SoilField) {
     }
 }
 
+#[test]
+fn sink_depth_sets_three_speeds() {
+    use silt::soil::{SINK_FRAME, SINK_HUB};
+    use silt::vehicle::{BELLY_Y, HARD_Y, REST_LEN, WHEEL_RADIUS};
+
+    let clearance = BELLY_Y - (HARD_Y - REST_LEN - WHEEL_RADIUS);
+    assert!(
+        (SINK_HUB - WHEEL_RADIUS).abs() < 1.0e-5,
+        "hub sink should be the wheel radius"
+    );
+    assert!(
+        (SINK_FRAME - clearance).abs() < 1.0e-5,
+        "frame sink {SINK_FRAME:.3} should meet the belly at droop, clearance {clearance:.3}"
+    );
+
+    let input = Input {
+        throttle: 0.7,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    // One damp pad. The only change is how deep the tread sits.
+    let (ankle_sink, ankle_slip, ankle_speed) = roll_at_depth(0.0, input);
+    let (hub_sink, hub_slip, hub_speed) = roll_at_depth(SINK_HUB, input);
+    let (frame_sink, frame_slip, frame_speed) = roll_at_depth(SINK_FRAME, input);
+    eprintln!(
+        "ankle sink {ankle_sink:.3} slip {ankle_slip:.3} speed {ankle_speed:.2}   \
+         hub sink {hub_sink:.3} slip {hub_slip:.3} speed {hub_speed:.2}   \
+         frame sink {frame_sink:.3} slip {frame_slip:.3} speed {frame_speed:.2}"
+    );
+    assert!(
+        ankle_speed > 2.0,
+        "ankle-deep tread should still drive, speed {ankle_speed:.2}"
+    );
+    assert!(
+        ankle_slip < 0.35,
+        "ankle-deep tread should hook up, slip {ankle_slip:.3}"
+    );
+    assert!(
+        hub_slip > 0.45,
+        "hub-deep tread should slip hard, slip {hub_slip:.3}"
+    );
+    assert!(
+        hub_speed > frame_speed + 0.35,
+        "hub speed {hub_speed:.2} should stay above the frame bog {frame_speed:.2}"
+    );
+    assert!(
+        ankle_speed > hub_speed + 1.0,
+        "ankle speed {ankle_speed:.2} and hub speed {hub_speed:.2} are not distinct"
+    );
+    assert!(
+        frame_speed < 0.25,
+        "frame-deep tread should bog, speed {frame_speed:.2}"
+    );
+}
+
+/// Flat damp ground lowered by `depth` metres, so the rut — not the wetness —
+/// is what the tire is buried in.
+fn roll_at_depth(depth: f32, input: Input) -> (f32, f32, f32) {
+    let mut world = World::flat(0.08);
+    if depth > 0.0 {
+        for h in &mut world.soil.height {
+            *h = -depth;
+        }
+    }
+    park(&mut world);
+    if depth > 0.0 {
+        let z = -12.0;
+        let h = world.soil.sample(0.0, z).height;
+        world.vehicle.pos.y = h + 0.62;
+        world.vehicle.pos.z = z;
+    }
+    slow_roll(&mut world, input)
+}
+
 fn slow_roll(world: &mut World, input: Input) -> (f32, f32, f32) {
     let mut sink = 0.0_f32;
     let mut slip = 0.0_f32;

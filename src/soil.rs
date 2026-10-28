@@ -75,22 +75,68 @@ pub fn terramech(softness: f32) -> Terramech {
     }
 }
 
-/// Terramechanics for one contact. A wet rut is remolded and lubricated:
-/// the modulus drops so a slow tire sinks, and friction drops so the tread
-/// slips, while the yield that holds the chassis stays.
+/// Soil constants at a contact. Moisture does not lubricate the tread.
+/// Shear is scaled later by [`grip_from_sink`] from how deep the tire sits.
 pub fn terramech_at(softness: f32, rut: f32, water: f32) -> Terramech {
-    let mut tm = terramech(softness);
-    let wet = (water / 0.08).clamp(0.0, 1.0);
-    let cut = (rut / 0.05).clamp(0.0, 1.0);
-    let lube = wet * cut;
-    if lube > 0.0 {
-        tm.k_eq *= lerp(1.0, 0.58, lube);
-        tm.phi *= lerp(1.0, 0.36, lube);
-        tm.cohesion *= lerp(1.0, 0.32, lube);
-        tm.shear_k *= lerp(1.0, 2.2, lube);
-        tm.yield_stress *= lerp(1.0, 1.15, lube);
+    let _ = (rut, water);
+    terramech(softness)
+}
+
+/// Tread burial that is only ankle-deep. Drive friction stays.
+pub const SINK_ANKLE: f32 = 0.10;
+/// Burial at the hub: one wheel radius over the contact patch.
+pub const SINK_HUB: f32 = 0.38;
+/// Burial at the frame rail, arm at droop.
+///
+/// Belly skin sits 0.18 m under the body origin. The drooped hub is
+/// `HARD_Y - REST_LEN` (-0.28 m) and the patch is one radius below it,
+/// so the rail clears the patch by 0.48 m.
+pub const SINK_FRAME: f32 = 0.48;
+
+/// How deep this contact sits. Bekker compression and the plastic rut
+/// are the same burial: the deeper one is what the tread has to climb through.
+pub fn contact_sink(sinkage: f32, rut: f32) -> f32 {
+    sinkage.max(0.0).max(rut.max(0.0))
+}
+
+/// Fraction of tread shear that still reaches the chassis.
+/// Ankle-deep is full drive. The hub packs the sidewall and the shear
+/// collapses. At the frame the tire cannot pull.
+pub fn grip_from_sink(depth: f32) -> f32 {
+    let d = depth.max(0.0);
+    const HUB_GRIP: f32 = 0.18;
+    const FRAME_GRIP: f32 = 0.02;
+    if d <= SINK_ANKLE {
+        1.0
+    } else if d < SINK_HUB {
+        lerp(1.0, HUB_GRIP, smooth01(SINK_ANKLE, SINK_HUB, d))
+    } else {
+        lerp(HUB_GRIP, FRAME_GRIP, smooth01(SINK_HUB, SINK_FRAME, d))
     }
-    tm
+}
+
+/// Viscous plow (N per m/s) of soil packed around a buried tire.
+/// Nothing above the ankle. A hub-deep tread settles to a walk.
+/// Frame-deep resistance stops a creep the static hold missed.
+pub fn sink_drag_coeff(depth: f32) -> f32 {
+    let d = depth.max(0.0);
+    if d <= SINK_ANKLE {
+        return 0.0;
+    }
+    const HUB_DRAG: f32 = 150.0;
+    const FRAME_DRAG: f32 = 4_000.0;
+    if d < SINK_HUB {
+        lerp(0.0, HUB_DRAG, smooth01(SINK_ANKLE, SINK_HUB, d))
+    } else {
+        lerp(HUB_DRAG, FRAME_DRAG, smooth01(SINK_HUB, SINK_FRAME, d))
+    }
+}
+
+/// Static hold (N) the tread must beat before the chassis moves.
+/// Zero through the hub. At the frame it is larger than leftover traction.
+pub fn sink_hold(depth: f32, normal: f32) -> f32 {
+    let t = smooth01(SINK_HUB, SINK_FRAME, depth.max(0.0));
+    t * normal.max(0.0) * 1.05
 }
 
 /// Wetness alone makes the ground heavy. Standing water and loose spoil
@@ -1246,54 +1292,48 @@ mod tests {
         0.5 * (lo + hi)
     }
 
-    /// Slip ratio at which Janosi shear matches `drive` (N). 1 means the
-    /// tread cannot hook up and the tire spins.
-    fn slip_for_drive(tm: &Terramech, sinkage: f32, load: f32, drive: f32) -> f32 {
-        let radius = 0.38;
-        let width = 0.28;
-        let length = contact_length(radius, sinkage.max(0.005)).max(0.05);
-        let area = width * length;
-        let sigma = load / area.max(0.01);
-        let tau_max = tm.cohesion + sigma * tm.phi.tan();
-        if tau_max * area <= drive {
-            return 1.0;
-        }
-        let mut lo = 0.0;
-        let mut hi = 1.5;
-        for _ in 0..22 {
-            let mid = 0.5 * (lo + hi);
-            let tau = janosi_hanamoto(tm.cohesion, sigma, tm.phi, mid * length, tm.shear_k);
-            if tau * area < drive {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        0.5 * (lo + hi)
-    }
-
     #[test]
-    fn wet_rut_sinks_and_slips_more_than_dry_ground() {
+    fn softer_ground_still_sinks_deeper() {
         let load = 1_600.0_f32;
-        // Slow throttle, about 0.42 of the buggy's 500 Nm.
-        let drive = 210.0 / 0.38;
         let dry_tm = terramech_at(softness_of(0.08, 0.0, 0.0), 0.0, 0.0);
         let wet_soft = softness_with_rut(1.0, 0.08, 0.07, 0.07);
         let wet_tm = terramech_at(wet_soft, 0.07, 0.07);
         let z_dry = sinkage_on(&dry_tm, load);
         let z_wet = sinkage_on(&wet_tm, load);
-        let slip_dry = slip_for_drive(&dry_tm, z_dry, load, drive);
-        let slip_wet = slip_for_drive(&wet_tm, z_wet, load, drive);
-        eprintln!(
-            "dry z {z_dry:.4} slip {slip_dry:.3}   wet rut z {z_wet:.4} slip {slip_wet:.3}  soft {wet_soft:.3}"
-        );
+        eprintln!("dry z {z_dry:.4}   soft rut z {z_wet:.4}  soft {wet_soft:.3}");
         assert!(
             z_wet > z_dry * 1.4,
-            "wet rut sinkage {z_wet:.4} is not deeper than dry {z_dry:.4}"
+            "soft rut sinkage {z_wet:.4} is not deeper than firm {z_dry:.4}"
         );
+    }
+
+    #[test]
+    fn grip_follows_sink_depth_not_moisture() {
+        let ankle = grip_from_sink(SINK_ANKLE);
+        let hub = grip_from_sink(SINK_HUB);
+        let frame = grip_from_sink(SINK_FRAME);
+        eprintln!("grip ankle {ankle:.3} hub {hub:.3} frame {frame:.3}");
+        assert!(ankle > 0.9, "ankle grip {ankle:.3} should still drive");
         assert!(
-            slip_wet > slip_dry + 0.2,
-            "wet rut slip {slip_wet:.3} is not above dry {slip_dry:.3}"
+            hub < 0.35 && hub > frame * 3.0,
+            "hub grip {hub:.3} should sit between drive and bog, frame {frame:.3}"
+        );
+        assert!(frame < 0.05, "frame grip {frame:.3} should not pull");
+        let soft = 0.8_f32;
+        let wet = terramech_at(soft, SINK_HUB, 0.10);
+        let dry = terramech_at(soft, SINK_HUB, 0.0);
+        assert!(
+            (wet.phi - dry.phi).abs() < 1.0e-5
+                && (wet.cohesion - dry.cohesion).abs() < 1.0e-3
+                && (wet.k_eq - dry.k_eq).abs() < 1.0e-2,
+            "moisture still changes the tread: wet phi {:.3} dry phi {:.3}",
+            wet.phi,
+            dry.phi
+        );
+        let buried = grip_from_sink(contact_sink(0.02, SINK_HUB));
+        assert!(
+            (grip_from_sink(SINK_HUB) - buried).abs() < 1.0e-5,
+            "a hub-deep rut should count even when the floor is firm"
         );
     }
 }
