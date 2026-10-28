@@ -1,6 +1,6 @@
 # Silt assets
 
-The motocross picture uses the Lada Niva and the photoreal forest. The dune buggy and the Gobkit kit stay in the tree so the older oval frame still builds. They are not drawn on the course.
+The motocross picture is the course, the 4K ground, and the Lada Niva. Trees, shrubs, ferns, and the Gobkit kit are not instanced. The dune buggy stays in the tree for the older oval frame and is not drawn on the course.
 
 ## Vehicles
 
@@ -14,11 +14,11 @@ The motocross picture uses the Lada Niva and the photoreal forest. The dune bugg
 
 The course blends those five packs by soil state: dry dirt on the racing line, mud in the hole and the slope puddle, clay in the rut floors, gravel on the start and the table, grass off the ribbon, rock in the far corners.
 
-## Forest and rocks (CC0, Poly Haven models, 1K glTF)
+## Forest and rocks (CC0, Poly Haven models, 1K glTF, not instanced)
 
-https://polyhaven.com/license — CC0. No Quixel / Megascans (that license does not allow shipping the source assets in this public repo). No Kenney.
+https://polyhaven.com/license — CC0. No Quixel / Megascans (that license does not allow shipping the source assets in this public repo). No Kenney. None of these meshes are loaded or drawn on the course.
 
-- env/photoreal/island_tree.glb — island_tree_02. Scanning: Rob Tuytel. Cleanup: Rico Cilliers. https://polyhaven.com/a/island_tree_02. Shipped with the kit. The course does not scatter it: the leaf cards break into specks at lap scale. The canopy is searsia, fern, and sorrel.
+- env/photoreal/island_tree.glb — island_tree_02. Scanning: Rob Tuytel. Cleanup: Rico Cilliers. https://polyhaven.com/a/island_tree_02. Not instanced.
 - env/photoreal/searsia.glb — searsia_lucida. Modeling: James Ray Cock. Photography: Jenelle van Heerden. https://polyhaven.com/a/searsia_lucida
 - env/photoreal/fern.glb — fern_02. Rob Tuytel, Rico Cilliers. https://polyhaven.com/a/fern_02
 - env/photoreal/shrub.glb — shrub_sorrel_01. Rico Cilliers. https://polyhaven.com/a/shrub_sorrel_01

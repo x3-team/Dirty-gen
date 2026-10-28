@@ -615,7 +615,7 @@ fn append_mesh(dst: &mut CpuMesh, mesh: &gltf::Mesh, blob: &[u8], node: Mat4, mi
 }
 
 fn place_props() -> CpuMesh {
-    // Gobkit meshes stay on disk. The course forest is the photoreal kits.
+    // Gobkit and the Poly Haven plants stay on disk. The course draws neither.
     let mut mesh = CpuMesh::new();
     mesh.vertices.push(MeshVertex {
         pos: [0.0, -50.0, 0.0],

@@ -322,27 +322,14 @@ fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
     return n;
 }
 
-fn ripple_height(xz: vec2<f32>, t: f32) -> f32 {
-    let x = xz.x;
-    let z = xz.y;
-    // Long waves. A tight lattice of sines reads as a checker from above.
-    return 0.012 * sin(x * 0.72 + z * 0.18 + t * 0.55)
-        + 0.009 * sin(z * 0.95 - x * 0.22 - t * 0.42)
-        + 0.005 * sin(x * 1.5 + z * 1.25 + t * 0.8);
-}
-
-// Analytic water normal. Screen derivatives of the mesh are a hard grid.
-fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
-    let x = xz.x;
-    let z = xz.y;
-    let dx = 0.012 * cos(x * 0.72 + z * 0.18 + t * 0.55) * 0.72
-        - 0.009 * cos(z * 0.95 - x * 0.22 - t * 0.42) * 0.22
-        + 0.005 * cos(x * 1.5 + z * 1.25 + t * 0.8) * 1.5;
-    let dz = 0.012 * cos(x * 0.72 + z * 0.18 + t * 0.55) * 0.18
-        + 0.009 * cos(z * 0.95 - x * 0.22 - t * 0.42) * 0.95
-        + 0.005 * cos(x * 1.5 + z * 1.25 + t * 0.8) * 1.25;
-    // A small tilt. Large normals turned the pond into a chrome dome.
-    return normalize(vec3<f32>(-dx * 1.6, 1.0, -dz * 1.6));
+fn bed_normal(xz: vec2<f32>) -> vec3<f32> {
+    // Wide step. A cell-sized sample faceted the pond into bands.
+    let e = 0.9;
+    let h_l = height_bilinear(xz - vec2<f32>(e, 0.0));
+    let h_r = height_bilinear(xz + vec2<f32>(e, 0.0));
+    let h_d = height_bilinear(xz - vec2<f32>(0.0, e));
+    let h_u = height_bilinear(xz + vec2<f32>(0.0, e));
+    return normalize(vec3<f32>(h_l - h_r, e * 2.0, h_d - h_u));
 }
 
 fn terrain_height(xz: vec2<f32>) -> f32 {
@@ -412,109 +399,48 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Loose soil on the shoulder. Lighter than the lane, only where the stamp piled it.
     albedo = mix(albedo, vec3<f32>(0.15, 0.078, 0.034), lip * 0.92);
 
-    // Wet rim on the soil. The sky reflection is the water sheet, not this grid.
-    let rim = smoothstep(0.0, 0.035, water) * (1.0 - smoothstep(0.04, 0.12, water));
-    albedo = mix(albedo, vec3<f32>(0.012, 0.008, 0.006), rim * 0.85);
+    // Standing water is the bed itself. A second sheet left a jagged lip.
+    let pond_d = smooth_water(xz);
+    let pond = smoothstep(0.02, 0.10, pond_d);
+    let muted = mix(diff, vec3<f32>(dot(diff, vec3<f32>(0.30, 0.50, 0.20))), 0.4);
+    var film = muted * vec3<f32>(0.92, 0.62, 0.34);
+    film = film * mix(1.0, 0.78, smoothstep(0.06, 0.15, pond_d));
+    albedo = mix(albedo, film, pond);
+    // Keep most of the bed normal. A full replace turned the bowl into steps.
+    n = normalize(mix(n, bed_normal(xz), pond * 0.35));
 
     // The lane stays matte. Shine is the soil ringing a puddle. The same lobe
     // on the tire cut turned the groove into a tan stripe, so the floor stays dark.
-    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
-    // Standing water is drawn as its own sheet. A mirror bed under that film
-    // is the gray metal disc.
-    let drowned = smoothstep(0.012, 0.05, water);
-    let rough_out = mix(mix(rough_map, 0.16, shore * (1.0 - drowned)), max(rough_map, 0.78), drowned);
+    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water)) * (1.0 - pond);
+    let drowned = smoothstep(0.012, 0.05, water) * (1.0 - pond);
+    let rough_out = mix(mix(rough_map, 0.16, shore), max(rough_map, 0.9), max(drowned, pond));
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+    // Sky fill turns a flat bowl purple. The pond keeps the bed's tan.
+    let sun = normalize(frame.sun_dir.xyz);
+    let ndl = clamp(dot(n, sun), 0.0, 1.0);
+    let warm = film * (vec3<f32>(0.62, 0.46, 0.30) + frame.sun_color.rgb * ndl * 0.2);
+    lit = mix(lit, warm, pond);
     // The sun sits low, so a tight Phong highlight misses this camera.
-    // A wide lobe on the shore is the wet sheen.
+    // A wide lobe on the shore is the wet sheen. It stays off the pond.
     let view = normalize(frame.cam_pos.xyz - in.world);
     let ndotv = clamp(dot(n, view), 0.0, 1.0);
-    let halfv = normalize(normalize(frame.sun_dir.xyz) + view);
+    let halfv = normalize(sun + view);
     let facing = pow(1.0 - ndotv, 2.0);
     let wide = pow(clamp(dot(n, halfv), 0.0, 1.0), 2.2);
-    let wet_spec = (facing * 0.75 + wide * 1.15) * shore * mix(1.0, 0.16, drowned);
+    let wet_spec = (facing * 0.75 + wide * 1.15) * shore;
     lit += vec3<f32>(0.22, 0.095, 0.032) * wet_spec;
     return present(lit);
 }
 
-struct WaterOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) world: vec3<f32>,
-    @location(1) ij: vec2<f32>,
-    @location(2) depth: f32,
-}
-
-fn water_depth(xz: vec2<f32>) -> f32 {
-    // Dilate slightly so a dry speck inside the bowl does not punch a black hole.
-    let e = 0.28;
-    let d0 = mat_bilinear(xz).g;
-    let d1 = mat_bilinear(xz + vec2<f32>(e, 0.0)).g;
-    let d2 = mat_bilinear(xz - vec2<f32>(e, 0.0)).g;
-    let d3 = mat_bilinear(xz + vec2<f32>(0.0, e)).g;
-    let d4 = mat_bilinear(xz - vec2<f32>(0.0, e)).g;
-    return max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
-}
-
-// Fill a dry speck inside the bowl. A wide step turned the pond into a block.
-fn covered_depth(xz: vec2<f32>) -> f32 {
-    let here = water_depth(xz);
-    let e = 0.42;
-    let px = water_depth(xz + vec2<f32>(e, 0.0));
-    let nx = water_depth(xz - vec2<f32>(e, 0.0));
-    let pz = water_depth(xz + vec2<f32>(0.0, e));
-    let nz = water_depth(xz - vec2<f32>(0.0, e));
-    let across = max(min(px, nx), min(pz, nz));
-    return max(here, across);
-}
-
-@vertex
-fn vs_water(in: TerrIn) -> WaterOut {
-    let soil = height_bilinear(in.xz);
-    let depth = covered_depth(in.xz);
-    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.04, depth);
-    // On the soil, in the hole. Averaging the bed lifted a flat card off the bowl.
-    let y = soil + 0.02 + rip;
-    let world = vec3<f32>(in.xz.x, y, in.xz.y);
-    var o: WaterOut;
-    o.clip = frame.view_proj * vec4<f32>(world, 1.0);
-    o.world = world;
-    o.ij = in.ij;
-    o.depth = depth;
-    return o;
-}
-
-@fragment
-fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
-    if (in.depth < 0.004) {
-        discard;
+fn smooth_water(xz: vec2<f32>) -> f32 {
+    var acc = 0.0;
+    let r = 0.75;
+    for (var j: i32 = -2; j <= 2; j = j + 1) {
+        for (var i: i32 = -2; i <= 2; i = i + 1) {
+            acc = acc + mat_bilinear(xz + vec2<f32>(f32(i), f32(j)) * r).g;
+        }
     }
-    // Slope of the bed, so the pond shades as a bowl instead of a flat fill.
-    let e = 0.55;
-    let xz = in.world.xz;
-    let slope = normalize(vec3<f32>(
-        height_bilinear(xz - vec2<f32>(e, 0.0)) - height_bilinear(xz + vec2<f32>(e, 0.0)),
-        e * 2.0,
-        height_bilinear(xz - vec2<f32>(0.0, e)) - height_bilinear(xz + vec2<f32>(0.0, e)),
-    ));
-    let rip = ripple_normal(xz, frame.misc.x);
-    let nrm = normalize(slope + vec3<f32>(rip.x, 0.0, rip.z) * 0.22);
-    let view = normalize(frame.cam_pos.xyz - in.world);
-    let sun = normalize(frame.sun_dir.xyz);
-    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
-    let fres = pow(1.0 - ndotv, 2.2);
-    let depth_t = smoothstep(0.004, 0.055, in.depth);
-    let shore_col = vec3<f32>(0.11, 0.048, 0.018);
-    let deep_col = vec3<f32>(0.030, 0.013, 0.005);
-    var col = mix(shore_col, deep_col, depth_t);
-    let refl = sky_color(reflect(-view, nrm));
-    col = mix(col, refl, fres * 0.34);
-    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 48.0);
-    col += vec3<f32>(0.06, 0.045, 0.030) * spec * shadow_factor(in.world, nrm);
-    let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
-    col += deep_col * ndl * 0.35;
-    let alpha = smoothstep(0.003, 0.028, in.depth) * mix(0.62, 0.92, depth_t);
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
-    return vec4<f32>(gamma, alpha);
+    return acc / 25.0 * 0.34;
 }
 
 struct MeshIn {

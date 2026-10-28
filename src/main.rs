@@ -225,7 +225,7 @@ impl App {
         surface.configure(&device, &config);
         let name = adapter.get_info().name;
         let formats = render::gpu_formats(&adapter);
-        eprintln!("loading course ground, Niva and forest");
+        eprintln!("loading course ground and the Niva");
         let scene = cc0::load();
         let picture = picture::load();
         let mut renderer = Renderer::new(
@@ -547,7 +547,7 @@ fn capture(args: &[String]) {
     }
     let (_instance, adapter, device, queue) = open_adapter(parsed.software, None);
     let formats = render::gpu_formats(&adapter);
-    eprintln!("loading course ground, Niva and forest");
+    eprintln!("loading course ground and the Niva");
     let scene = cc0::load();
     let picture = picture::load();
     let mut renderer = Renderer::new(

@@ -102,7 +102,6 @@ pub struct Renderer {
     chunk_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
-    pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
     pipe_mesh_blend: wgpu::RenderPipeline,
     pipe_mesh_double: wgpu::RenderPipeline,
@@ -677,22 +676,6 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
-        let pipe_water = pipeline(
-            &device,
-            &shader,
-            terrain_layout_ref,
-            "vs_water",
-            Some("fs_water"),
-            terrain_buffers(),
-            color_format,
-            Some(depth_state(
-                formats.depth,
-                false,
-                wgpu::CompareFunction::Less,
-            )),
-            true,
-            None,
-        );
         let pipe_mesh = pipeline(
             &device,
             &shader,
@@ -941,7 +924,6 @@ impl Renderer {
             chunk_i,
             pipe_sky,
             pipe_terrain,
-            pipe_water,
             pipe_mesh,
             pipe_mesh_blend,
             pipe_mesh_double,
@@ -1189,9 +1171,6 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_niva(&mut pass);
-
-            pass.set_pipeline(&self.pipe_water);
-            draw_indexed(&mut pass, &self.terrain);
 
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -1735,6 +1714,25 @@ fn upload_mesh<V: bytemuck::Pod>(
     label: &str,
 ) -> GpuMesh {
     use wgpu::util::DeviceExt;
+    if vertices.is_empty() || indices.is_empty() {
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of::<V>().max(4) as u64,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let ibuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: 4,
+            usage: wgpu::BufferUsages::INDEX,
+            mapped_at_creation: false,
+        });
+        return GpuMesh {
+            vbuf,
+            ibuf,
+            count: 0,
+        };
+    }
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
         contents: bytemuck::cast_slice(vertices),

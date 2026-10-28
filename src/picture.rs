@@ -1,15 +1,11 @@
-//! Photoreal course dressing and the Lada Niva.
-//!
-//! Trees, shrubs and rocks are Poly Haven CC0. The Niva is Greg McKechnie's
-//! Sketchfab model (CC BY 4.0). Gobkit stays in the repo; it is too stylized
-//! to carry the forest on its own, so it is not instanced on this course.
+//! The Lada Niva on the course. Poly Haven and Gobkit plants stay on disk
+//! and are not instanced: the leaf cards turned into specks and the kit
+//! only cost triangles.
 
 use std::collections::HashMap;
 
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use image::imageops::FilterType;
-use silt::course;
-use silt::soil::SoilField;
 
 use crate::cc0::RgbaTex;
 use crate::mesh::{CpuMesh, MeshVertex};
@@ -17,17 +13,8 @@ use crate::mesh::{CpuMesh, MeshVertex};
 const ATLAS: u32 = 2048;
 const CELL: u32 = 512;
 
-const ISLAND: &[u8] = include_bytes!("../assets/env/photoreal/island_tree.glb");
-const SEARSIA: &[u8] = include_bytes!("../assets/env/photoreal/searsia.glb");
-const BOULDER: &[u8] = include_bytes!("../assets/env/photoreal/boulder.glb");
-const TRUNK: &[u8] = include_bytes!("../assets/env/photoreal/dead_trunk.glb");
-const MOSS: &[u8] = include_bytes!("../assets/env/photoreal/rock_moss.glb");
-const GRASS: &[u8] = include_bytes!("../assets/env/photoreal/grass.glb");
-const FERN: &[u8] = include_bytes!("../assets/env/photoreal/fern.glb");
-const SHRUB: &[u8] = include_bytes!("../assets/env/photoreal/shrub.glb");
 const NIVA: &[u8] = include_bytes!("../assets/vehicle/niva-greg/lada_niva.glb");
 
-pub const PANEL_FLORA: f32 = 71.0;
 pub const PANEL_NIVA: f32 = 72.0;
 pub const PANEL_NIVA_GLASS: f32 = 73.0;
 
@@ -47,34 +34,23 @@ pub struct Picture {
 }
 
 pub fn load() -> Picture {
-    let mut flora_atlas = Atlas::new();
-    let kits = [
-        load_kit(ISLAND, &mut flora_atlas, "island_tree"),
-        load_kit(SEARSIA, &mut flora_atlas, "searsia"),
-        load_kit(BOULDER, &mut flora_atlas, "boulder"),
-        load_kit(TRUNK, &mut flora_atlas, "dead_trunk"),
-        load_kit(MOSS, &mut flora_atlas, "rock_moss"),
-        load_kit(GRASS, &mut flora_atlas, "grass"),
-        load_kit(FERN, &mut flora_atlas, "fern"),
-        load_kit(SHRUB, &mut flora_atlas, "shrub"),
-    ];
-    let soil = course::field();
-    let flora = scatter(&kits, &soil);
     let mut niva_atlas = Atlas::new();
     let (niva, niva_glass) = load_niva(&mut niva_atlas);
     eprintln!(
-        "picture flora {} tris, niva {} tris, glass {} tris, atlas slots {}/{}",
-        flora.indices.len() / 3,
+        "picture niva {} tris, glass {} tris, atlas slots {}",
         niva.indices.len() / 3,
         niva_glass.indices.len() / 3,
-        flora_atlas.next,
         niva_atlas.next
     );
     Picture {
-        flora,
+        flora: CpuMesh::new(),
         niva,
         niva_glass,
-        flora_tex: flora_atlas.finish(),
+        flora_tex: RgbaTex {
+            width: 4,
+            height: 4,
+            rgba: vec![0; 4 * 4 * 4],
+        },
         niva_tex: niva_atlas.finish(),
     }
 }
@@ -128,26 +104,6 @@ impl Atlas {
             rgba: self.rgba,
         }
     }
-}
-
-fn load_kit(glb: &[u8], atlas: &mut Atlas, label: &str) -> CpuMesh {
-    let mut mesh = CpuMesh::new();
-    append_glb(&mut mesh, glb, atlas, PANEL_FLORA, false, label);
-    let min_y = mesh
-        .vertices
-        .iter()
-        .map(|v| v.pos[1])
-        .fold(f32::MAX, f32::min);
-    if min_y.is_finite() {
-        for v in &mut mesh.vertices {
-            v.pos[1] -= min_y;
-        }
-    }
-    eprintln!(
-        "flora {label} tris {}",
-        mesh.indices.len() / 3
-    );
-    mesh
 }
 
 fn load_niva(atlas: &mut Atlas) -> (CpuMesh, CpuMesh) {
@@ -507,217 +463,4 @@ fn world_matrix(mut index: usize, locals: &[Mat4], parents: &[Option<usize>]) ->
         }
     }
     m
-}
-
-fn scatter(kits: &[CpuMesh; 8], soil: &SoilField) -> CpuMesh {
-    let mut dst = CpuMesh::new();
-    let tau = std::f32::consts::TAU;
-    // Three belts past the berm. Crowns overlap, so the lap sits in woods.
-    // The south slot in front of the wide camera stays low shrubs.
-    for ring in 0..3u32 {
-        let count = 22 + ring * 6;
-        let radius = 23.2 + ring as f32 * 2.7;
-        for i in 0..count {
-            let n = i + ring * 50;
-            let a = (i as f32 + (jitter(n) - 0.5) * 0.7) / count as f32 * tau;
-            let r = radius + (jitter(n + 4) - 0.5) * 1.6;
-            let Some((x, z)) = push_outside(a.cos() * r, a.sin() * r) else {
-                continue;
-            };
-            if !shot_clear(x, z) {
-                continue;
-            }
-            let yaw = jitter(n + 8) * tau;
-            // Wide camera looks up the south side. Tall crowns there hide the lap.
-            if z < -16.5 && x.abs() < 11.0 {
-                stamp(
-                    &mut dst,
-                    &kits[7],
-                    soil,
-                    x,
-                    z,
-                    yaw,
-                    18.0 + jitter(n + 2) * 8.0,
-                );
-                continue;
-            }
-            let scale = 3.15 + jitter(n + 11) * 1.45;
-            stamp(&mut dst, &kits[1], soil, x, z, yaw, scale);
-            if i % 2 == 0 {
-                let jx = x + (jitter(n + 15) - 0.5) * 2.4;
-                let jz = z + (jitter(n + 19) - 0.5) * 2.4;
-                if course::forest_spot(jx, jz)
-                    && shot_clear(jx, jz)
-                    && jx.abs() < 31.0
-                    && jz.abs() < 31.0
-                {
-                    stamp(
-                        &mut dst,
-                        &kits[1],
-                        soil,
-                        jx,
-                        jz,
-                        yaw + 1.1,
-                        scale * (0.72 + jitter(n + 21) * 0.2),
-                    );
-                }
-            }
-        }
-    }
-    // Understory between the crowns. Shrub is a few centimetres; fern is short.
-    for i in 0..64u32 {
-        let a = (i as f32 + jitter(700 + i)) / 64.0 * tau;
-        let r = 24.0 + jitter(800 + i) * 6.2;
-        let x = a.cos() * r;
-        let z = a.sin() * r;
-        if !course::clear_of_track(x, z, 4.6) || !shot_clear(x, z) || x.abs() > 31.0 || z.abs() > 31.0
-        {
-            continue;
-        }
-        let shrub = i % 2 == 0;
-        let kit = if shrub { 7 } else { 6 };
-        let scale = if shrub {
-            20.0 + jitter(900 + i) * 10.0
-        } else {
-            3.2 + jitter(900 + i) * 1.4
-        };
-        stamp(&mut dst, &kits[kit], soil, x, z, jitter(1000 + i) * tau, scale);
-    }
-    for (i, (x, z)) in [(28.0, 6.0), (-29.5, 10.0), (16.0, -29.0), (-6.0, 29.2), (29.0, -18.0)]
-        .into_iter()
-        .enumerate()
-    {
-        if let Some((x, z)) = push_outside(x, z) {
-            if shot_clear(x, z) {
-                stamp(
-                    &mut dst,
-                    &kits[2],
-                    soil,
-                    x,
-                    z,
-                    jitter(200 + i as u32) * tau,
-                    1.2 + jitter(210 + i as u32) * 0.5,
-                );
-            }
-        }
-    }
-    for (i, (x, z)) in [(-28.0, 20.0), (22.0, -26.0), (27.5, 24.0), (-22.0, -26.0)]
-        .into_iter()
-        .enumerate()
-    {
-        if let Some((x, z)) = push_outside(x, z) {
-            if shot_clear(x, z) {
-                stamp(&mut dst, &kits[3], soil, x, z, jitter(300 + i as u32) * tau, 1.05);
-            }
-        }
-    }
-    for i in 0..6u32 {
-        let a = i as f32 / 6.0 * tau + 0.4;
-        let x = a.cos() * 29.4;
-        let z = a.sin() * 29.4;
-        if let Some((x, z)) = push_outside(x, z) {
-            if shot_clear(x, z) {
-                stamp(&mut dst, &kits[4], soil, x, z, jitter(400 + i) * tau, 0.62);
-            }
-        }
-    }
-    for i in 0..22u32 {
-        let a = i as f32 / 22.0 * tau + 0.15;
-        let r = 26.5 + jitter(500 + i) * 3.8;
-        let x = a.cos() * r;
-        let z = a.sin() * r;
-        if course::clear_of_track(x, z, 6.5) && shot_clear(x, z) && x.abs() < 31.0 && z.abs() < 31.0 {
-            stamp(
-                &mut dst,
-                &kits[5],
-                soil,
-                x,
-                z,
-                jitter(520 + i) * tau,
-                2.0 + jitter(540 + i) * 0.9,
-            );
-        }
-    }
-    // Opaque sorrel, so the belt reads as woods and not only leaf specks.
-    for i in 0..48u32 {
-        let a = (i as f32 + 0.37) / 48.0 * tau + jitter(1200 + i) * 0.08;
-        let r = 24.5 + jitter(1300 + i) * 5.5;
-        let x = a.cos() * r;
-        let z = a.sin() * r;
-        if course::clear_of_track(x, z, 4.8) && shot_clear(x, z) && x.abs() < 31.0 && z.abs() < 31.0
-        {
-            stamp(
-                &mut dst,
-                &kits[7],
-                soil,
-                x,
-                z,
-                jitter(1400 + i) * tau,
-                26.0 + jitter(1500 + i) * 12.0,
-            );
-        }
-    }
-    // Low cover on the island. Nothing tall enough to hide the inner lap.
-    stamp(&mut dst, &kits[7], soil, -0.8, 1.1, 0.4, 14.0);
-    stamp(&mut dst, &kits[6], soil, 1.1, -0.6, 1.2, 2.4);
-    dst
-}
-
-/// Keep the rut camera and the puddle camera from looking through a bush.
-fn shot_clear(x: f32, z: f32) -> bool {
-    let (hx, hz) = course::hole_center();
-    // Wide enough that the pond camera is not inside a leaf card.
-    if (x - hx).hypot(z - hz) < 13.0 {
-        return false;
-    }
-    let (vx, vz, _) = course::hero();
-    if (x - vx).hypot(z - vz) < 10.0 {
-        return false;
-    }
-    true
-}
-
-fn push_outside(x: f32, z: f32) -> Option<(f32, f32)> {
-    if course::forest_spot(x, z) && x.abs() < 31.2 && z.abs() < 31.2 {
-        return Some((x, z));
-    }
-    let mut p = Vec2::new(x, z);
-    if p.length() < 0.5 {
-        return None;
-    }
-    for _ in 0..10 {
-        p *= 1.06;
-        if course::forest_spot(p.x, p.y) && p.x.abs() < 31.2 && p.y.abs() < 31.2 {
-            return Some((p.x, p.y));
-        }
-    }
-    None
-}
-
-fn stamp(dst: &mut CpuMesh, src: &CpuMesh, soil: &SoilField, x: f32, z: f32, yaw: f32, scale: f32) {
-    let h = soil.sample(x, z).height;
-    let q = Quat::from_rotation_y(yaw);
-    let base = dst.vertices.len() as u32;
-    for v in &src.vertices {
-        let p = Vec3::from(v.pos) * scale;
-        let p = Vec3::new(x, h, z) + q * p;
-        let n = q * Vec3::from(v.nrm);
-        dst.vertices.push(MeshVertex {
-            pos: p.to_array(),
-            nrm: n.normalize_or_zero().to_array(),
-            uv: v.uv,
-            panel: v.panel,
-        });
-    }
-    for idx in &src.indices {
-        dst.indices.push(base + idx);
-    }
-}
-
-fn jitter(n: u32) -> f32 {
-    let mut x = n.wrapping_mul(747796405).wrapping_add(2891336453);
-    x = (x >> 16) ^ x;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    (x & 0xffff) as f32 / 65535.0
 }
