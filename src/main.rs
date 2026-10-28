@@ -37,11 +37,20 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
-            let rest: Vec<String> = args.collect();
-            capture(&rest);
-        } else {
-            run_window();
+        match args.next().as_deref() {
+            Some("capture") => {
+                let rest: Vec<String> = args.collect();
+                capture(&rest);
+            }
+            Some("capture-rut") => {
+                let rest: Vec<String> = args.collect();
+                capture_rut(&rest);
+            }
+            Some("capture-flow") => {
+                let rest: Vec<String> = args.collect();
+                capture_flow(&rest);
+            }
+            _ => run_window(),
         }
     }
 }
@@ -574,6 +583,317 @@ fn capture(args: &[String]) {
         video.display(),
         t0.elapsed().as_secs_f32()
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_rut(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut pass_path = PathBuf::from(format!("{MEDIA}/rut-memory-pass.png"));
+    let mut water_path = PathBuf::from(format!("{MEDIA}/rut-memory-water.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--pass" => pass_path = PathBuf::from(val(&mut i)),
+            "--water" => water_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-rut flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::flat(0.2);
+    world.soil.sculpt_banked_puddle();
+    // Bowl past the bank, below the puddle surface. The bed is ground
+    // (initial height moves with it), so a sheet that arrives there is
+    // standing water rather than a shadowed groove. The ruts are the
+    // only notch through the bank, and they stop inside the bowl.
+    {
+        let soil = &mut world.soil;
+        let res = soil.res;
+        let half = soil.size * 0.5;
+        let cell = soil.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if (1.05..4.0).contains(&x) && z.abs() < 2.15 {
+                    let idx = j * res + i;
+                    let rz = (z.abs() / 2.15).clamp(0.0, 1.0);
+                    let rx = ((x - 1.05) / 2.95).clamp(0.0, 1.0);
+                    let h = 0.03 + rz * rz * 0.09 + rx * rx * 0.035;
+                    if soil.height[idx] > h {
+                        soil.height[idx] = h;
+                        soil.initial_height[idx] = h;
+                    }
+                }
+            }
+        }
+    }
+    let travel = Vec3::X;
+    // Two visits of the same slots. The second cut breaches the bank.
+    for _pass in 0..2 {
+        for z in [-0.74_f32, 0.74] {
+            world
+                .soil
+                .roll_pass(Vec3::new(-2.6, 0.0, z), travel, 4.3, 0.09, 0.0);
+        }
+        if _pass == 0 {
+            world.soil.age_water(0.55);
+        }
+    }
+    let depth = world.soil.rut_near(0.2, 0.74);
+    world.bike.pos = Vec3::new(18.0, 2.0, 18.0);
+    world.particles.clear();
+    // Off the bowl. Its shadow falls away from the cut, toward -x.
+    let park_h = world.soil.sample(-5.5, -4.2).height;
+    world.vehicle.pos = Vec3::new(-5.5, park_h + 0.55, -4.2);
+    world.vehicle.yaw = 0.4;
+    world.vehicle.vel = Vec3::ZERO;
+    for w in &mut world.vehicle.wheels {
+        w.compression = 0.12;
+    }
+    let pose = CameraPose {
+        eye: Vec3::new(5.2, 4.8, 4.6),
+        target: Vec3::new(1.35, 0.06, 0.05),
+        ortho_width: Some(6.4),
+    };
+    let rgba = renderer.draw(&world, pose, None, true).expect("pass readback");
+    write_png(&pass_path, width, height, &rgba).expect("pass png");
+    println!(
+        "pass {} rut {:.3} bowl {:.4} at ({:.1},{:.1})",
+        pass_path.display(),
+        depth,
+        world.soil.sample(2.4, 0.0).water,
+        world.vehicle.pos.x,
+        world.vehicle.pos.z
+    );
+
+    world.soil.age_water(28.0);
+    let rgba = renderer.draw(&world, pose, None, true).expect("water readback");
+    write_png(&water_path, width, height, &rgba).expect("water png");
+    println!(
+        "water {} depth {:.3} bowl {:.3}",
+        water_path.display(),
+        world.soil.rut_near(0.2, 0.74),
+        world.soil.sample(2.6, 0.0).water
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Sloping pair of ruts into a bowl. A tire sloshes the film, then the
+/// shallow-water step drains it to the bowl. The high still is the upper
+/// grooves after that drain; the pool still is the bowl.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_flow(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut high_path = PathBuf::from(format!("{MEDIA}/water-flow-high.png"));
+    let mut pool_path = PathBuf::from(format!("{MEDIA}/water-flow-pool.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--high" => high_path = PathBuf::from(val(&mut i)),
+            "--pool" => pool_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-flow flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::flat(0.22);
+    lay_draining_ruts(&mut world.soil);
+    let soil = &mut world.soil;
+    let res = soil.res;
+    let half = soil.size * 0.5;
+    let cell = soil.cell;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let idx = j * res + i;
+            let rut = soil.initial_height[idx] - soil.height[idx];
+            if rut > 0.025 && (-3.4..1.7).contains(&x) && z.abs() < 1.15 {
+                soil.water[idx] = 0.045;
+                soil.wetness[idx] = 1.0;
+            }
+        }
+    }
+    // The tire shoves the film ahead and sideways, then leaves.
+    for lane in [-0.70_f32, 0.70] {
+        let mut x = -3.2_f32;
+        while x < 1.5 {
+            soil.displace_water(x, lane, Vec3::X, 0.025);
+            x += cell * 0.7;
+        }
+    }
+    // Long enough for the film to leave the upper cut and sit in the bowl.
+    soil.age_water(5.0);
+
+    let high_l = soil.sample(-2.6, -0.70).water;
+    let high_r = soil.sample(-2.6, 0.70).water;
+    let mut pool_depth = 0.0_f32;
+    let mut pool_at = Vec3::ZERO;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            if x > 2.2 && z.abs() < 1.8 {
+                let w = soil.water[j * res + i];
+                if w > pool_depth {
+                    pool_depth = w;
+                    pool_at = Vec3::new(x, soil.height[j * res + i], z);
+                }
+            }
+        }
+    }
+    let volume: f32 = soil.water.iter().sum();
+    let profile: String = [-2.6_f32, -1.2, 0.2, 1.4, 2.2]
+        .iter()
+        .map(|x| format!("{x:.1}:{:.3}", soil.sample(*x, 0.70).water))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "flow high {:.4} {:.4}  pool {:.4} at ({:.2},{:.2}) bed {:.3}  volume {volume:.3}  lane {profile}",
+        high_l, high_r, pool_depth, pool_at.x, pool_at.z, pool_at.y
+    );
+
+    world.bike.pos = Vec3::new(16.0, 2.0, 16.0);
+    world.particles.clear();
+    world.vehicle.pos = Vec3::new(-12.0, 1.2, -12.0);
+    world.vehicle.vel = Vec3::ZERO;
+    for w in &mut world.vehicle.wheels {
+        w.compression = 0.12;
+    }
+
+    let high_pose = CameraPose {
+        eye: Vec3::new(-0.6, 4.6, 4.0),
+        target: Vec3::new(-2.35, 0.16, 0.0),
+        ortho_width: Some(5.4),
+    };
+    let rgba = renderer
+        .draw(&world, high_pose, None, true)
+        .expect("high readback");
+    write_png(&high_path, width, height, &rgba).expect("high png");
+    println!("high {}", high_path.display());
+
+    let pool_pose = CameraPose {
+        eye: Vec3::new(4.4, 6.4, 3.8),
+        target: Vec3::new(2.55, 0.0, 0.0),
+        ortho_width: Some(6.6),
+    };
+    let rgba = renderer
+        .draw(&world, pool_pose, None, true)
+        .expect("pool readback");
+    write_png(&pool_path, width, height, &rgba).expect("pool png");
+    println!("pool {}", pool_path.display());
+}
+
+/// Two grooves down a grade into a bowl that is the low point.
+#[cfg(not(target_arch = "wasm32"))]
+/// Smooth valley, lowest at the bowl. A hard lip downstream read as a crack.
+#[cfg(not(target_arch = "wasm32"))]
+fn flow_bed(x: f32, z: f32) -> f32 {
+    let along = (x - 3.15) / 4.8;
+    let mut h = 0.10 + along * along * 0.20;
+    let dx = x - 3.15;
+    let r = (dx * dx + z * z).sqrt() / 1.65;
+    if r < 1.0 {
+        h -= (1.0 - r).powf(1.4) * 0.22;
+    }
+    h
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lay_draining_ruts(soil: &mut silt::soil::SoilField) {
+    let res = soil.res;
+    let half = soil.size * 0.5;
+    let cell = soil.cell;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let idx = j * res + i;
+            let h = flow_bed(x, z);
+            soil.height[idx] = h;
+            soil.initial_height[idx] = h;
+            soil.water[idx] = 0.0;
+            soil.wetness[idx] = 0.2;
+            soil.base_wetness[idx] = 0.2;
+            soil.loose[idx] = 0.0;
+            soil.darken[idx] = 0.05;
+            soil.roughness[idx] = 0.9;
+            soil.rest[idx] = 10.0;
+            soil.passes[idx] = 0;
+        }
+    }
+    for lane in [-0.70_f32, 0.70] {
+        soil.roll_pass(Vec3::new(-3.7, 0.0, lane), Vec3::X, 6.4, 0.09, 0.0);
+    }
+    // The tire crosses the lip. Restore the bowl so both grooves drain into one bed.
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let dx = x - 3.15;
+            let r = (dx * dx + z * z).sqrt() / 1.65;
+            if r < 1.0 {
+                let bed = flow_bed(x, z);
+                let idx = j * res + i;
+                // Inner bed is the pond, not two slots the tire cut on the way through.
+                if r < 0.72 || soil.height[idx] > bed {
+                    soil.height[idx] = bed;
+                    soil.initial_height[idx] = bed;
+                    soil.darken[idx] = 0.06;
+                    soil.roughness[idx] = 0.88;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
