@@ -52,7 +52,7 @@ pub struct CpuMesh {
 }
 
 impl CpuMesh {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -704,7 +704,8 @@ pub fn terrain_mesh(res: usize, size: f32) -> (Vec<TerrainVertex>, Vec<u32>) {
     // The solver stores one height per ~20 cm. A rut is often a single cell,
     // which is one kink and reads as a tint. Draw a finer mesh and sample the
     // same heightfield so the displaced walls have real triangles.
-    let sub = 3usize;
+    // Lug pitch is ~20 cm. At sub 4 a void is one quad and reads as a card.
+    let sub = 8usize;
     let n = (res - 1) * sub + 1;
     let mut verts = Vec::with_capacity(n * n);
     let half = size * 0.5;
@@ -836,39 +837,9 @@ pub fn environment_mesh() -> CpuMesh {
     );
 
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
-    // sits on the ground instead of floating as boxes.
+    // sits on the ground instead of floating as boxes. Trees, rocks and grass
+    // are the Gobkit meshes placed around the oval.
     add_horizon(&mut m);
-
-    let trees = [
-        Vec3::new(-16.0, 0.0, 14.0),
-        Vec3::new(18.0, 0.0, -16.0),
-        Vec3::new(14.0, 0.0, 16.0),
-        Vec3::new(-18.0, 0.0, -11.0),
-        Vec3::new(20.0, 0.0, 6.0),
-    ];
-    for (k, p) in trees.iter().enumerate() {
-        let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
-        add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
-        // Stacked cones so the crown has volume instead of a flat card.
-        let layers = [
-            (trunk_h * 0.42, 1.25, 1.45),
-            (trunk_h * 0.85, 1.0, 1.2),
-            (trunk_h * 1.25, 0.72, 0.95),
-        ];
-        for (i, (y, radius, height)) in layers.iter().enumerate() {
-            let j = hash(40 + k as u32 * 3 + i as u32);
-            let jx = (j - 0.5) * 0.2;
-            let jz = (hash(90 + k as u32 * 3 + i as u32) - 0.5) * 0.2;
-            add_cone(
-                &mut m,
-                *p + Vec3::new(jx, *y, jz),
-                *height,
-                *radius * (0.9 + j * 0.2),
-                PANEL_TREE,
-                6,
-            );
-        }
-    }
     m
 }
 
@@ -1059,15 +1030,244 @@ fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, s
     );
 }
 
+/// Airborne ledger soil. A flat ribbon of the carried volume. A sphere of
+/// `cbrt(volume)` was a blob several times the field.
+fn add_soil_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.22, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::Z;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = (0.22 + p.vel.length() * 0.05).clamp(0.24, 0.80);
+    let width = (p.volume / length).sqrt().clamp(0.018, 0.09);
+    let thick = (p.volume / (length * width)).clamp(0.005, 0.022);
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (1.0 - (t * 2.0 - 1.0).abs()).clamp(0.15, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * taper;
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
+/// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
+/// is a ribbon rather than a box, a tablet, or a cube.
+fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.35, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::Z;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let speed = p.vel.length();
+    let length = (0.34 + speed * 0.04).clamp(0.42, 0.78);
+    let width = (p.volume / length).sqrt().clamp(0.022, 0.10);
+    let thick = (p.volume / (length * width * 0.55)).clamp(0.004, 0.014);
+    let segs = 8usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        // Pinched ends. A constant width would be a tablet.
+        let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0);
+        let arc = (t * std::f32::consts::PI).sin();
+        let twist = (t - 0.5) * 0.7;
+        let side_t = side * twist.cos() + up * twist.sin();
+        let up_t = -side * twist.sin() + up * twist.cos();
+        let c = p.pos
+            + dir * (length * (t - 0.5))
+            + up * (arc - 0.55) * length * 0.16
+            + side * (t - 0.5) * width * 0.35;
+        let w = side_t * width * 0.5 * taper;
+        let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
+/// A small liquid drop torn off with the ribbons. A short pinched fleck.
+/// The ledger volume stays on the particle; this mark does not swell into a
+/// teardrop blob, a sphere, or a tablet.
+fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    // Long axis in the horizontal plane, width vertical, thickness to the side.
+    // A side camera then sees a small fleck instead of an edge-on hair.
+    let mut dir = Vec3::new(p.vel.x * 0.2, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-4 {
+        dir = Vec3::new(p.vel.x, 0.0, -1.0);
+    }
+    dir = dir.normalize();
+    let up = Vec3::Y;
+    let side = dir.cross(up).normalize();
+    let wobble = (p.seed % 5) as f32;
+    let length = 0.048 + wobble * 0.003;
+    let width = 0.016;
+    let thick = 0.0026;
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (t * (1.0 - t) * 4.0).powf(0.7).clamp(0.16, 1.0);
+        let arc = (t * std::f32::consts::PI).sin();
+        let c = p.pos + dir * (length * (t - 0.5)) + up * (arc - 0.5) * length * 0.06;
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * (0.55 + 0.45 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
+#[cfg(test)]
+mod slurry_shapes {
+    use super::*;
+    use silt::particles::Particle;
+
+    fn piece(kind: u8, volume: f32, vel: Vec3) -> Particle {
+        Particle {
+            pos: Vec3::new(0.0, 0.5, 0.0),
+            vel,
+            life: 2.0,
+            max_life: 2.0,
+            size: 0.05,
+            kind,
+            alive: true,
+            volume,
+            ledger: true,
+            ..Particle::default()
+        }
+    }
+
+    fn extents(mesh: &CpuMesh) -> [f32; 3] {
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(-f32::MAX);
+        for v in &mesh.vertices {
+            let p = Vec3::from_array(v.pos);
+            min = min.min(p);
+            max = max.max(p);
+        }
+        let mut e = (max - min).to_array();
+        e.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        e
+    }
+
+    #[test]
+    fn breakaway_mud_is_a_ribbon_and_a_drop() {
+        let mut ribbon = CpuMesh::new();
+        add_slurry_ribbon(
+            &mut ribbon,
+            &piece(5, 0.004, Vec3::new(0.0, 0.15, 5.0)),
+        );
+        let mut drop = CpuMesh::new();
+        add_mud_drop(&mut drop, &piece(6, 0.0008, Vec3::new(0.05, 3.4, 0.0)));
+        assert!(ribbon.vertices.len() > 24, "ribbon mesh missing");
+        assert!(drop.vertices.len() > 24, "drop mesh missing");
+        let r = extents(&ribbon);
+        let d = extents(&drop);
+        assert!(
+            r[0] > r[1] * 2.4 && r[0] > r[2] * 3.0,
+            "ribbon is not a long sheet {r:?}"
+        );
+        assert!(
+            r[1] / r[0] < 0.42,
+            "ribbon reads as a tablet {r:?}"
+        );
+        assert!(d[0] < 0.075, "drop is a teardrop blob {d:?}");
+        assert!(
+            d[0] > d[1] * 2.2,
+            "drop is round like a sphere {d:?}"
+        );
+        assert!(
+            d[1] / d[0] < 0.45,
+            "drop reads as a tablet {d:?}"
+        );
+        assert!(d[1] > d[2] * 1.8, "drop is a bar {d:?}");
+        assert!(d[0] / d[1] < 6.0, "drop is a needle {d:?}");
+    }
+
+    #[test]
+    fn mud_chunks_includes_the_breakaway() {
+        use silt::particles::Particles;
+        let mut particles = Particles::new();
+        let threw = particles.throw_slurry(Vec3::new(0.4, 0.2, 0.6), Vec3::Z, Vec3::X, 0.012);
+        assert!(threw.ribbons > 0.0 && threw.drops > 0.0);
+        let mesh = mud_chunks(&particles.items);
+        assert!(
+            mesh.vertices.len() > 80,
+            "breakaway pieces were not meshed, verts {}",
+            mesh.vertices.len()
+        );
+    }
+}
+
 /// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
-/// smaller lumps. Nothing here is a camera-facing quad or a faceted stone.
+/// smaller lumps. Ledger soil is not in this mesh once it has landed: that
+/// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    for kind in [3u8, 1, 4, 0, 2] {
+    // 5 and 6 are the slurry breakaway: ribbons, then drops.
+    for kind in [5u8, 6, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
+                continue;
+            }
+            if p.ledger {
+                if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
+                    if p.kind == silt::particles::KIND_SLURRY_DROP {
+                        add_mud_drop(&mut mesh, p);
+                    } else if p.kind == silt::particles::KIND_SLURRY_RIBBON {
+                        add_slurry_ribbon(&mut mesh, p);
+                    } else {
+                        add_soil_ribbon(&mut mesh, p);
+                    }
+                }
                 continue;
             }
             if mesh.vertices.len() + 700 > MAX_VERTS {
