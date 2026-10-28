@@ -524,25 +524,9 @@ struct MeshOut {
     @location(4) local: vec3<f32>,
 }
 
-// 0 is bare rubber. 1 is wet clay. The face stays dark. Cuts stay packed.
-fn clay_pack(pos: vec3<f32>, uv: vec2<f32>) -> f32 {
-    if (model.extra.x < 0.5 || model.extra.z <= 1.0e-5) {
-        return 0.0;
-    }
-    let radial = length(pos.yz);
-    let ang = atan2(pos.y, pos.z);
-    if (uv.y > 1.5) {
-        // A few wet smears on the outer sidewall. The hub and most of the face stay rubber.
-        let reach = smoothstep(0.14, 0.24, radial);
-        let dab = smoothstep(0.70, 0.86, noise(pos.yz * 8.5 + vec2<f32>(pos.x * 5.0, 0.8)));
-        return reach * dab;
-    }
-    // Deep cuts sit near 0.34. High ribs sit near 0.37. The bead near 0.29 stays rubber.
-    let in_cut = smoothstep(0.300, 0.328, radial) * (1.0 - smoothstep(0.362, 0.376, radial));
-    let clump = noise(vec2<f32>(ang * 1.1, pos.x * 16.0));
-    let fine = noise(vec2<f32>(pos.y * 8.0 + ang, pos.z * 8.0));
-    let packed = smoothstep(0.06, 0.34, clump * 0.6 + fine * 0.4);
-    return in_cut * packed;
+// The tread film is mesh in the cuts (panel 48), not a color on the rubber.
+fn clay_pack(_pos: vec3<f32>, _uv: vec2<f32>) -> f32 {
+    return 0.0;
 }
 
 fn clay_pos(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
@@ -668,6 +652,21 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        // Wet sheet. Pale water with darker streaks. Rough enough to stay a sheet.
+        let g = noise(world.xz * 3.6 + vec2<f32>(world.y * 2.4, 0.3));
+        let streak = noise(vec2<f32>(world.x * 7.0 + world.z * 1.6, world.y * 5.0));
+        let pale = vec3<f32>(0.58, 0.55, 0.50);
+        let mud = vec3<f32>(0.20, 0.12, 0.06);
+        let col = mix(pale, mud, smoothstep(0.58, 0.88, streak) * 0.62 + g * 0.06);
+        return vec4<f32>(col, 0.62);
+    } else if (panel < 48.5) {
+        // Packed clay. Matte. A few sand grains, no spec.
+        let g = noise(world.xz * 5.5 + vec2<f32>(world.y * 4.0, 0.2));
+        var col = mix(vec3<f32>(0.085, 0.036, 0.014), vec3<f32>(0.13, 0.058, 0.022), g);
+        let sand = smoothstep(0.84, 0.96, noise(world.xy * 19.0 + vec2<f32>(world.z * 4.0, 1.0)));
+        col = mix(col, vec3<f32>(0.24, 0.20, 0.14), sand * 0.4);
+        return vec4<f32>(col, 0.97);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -759,7 +758,37 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
 
     var lit = shade(in.world, nrm, albedo, rough, emit);
     // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
-    if (in.panel > 45.5 && in.panel < 46.5) {
+    if (in.panel > 46.5 && in.panel < 47.5) {
+        // Wet sheet. The sky fill was painting the ribbon blue, and a sharp spec
+        // was turning it into a plastic card.
+        let n = normalize(nrm);
+        let sun = normalize(frame.sun_dir.xyz);
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let ndotv = clamp(dot(n, view), 0.0, 1.0);
+        let streak = noise(in.world.xz * 5.5 + vec2<f32>(in.world.y * 3.0, 0.4));
+        let vein = noise(in.world.xz * 11.0 + vec2<f32>(in.world.y * 7.0, 1.6));
+        // Pale wet face, dark mud in the streaks. A flat grey read as plastic.
+        let pale = vec3<f32>(0.58, 0.54, 0.46);
+        let mud = vec3<f32>(0.05, 0.022, 0.008);
+        let dirt = smoothstep(0.32, 0.58, vein) * 0.78 + smoothstep(0.62, 0.88, streak) * 0.35;
+        let body = mix(pale, mud, clamp(dirt, 0.0, 1.0));
+        lit = body * (0.38 + ndl * shadow * 0.5);
+        let wet = smoothstep(0.84, 0.96, streak);
+        lit += vec3<f32>(0.12, 0.09, 0.05) * pow(ndotv, 28.0) * wet * shadow * 0.18;
+    } else if (in.panel > 47.5 && in.panel < 48.5) {
+        // Packed clay in a tread cut. Matte. No spec, so it cannot read as a sticker.
+        let n = normalize(nrm);
+        let sun = normalize(frame.sun_dir.xyz);
+        let ndl = clamp(dot(n, sun), 0.0, 1.0);
+        let shadow = shadow_factor(in.world + n * 0.02, n);
+        let g = noise(in.world.xz * 6.0 + vec2<f32>(in.world.y * 4.2, 0.2));
+        var body = mix(vec3<f32>(0.14, 0.055, 0.018), vec3<f32>(0.22, 0.09, 0.03), g);
+        let sand = smoothstep(0.86, 0.97, noise(in.world.xy * 18.0 + vec2<f32>(in.world.z, 1.3)));
+        body = mix(body, vec3<f32>(0.28, 0.22, 0.14), sand * 0.28);
+        lit = body * (0.55 + ndl * shadow * 0.85);
+    } else if (in.panel > 45.5 && in.panel < 46.5) {
         var n = normalize(nrm);
         // Soft skin. A strong bump turns the highlight into gravel.
         let e = 0.06;

@@ -4,7 +4,7 @@
 //! into paint, rubber or mud. Wheel and shock meshes stay in the spaces the
 //! vehicle solver already uses, so the picture matches the contact model.
 
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 use silt::bike::Bike;
 use silt::vehicle::{hardpoints, Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
@@ -21,6 +21,10 @@ pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
 /// Wet mud clod. Not body paint, and not a camera-facing card.
 pub const PANEL_CLOD: f32 = 46.0;
+/// Continuous sheet thrown off a coated tread. Drawn, not simulated.
+pub const PANEL_SHEET: f32 = 47.0;
+/// Clay packed into a tread cut. Matte, and not a coat painted on the rubber.
+pub const PANEL_PACK: f32 = 48.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,6 +61,12 @@ impl CpuMesh {
             vertices: Vec::new(),
             indices: Vec::new(),
         }
+    }
+
+    pub fn append(&mut self, other: &CpuMesh) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&other.vertices);
+        self.indices.extend(other.indices.iter().map(|i| i + base));
     }
 }
 
@@ -1107,4 +1117,386 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
         }
     }
     mesh
+}
+
+fn value_noise(x: f32, y: f32) -> f32 {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let h = |ix: i32, iy: i32| chunk_hash(ix as u32 ^ 0xA5A5_5A5A, iy as u32 ^ 0x3C3C_C3C3);
+    let a = h(x0, y0);
+    let b = h(x0 + 1, y0);
+    let c = h(x0, y0 + 1);
+    let d = h(x0 + 1, y0 + 1);
+    a * (1.0 - sx) * (1.0 - sy) + b * sx * (1.0 - sy) + c * (1.0 - sx) * sy + d * sx * sy
+}
+
+/// Unscaled tread radius at an axle position. Matches `wheel_mesh`.
+fn profile_radius(x: f32) -> f32 {
+    const P: [(f32, f32); 11] = [
+        (-0.140, 0.30),
+        (-0.115, 0.355),
+        (-0.085, 0.385),
+        (-0.055, 0.348),
+        (-0.025, 0.388),
+        (0.005, 0.350),
+        (0.035, 0.380),
+        (0.065, 0.348),
+        (0.095, 0.385),
+        (0.120, 0.350),
+        (0.140, 0.30),
+    ];
+    if x <= P[0].0 {
+        return P[0].1;
+    }
+    for w in P.windows(2) {
+        if x <= w[1].0 + 1.0e-5 {
+            let t = ((x - w[0].0) / (w[1].0 - w[0].0)).clamp(0.0, 1.0);
+            return w[0].1 + (w[1].1 - w[0].1) * t;
+        }
+    }
+    P[10].1
+}
+
+fn transform_mesh(mesh: &mut CpuMesh, xform: Mat4) {
+    for v in &mut mesh.vertices {
+        let p = xform.transform_point3(Vec3::from_array(v.pos));
+        let n = xform
+            .transform_vector3(Vec3::from_array(v.nrm))
+            .normalize_or_zero();
+        v.pos = p.to_array();
+        v.nrm = n.to_array();
+    }
+}
+
+/// Grid surface. `hint` picks which side is front-facing so backface culling
+/// keeps the outside of a tread cut and the top of a sheet.
+fn add_grid<F>(mesh: &mut CpuMesh, nu: usize, nv: usize, panel: f32, hint: Vec3, mut at: F)
+where
+    F: FnMut(usize, usize) -> Vec3,
+{
+    let stride = nv + 1;
+    let npts = (nu + 1) * stride;
+    let mut pts = Vec::with_capacity(npts);
+    for iu in 0..=nu {
+        for iv in 0..=nv {
+            pts.push(at(iu, iv));
+        }
+    }
+    let mut nrm = vec![Vec3::ZERO; npts];
+    for iu in 0..=nu {
+        for iv in 0..=nv {
+            let iu0 = iu.saturating_sub(1);
+            let iu1 = (iu + 1).min(nu);
+            let iv0 = iv.saturating_sub(1);
+            let iv1 = (iv + 1).min(nv);
+            let du = pts[iu1 * stride + iv] - pts[iu0 * stride + iv];
+            let dv = pts[iu * stride + iv1] - pts[iu * stride + iv0];
+            let mut n = du.cross(dv);
+            if n.length_squared() < 1.0e-10 {
+                n = hint;
+            }
+            nrm[iu * stride + iv] = n;
+        }
+    }
+    let mid = npts / 2;
+    let mid_p = pts[mid];
+    // A zero hint means "outward from the axle", which is the same side all
+    // the way around a tread cut. A fixed world up would flip the bottom.
+    let hint = if hint.length_squared() < 1.0e-8 {
+        Vec3::new(0.0, mid_p.y, mid_p.z)
+    } else {
+        hint
+    };
+    let mut flip = false;
+    if nrm[mid].dot(hint) < 0.0 {
+        flip = true;
+        for n in &mut nrm {
+            *n = -*n;
+        }
+    }
+    let base = mesh.vertices.len() as u32;
+    for i in 0..npts {
+        push_smooth(mesh, pts[i], nrm[i], panel);
+    }
+    for iu in 0..nu {
+        for iv in 0..nv {
+            let a = base + (iu * stride + iv) as u32;
+            let b = base + ((iu + 1) * stride + iv) as u32;
+            let c = base + ((iu + 1) * stride + iv + 1) as u32;
+            let d = base + (iu * stride + iv + 1) as u32;
+            if flip {
+                mesh.indices.extend_from_slice(&[a, c, b, a, d, c]);
+            } else {
+                mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+            }
+        }
+    }
+}
+
+/// Same grid, extruded into a thin shell so the rim has thickness.
+fn add_shell<F>(mesh: &mut CpuMesh, nu: usize, nv: usize, panel: f32, thick: f32, mut at: F)
+where
+    F: FnMut(usize, usize) -> Vec3,
+{
+    let stride = nv + 1;
+    let npts = (nu + 1) * stride;
+    let mut pts = Vec::with_capacity(npts);
+    for iu in 0..=nu {
+        for iv in 0..=nv {
+            pts.push(at(iu, iv));
+        }
+    }
+    let mut nrm = vec![Vec3::Y; npts];
+    for iu in 0..=nu {
+        for iv in 0..=nv {
+            let iu0 = iu.saturating_sub(1);
+            let iu1 = (iu + 1).min(nu);
+            let iv0 = iv.saturating_sub(1);
+            let iv1 = (iv + 1).min(nv);
+            let du = pts[iu1 * stride + iv] - pts[iu0 * stride + iv];
+            let dv = pts[iu * stride + iv1] - pts[iu * stride + iv0];
+            let n = du.cross(dv);
+            if n.length_squared() > 1.0e-10 {
+                nrm[iu * stride + iv] = n.normalize();
+            }
+        }
+    }
+    let mid = npts / 2;
+    let geo_up = nrm[mid].y >= 0.0;
+    if !geo_up {
+        for n in &mut nrm {
+            *n = -*n;
+        }
+    }
+    let half = thick * 0.5;
+    let top_p: Vec<Vec3> = pts
+        .iter()
+        .zip(nrm.iter())
+        .map(|(p, n)| *p + *n * half)
+        .collect();
+    let bot_p: Vec<Vec3> = pts
+        .iter()
+        .zip(nrm.iter())
+        .map(|(p, n)| *p - *n * half)
+        .collect();
+    let base = mesh.vertices.len() as u32;
+    for i in 0..npts {
+        push_smooth(mesh, top_p[i], nrm[i], panel);
+    }
+    for i in 0..npts {
+        push_smooth(mesh, bot_p[i], -nrm[i], panel);
+    }
+    let top = |iu: usize, iv: usize| base + (iu * stride + iv) as u32;
+    let bot = |iu: usize, iv: usize| base + (npts + iu * stride + iv) as u32;
+    // After the flip, stored normals point up and match triangle a,b,c.
+    for iu in 0..nu {
+        for iv in 0..nv {
+            let a = top(iu, iv);
+            let b = top(iu + 1, iv);
+            let c = top(iu + 1, iv + 1);
+            let d = top(iu, iv + 1);
+            let e = bot(iu, iv);
+            let f = bot(iu + 1, iv);
+            let g = bot(iu + 1, iv + 1);
+            let h = bot(iu, iv + 1);
+            if geo_up {
+                mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+                mesh.indices.extend_from_slice(&[e, g, f, e, h, g]);
+            } else {
+                mesh.indices.extend_from_slice(&[a, c, b, a, d, c]);
+                mesh.indices.extend_from_slice(&[e, f, g, e, g, h]);
+            }
+        }
+    }
+    let center = pts[mid];
+    let emit_rim = |mesh: &mut CpuMesh, a: u32, b: u32, c: u32, d: u32, outward: Vec3| {
+        let pa = Vec3::from_array(mesh.vertices[a as usize].pos);
+        let pb = Vec3::from_array(mesh.vertices[b as usize].pos);
+        let pc = Vec3::from_array(mesh.vertices[c as usize].pos);
+        let n = (pb - pa).cross(pc - pa);
+        if n.dot(outward) >= 0.0 {
+            mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+        } else {
+            mesh.indices.extend_from_slice(&[a, c, b, a, d, c]);
+        }
+    };
+    for iu in 0..nu {
+        let outward = (pts[iu * stride] - center).normalize_or_zero();
+        emit_rim(
+            mesh,
+            top(iu, 0),
+            top(iu + 1, 0),
+            bot(iu + 1, 0),
+            bot(iu, 0),
+            outward,
+        );
+        let outward = (pts[iu * stride + nv] - center).normalize_or_zero();
+        emit_rim(
+            mesh,
+            top(iu, nv),
+            bot(iu, nv),
+            bot(iu + 1, nv),
+            top(iu + 1, nv),
+            outward,
+        );
+    }
+    for iv in 0..nv {
+        let outward = (pts[iv] - center).normalize_or_zero();
+        emit_rim(
+            mesh,
+            top(0, iv),
+            bot(0, iv),
+            bot(0, iv + 1),
+            top(0, iv + 1),
+            outward,
+        );
+        let outward = (pts[nu * stride + iv] - center).normalize_or_zero();
+        emit_rim(
+            mesh,
+            top(nu, iv),
+            top(nu, iv + 1),
+            bot(nu, iv + 1),
+            bot(nu, iv),
+            outward,
+        );
+    }
+}
+
+/// Clay sitting in the three deep cuts. The ribs stay rubber. World space,
+/// and only a picture of the volume the tire already holds.
+pub fn tread_clay(vehicle: &Vehicle) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    let body = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
+    let scale = WHEEL_RADIUS / 0.390;
+    // Crown pairs. The low ring between them is the cut.
+    const CUTS: [(f32, f32, f32, f32); 3] = [
+        (-0.085, 0.385, -0.025, 0.388),
+        (-0.025, 0.388, 0.035, 0.380),
+        (0.035, 0.380, 0.095, 0.385),
+    ];
+    for i in 0..4 {
+        let wheel = vehicle.wheels[i];
+        let coat = wheel.clay_coat();
+        if wheel.clay_thickness() < 1.0e-4 || coat < 0.02 {
+            continue;
+        }
+        let xform = body
+            * Mat4::from_translation(vehicle.wheel_center_local(i))
+            * Mat4::from_rotation_y(wheel.steer)
+            * Mat4::from_rotation_x(wheel.spin);
+        let mut local = CpuMesh::new();
+        for (cut, (x0, r0, x1, r1)) in CUTS.iter().copied().enumerate() {
+            add_groove(&mut local, x0, r0, x1, r1, scale, coat, i as u32 * 4 + cut as u32);
+        }
+        transform_mesh(&mut local, xform);
+        mesh.append(&local);
+    }
+    mesh
+}
+
+fn add_groove(
+    mesh: &mut CpuMesh,
+    x0: f32,
+    r0: f32,
+    x1: f32,
+    r1: f32,
+    scale: f32,
+    coat: f32,
+    seed: u32,
+) {
+    let nu = 40;
+    let nv = 6;
+    // A narrow rubber rib stays proud. The rest of the cut is the packed layer.
+    let inset = 0.05;
+    let fill = (0.62 + coat * 0.40).clamp(0.2, 1.0);
+    add_grid(mesh, nu, nv, PANEL_PACK, Vec3::ZERO, |iu, iv| {
+        let ang = iu as f32 / nu as f32 * std::f32::consts::TAU;
+        let s = inset + (1.0 - 2.0 * inset) * (iv as f32 / nv as f32);
+        let x = x0 + (x1 - x0) * s;
+        let lip = r0 + (r1 - r0) * s;
+        let rubber = profile_radius(x);
+        let edge = ((s - inset) / (1.0 - 2.0 * inset)).clamp(0.0, 1.0);
+        let arch = (edge * std::f32::consts::PI).sin();
+        let lump = 0.62 + 0.38 * value_noise(ang * 2.2 + seed as f32 * 0.17, x * 36.0);
+        let grain = 0.86 + 0.14 * value_noise(ang * 9.0, x * 70.0 + 2.0);
+        let depth = (lip - rubber).max(0.0);
+        let mut r = rubber + 0.005 + depth * fill * arch * lump * grain;
+        r = r.min(lip - 0.003).max(rubber + 0.004);
+        let rr = r * scale;
+        Vec3::new(x, ang.sin() * rr, ang.cos() * rr)
+    });
+}
+
+/// One wet sheet leaving each coated, moving tire. Not a particle, so it
+/// does not land or change the heightfield.
+pub fn flung_sheet(vehicle: &Vehicle) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    if vehicle.speed() < 0.6 {
+        return mesh;
+    }
+    let fwd = vehicle.forward();
+    if fwd.length_squared() < 1.0e-6 {
+        return mesh;
+    }
+    let ori = vehicle.orientation();
+    for i in 0..4 {
+        let wheel = vehicle.wheels[i];
+        let coat = wheel.clay_coat();
+        if wheel.clay_thickness() < 1.0e-4 || coat < 0.05 {
+            continue;
+        }
+        let hub = vehicle.pos + ori * vehicle.wheel_center_local(i);
+        let sign = hardpoints()[i].x.signum();
+        let axle = (ori * Quat::from_rotation_y(wheel.steer) * Vec3::X).normalize_or_zero();
+        if axle.length_squared() < 1.0e-6 {
+            continue;
+        }
+        add_fling(&mut mesh, hub, fwd, axle * sign, wheel.spin, coat, i as u32);
+    }
+    mesh
+}
+
+fn add_fling(mesh: &mut CpuMesh, hub: Vec3, fwd: Vec3, out: Vec3, spin: f32, coat: f32, seed: u32) {
+    // Leave the crown and run back along the rut. That is the open air beside
+    // the tire. A forward throw runs into the camera and reads as a loose ribbon.
+    let peel = (-fwd * 0.42 + Vec3::Y * 0.86 + out * 0.08).normalize();
+    // On the rubber, so the root is the tread and not a gap above it.
+    let origin = hub + peel * (WHEEL_RADIUS * 1.01);
+    let throw = (-fwd * 0.86 - out * 0.16).normalize_or_zero();
+    let side = throw.cross(Vec3::Y).normalize_or_zero();
+    if throw.length_squared() < 1.0e-6 || side.length_squared() < 1.0e-6 {
+        return;
+    }
+    let nu = 22;
+    let nv = 14;
+    let length = 0.72 * (0.82 + 0.18 * coat);
+    let phase = spin * 0.35;
+    // A thin shell, so the lip has thickness. The tip wave stays shallow;
+    // deep cuts in that edge were reading as separate feathers.
+    add_shell(mesh, nu, nv, PANEL_SHEET, 0.012, |iu, iv| {
+        let u = iu as f32 / nu as f32;
+        let v = iv as f32 / nv as f32;
+        let reach = 0.90 + 0.10 * value_noise(v * 2.1 + seed as f32 * 0.13, 1.7);
+        let uu = u * reach;
+        let vc = v - 0.5;
+        let hug = (1.0 - uu * 2.4).max(0.0);
+        let side_tear = 1.0 - vc.abs().powf(1.5) * uu * 0.22;
+        let arc = (uu * std::f32::consts::PI * 0.78).sin();
+        let curl = (v * std::f32::consts::PI).sin();
+        let span = (0.18 + uu * 0.24) * (0.84 + 0.16 * coat) * side_tear.max(0.45);
+        // Edges drop into a trough, so the sheet is not a flat card.
+        let gutter = (curl - 1.0) * (0.028 + uu * 0.07);
+        let ripple = (uu * 6.5 + v * 2.4 + phase).sin() * 0.007 * uu;
+        let wander = (value_noise(uu * 2.0 + seed as f32, v * 1.6) - 0.5) * 0.018 * uu;
+        // One edge climbs as the sheet leaves, so the face is a curl and not a card.
+        let twist = vc * uu * 0.07;
+        origin
+            + throw * (uu * length * (1.0 - hug * 0.35))
+            + side * (vc * span + wander)
+            + Vec3::Y * (arc * 0.13 * (1.0 - hug * 0.7) + gutter + ripple + twist)
+    });
 }

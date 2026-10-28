@@ -11,8 +11,9 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bike_body, bike_suspension, buggy_body, environment_mesh, flung_sheet, mud_chunks,
+    suspension_mesh, terrain_mesh, tread_clay, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex,
+    TerrainVertex,
 };
 
 const SHADOW: u32 = 2048;
@@ -886,7 +887,21 @@ impl Renderer {
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
-        let chunks = mud_chunks(&world.particles.items);
+        let mut chunks = mud_chunks(&world.particles.items);
+        // Pictures of the clay film. Neither mesh is stepped, so the soil volume stays put.
+        chunks.append(&tread_clay(&world.vehicle));
+        chunks.append(&flung_sheet(&world.vehicle));
+        // The chunk buffers are fixed. Drop a tail rather than write past the end.
+        const MAX_CHUNK_VERTS: usize = 16384;
+        const MAX_CHUNK_INDICES: usize = 48000;
+        if chunks.vertices.len() > MAX_CHUNK_VERTS {
+            chunks.vertices.truncate(MAX_CHUNK_VERTS);
+            chunks.indices.retain(|i| (*i as usize) < chunks.vertices.len());
+        }
+        if chunks.indices.len() > MAX_CHUNK_INDICES {
+            let n = MAX_CHUNK_INDICES - MAX_CHUNK_INDICES % 3;
+            chunks.indices.truncate(n);
+        }
         let chunk_count = chunks.indices.len() as u32;
         if chunk_count > 0 {
             self.queue
