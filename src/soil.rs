@@ -3,8 +3,11 @@
 //! The cut and the spoil are different layers. `bed` is the ground the tire
 //! carved. `placed` is soil that has already been put somewhere else (berm,
 //! crest clod, impact ring). Standing water in a rut or a hole mixes with the
-//! wet soil into one slurry. The visible height is bed + placed + that slurry,
-//! so the picture is not a solid floor under a separate water column.
+//! wet soil into one slurry. That slurry then flows downhill into the low rut
+//! and into holes. A berm beside it slowly creeps into the slurry. A tire in
+//! the slurry pushes a bow wave and leaves its track in the slurry thickness.
+//! The visible height is bed + placed + that slurry, so the picture is not a
+//! solid floor under a separate water column.
 //!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
@@ -180,6 +183,29 @@ pub fn slurry_viscosity(kind: SurfaceKind, moisture: f32) -> f32 {
         _ => (1.5, 0.08),
     };
     lerp(stiff, fluid, thin)
+}
+
+/// Metres per second of slurry, per metre of free-surface head, across one cell.
+/// Clay is the thick end. Sand runs. A berm is spoil, so it uses the clay paste.
+pub fn slurry_flow_conduct(kind: SurfaceKind, moisture: f32) -> f32 {
+    let kind = paste_kind(kind);
+    let visc = slurry_viscosity(kind, moisture).max(0.05);
+    (22.0 / visc).clamp(0.02, 3.0)
+}
+
+/// Metres per second of berm soil that can join a neighbouring slurry.
+/// The same viscosity that slows the pipe keeps the creep slow.
+pub fn berm_creep_rate(kind: SurfaceKind, moisture: f32) -> f32 {
+    let kind = paste_kind(kind);
+    let visc = slurry_viscosity(kind, moisture).max(0.2);
+    (1.35 / visc).clamp(0.0018, 0.012)
+}
+
+fn paste_kind(kind: SurfaceKind) -> SurfaceKind {
+    match kind {
+        SurfaceKind::Berm | SurfaceKind::PlacedClod | SurfaceKind::CutLip => SurfaceKind::WetMud,
+        other => other,
+    }
 }
 
 /// Stadium centerline. South cap sits on `TRACK_ZS`, north cap on `TRACK_ZN`.
@@ -2485,7 +2511,8 @@ impl SoilField {
     /// Standing water in a rut or a hole joins the wet soil under it.
     /// The water column is cleared. The soil it takes leaves the bed and
     /// the two become one slurry thickness. Volume of water plus soil is
-    /// unchanged. This does not move slurry along the ground.
+    /// unchanged. Mixing stays in the cell. [`flow_slurry`](Self::flow_slurry)
+    /// is what carries that body downhill.
     pub fn mix_slurry(&mut self) {
         let n = self.water.len();
         for idx in 0..n {
@@ -2512,6 +2539,323 @@ impl SoilField {
             self.water[idx] = 0.0;
             self.sync(idx);
         }
+    }
+
+    /// High rut of slurry, the deeper rut it can run into, and the berm on
+    /// the shoulder of the high rut. World metres. The low band starts where
+    /// the high band ends, so the two share a face.
+    pub fn paint_slurry_flow(&mut self) -> SlurryFlowBed {
+        let bed = SlurryFlowBed {
+            high_z0: -0.55,
+            high_z1: 0.12,
+            low_z0: 0.12,
+            low_z1: 1.45,
+            x0: -1.15,
+            x1: 1.15,
+        };
+        let half = self.size * 0.5;
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < bed.x0 || x >= bed.x1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if z >= bed.high_z0 && z < bed.high_z1 {
+                    self.bed[idx] -= 0.035;
+                    self.slurry[idx] = 0.16;
+                    self.water[idx] = 0.0;
+                    self.wetness[idx] = moisture;
+                    self.kind[idx] = SurfaceKind::FreshCut as u8;
+                    self.sync(idx);
+                    if i + 1 < self.res {
+                        let nx = ((i + 1) as f32 + 0.5) * self.cell - half;
+                        let nidx = j * self.res + i + 1;
+                        if nx >= bed.x1 && self.initial_height[nidx] - self.bed[nidx] < 0.012 {
+                            self.placed[nidx] = 0.20;
+                            self.kind[nidx] = SurfaceKind::Berm as u8;
+                            self.wetness[nidx] = 0.70;
+                            self.loose[nidx] = 0.08;
+                            self.water[nidx] = 0.0;
+                            self.sync(nidx);
+                        }
+                    }
+                } else if z >= bed.low_z0 && z < bed.low_z1 {
+                    self.bed[idx] -= 0.18;
+                    self.slurry[idx] = 0.0;
+                    self.water[idx] = 0.0;
+                    self.wetness[idx] = moisture;
+                    self.kind[idx] = SurfaceKind::FreshCut as u8;
+                    self.sync(idx);
+                }
+            }
+        }
+        bed
+    }
+
+    /// Cubic metres of slurry whose cell centers lie in the rectangle.
+    pub fn slurry_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        self.column_volume_in(x0, x1, z0, z1, &self.slurry)
+    }
+
+    /// Cubic metres of placed soil whose cell centers lie in the rectangle.
+    pub fn placed_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        self.column_volume_in(x0, x1, z0, z1, &self.placed)
+    }
+
+    fn column_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32, column: &[f32]) -> f32 {
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let mut sum = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                sum += column[j * self.res + i];
+            }
+        }
+        sum * area
+    }
+
+    /// Creep the berm into neighbouring slurry, then let the slurry run
+    /// downhill. Water plus soil is unchanged. The bed is not cut.
+    pub fn step_slurry(&mut self, dt: f32) {
+        if dt <= 0.0 || self.slurry.iter().all(|s| *s <= 1.0e-5) {
+            return;
+        }
+        self.creep_berm_into_slurry(dt);
+        self.flow_slurry(dt);
+    }
+
+    /// Advance slurry in short bites so a long settle does not overshoot the head.
+    pub fn advance_slurry(&mut self, seconds: f32) {
+        if seconds <= 0.0 {
+            return;
+        }
+        let steps = (seconds / 0.05).ceil().max(1.0) as u32;
+        let dt = seconds / steps as f32;
+        for _ in 0..steps {
+            self.step_slurry(dt);
+        }
+    }
+
+    /// A berm loses placed soil into a lower neighbour that already holds slurry.
+    /// The soil joins that slurry. The move is a few millimetres a second.
+    fn creep_berm_into_slurry(&mut self, dt: f32) {
+        let res = self.res;
+        let n = self.placed.len();
+        let placed0 = self.placed.clone();
+        let slurry0 = self.slurry.clone();
+        let mut take = vec![0.0_f32; n];
+        let mut give = vec![0.0_f32; n];
+        for idx in 0..n {
+            if placed0[idx] < 0.008 {
+                continue;
+            }
+            let i = (idx % res) as isize;
+            let j = (idx / res) as isize;
+            let top = self.bed[idx] + placed0[idx] + slurry0[idx];
+            let mut dest: Option<usize> = None;
+            let mut dest_h = top;
+            for (di, dj) in [(1_isize, 0), (-1, 0), (0, 1), (0, -1)] {
+                let ii = i + di;
+                let jj = j + dj;
+                if ii < 0 || jj < 0 || ii >= res as isize || jj >= res as isize {
+                    continue;
+                }
+                let nidx = jj as usize * res + ii as usize;
+                if slurry0[nidx] < 0.004 {
+                    continue;
+                }
+                let surf = self.bed[nidx] + placed0[nidx] + slurry0[nidx];
+                if surf < dest_h - 0.004 {
+                    dest_h = surf;
+                    dest = Some(nidx);
+                }
+            }
+            let Some(nidx) = dest else {
+                continue;
+            };
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            let moisture = self.wetness[idx].max(self.wetness[nidx]).clamp(0.08, 0.92);
+            let depth = (berm_creep_rate(kind, moisture) * dt)
+                .min(placed0[idx] * 0.12)
+                .min(placed0[idx]);
+            if depth <= 1.0e-6 {
+                continue;
+            }
+            take[idx] += depth;
+            give[nidx] += depth;
+        }
+        for idx in 0..n {
+            let lost = take[idx];
+            let gained = give[idx];
+            if lost <= 0.0 && gained <= 0.0 {
+                continue;
+            }
+            if lost > 0.0 {
+                self.placed[idx] = (placed0[idx] - lost).max(0.0);
+            }
+            if gained > 0.0 {
+                let before = slurry0[idx];
+                self.slurry[idx] = before + gained;
+                let m = self.wetness[idx].clamp(0.08, 0.92);
+                self.wetness[idx] = (m * before / self.slurry[idx].max(1.0e-4)).clamp(0.08, 0.92);
+            }
+            self.sync(idx);
+        }
+    }
+
+    /// Move slurry from a higher free surface into a lower rut, hole, or
+    /// slurry cell. Flat ground beside the rut does not receive it. The
+    /// sum of the slurry column is unchanged.
+    pub fn flow_slurry(&mut self, dt: f32) {
+        let dt = dt.max(0.0);
+        if dt <= 0.0 {
+            return;
+        }
+        let res = self.res;
+        let dx = self.cell;
+        let n = self.slurry.len();
+        let head = self.slurry.clone();
+        let mut budget = head.clone();
+        let mut next = head.clone();
+        for j in 0..res {
+            for i in 0..res {
+                let a = j * res + i;
+                if i + 1 < res {
+                    self.slurry_flux(a, a + 1, dt, dx, &head, &mut budget, &mut next);
+                }
+                if j + 1 < res {
+                    self.slurry_flux(a, a + res, dt, dx, &head, &mut budget, &mut next);
+                }
+            }
+        }
+        self.slurry = next;
+        for idx in 0..n {
+            if (self.slurry[idx] - head[idx]).abs() > 0.0 {
+                self.sync(idx);
+            }
+        }
+    }
+
+    fn slurry_flux(
+        &self,
+        a: usize,
+        b: usize,
+        dt: f32,
+        dx: f32,
+        head_slurry: &[f32],
+        budget: &mut [f32],
+        next: &mut [f32],
+    ) {
+        let sa = self.bed[a] + self.placed[a] + head_slurry[a];
+        let sb = self.bed[b] + self.placed[b] + head_slurry[b];
+        let dh = sa - sb;
+        if dh.abs() < 0.003 {
+            return;
+        }
+        let (donor, recv, head) = if dh > 0.0 { (a, b, dh) } else { (b, a, -dh) };
+        if head_slurry[donor] <= 1.0e-4 || budget[donor] <= 1.0e-4 {
+            return;
+        }
+        if head_slurry[recv] <= 1.0e-4 && !self.in_rut_or_hole(recv) {
+            return;
+        }
+        let kind = SurfaceKind::from_u8(self.kind[donor]);
+        let moisture = self.wetness[donor].clamp(0.08, 0.92);
+        let conduct = slurry_flow_conduct(kind, moisture);
+        let mut depth = head * conduct * dt / dx.max(1.0e-3) * 0.55;
+        depth = depth.min(head * 0.48).min(budget[donor]);
+        if depth <= 1.0e-6 {
+            return;
+        }
+        budget[donor] -= depth;
+        next[donor] -= depth;
+        next[recv] += depth;
+    }
+
+    /// A tire in slurry. Slurry leaves the contact and piles ahead as a bow.
+    /// The thinned column under the tire is the splash track. The bed is not
+    /// cut, nothing is sprayed, and nothing is pulled up out of the rut.
+    /// Returns the bow height in metres: the most slurry added on one cell.
+    pub fn raise_bow_wave(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        radius: f32,
+        width: f32,
+    ) -> f32 {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let radius = radius.max(0.15);
+        let half_track = width * 0.5 + self.cell * 0.55;
+        let half_bow = half_track + self.cell * 0.35;
+        let reach = radius * 1.6 + half_bow;
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let track_back = -radius * 0.55;
+        let track_front = radius * 0.12;
+        // Ahead of the rubber, so the wave is in front of the tread and not under it.
+        let bow_near = radius * 0.95;
+        let bow_far = radius * 2.2;
+
+        let mut taken: Vec<(usize, f32)> = Vec::new();
+        let mut weights: Vec<(usize, f32)> = Vec::new();
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                let idx = j as usize * self.res + i as usize;
+                if (track_back..=track_front).contains(&along) && lat.abs() <= half_track {
+                    let take = self.slurry[idx] * 0.64;
+                    if take > 1.0e-6 {
+                        taken.push((idx, take));
+                    }
+                } else if (bow_near..=bow_far).contains(&along) && lat.abs() <= half_bow {
+                    let span = (bow_far - bow_near).max(0.05);
+                    let u = ((along - bow_near) / span).clamp(0.0, 1.0);
+                    let crest = (1.0 - (u - 0.32).abs() / 0.68).max(0.0);
+                    let across = 1.0 - (lat.abs() / half_bow).clamp(0.0, 1.0);
+                    let w = crest * across;
+                    if w > 0.03 {
+                        weights.push((idx, w));
+                    }
+                }
+            }
+        }
+        let removed: f32 = taken.iter().map(|(_, t)| *t).sum();
+        let wsum: f32 = weights.iter().map(|(_, w)| *w).sum();
+        if removed <= 1.0e-6 || wsum <= 1.0e-6 {
+            return 0.0;
+        }
+        for (idx, take) in &taken {
+            self.slurry[*idx] -= *take;
+        }
+        let mut bow = 0.0_f32;
+        for (idx, w) in &weights {
+            let add = removed * (*w / wsum);
+            self.slurry[*idx] += add;
+            bow = bow.max(add);
+        }
+        for (idx, _) in taken.iter().chain(weights.iter()) {
+            self.sync(*idx);
+        }
+        bow
     }
 
     /// A tire rut is a bed below the surface it started at. A hole is a
@@ -2602,15 +2946,18 @@ impl SoilField {
         }
     }
 
-    /// Virtual-pipe shallow water, then pore moisture. `rain` is metres per
-    /// second landing on the field. Nothing here moves the bed or the berm.
+    /// Virtual-pipe shallow water, pore moisture, then slurry flow.
+    /// `rain` is metres per second landing on the field. The bed is not cut.
+    /// A berm moves only when it creeps into slurry that is already there.
     pub fn step_water(&mut self, dt: f32) {
         self.step_surface(dt, 0.0);
     }
 
     /// One weather step. Infiltration and the pipe move standing water.
     /// [`step_moisture`](Self::step_moisture) dries clay toward a crust and
-    /// wets that crust again when rain or a pond is on it.
+    /// wets that crust again when rain or a pond is on it. Slurry that is
+    /// already mixed then flows downhill, and a berm beside it creeps in.
+    /// The bed is not cut here.
     pub fn step_surface(&mut self, dt: f32, rain: f32) {
         // Time away from a cell is what makes the next visit a new pass.
         self.age_passes(dt);
@@ -2661,6 +3008,7 @@ impl SoilField {
         }
         self.water = next;
         self.step_moisture(dt, rain);
+        self.step_slurry(dt);
     }
 
     /// Advance weather in quarter-second bites so a long dry spell stays stable.
@@ -3858,6 +4206,17 @@ pub struct PlowCut {
     pub moved: f32,
     pub berm: f32,
     pub thrown: f32,
+}
+
+/// High slurry, the low rut in front of it, and the shared plan extents.
+#[derive(Clone, Copy, Debug)]
+pub struct SlurryFlowBed {
+    pub high_z0: f32,
+    pub high_z1: f32,
+    pub low_z0: f32,
+    pub low_z1: f32,
+    pub x0: f32,
+    pub x1: f32,
 }
 
 /// Water plus soil, split into the solid, the free column, and the slurry.
@@ -5631,5 +5990,139 @@ mod tests {
             }
         }
         n
+    }
+
+    /// Slurry runs into the low rut, the berm creeps into that slurry, and a
+    /// tire pass raises a bow in the slurry column. The bed under the tire
+    /// stays put, so the track is not a dry cut.
+    #[test]
+    fn slurry_flows_downhill_and_a_tire_raises_a_bow_wave() {
+        let mut soil = SoilField::mud_pad();
+        let bed = soil.paint_slurry_flow();
+        let before = soil.mix_volumes();
+        let low_before = soil.slurry_volume_in(bed.x0, bed.x1, bed.low_z0, bed.low_z1);
+        let high_before = soil.slurry_volume_in(bed.x0, bed.x1, bed.high_z0, bed.high_z1);
+        let berm_before = soil.placed_volume_in(bed.x1, bed.x1 + 0.6, bed.high_z0, bed.high_z1);
+        let far = soil.idx_at(6.0, 6.0).expect("far cell");
+        let far_slurry = soil.slurry[far];
+        let far_placed = soil.placed[far];
+        assert!(high_before > 0.05, "the high rut should start full of slurry");
+        assert!(low_before < 1.0e-6, "the low rut should start empty");
+        assert!(berm_before > 0.005, "the shoulder should be a berm, {berm_before}");
+
+        soil.advance_slurry(3.0);
+        let after = soil.mix_volumes();
+        let low_after = soil.slurry_volume_in(bed.x0, bed.x1, bed.low_z0, bed.low_z1);
+        let high_after = soil.slurry_volume_in(bed.x0, bed.x1, bed.high_z0, bed.high_z1);
+        let berm_after = soil.placed_volume_in(bed.x1, bed.x1 + 0.6, bed.high_z0, bed.high_z1);
+        eprintln!(
+            "slurry flow before  soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+            before.soil, before.water, before.slurry, before.total()
+        );
+        eprintln!(
+            "slurry flow after   soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+            after.soil, after.water, after.slurry, after.total()
+        );
+        eprintln!(
+            "slurry low {:.4} -> {:.4} m3   high {:.4} -> {:.4} m3   berm {:.4} -> {:.4} m3",
+            low_before, low_after, high_before, high_after, berm_before, berm_after
+        );
+        assert!(
+            (after.total() - before.total()).abs() < 1.0e-3,
+            "water plus soil drifted {:.6} -> {:.6}",
+            before.total(),
+            after.total()
+        );
+        let soil_lost = before.soil - after.soil;
+        let slurry_gained = after.slurry - before.slurry;
+        assert!(
+            (soil_lost - slurry_gained).abs() < 1.0e-3,
+            "berm soil {:.4} did not become slurry {:.4}",
+            soil_lost,
+            slurry_gained
+        );
+        assert!(
+            low_after > low_before + 0.01,
+            "slurry did not reach the low rut, {low_before:.4} -> {low_after:.4}"
+        );
+        assert!(
+            high_after < high_before - 0.01,
+            "the high rut kept its slurry, {high_before:.4} -> {high_after:.4}"
+        );
+        assert!(
+            berm_after < berm_before - 0.001,
+            "the berm did not creep, {berm_before:.4} -> {berm_after:.4}"
+        );
+        assert!(
+            berm_after > berm_before * 0.35,
+            "the berm collapsed instead of creeping, {berm_before:.4} -> {berm_after:.4}"
+        );
+        assert!(
+            (soil.slurry[far] - far_slurry).abs() < 1.0e-6
+                && (soil.placed[far] - far_placed).abs() < 1.0e-6,
+            "slurry left the rut"
+        );
+
+        let tire = slurry_tire_cell(&soil, &bed);
+        let idx = tire.0;
+        let bed0 = soil.bed[idx];
+        let placed0 = soil.placed[idx];
+        let track0 = soil.slurry[idx];
+        let ahead = soil.idx_at(tire.1, tire.2 + 0.42).expect("ahead");
+        let ahead0 = soil.slurry[ahead];
+        let bow = soil.raise_bow_wave(tire.1, tire.2, Vec3::Z, 0.38, 0.28);
+        let track1 = soil.slurry[idx];
+        eprintln!(
+            "bow wave height {bow:.4} m   splash track {track0:.4} -> {track1:.4} m   ahead {ahead0:.4} -> {:.4} m",
+            soil.slurry[ahead]
+        );
+        assert!(bow > 0.01, "the tire did not raise a bow wave, {bow:.4} m");
+        assert!(
+            track1 < track0 - 0.008,
+            "the splash track is not in the slurry, {track0:.4} -> {track1:.4}"
+        );
+        assert!(
+            soil.slurry[ahead] > ahead0 + 0.005,
+            "the bow is not ahead of the tire"
+        );
+        assert!(
+            (soil.bed[idx] - bed0).abs() < 1.0e-6 && (soil.placed[idx] - placed0).abs() < 1.0e-6,
+            "the tire pass cut the bed instead of moving slurry"
+        );
+        let passed = soil.mix_volumes();
+        assert!(
+            (passed.total() - after.total()).abs() < 1.0e-3,
+            "the bow wave did not conserve water plus soil, {:.6} -> {:.6}",
+            after.total(),
+            passed.total()
+        );
+    }
+
+    fn slurry_tire_cell(soil: &SoilField, bed: &SlurryFlowBed) -> (usize, f32, f32) {
+        let half = soil.size * 0.5;
+        let mut best: Option<(usize, f32, f32, f32)> = None;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if x < bed.x0 + 0.35 || x >= bed.x1 - 0.35 {
+                    continue;
+                }
+                if z < bed.low_z0 + 0.35 || z >= bed.low_z0 + 1.05 {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                let depth = soil.slurry[idx];
+                if depth < 0.02 {
+                    continue;
+                }
+                let score = depth - (x - 0.15).abs() * 0.02;
+                if best.map(|b| score > b.3).unwrap_or(true) {
+                    best = Some((idx, x, z, score));
+                }
+            }
+        }
+        let (idx, x, z, _) = best.expect("low rut should hold slurry under a tire");
+        (idx, x, z)
     }
 }

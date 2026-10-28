@@ -516,6 +516,8 @@ struct CaptureArgs {
     force_proof: PathBuf,
     slurry: bool,
     slurry_proof: PathBuf,
+    slurry_flow: bool,
+    slurry_flow_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -584,6 +586,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry {
         capture_slurry(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_flow {
+        capture_slurry_flow(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -762,6 +768,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut force_proof = PathBuf::from(format!("{MEDIA}/force-proof.png"));
     let mut slurry = false;
     let mut slurry_proof = PathBuf::from(format!("{MEDIA}/slurry-mix-proof.png"));
+    let mut slurry_flow = false;
+    let mut slurry_flow_proof = PathBuf::from(format!("{MEDIA}/slurry-flow-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -808,6 +816,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-flow-proof" => {
+                slurry_flow = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_flow_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -889,6 +903,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         force_proof,
         slurry,
         slurry_proof,
+        slurry_flow,
+        slurry_flow_proof,
     }
 }
 
@@ -1735,6 +1751,156 @@ fn capture_slurry(renderer: &mut Renderer, parsed: &CaptureArgs) {
         parsed,
         slurry_camera(&world),
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Slurry that has run into the low rut, with a bow in front of the Niva.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_flow(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::vehicle::{hardpoints, REST_LEN, WHEEL_RADIUS, WHEEL_WIDTH};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let bed = world.soil.paint_slurry_flow();
+    let before = world.soil.mix_volumes();
+    let low_before = world
+        .soil
+        .slurry_volume_in(bed.x0, bed.x1, bed.low_z0, bed.low_z1);
+    let berm_before = world
+        .soil
+        .placed_volume_in(bed.x1, bed.x1 + 0.6, bed.high_z0, bed.high_z1);
+    println!(
+        "slurry flow before  soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+        before.soil,
+        before.water,
+        before.slurry,
+        before.total()
+    );
+    world.soil.advance_slurry(5.0);
+    let after = world.soil.mix_volumes();
+    let low_after = world
+        .soil
+        .slurry_volume_in(bed.x0, bed.x1, bed.low_z0, bed.low_z1);
+    let berm_after = world
+        .soil
+        .placed_volume_in(bed.x1, bed.x1 + 0.6, bed.high_z0, bed.high_z1);
+    println!(
+        "slurry flow after   soil {:.4} m3  water {:.4} m3  slurry {:.4} m3  total {:.4} m3",
+        after.soil, after.water, after.slurry, after.total()
+    );
+    println!(
+        "slurry low {:.4} -> {:.4} m3   berm {:.4} -> {:.4} m3",
+        low_before, low_after, berm_before, berm_after
+    );
+
+    let pool = deepest_slurry_row(&world.soil, &bed);
+    // Front axle on the pooled slurry. The nose sits in the low bed.
+    world.vehicle.pos = Vec3::new(0.0, 0.8, pool - 1.08);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    println!("slurry pool z {pool:.2}  niva z {:.2}", world.vehicle.pos.z);
+    let ori = world.vehicle.orientation();
+    let mut bow_max = 0.0_f32;
+    for i in [0_usize, 1] {
+        let local = ori * world.vehicle.wheel_center_local(i);
+        let x = world.vehicle.pos.x + local.x;
+        let z = world.vehicle.pos.z + local.z;
+        let depth = world.soil.sample(x, z).slurry;
+        let bow = world
+            .soil
+            .raise_bow_wave(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH);
+        println!("wheel {i} slurry {depth:.4} m");
+        bow_max = bow_max.max(bow);
+        println!("bow wave wheel {i} {bow:.4} m at ({x:.2}, {z:.2})");
+    }
+    println!("bow wave height {bow_max:.4} m");
+
+    // Each tire sits on the slurry under it. The front axle drops into the
+    // low bed; the rear stays on the higher rut.
+    let hps = hardpoints();
+    let mut ground = [0.0_f32; 4];
+    for i in 0..4 {
+        let x = world.vehicle.pos.x + hps[i].x;
+        let z = world.vehicle.pos.z + hps[i].z;
+        ground[i] = world.soil.sample(x, z).height;
+    }
+    let min_g = ground.into_iter().fold(f32::MAX, f32::min);
+    for i in 0..4 {
+        world.vehicle.wheels[i].compression = (ground[i] - min_g + 0.04).clamp(0.0, 0.30);
+    }
+    let c0 = world.vehicle.wheels[0].compression;
+    world.vehicle.pos.y = ground[0] + WHEEL_RADIUS - hps[0].y + REST_LEN - c0;
+    let bottom = world.vehicle.pos.y + hps[0].y - REST_LEN + c0 - WHEEL_RADIUS;
+    println!(
+        "front tire on slurry  ground {:.4} m  bottom {:.4} m  compression {:.3}",
+        ground[0], bottom, c0
+    );
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "slurry-flow",
+        &parsed.slurry_flow_proof,
+        parsed,
+        slurry_flow_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+fn deepest_slurry_row(soil: &silt::soil::SoilField, bed: &silt::soil::SlurryFlowBed) -> f32 {
+    let half = soil.size * 0.5;
+    let mut best_z = bed.low_z0 + 0.55;
+    let mut best = 0.0_f32;
+    for j in 0..soil.res {
+        let z = (j as f32 + 0.5) * soil.cell - half;
+        if z < bed.low_z0 + 0.25 || z >= bed.low_z1 - 0.55 {
+            continue;
+        }
+        let mut row = 0.0_f32;
+        let mut n = 0.0_f32;
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            if x < bed.x0 + 0.2 || x >= bed.x1 - 0.2 {
+                continue;
+            }
+            row += soil.slurry[j * soil.res + i];
+            n += 1.0;
+        }
+        if n > 0.0 && row / n > best {
+            best = row / n;
+            best_z = z;
+        }
+    }
+    best_z
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_flow_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let p = world.vehicle.pos;
+    // Right front tire, then the bow piled in the slurry ahead of it.
+    let wheel = p + fwd * 1.08 + right * 0.74;
+    let bow = wheel + fwd * 0.55;
+    let floor = world.soil.sample(bow.x, bow.z).height;
+    let look = Vec3::new(
+        wheel.x * 0.35 + bow.x * 0.65,
+        floor + 0.01,
+        wheel.z * 0.30 + bow.z * 0.70,
+    );
+    // Low, beside the wave, so the mound in front of the tread and the low bed read together.
+    let eye = wheel + right * 1.05 + fwd * 0.85 + Vec3::Y * 0.28;
+    let ortho = 1.35;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

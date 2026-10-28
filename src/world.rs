@@ -398,6 +398,17 @@ impl World {
                     c.sample.water.min(0.05) * 0.25 * (0.4 + speed * 0.15),
                 );
             }
+            // The bow is slurry pushed ahead of the tread. It is not a spray
+            // and it does not pull slurry up out of the rut.
+            if c.sample.slurry > 0.01 && c.speed > 0.25 {
+                self.soil.raise_bow_wave(
+                    c.wheel_center.x,
+                    c.wheel_center.z,
+                    c.forward,
+                    WHEEL_RADIUS,
+                    WHEEL_WIDTH,
+                );
+            }
         }
         let width = crate::vehicle::WHEEL_WIDTH;
         for side in &sides {
