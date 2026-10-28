@@ -39,7 +39,18 @@ pub struct SoilField {
     pub darken: Vec<f32>,
     /// Linear roughness, 0 smooth / wet, 1 dry and broken.
     pub roughness: Vec<f32>,
+    /// Seconds since a tire last claimed this cell. A gap starts a new pass.
+    pub rest: Vec<f32>,
+    /// Distinct passes that have cut this cell. The groove deepens with this.
+    pub passes: Vec<u8>,
+    /// Volume flux (m²/s) from this cell toward +x. The last column is unused.
+    pub flow_x: Vec<f32>,
+    /// Volume flux (m²/s) from this cell toward +z. The last row is unused.
+    pub flow_z: Vec<f32>,
 }
+
+/// A tire that leaves and comes back after this many seconds cuts a new pass.
+const PASS_GAP: f32 = 0.40;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Terramech {
@@ -68,12 +79,41 @@ pub fn terramech(softness: f32) -> Terramech {
     }
 }
 
+/// Terramechanics for one contact. A wet rut is remolded and lubricated:
+/// the modulus drops so a slow tire sinks, and friction drops so the tread
+/// slips, while the yield that holds the chassis stays.
+pub fn terramech_at(softness: f32, rut: f32, water: f32) -> Terramech {
+    let mut tm = terramech(softness);
+    let wet = (water / 0.08).clamp(0.0, 1.0);
+    let cut = (rut / 0.05).clamp(0.0, 1.0);
+    let lube = wet * cut;
+    if lube > 0.0 {
+        tm.k_eq *= lerp(1.0, 0.58, lube);
+        tm.phi *= lerp(1.0, 0.36, lube);
+        tm.cohesion *= lerp(1.0, 0.32, lube);
+        tm.shear_k *= lerp(1.0, 2.2, lube);
+        tm.yield_stress *= lerp(1.0, 1.15, lube);
+    }
+    tm
+}
+
 /// Wetness alone makes the ground heavy. Standing water and loose spoil
 /// are what push it into a true bog.
 pub fn softness_of(wetness: f32, loose: f32, water: f32) -> f32 {
     let loose_n = (loose / 0.09).clamp(0.0, 1.0);
     let depth = (water / 0.18).clamp(0.0, 1.0);
     (wetness.clamp(0.0, 1.0) * 0.48 + depth * 0.34 + loose_n * 0.22).clamp(0.0, 1.0)
+}
+
+/// Softness at a contact. Dry ground is unchanged. Water sitting in a cut
+/// remolds the floor, so the next tire sinks further than it would on the
+/// same wetness with no rut.
+pub fn softness_with_rut(wetness: f32, loose: f32, water: f32, rut: f32) -> f32 {
+    let base = softness_of(wetness, loose, water);
+    let wet = (water / 0.10).clamp(0.0, 1.0);
+    let cut = (rut / 0.06).clamp(0.0, 1.0);
+    let remold = cut * wet;
+    (base + 0.35 * remold * (1.0 - base)).clamp(0.0, 1.0)
 }
 
 pub fn contact_length(radius: f32, sinkage: f32) -> f32 {
@@ -160,6 +200,10 @@ impl SoilField {
             water: vec![0.0; n],
             darken: vec![0.0; n],
             roughness: vec![0.0; n],
+            rest: vec![PASS_GAP + 1.0; n],
+            passes: vec![0; n],
+            flow_x: vec![0.0; n],
+            flow_z: vec![0.0; n],
         }
     }
 
@@ -319,7 +363,7 @@ impl SoilField {
             loose,
             darken,
             roughness,
-            softness: softness_of(wetness, loose, water),
+            softness: softness_with_rut(wetness, loose, water, rut),
             rut,
         }
     }
@@ -375,18 +419,13 @@ impl SoilField {
         }
         let len = contact_length(radius, sinkage).max(radius * 0.35);
         let slip_n = slip.abs().min(1.2);
-        // The groove is the Bekker bite. A fast straight used to leave only a few
-        // millimetres: the plastic rate was tuned for a spun puddle, and the tire
-        // was gone before that cut arrived, so the lane behind the vehicle stayed
-        // smooth. The first several centimetres now stay in the heightfield after
-        // one pass. Slip still digs deeper than that, on the slow rate, so a driver
-        // can back out of a hole they are spinning.
-        let groove = (sinkage * 0.82).min(0.055);
+        // The groove is the Bekker bite of one pass. A second pass of the same
+        // lane raises the pass count and cuts deeper into that slot. Darkening
+        // the albedo does not stand in for the missing depth. Slip still digs
+        // past the rolling groove, on the slow rate, so a driver can back out
+        // of a hole they are spinning.
+        let one_pass = (sinkage * 0.82).min(0.055);
         let spun = sinkage * (0.48 + 0.90 * slip_n);
-        let want = spun.max(groove).min(0.40);
-        // A rolling per-tire stamp stops at a scuff the shader does not darken.
-        // The visible pair is the `lane` call. Spinning still reaches `want`.
-        let fast = if lane { groove } else { groove.min(0.008) };
         let sigma = (width * 0.42).max(self.cell * 0.34);
         // Flat floor, about two cells wide, then a short shoulder. A gaussian
         // narrower than the grid left a dotted scar beside every tire.
@@ -402,11 +441,15 @@ impl SoilField {
         } else {
             half_l + self.cell * 0.35
         };
-        let lateral_reach = if lane {
-            half_w + shoulder + self.cell * 1.2
+        // Berm starts just outside the cut and is wide enough to hold the
+        // whole displaced volume without a second groove.
+        let berm_inner = if lane {
+            half_w + shoulder * 0.82
         } else {
-            sigma * 3.0
+            sigma * 1.85
         };
+        let berm_outer = berm_inner + self.cell * 3.0;
+        let lateral_reach = berm_outer + self.cell * 0.35;
         let reach = along_reach + lateral_reach;
         let half = self.size * 0.5;
         let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
@@ -416,13 +459,11 @@ impl SoilField {
         let res = self.res as isize;
 
         let mut vol = 0.0_f32;
-        let mut left_cells = [0usize; 96];
-        let mut right_cells = [0usize; 96];
-        let mut n_left = 0;
-        let mut n_right = 0;
+        let mut berms: Vec<(usize, f32)> = Vec::new();
         let area = self.cell * self.cell;
-        let lip_in = half_w + shoulder * 0.85;
-        let lip_out = half_w + shoulder + self.cell * 0.75;
+        // Only the lane ribbon counts as a pass. A tread scuff must not
+        // promote the same visit into a second, deeper cut.
+        let claim_pass = lane;
 
         for j in j0.max(1)..j1.min(res - 1) {
             for i in i0.max(1)..i1.min(res - 1) {
@@ -460,18 +501,24 @@ impl SoilField {
                 };
 
                 if across > 0.2 {
+                    let passes = self.note_pass(idx, claim_pass);
+                    let groove = pass_groove(one_pass, passes);
+                    let want = spun.max(groove).min(0.40);
+                    // A rolling per-tire stamp stops at a scuff. The visible
+                    // pair is the lane call. Spinning still reaches `want`.
+                    let fast = if lane { groove } else { groove.min(0.008) };
                     let already = (self.initial_height[idx] - self.height[idx]).max(0.0);
                     let local_want = if lane {
                         want * across
-                    } else if spun > groove {
+                    } else if spun > one_pass {
                         want * across
                     } else {
                         fast * across
                     };
-                    let local_groove = fast * across;
+                    let local_fast = fast * across;
                     if already < local_want {
                         let room = (local_want - already).min(0.40 - already).max(0.0);
-                        let rate = if already < local_groove { 48.0 } else { 2.2 };
+                        let rate = if already < local_fast { 36.0 } else { 2.2 };
                         let drop = room * (1.0 - (-dt * rate).exp()) * along;
                         self.height[idx] -= drop;
                         self.loose[idx] = (self.loose[idx] + drop * 0.45).min(0.16);
@@ -483,34 +530,42 @@ impl SoilField {
                     let target_r = lerp(0.62, 0.16, wet);
                     let blend = (5.0 * dt * across * along).min(0.45);
                     self.roughness[idx] = lerp(self.roughness[idx], target_r, blend);
-                } else if lane && ax > lip_in && ax < lip_out {
-                    if lx > 0.0 {
-                        if n_right < right_cells.len() {
-                            right_cells[n_right] = idx;
-                            n_right += 1;
-                        }
-                    } else if n_left < left_cells.len() {
-                        left_cells[n_left] = idx;
-                        n_left += 1;
+                } else if ax > berm_inner && ax < berm_outer {
+                    let span = (berm_outer - berm_inner).max(self.cell * 0.25);
+                    let edge = 1.0 - ((ax - berm_inner) / span).clamp(0.0, 1.0);
+                    let w = along * (0.35 + 0.65 * edge);
+                    if w > 0.0 {
+                        berms.push((idx, w));
                     }
                 }
             }
         }
 
-        // A thin lip on the lane ribbon only. Per-tire scuffs do not pile a
-        // second ridge, or the berm reads as extra grooves.
-        if !lane || n_left + n_right == 0 {
+        // Every cubic metre cut out of the rut is piled on the shoulders.
+        // Nothing is deleted and nothing is painted back into the floor.
+        self.deposit_berm(&berms, vol, area);
+    }
+
+    fn note_pass(&mut self, idx: usize, claim: bool) -> u8 {
+        if claim {
+            if self.rest[idx] > PASS_GAP {
+                self.passes[idx] = self.passes[idx].saturating_add(1);
+            }
+            self.rest[idx] = 0.0;
+        }
+        self.passes[idx].max(1)
+    }
+
+    fn deposit_berm(&mut self, berms: &[(usize, f32)], vol: f32, area: f32) {
+        if vol <= 1.0e-8 || berms.is_empty() {
             return;
         }
-        let berm_vol = vol * 0.85;
-        let n_berm = (n_left + n_right) as f32;
-        let dh = berm_vol / (n_berm * area);
-        for idx in left_cells.iter().take(n_left).chain(right_cells.iter().take(n_right)) {
-            let pile = (self.height[*idx] - self.initial_height[*idx]).max(0.0);
-            let add = dh.min((0.032 - pile).max(0.0));
-            if add <= 0.0 {
-                continue;
-            }
+        let sum: f32 = berms.iter().map(|(_, w)| *w).sum();
+        if sum <= 1.0e-8 {
+            return;
+        }
+        for (idx, w) in berms {
+            let add = vol * (*w / sum) / area;
             self.height[*idx] += add;
             self.roughness[*idx] = lerp(self.roughness[*idx], 0.96, 0.25);
             self.darken[*idx] = lerp(self.darken[*idx], 0.28, 0.15);
@@ -518,81 +573,241 @@ impl SoilField {
         }
     }
 
-    /// Displace puddle water out of a wheel footprint. Returns displaced depth scale.
+    /// One rolling pass of a lane-width tire. `dir` is the travel direction.
+    /// Returns the rut depth halfway along the pass.
+    pub fn roll_pass(
+        &mut self,
+        origin: Vec3,
+        dir: Vec3,
+        distance: f32,
+        sinkage: f32,
+        slip: f32,
+    ) -> f32 {
+        let dir = dir.normalize_or_zero();
+        if dir.length_squared() < 0.5 {
+            return 0.0;
+        }
+        let right = Vec3::new(dir.z, 0.0, -dir.x);
+        let step = (self.cell * 0.55).max(0.08);
+        let mut travelled = 0.0_f32;
+        while travelled < distance {
+            let p = origin + dir * travelled;
+            self.stamp_wheel(p, 0.38, 0.28, dir, right, sinkage, slip, 1.0 / 60.0, true);
+            travelled += step;
+        }
+        let mid = origin + dir * (distance * 0.5);
+        self.rut_near(mid.x, mid.z)
+    }
+
+    /// Deepest rut in a small window. A sample that lands on a shoulder
+    /// would under-report the floor.
+    pub fn rut_near(&self, x: f32, z: f32) -> f32 {
+        let mut m = 0.0_f32;
+        for dz in [-1, 0, 1] {
+            for dx in [-1, 0, 1] {
+                let s = self.cell * 0.45;
+                m = m.max(self.sample(x + dx as f32 * s, z + dz as f32 * s).rut);
+            }
+        }
+        m
+    }
+
+    /// Puddle, a bank that holds it, and higher ground past the bank.
+    /// Water cannot leave until a rut cuts the bank.
+    pub fn sculpt_banked_puddle(&mut self) {
+        let res = self.res;
+        let half = self.size * 0.5;
+        let cell = self.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let (h, water) = if x < -1.15 {
+                    (0.0, 0.14)
+                } else if x < 0.95 {
+                    (0.20, 0.0)
+                } else {
+                    (0.16, 0.0)
+                };
+                self.height[idx] = h;
+                self.initial_height[idx] = h;
+                self.water[idx] = water;
+                let wet = if water > 0.0 { 1.0 } else { 0.22 };
+                self.wetness[idx] = wet;
+                self.base_wetness[idx] = wet;
+                self.loose[idx] = 0.0;
+                self.darken[idx] = 0.05;
+                self.roughness[idx] = if water > 0.0 { 0.35 } else { 0.9 };
+                self.rest[idx] = PASS_GAP + 1.0;
+                self.passes[idx] = 0;
+            }
+        }
+    }
+
+    /// A walled rut that falls toward +x, with a pocket at the low end.
+    /// Water poured along it drains into that pocket and stays there.
+    pub fn sculpt_sloped_rut(&mut self) {
+        self.flow_x.fill(0.0);
+        self.flow_z.fill(0.0);
+        let res = self.res;
+        let half = self.size * 0.5;
+        let cell = self.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let on_floor = x.abs() <= 4.55 && z.abs() <= 0.58;
+                let on_wall = x.abs() <= 5.35 && z.abs() <= 1.22 && !on_floor;
+                if on_floor {
+                    let h = sloped_rut_bed(x);
+                    self.height[idx] = h;
+                    self.initial_height[idx] = h;
+                    // Poured on the high reach. The pocket at +x starts dry so
+                    // the step has to carry the water downhill.
+                    let poured = if x < -1.6 { 0.14 } else { 0.0 };
+                    self.water[idx] = poured;
+                    self.wetness[idx] = if poured > 0.0 { 1.0 } else { 0.35 };
+                    self.base_wetness[idx] = 0.35;
+                    self.loose[idx] = 0.04;
+                    self.darken[idx] = 0.55;
+                    self.roughness[idx] = 0.42;
+                    self.flow_x[idx] = 0.0;
+                    self.flow_z[idx] = 0.0;
+                } else if on_wall {
+                    let h = 0.22;
+                    self.height[idx] = h;
+                    self.initial_height[idx] = h;
+                    self.water[idx] = 0.0;
+                    self.wetness[idx] = 0.22;
+                    self.base_wetness[idx] = 0.22;
+                    self.loose[idx] = 0.02;
+                    self.darken[idx] = 0.2;
+                    self.roughness[idx] = 0.94;
+                    self.flow_x[idx] = 0.0;
+                    self.flow_z[idx] = 0.0;
+                }
+            }
+        }
+    }
+
+    /// Step the shallow-water pipes for `seconds`, in stable slices.
+    pub fn age_water(&mut self, seconds: f32) {
+        if seconds <= 0.0 {
+            return;
+        }
+        let steps = (seconds * 60.0).round().max(1.0) as u32;
+        let dt = seconds / steps as f32;
+        for _ in 0..steps {
+            self.step_water(dt);
+        }
+    }
+
+    /// Shove the water under a tire along its heading.
+    ///
+    /// `amount` is the depth scale the wheel contact already computes from
+    /// speed. A crawl only wets the cell. A pass sets the volume flux so the
+    /// shallow-water step carries a wave along the rut. The depth itself is
+    /// not deleted here: the sweep moves it, and the sum stays put.
     pub fn displace_water(&mut self, x: f32, z: f32, forward: Vec3, amount: f32) {
         let Some(idx) = self.idx_at(x, z) else {
             return;
         };
-        let take = amount.min(self.water[idx] * 0.45).max(0.0);
-        if take <= 0.0 {
+        if amount <= 0.0 || self.water[idx] < 1.0e-4 {
             return;
         }
-        self.water[idx] -= take;
-        // Push ahead of the tire and a little to both sides.
+        let dir = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        if dir.length_squared() < 0.25 {
+            return;
+        }
+        // Invert `water.min(0.05) * 0.25 * (0.4 + speed * 0.15)` back to a
+        // speed. The idle term is 0.10 of that product; the rest is the pass.
+        let w = self.water[idx].min(0.05).max(0.004);
+        let speed = (((amount / w) - 0.10) / 0.0375).clamp(0.0, 4.2);
+        self.wetness[idx] = (self.wetness[idx] + 0.04).min(1.0);
+        if speed <= 0.05 {
+            return;
+        }
+        let cell = self.cell;
         let spots = [
-            (
-                x + forward.x * self.cell * 1.4,
-                z + forward.z * self.cell * 1.4,
-                0.45,
-            ),
-            (x + forward.z * self.cell, z - forward.x * self.cell, 0.275),
-            (x - forward.z * self.cell, z + forward.x * self.cell, 0.275),
+            (x, z),
+            (x + dir.x * cell, z + dir.z * cell),
+            (x + dir.z * cell * 0.85, z - dir.x * cell * 0.85),
+            (x - dir.z * cell * 0.85, z + dir.x * cell * 0.85),
         ];
-        for (sx, sz, share) in spots {
+        for (sx, sz) in spots {
             if let Some(sidx) = self.idx_at(sx, sz) {
-                self.water[sidx] = (self.water[sidx] + take * share).min(0.32);
+                self.add_downstream_flux(sidx, dir, speed);
                 self.wetness[sidx] = (self.wetness[sidx] + 0.04).min(1.0);
             }
         }
     }
 
-    /// Virtual-pipe shallow water. Dry cells are skipped.
-    pub fn step_water(&mut self, dt: f32) {
-        let res = self.res;
-        let dx = self.cell;
-        let area = dx * dx;
-        let mut next = self.water.clone();
-        let cond = 1.35; // m/s per metre of head, scaled below by dt
-
-        for j in 0..res {
-            for i in 0..res {
-                let a = j * res + i;
-                if i + 1 < res {
-                    let b = a + 1;
-                    transfer(
-                        &self.height,
-                        &self.water,
-                        &mut next,
-                        a,
-                        b,
-                        dt,
-                        dx,
-                        area,
-                        cond,
-                    );
-                }
-                if j + 1 < res {
-                    let b = a + res;
-                    transfer(
-                        &self.height,
-                        &self.water,
-                        &mut next,
-                        a,
-                        b,
-                        dt,
-                        dx,
-                        area,
-                        cond,
-                    );
-                }
+    /// A tire heading uphill through the sloped rut. When this returns, the
+    /// bow is still up the channel. [`Self::age_water`] lets it fall back
+    /// into the pocket.
+    pub fn pass_tire_up_sloped_rut(&mut self) {
+        let dir = Vec3::new(-1.0, 0.0, 0.0);
+        let mut x = 3.2_f32;
+        while x > -1.15 {
+            for z in [-0.28_f32, 0.0, 0.28] {
+                self.displace_water(x, z, dir, 0.014);
             }
+            self.step_water(1.0 / 24.0);
+            x -= 0.22;
         }
-        for w in &mut next {
-            *w = w.clamp(0.0, 0.34);
-        }
-        self.water = next;
+        self.age_water(0.35);
+    }
 
-        let n = res * res;
+    fn add_downstream_flux(&mut self, idx: usize, dir: Vec3, speed: f32) {
+        let depth = self.water[idx];
+        if depth < 1.0e-4 || speed <= 0.0 {
+            return;
+        }
+        let res = self.res;
+        let i = idx % res;
+        let j = idx / res;
+        let q = depth * speed;
+        if dir.x >= 0.0 {
+            if i + 1 < res {
+                self.flow_x[idx] = self.flow_x[idx].max(q * dir.x);
+            }
+        } else if i > 0 {
+            let e = idx - 1;
+            self.flow_x[e] = self.flow_x[e].min(q * dir.x);
+        }
+        if dir.z >= 0.0 {
+            if j + 1 < res {
+                self.flow_z[idx] = self.flow_z[idx].max(q * dir.z);
+            }
+        } else if j > 0 {
+            let e = idx - res;
+            self.flow_z[e] = self.flow_z[e].min(q * dir.z);
+        }
+    }
+
+    /// Virtual-pipe shallow water with inertia.
+    ///
+    /// A tire's flux runs as a wave along the rut. Drag then lets the free
+    /// surface flatten, so the same water ends in the low bed. Each sweep
+    /// only moves depth from one cell to its neighbour, and never more than
+    /// that cell holds, so the sum of depths is unchanged.
+    pub fn step_water(&mut self, dt: f32) {
+        if !(dt > 0.0) {
+            return;
+        }
+        // The field clock lives here so a tire that has rolled away can be
+        // told from one that is still on the same cell.
+        for rest in &mut self.rest {
+            *rest = (*rest + dt).min(30.0);
+        }
+        let steps = (dt * 60.0).ceil().max(1.0) as u32;
+        let h = dt / steps as f32;
+        for _ in 0..steps {
+            self.sweep_water(h);
+        }
+
+        let n = self.res * self.res;
         for idx in 0..n {
             if self.water[idx] > 0.004 {
                 self.wetness[idx] = (self.wetness[idx] + dt * 0.55).min(1.0);
@@ -601,6 +816,180 @@ impl SoilField {
                 self.wetness[idx] += (base - self.wetness[idx]) * (dt * 0.12).min(0.25);
             }
         }
+    }
+
+    fn sweep_water(&mut self, dt: f32) {
+        let res = self.res;
+        let dx = self.cell;
+        let n = res * res;
+        for j in 0..res {
+            for i in 0..res - 1 {
+                let a = j * res + i;
+                accel_flux(
+                    &mut self.flow_x[a],
+                    self.height[a],
+                    self.water[a],
+                    self.height[a + 1],
+                    self.water[a + 1],
+                    dx,
+                    dt,
+                );
+            }
+        }
+        for j in 0..res - 1 {
+            for i in 0..res {
+                let a = j * res + i;
+                let b = a + res;
+                accel_flux(
+                    &mut self.flow_z[a],
+                    self.height[a],
+                    self.water[a],
+                    self.height[b],
+                    self.water[b],
+                    dx,
+                    dt,
+                );
+            }
+        }
+
+        let mut shift_x = vec![0.0_f32; n];
+        let mut shift_z = vec![0.0_f32; n];
+        let mut demand = vec![0.0_f32; n];
+        for j in 0..res {
+            for i in 0..res - 1 {
+                let a = j * res + i;
+                let s = self.flow_x[a] * dt / dx;
+                shift_x[a] = s;
+                if s > 0.0 {
+                    demand[a] += s;
+                } else {
+                    demand[a + 1] += -s;
+                }
+            }
+        }
+        for j in 0..res - 1 {
+            for i in 0..res {
+                let a = j * res + i;
+                let s = self.flow_z[a] * dt / dx;
+                shift_z[a] = s;
+                if s > 0.0 {
+                    demand[a] += s;
+                } else {
+                    demand[a + res] += -s;
+                }
+            }
+        }
+
+        let mut next = self.water.clone();
+        for j in 0..res {
+            for i in 0..res - 1 {
+                let a = j * res + i;
+                let b = a + 1;
+                let s = shift_x[a];
+                if s.abs() <= 1.0e-12 {
+                    continue;
+                }
+                let scale = outflow_scale(s, a, b, &self.water, &demand);
+                let applied = s * scale;
+                next[a] -= applied;
+                next[b] += applied;
+                self.flow_x[a] *= scale;
+            }
+        }
+        for j in 0..res - 1 {
+            for i in 0..res {
+                let a = j * res + i;
+                let b = a + res;
+                let s = shift_z[a];
+                if s.abs() <= 1.0e-12 {
+                    continue;
+                }
+                let scale = outflow_scale(s, a, b, &self.water, &demand);
+                let applied = s * scale;
+                next[a] -= applied;
+                next[b] += applied;
+                self.flow_z[a] *= scale;
+            }
+        }
+        for w in &mut next {
+            if *w < 0.0 {
+                *w = 0.0;
+            }
+        }
+        self.water = next;
+    }
+
+    /// Sum of water depths. Cell area is uniform, so this is the volume.
+    pub fn water_sum(&self) -> f32 {
+        self.water.iter().sum()
+    }
+
+    /// Uphill edge of standing water in the sloped rut. Larger x is downhill.
+    pub fn sloped_rut_shore_x(&self, min_depth: f32) -> f32 {
+        let half = self.size * 0.5;
+        let mut shore = f32::MAX;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if z.abs() > 0.7 || x.abs() > 6.0 {
+                    continue;
+                }
+                if self.water[j * self.res + i] >= min_depth {
+                    shore = shore.min(x);
+                }
+            }
+        }
+        if shore.is_finite() {
+            shore
+        } else {
+            5.0
+        }
+    }
+
+    /// Depth-weighted x of every wet cell.
+    pub fn water_centroid_x(&self) -> f32 {
+        let half = self.size * 0.5;
+        let mut moment = 0.0_f32;
+        let mut mass = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let d = self.water[j * self.res + i];
+                if d <= 0.0 {
+                    continue;
+                }
+                let x = (i as f32 + 0.5) * self.cell - half;
+                moment += d * x;
+                mass += d;
+            }
+        }
+        if mass <= 1.0e-6 {
+            0.0
+        } else {
+            moment / mass
+        }
+    }
+
+    /// x of the deepest water inside the sloped rut.
+    pub fn sloped_rut_deepest_x(&self) -> f32 {
+        let half = self.size * 0.5;
+        let mut best_d = -1.0_f32;
+        let mut best_x = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if z.abs() > 0.7 || x.abs() > 6.0 {
+                    continue;
+                }
+                let d = self.water[j * self.res + i];
+                if d > best_d {
+                    best_d = d;
+                    best_x = x;
+                }
+            }
+        }
+        best_x
     }
 
     /// Body-sized crater. The displaced soil is piled on the rim. Returns the
@@ -748,37 +1137,68 @@ impl SoilField {
     }
 }
 
-fn transfer(
-    height: &[f32],
-    water: &[f32],
-    next: &mut [f32],
-    a: usize,
-    b: usize,
-    dt: f32,
-    dx: f32,
-    area: f32,
-    cond: f32,
-) {
-    if water[a] < 1.0e-5 && water[b] < 1.0e-5 {
+/// Bed of the sloped rut. A chute falls toward +x into a pocket.
+fn sloped_rut_bed(x: f32) -> f32 {
+    if x < 1.2 {
+        let t = ((x + 4.4) / 5.6).clamp(0.0, 1.0);
+        return 0.02 + (-0.36) * t;
+    }
+    let u = ((x - 1.2) / 3.2).clamp(0.0, 1.0);
+    -0.34 - 0.06 * u
+}
+
+/// Linear drag that sets how fast a slope drains, 1/s.
+const WATER_DRAG: f32 = 0.48;
+/// How quickly the flux follows that drain. Explicit gravity on this grid
+/// rings in place, so the cut never fills. Relaxing toward the drag balance
+/// runs downhill without a seiche. A tire's uphill shove is the part above
+/// that balance, and it dies at this same rate after the tread has passed.
+const WATER_RELAX: f32 = 1.7;
+const WATER_GRAVITY: f32 = 9.81;
+const WATER_SPEED_CAP: f32 = 4.8;
+
+fn accel_flux(q: &mut f32, ha: f32, wa: f32, hb: f32, wb: f32, dx: f32, dt: f32) {
+    if wa < 1.0e-6 && wb < 1.0e-6 {
+        *q = 0.0;
         return;
     }
-    let sa = height[a] + water[a];
-    let sb = height[b] + water[b];
-    let dh = sa - sb;
-    if dh.abs() < 1.0e-5 {
+    // Positive when `a` sits higher than `b`. A flat free surface, any bed,
+    // asks for no flux, so a resting pool stays put.
+    let drop = (ha + wa) - (hb + wb);
+    let h = if drop >= 0.0 { wa } else { wb };
+    if h < 1.0e-6 {
+        *q *= (-WATER_RELAX * dt).exp();
+        if q.abs() < 1.0e-6 {
+            *q = 0.0;
+        }
         return;
     }
-    // Volume across the shared face. Limited so one pass cannot drain a cell.
-    let mut vol = dh * cond * dt * dx * 0.35;
-    if vol > 0.0 {
-        vol = vol.min(water[a] * area * 0.22);
-        next[a] -= vol / area;
-        next[b] += vol / area;
+    let cap = h * WATER_SPEED_CAP;
+    let q_star = ((WATER_GRAVITY * h * drop / dx) / WATER_DRAG).clamp(-cap, cap);
+    let blend = 1.0 - (-WATER_RELAX * dt).exp();
+    *q += (q_star - *q) * blend;
+    *q = q.clamp(-cap, cap);
+}
+
+fn outflow_scale(shift: f32, a: usize, b: usize, water: &[f32], demand: &[f32]) -> f32 {
+    let donor = if shift > 0.0 { a } else { b };
+    let need = demand[donor];
+    let have = water[donor];
+    if need > have && need > 1.0e-12 {
+        (have / need).clamp(0.0, 1.0)
     } else {
-        vol = (-vol).min(water[b] * area * 0.22);
-        next[b] -= vol / area;
-        next[a] += vol / area;
+        1.0
     }
+}
+
+/// Rolling depth after `passes` visits. Pass 1 is the fresh bite; each
+/// later pass of the same slot is deeper, with a cap so the chassis is not
+/// swallowed.
+fn pass_groove(one_pass: f32, passes: u8) -> f32 {
+    let n = (passes as f32).max(1.0);
+    // Pass 1 is the fresh bite. Pass 2 is a little more than twice as deep,
+    // so a second visit cuts a bank instead of polishing the same scuff.
+    (one_pass * n.powf(1.25)).min(0.30)
 }
 
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -995,6 +1415,324 @@ mod tests {
         assert!(
             after > total * 0.85,
             "water drained too fast {total} -> {after}"
+        );
+    }
+
+    fn height_sum(soil: &SoilField) -> f32 {
+        soil.height.iter().sum()
+    }
+
+    #[test]
+    fn second_pass_deepens_the_same_rut() {
+        let mut soil = SoilField::flat(0.25);
+        let origin = Vec3::new(-2.2, 0.0, 0.0);
+        let dir = Vec3::X;
+        let before = height_sum(&soil);
+        let first = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
+        let after_first = height_sum(&soil);
+        // Saturated albedo. A second pass has nothing left to repaint.
+        for d in &mut soil.darken {
+            *d = 1.0;
+        }
+        soil.age_water(0.55);
+        let second = soil.roll_pass(origin, dir, 6.4, 0.09, 0.0);
+        let after_second = height_sum(&soil);
+        let floor = soil.sample(1.0, 0.0);
+        let berm = soil
+            .sample(1.0, 0.45)
+            .height
+            .max(soil.sample(1.0, -0.45).height);
+        eprintln!(
+            "pass depths {first:.4} -> {second:.4}  berm {berm:.4} floor {:.4}  volume {before:.4} {after_first:.4} {after_second:.4}",
+            floor.height
+        );
+        assert!(
+            first > 0.035,
+            "first pass did not cut a rut, depth {first:.4}"
+        );
+        assert!(
+            second > first + 0.015,
+            "second pass did not deepen the rut: {first:.4} -> {second:.4}"
+        );
+        assert!(
+            (after_first - before).abs() < 5.0e-3,
+            "first pass deleted soil: height sum {before:.5} -> {after_first:.5}"
+        );
+        assert!(
+            (after_second - before).abs() < 8.0e-3,
+            "second pass deleted soil: height sum {before:.5} -> {after_second:.5}"
+        );
+        assert!(
+            berm > floor.height + 0.02,
+            "displaced soil did not raise the berm: berm {berm:.4} floor {:.4}",
+            floor.height
+        );
+        assert!(
+            soil.darken
+                .iter()
+                .all(|d| (*d - 1.0).abs() < 1.0e-5 || *d <= 1.0),
+            "darken left the 0..1 range"
+        );
+    }
+
+    #[test]
+    fn puddle_flows_into_the_rut_and_stays() {
+        let mut soil = SoilField::flat(0.2);
+        soil.sculpt_banked_puddle();
+        let stored: f32 = soil.water.iter().sum();
+        soil.age_water(1.5);
+        let dry_before = soil.sample(2.2, 0.0).water;
+        assert!(
+            dry_before < 0.004,
+            "water crossed the bank before any rut, depth {dry_before:.4}"
+        );
+        let origin = Vec3::new(-2.4, 0.0, 0.0);
+        let dir = Vec3::X;
+        let first = soil.roll_pass(origin, dir, 6.6, 0.09, 0.0);
+        soil.age_water(0.55);
+        let second = soil.roll_pass(origin, dir, 6.6, 0.09, 0.0);
+        let bank = soil.sample(0.0, 0.0);
+        eprintln!(
+            "channel passes {first:.4} -> {second:.4}  bank height {:.4} rut {:.4}",
+            bank.height, bank.rut
+        );
+        assert!(
+            second > first + 0.012,
+            "the rut that cuts the bank did not deepen: {first:.4} -> {second:.4}"
+        );
+        assert!(
+            bank.height < 0.13,
+            "rut did not cut the bank below the puddle surface, height {:.4}",
+            bank.height
+        );
+        soil.age_water(4.0);
+        let in_rut = soil.sample(2.2, 0.0).water;
+        let shoulder = soil.sample(2.2, 1.15).water;
+        let held_total: f32 = soil.water.iter().sum();
+        eprintln!(
+            "rut water {in_rut:.4}  shoulder {shoulder:.4}  volume {stored:.2} -> {held_total:.2}"
+        );
+        assert!(
+            in_rut > 0.025,
+            "puddle water did not flow into the rut, depth {in_rut:.4}"
+        );
+        assert!(
+            shoulder < in_rut * 0.5,
+            "water left the rut onto the bank: rut {in_rut:.4} shoulder {shoulder:.4}"
+        );
+        soil.age_water(2.5);
+        let still = soil.sample(2.2, 0.0).water;
+        let after: f32 = soil.water.iter().sum();
+        eprintln!("rut water after waiting {still:.4}  volume {after:.2}");
+        assert!(
+            still > 0.02,
+            "water did not stay in the rut, depth {still:.4}"
+        );
+        assert!(
+            after > stored * 0.92,
+            "water was deleted: {stored:.2} -> {after:.2}"
+        );
+    }
+
+    fn sinkage_on(tm: &Terramech, load: f32) -> f32 {
+        let radius = 0.38;
+        let width = 0.28;
+        let mut lo = 0.0;
+        let mut hi = radius * 0.9;
+        for _ in 0..18 {
+            let mid = 0.5 * (lo + hi);
+            let w = bekker_load(mid, radius, width, tm.k_eq, tm.n);
+            if w < load {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// Slip ratio at which Janosi shear matches `drive` (N). 1 means the
+    /// tread cannot hook up and the tire spins.
+    fn slip_for_drive(tm: &Terramech, sinkage: f32, load: f32, drive: f32) -> f32 {
+        let radius = 0.38;
+        let width = 0.28;
+        let length = contact_length(radius, sinkage.max(0.005)).max(0.05);
+        let area = width * length;
+        let sigma = load / area.max(0.01);
+        let tau_max = tm.cohesion + sigma * tm.phi.tan();
+        if tau_max * area <= drive {
+            return 1.0;
+        }
+        let mut lo = 0.0;
+        let mut hi = 1.5;
+        for _ in 0..22 {
+            let mid = 0.5 * (lo + hi);
+            let tau = janosi_hanamoto(tm.cohesion, sigma, tm.phi, mid * length, tm.shear_k);
+            if tau * area < drive {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    #[test]
+    fn wet_rut_sinks_and_slips_more_than_dry_ground() {
+        let load = 1_600.0_f32;
+        // Slow throttle, about 0.42 of the buggy's 500 Nm.
+        let drive = 210.0 / 0.38;
+        let dry_tm = terramech_at(softness_of(0.08, 0.0, 0.0), 0.0, 0.0);
+        let wet_soft = softness_with_rut(1.0, 0.08, 0.07, 0.07);
+        let wet_tm = terramech_at(wet_soft, 0.07, 0.07);
+        let z_dry = sinkage_on(&dry_tm, load);
+        let z_wet = sinkage_on(&wet_tm, load);
+        let slip_dry = slip_for_drive(&dry_tm, z_dry, load, drive);
+        let slip_wet = slip_for_drive(&wet_tm, z_wet, load, drive);
+        eprintln!(
+            "dry z {z_dry:.4} slip {slip_dry:.3}   wet rut z {z_wet:.4} slip {slip_wet:.3}  soft {wet_soft:.3}"
+        );
+        assert!(
+            z_wet > z_dry * 1.4,
+            "wet rut sinkage {z_wet:.4} is not deeper than dry {z_dry:.4}"
+        );
+        assert!(
+            slip_wet > slip_dry + 0.2,
+            "wet rut slip {slip_wet:.3} is not above dry {slip_dry:.3}"
+        );
+    }
+
+    fn dump_slosh(soil: &SoilField, tag: &str) {
+        let mut line = String::new();
+        let mut x = -4.5_f32;
+        while x <= 5.0 {
+            let depth = soil.sample(x, 0.0).water;
+            line.push_str(&format!(" {x:.1}:{depth:.3}"));
+            x += 0.5;
+        }
+        eprintln!(
+            "{tag} shore {:.2} cent {:.2} deep {:.2} sum {:.3} bow {:.3}{line}",
+            soil.sloped_rut_shore_x(0.02),
+            soil.water_centroid_x(),
+            soil.sloped_rut_deepest_x(),
+            soil.water_sum(),
+            soil.sample(-1.0, 0.0).water
+        );
+    }
+
+    #[test]
+    fn passing_tire_sloshes_then_water_pools_low() {
+        let mut soil = SoilField::flat(0.2);
+        soil.sculpt_sloped_rut();
+        let poured = soil.water_sum();
+        assert!(poured > 5.0, "rut was not filled, sum {poured:.2}");
+        // The pour starts uphill. Wait until the free surface has gone flat
+        // in the pocket, then check it is no longer running.
+        soil.age_water(16.0);
+        let shore_drain = soil.sloped_rut_shore_x(0.02);
+        let cent_drain = soil.water_centroid_x();
+        dump_slosh(&soil, "drained");
+        soil.age_water(3.0);
+        let settled = soil.water_sum();
+        dump_slosh(&soil, "settled");
+        let shore_low = soil.sloped_rut_shore_x(0.02);
+        let cent_low = soil.water_centroid_x();
+        let deep_low = soil.sloped_rut_deepest_x();
+        assert!(
+            (settled - poured).abs() < poured * 0.01,
+            "drain deleted water: {poured:.3} -> {settled:.3}"
+        );
+        assert!(
+            (shore_low - shore_drain).abs() < 0.45,
+            "shore still moving, {shore_drain:.2} -> {shore_low:.2}"
+        );
+        assert!(
+            (cent_low - cent_drain).abs() < 0.25,
+            "centroid still moving, {cent_drain:.2} -> {cent_low:.2}"
+        );
+        assert!(
+            soil.sample(-2.5, 0.0).water < 0.008,
+            "high end of the rut did not dry"
+        );
+        assert!(
+            soil.sample(3.4, 0.0).water > 0.06,
+            "water did not pool at the low end, depth {:.4}",
+            soil.sample(3.4, 0.0).water
+        );
+        assert!(
+            deep_low > 2.4,
+            "deepest water is not in the pocket, x {deep_low:.2}"
+        );
+        assert!(
+            cent_low > 2.0,
+            "settled water is not downhill, centroid {cent_low:.2}"
+        );
+        assert!(
+            soil.sample(3.4, 1.05).water < 0.004,
+            "water spilled over the rut wall"
+        );
+
+        soil.pass_tire_up_sloped_rut();
+        let pushed = soil.water_sum();
+        let shore_wave = soil.sloped_rut_shore_x(0.02);
+        let cent_wave = soil.water_centroid_x();
+        let bow = soil.sample(-1.0, 0.0).water;
+        dump_slosh(&soil, "pushed");
+        assert!(
+            (pushed - poured).abs() < poured * 0.01,
+            "the tire deleted water: {poured:.3} -> {pushed:.3}"
+        );
+        assert!(
+            shore_wave < shore_low - 1.0,
+            "wave did not run uphill: shore {shore_low:.2} -> {shore_wave:.2}"
+        );
+        assert!(
+            cent_wave < cent_low - 0.8,
+            "the mass of water did not move uphill: {cent_low:.2} -> {cent_wave:.2}"
+        );
+        assert!(
+            bow > 0.05,
+            "the bow up the rut is too thin to be a wave, depth {bow:.3}"
+        );
+        assert!(
+            soil.water.iter().all(|w| w.is_finite() && *w >= 0.0),
+            "wave produced a bad depth"
+        );
+
+        soil.age_water(12.0);
+        let pooled = soil.water_sum();
+        let shore_back = soil.sloped_rut_shore_x(0.02);
+        let cent_back = soil.water_centroid_x();
+        let deep_back = soil.sloped_rut_deepest_x();
+        dump_slosh(&soil, "pooled");
+        assert!(
+            (pooled - poured).abs() < poured * 0.01,
+            "settling deleted water: {poured:.3} -> {pooled:.3}"
+        );
+        assert!(
+            shore_back > shore_wave + 1.0,
+            "water did not fall back downhill: wave shore {shore_wave:.2} now {shore_back:.2}"
+        );
+        assert!(
+            (shore_back - shore_low).abs() < 0.55,
+            "pooled shore {shore_back:.2} is not the low pool {shore_low:.2}"
+        );
+        assert!(
+            cent_back > cent_wave + 0.8 && (cent_back - cent_low).abs() < 0.45,
+            "centroid did not return downhill: low {cent_low:.2} wave {cent_wave:.2} now {cent_back:.2}"
+        );
+        assert!(
+            deep_back > 2.4,
+            "deepest water left the pocket, x {deep_back:.2}"
+        );
+        assert!(
+            soil.sample(-1.0, 0.0).water < 0.012,
+            "the bow stayed up the rut, depth {:.3}",
+            soil.sample(-1.0, 0.0).water
+        );
+        assert!(
+            soil.sample(3.4, 1.05).water < 0.004,
+            "settled water is sitting on the wall"
         );
     }
 }
