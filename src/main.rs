@@ -37,11 +37,20 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
-            let rest: Vec<String> = args.collect();
-            capture(&rest);
-        } else {
-            run_window();
+        match args.next().as_deref() {
+            Some("capture") => {
+                let rest: Vec<String> = args.collect();
+                capture(&rest);
+            }
+            Some("capture-rut") => {
+                let rest: Vec<String> = args.collect();
+                capture_rut(&rest);
+            }
+            Some("capture-tire") => {
+                let rest: Vec<String> = args.collect();
+                capture_tire(&rest);
+            }
+            _ => run_window(),
         }
     }
 }
@@ -574,6 +583,269 @@ fn capture(args: &[String]) {
         video.display(),
         t0.elapsed().as_secs_f32()
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_rut(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut pass_path = PathBuf::from(format!("{MEDIA}/rut-memory-pass.png"));
+    let mut water_path = PathBuf::from(format!("{MEDIA}/rut-memory-water.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--pass" => pass_path = PathBuf::from(val(&mut i)),
+            "--water" => water_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-rut flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    let mut world = World::flat(0.2);
+    world.soil.sculpt_banked_puddle();
+    // Bowl past the bank, below the puddle surface. The bed is ground
+    // (initial height moves with it), so a sheet that arrives there is
+    // standing water rather than a shadowed groove. The ruts are the
+    // only notch through the bank, and they stop inside the bowl.
+    {
+        let soil = &mut world.soil;
+        let res = soil.res;
+        let half = soil.size * 0.5;
+        let cell = soil.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if (1.05..4.0).contains(&x) && z.abs() < 2.15 {
+                    let idx = j * res + i;
+                    let rz = (z.abs() / 2.15).clamp(0.0, 1.0);
+                    let rx = ((x - 1.05) / 2.95).clamp(0.0, 1.0);
+                    let h = 0.03 + rz * rz * 0.09 + rx * rx * 0.035;
+                    if soil.height[idx] > h {
+                        soil.height[idx] = h;
+                        soil.initial_height[idx] = h;
+                    }
+                }
+            }
+        }
+    }
+    let travel = Vec3::X;
+    // Two visits of the same slots. The second cut breaches the bank.
+    for _pass in 0..2 {
+        for z in [-0.74_f32, 0.74] {
+            world
+                .soil
+                .roll_pass(Vec3::new(-2.6, 0.0, z), travel, 4.3, 0.09, 0.0);
+        }
+        if _pass == 0 {
+            world.soil.age_water(0.55);
+        }
+    }
+    let depth = world.soil.rut_near(0.2, 0.74);
+    world.bike.pos = Vec3::new(18.0, 2.0, 18.0);
+    world.particles.clear();
+    // Off the bowl. Its shadow falls away from the cut, toward -x.
+    let park_h = world.soil.sample(-5.5, -4.2).height;
+    world.vehicle.pos = Vec3::new(-5.5, park_h + 0.55, -4.2);
+    world.vehicle.yaw = 0.4;
+    world.vehicle.vel = Vec3::ZERO;
+    for w in &mut world.vehicle.wheels {
+        w.compression = 0.12;
+    }
+    let pose = CameraPose {
+        eye: Vec3::new(5.2, 4.8, 4.6),
+        target: Vec3::new(1.35, 0.06, 0.05),
+        ortho_width: Some(6.4),
+    };
+    let rgba = renderer.draw(&world, pose, None, true).expect("pass readback");
+    write_png(&pass_path, width, height, &rgba).expect("pass png");
+    println!(
+        "pass {} rut {:.3} bowl {:.4} at ({:.1},{:.1})",
+        pass_path.display(),
+        depth,
+        world.soil.sample(2.4, 0.0).water,
+        world.vehicle.pos.x,
+        world.vehicle.pos.z
+    );
+
+    world.soil.age_water(28.0);
+    let rgba = renderer.draw(&world, pose, None, true).expect("water readback");
+    write_png(&water_path, width, height, &rgba).expect("water png");
+    println!(
+        "water {} depth {:.3} bowl {:.3}",
+        water_path.display(),
+        world.soil.rut_near(0.2, 0.74),
+        world.soil.sample(2.6, 0.0).water
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_tire(args: &[String]) {
+    let mut software = false;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut on_path = PathBuf::from(format!("{MEDIA}/tire-mud-on.png"));
+    let mut shed_path = PathBuf::from(format!("{MEDIA}/tire-mud-shed.png"));
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let val = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                panic!("missing value after {flag}");
+            })
+        };
+        match flag {
+            "--software" => software = true,
+            "--width" => width = val(&mut i).parse().expect("width"),
+            "--height" => height = val(&mut i).parse().expect("height"),
+            "--on" => on_path = PathBuf::from(val(&mut i)),
+            "--shed" => shed_path = PathBuf::from(val(&mut i)),
+            other => panic!("unknown capture-tire flag {other}"),
+        }
+        i += 1;
+    }
+    if software {
+        prepare_software_vulkan();
+    }
+    let (_instance, adapter, device, queue) = open_adapter(software, None);
+    let formats = render::gpu_formats(&adapter);
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+    );
+    // Damp clay, no standing water. The tire can roll without spinning the film off.
+    let mut world = World::flat(0.52);
+    world.bike.pos = Vec3::new(16.0, 4.0, 16.0);
+    world.particles.clear();
+    let roll = Input {
+        throttle: 0.42,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    for _ in 0..(3.6 * 60.0) as u32 {
+        world.step(1.0 / 60.0, &roll);
+    }
+    let behind = tire_behind(&world);
+    println!(
+        "tire on  clay {:.5}  thick {:.4}  speed {:.2}  pos ({:.2},{:.2})  rut {:.3}  behind h {:.4} rut {:.4}  panel {:.3}",
+        world.vehicle.clay_volume(),
+        world.vehicle.wheels[3].clay_thickness(),
+        world.vehicle.speed(),
+        world.vehicle.pos.x,
+        world.vehicle.pos.z,
+        world.soil.max_rut_depth(),
+        world.soil.sample(behind.x, behind.z).height,
+        world.soil.rut_near(behind.x, behind.z),
+        world.vehicle.panels.iter().map(|p| p.mass).sum::<f32>()
+    );
+    let pose_on = tire_pose(&world);
+    let rgba = renderer.draw(&world, pose_on, None, true).expect("on readback");
+    write_png(&on_path, width, height, &rgba).expect("on png");
+    println!("on {}", on_path.display());
+    // Spray from the roll is not part of the shed still. Stepping it would wet the rut.
+    world.particles.clear();
+
+    let hold = Input {
+        throttle: 0.0,
+        brake: 1.0,
+        steer: 0.0,
+    };
+    // Hold the chassis and spin the treads, so the film drops into the groove
+    // just behind the tire instead of smearing down the straight.
+    world.vehicle.vel = Vec3::ZERO;
+    for _ in 0..80 {
+        for w in &mut world.vehicle.wheels {
+            w.omega = 24.0;
+        }
+        world.vehicle.vel.x = 0.0;
+        world.vehicle.vel.z = 0.0;
+        world.step(1.0 / 60.0, &hold);
+    }
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.pos.y += 0.42;
+    world.vehicle.vel.y = -3.3;
+    for _ in 0..36 {
+        world.vehicle.vel.x = 0.0;
+        world.vehicle.vel.z = 0.0;
+        world.step(1.0 / 60.0, &hold);
+    }
+    world.particles.clear();
+    let behind = tire_behind(&world);
+    println!(
+        "tire shed clay {:.5}  thick {:.4}  speed {:.2}  pos ({:.2},{:.2})  rut {:.3}  behind h {:.4} rut {:.4}",
+        world.vehicle.clay_volume(),
+        world.vehicle.wheels[3].clay_thickness(),
+        world.vehicle.speed(),
+        world.vehicle.pos.x,
+        world.vehicle.pos.z,
+        world.soil.max_rut_depth(),
+        world.soil.sample(behind.x, behind.z).height,
+        world.soil.rut_near(behind.x, behind.z)
+    );
+    let pose_shed = tire_pose(&world);
+    let rgba = renderer
+        .draw(&world, pose_shed, None, true)
+        .expect("shed readback");
+    write_png(&shed_path, width, height, &rgba).expect("shed png");
+    println!("shed {}", shed_path.display());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tire_hub(world: &World) -> Vec3 {
+    let ori = world.vehicle.orientation();
+    world.vehicle.pos + ori * world.vehicle.wheel_center_local(3)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tire_behind(world: &World) -> Vec3 {
+    let hub = tire_hub(world);
+    let fwd = world.vehicle.forward();
+    hub - fwd * 0.72
+}
+
+/// Sun-side view of the rear tread, the sheet thrown off it, and the groove.
+#[cfg(not(target_arch = "wasm32"))]
+fn tire_pose(world: &World) -> CameraPose {
+    let hub = tire_hub(world);
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Outboard and a little inboard of the crown, so the side rail and the
+    // flung splash sit with the tread and the groove behind it.
+    let eye = hub + right * 1.55 - fwd * 1.35 + Vec3::Y * 1.05;
+    let target = hub - right * 0.28 - fwd * 0.2 + Vec3::Y * 0.02;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: Some(2.15),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
