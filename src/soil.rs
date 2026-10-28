@@ -57,6 +57,16 @@ const CREST_CLOD_CAP: f32 = 0.04;
 /// they do not fill the groove back in.
 const PASS_GAP: f32 = 0.40;
 
+/// Placed spoil starts to walk once the bed under it is steeper than this.
+/// The carved bed never creeps. A hole stays a hole.
+const CREEP_REPOSE: f32 = 0.20;
+
+/// Downhill speed of the mobile pile, per second, per unit of grade past repose.
+const CREEP_RATE: f32 = 0.18;
+
+/// Sideways friction on wet clay. A push past this slides the tire.
+const WET_SIDE_MU: f32 = 0.08;
+
 impl SurfaceKind {
     pub fn from_u8(v: u8) -> Self {
         match v {
@@ -378,6 +388,36 @@ pub fn surface_grip_sink(kind: SurfaceKind) -> (f32, f32) {
 pub fn grip_mu(kind: SurfaceKind, wetness: f32, loose: f32, water: f32) -> f32 {
     let tm = terramech_for(kind, softness_of(wetness, loose, water), water);
     tm.phi.tan()
+}
+
+/// Wet clay, a fresh cut, packed clay, and a wet berm. A sideways push
+/// shears this instead of anchoring the tire. A crust, gravel, sand, and
+/// silt keep their own friction.
+pub fn lateral_slick(kind: SurfaceKind, wetness: f32) -> bool {
+    wetness > 0.55
+        && matches!(
+            kind,
+            SurfaceKind::WetMud
+                | SurfaceKind::FreshCut
+                | SurfaceKind::PackedClay
+                | SurfaceKind::Berm
+                | SurfaceKind::PlacedClod
+        )
+}
+
+/// Newtons of sideways force one contact will hold.
+///
+/// On wet clay the cap is `WET_SIDE_MU` times the load, so a harder push
+/// slides. Firm ground holds with the full shear strength.
+pub fn lateral_hold(kind: SurfaceKind, wetness: f32, normal: f32, area: f32) -> f32 {
+    let normal = normal.max(0.0);
+    if lateral_slick(kind, wetness) {
+        return WET_SIDE_MU * normal;
+    }
+    let area = area.max(1.0e-4);
+    let tm = terramech_for(kind, softness_of(wetness, 0.0, 0.0), 0.0);
+    let sigma = normal / area;
+    (tm.cohesion + sigma * tm.phi.tan()).max(0.0) * area
 }
 
 /// Cohesion (Pa). Wet clay sticks. A dry crust shears instead of smearing.
@@ -2056,6 +2096,119 @@ impl SoilField {
         self.step_moisture(dt, rain);
     }
 
+    /// Move placed spoil downhill. The bed is not touched, so a hole keeps
+    /// its floor. Thickness that leaves a cell arrives on a downhill cell.
+    /// Nothing is dropped off the map or into a cut.
+    pub fn step_creep(&mut self, dt: f32) {
+        let dt = dt.max(0.0);
+        if dt <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        let res = self.res;
+        let n = self.placed.len();
+        let mut delta = vec![0.0_f32; n];
+        for j in 1..res - 1 {
+            for i in 1..res - 1 {
+                let src = j * res + i;
+                let kind = SurfaceKind::from_u8(self.kind[src]);
+                if !creep_donor(kind, self.placed[src]) {
+                    continue;
+                }
+                let Some((dst, slope)) = self.creep_target(i, j) else {
+                    continue;
+                };
+                let excess = slope - CREEP_REPOSE;
+                if excess <= 0.0 {
+                    continue;
+                }
+                let frac = (CREEP_RATE * excess * dt).clamp(0.0, 0.22);
+                let dh = self.placed[src] * frac;
+                if dh <= 1.0e-8 {
+                    continue;
+                }
+                delta[src] -= dh;
+                delta[dst] += dh;
+            }
+        }
+        for idx in 0..n {
+            if delta[idx] == 0.0 {
+                continue;
+            }
+            self.placed[idx] = (self.placed[idx] + delta[idx]).max(0.0);
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            let dug = self.initial_height[idx] - self.bed[idx];
+            if self.placed[idx] > 0.004 && creep_can_tag(kind) && dug < 0.012 {
+                self.kind[idx] = SurfaceKind::Berm as u8;
+            }
+            self.sync(idx);
+        }
+    }
+
+    /// Creep in short bites so a long slump stays stable.
+    pub fn advance_creep(&mut self, seconds: f32) {
+        if seconds <= 0.0 || !seconds.is_finite() {
+            return;
+        }
+        let steps = (seconds / 0.05).ceil().max(1.0) as u32;
+        let dt = seconds / steps as f32;
+        for _ in 0..steps {
+            self.step_creep(dt);
+        }
+    }
+
+    /// Steepest open neighbour steeper than repose. A cut is not a receiver,
+    /// so spoil does not pour into a hole and the bed stays put.
+    fn creep_target(&self, i: usize, j: usize) -> Option<(usize, f32)> {
+        let res = self.res;
+        let src = j * res + i;
+        let h = self.bed[src];
+        let mut best: Option<(usize, f32)> = None;
+        let mut best_slope = CREEP_REPOSE;
+        for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let ni = i as i32 + di;
+            let nj = j as i32 + dj;
+            if ni <= 0 || nj <= 0 || ni >= res as i32 - 1 || nj >= res as i32 - 1 {
+                continue;
+            }
+            let dst = nj as usize * res + ni as usize;
+            let slope = (h - self.bed[dst]) / self.cell;
+            if slope <= best_slope {
+                continue;
+            }
+            let dug = self.initial_height[dst] - self.bed[dst];
+            if !creep_receiver(SurfaceKind::from_u8(self.kind[dst]), dug) {
+                continue;
+            }
+            best_slope = slope;
+            best = Some((dst, slope));
+        }
+        best
+    }
+
+    /// Volume-weighted centre of placed spoil. Empty field returns the origin.
+    pub fn placed_centroid(&self) -> (f32, f32) {
+        let half = self.size * 0.5;
+        let mut w = 0.0_f32;
+        let mut x = 0.0_f32;
+        let mut z = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let p = self.placed[j * self.res + i];
+                if p <= 0.0 {
+                    continue;
+                }
+                w += p;
+                x += p * ((i as f32 + 0.5) * self.cell - half);
+                z += p * ((j as f32 + 0.5) * self.cell - half);
+            }
+        }
+        if w <= 1.0e-8 {
+            (0.0, 0.0)
+        } else {
+            (x / w, z / w)
+        }
+    }
+
     /// Advance weather in quarter-second bites so a long dry spell stays stable.
     pub fn advance_weather(&mut self, seconds: f32, rain: f32) {
         if seconds <= 0.0 {
@@ -2752,6 +2905,64 @@ impl SoilField {
         }
         field
     }
+
+    /// A berm on the 0.42 ramp, and a hole uphill of it. Creep walks the berm
+    /// toward -X. The hole is a bed cut with no placed spoil.
+    pub fn creep_scene() -> Self {
+        let mut field = Self::sloped(0.42);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        let hole = (1.45_f32, 1.25_f32);
+        let hole_r = 0.46_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let hd = ((x - hole.0).powi(2) + (z - hole.1).powi(2)).sqrt();
+                if hd < hole_r {
+                    let w = (1.0 - hd / hole_r).clamp(0.0, 1.0);
+                    field.bed[idx] -= 0.13 * w.powf(1.15);
+                    field.kind[idx] = SurfaceKind::FreshCut as u8;
+                    field.sync(idx);
+                }
+                if (-0.05..0.55).contains(&x) && (-0.9..0.9).contains(&z) {
+                    field.placed[idx] = 0.065;
+                    field.kind[idx] = SurfaceKind::Berm as u8;
+                    field.loose[idx] = (field.loose[idx] + 0.03).min(0.12);
+                    field.sync(idx);
+                }
+            }
+        }
+        field
+    }
+}
+
+fn creep_donor(kind: SurfaceKind, placed: f32) -> bool {
+    placed > 0.004
+        && matches!(kind, SurfaceKind::Berm | SurfaceKind::PlacedClod)
+}
+
+fn creep_receiver(kind: SurfaceKind, dug: f32) -> bool {
+    dug < 0.012
+        && matches!(
+            kind,
+            SurfaceKind::WetMud
+                | SurfaceKind::Undisturbed
+                | SurfaceKind::Berm
+                | SurfaceKind::PlacedClod
+        )
+}
+
+fn creep_can_tag(kind: SurfaceKind) -> bool {
+    matches!(
+        kind,
+        SurfaceKind::WetMud
+            | SurfaceKind::Undisturbed
+            | SurfaceKind::Berm
+            | SurfaceKind::PlacedClod
+    )
 }
 
 /// Where a shed sidewall coat landed. Volumes are cubic metres.
@@ -4280,5 +4491,101 @@ mod tests {
         let legacy = SoilField::load_state(&saved[..legacy_len]).expect("old snapshot");
         assert_eq!(legacy.tread_amp[idx], 0.0);
         assert!((legacy.bed[idx] - soil.bed[idx]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn berm_on_a_slope_creeps_downhill_and_the_hole_keeps_its_bed() {
+        let mut soil = SoilField::creep_scene();
+        let bed = soil.bed.clone();
+        let before = soil.placed_volume();
+        let before64 = placed_sum(&soil);
+        let (x0, z0) = soil.placed_centroid();
+        let hole0 = hole_floor(&soil);
+        assert!(hole0 > 0.08, "the hole has no bed, dug {hole0}");
+        assert_eq!(
+            soil.sample(1.45, 1.25).kind(),
+            SurfaceKind::FreshCut,
+            "the hole should start as a cut"
+        );
+        assert!(before > 0.02, "the berm has no volume, {before}");
+        soil.imprint_tread(
+            Vec3::new(-1.2, 0.9, 2.2),
+            Vec3::X,
+            Vec3::Z,
+            0.38,
+            0.28,
+            0.05,
+        );
+        let (tread_n, tread_amp) = soil.tread_imprint_stats();
+        assert!(tread_n > 0 && tread_amp > 0.01, "tread was not stored");
+
+        soil.advance_creep(48.0);
+
+        let after = soil.placed_volume();
+        let after64 = placed_sum(&soil);
+        let (x1, z1) = soil.placed_centroid();
+        let shift = x0 - x1;
+        let hole1 = hole_floor(&soil);
+        eprintln!(
+            "berm creep  shift {shift:.4} m downhill  along {:+.4} m  volume {before:.4} -> {after:.4} m3  hole bed {hole0:.4} -> {hole1:.4} m",
+            z1 - z0
+        );
+        assert!(
+            shift > 0.20,
+            "berm did not walk downhill, shift {shift:.4} m ({x0:.3} -> {x1:.3})"
+        );
+        assert!(
+            (before64 - after64).abs() < 1.0e-6,
+            "creep deleted soil, {before64:.6} -> {after64:.6} m3"
+        );
+        assert!(
+            (after - before).abs() < 1.0e-3,
+            "placed volume changed, {before:.4} -> {after:.4}"
+        );
+        for (a, b) in bed.iter().zip(soil.bed.iter()) {
+            assert!((a - b).abs() < 1.0e-6, "creep moved the bed");
+        }
+        assert!(
+            (hole1 - hole0).abs() < 1.0e-6,
+            "the hole bed moved, {hole0} -> {hole1}"
+        );
+        assert_eq!(
+            soil.sample(1.45, 1.25).kind(),
+            SurfaceKind::FreshCut,
+            "the hole was retagged"
+        );
+        assert_eq!(
+            soil.sample(8.0, 8.0).kind(),
+            SurfaceKind::WetMud,
+            "creep retagged clay it never touched"
+        );
+        let (n2, amp2) = soil.tread_imprint_stats();
+        assert_eq!(n2, tread_n, "creep wiped the tread imprint");
+        assert!(
+            (amp2 - tread_amp).abs() < 1.0e-6,
+            "creep changed the tread height"
+        );
+    }
+
+    fn placed_sum(soil: &SoilField) -> f64 {
+        let area = (soil.cell as f64) * (soil.cell as f64);
+        soil.placed.iter().map(|p| *p as f64).sum::<f64>() * area
+    }
+
+    fn hole_floor(soil: &SoilField) -> f32 {
+        let half = soil.size * 0.5;
+        let mut dug = 0.0_f32;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if (x - 1.45).hypot(z - 1.25) > 0.18 {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                dug = dug.max(soil.initial_height[idx] - soil.bed[idx]);
+            }
+        }
+        dug
     }
 }

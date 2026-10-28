@@ -5,8 +5,8 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::patch::{contact_patch, step_tread, TreadCoat, TreadStep};
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
-    terramech_for, wheel_buoyancy, SoilField, SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, lateral_hold, lateral_slick, on_launch_crest,
+    rolling_resistance, stick_scale, terramech_for, wheel_buoyancy, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -125,6 +125,9 @@ pub struct Vehicle {
     pub panels: [PanelMud; PANEL_COUNT],
     /// Seconds of free flight after the crest. A clipping tire must not erase the launch.
     pub jump_hold: f32,
+    /// Sideways push on the chassis, newtons, along body right. Zero on a lap.
+    /// Wet clay holds only a small share of this, so the tires slide.
+    pub side_force: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,6 +156,8 @@ pub struct Contact {
     /// Rate a spinning tread is pulling mud back out, 1/s.
     pub pull: f32,
     pub patch_length: f32,
+    /// Sideways newtons this contact will hold against `Vehicle::side_force`.
+    pub lat_hold: f32,
 }
 
 impl Vehicle {
@@ -169,6 +174,7 @@ impl Vehicle {
             wheels: [Wheel::default(); 4],
             panels: [PanelMud::default(); PANEL_COUNT],
             jump_hold: 0.0,
+            side_force: 0.0,
         }
     }
 
@@ -292,6 +298,7 @@ impl Vehicle {
             let mut squeeze = 0.0;
             let mut pull = 0.0;
             let mut patch_length = 0.0;
+            let mut lat_hold = 0.0;
 
             if active {
                 let tm = terramech_for(sample.kind(), sample.softness, sample.water);
@@ -418,6 +425,13 @@ impl Vehicle {
                     * (0.2 + slip.abs());
                 // A share of what the tread pulled out. The existing clods throw it.
                 fling += (tread_fling * 0.06).min(0.40);
+
+                lat_hold = lateral_hold(sample.kind(), sample.wetness, normal, area);
+                // A sideways push on wet clay cannot recruit the full shear.
+                // Firm ground keeps the force the lap already uses.
+                if self.side_force.abs() > 1.0 && lateral_slick(sample.kind(), sample.wetness) {
+                    chassis_lat = chassis_lat.clamp(-lat_hold, lat_hold);
+                }
             }
 
             out[i] = Contact {
@@ -442,6 +456,7 @@ impl Vehicle {
                 squeeze,
                 pull,
                 patch_length,
+                lat_hold,
             };
         }
         out
@@ -478,6 +493,35 @@ impl Vehicle {
             w.normal = c.normal;
             w.in_water = c.sample.water > 0.01 && c.active;
             w.drive_force = c.chassis_long;
+        }
+
+        // A sideways push is held up to the soil's lateral capacity. Wet clay
+        // is under that push, so the tire slides. The reaction is at the mass
+        // centre: it cancels force, it does not add a yaw the tires did not ask for.
+        if self.side_force.abs() > 1.0 {
+            let fwd = self.forward();
+            let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+            if right.length_squared() > 0.25 {
+                let mut tire_lat = 0.0_f32;
+                let mut hold = 0.0_f32;
+                for c in contacts.iter() {
+                    if !c.active {
+                        continue;
+                    }
+                    let along = c.right.x * right.x + c.right.z * right.z;
+                    let across = c.forward.x * right.x + c.forward.z * right.z;
+                    tire_lat += c.chassis_lat * along + c.chassis_long * across;
+                    hold += c.lat_hold;
+                }
+                if hold > 1.0 {
+                    let net = self.side_force + tire_lat;
+                    let remain = (hold - tire_lat.abs()).max(0.0);
+                    let cancel = (-net).clamp(-remain, remain);
+                    let push = self.side_force + cancel;
+                    force.x += right.x * push;
+                    force.z += right.z * push;
+                }
+            }
         }
 
         // Suspension damping from hardpoint vertical speed.
@@ -745,6 +789,7 @@ impl Default for Contact {
             squeeze: 0.0,
             pull: 0.0,
             patch_length: 0.0,
+            lat_hold: 0.0,
         }
     }
 }

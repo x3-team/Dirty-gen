@@ -174,15 +174,25 @@ impl World {
 
     /// Uniform flat pad. `wetness` 0 is firm, 1 is deep mud. No puddle.
     pub fn flat(wetness: f32) -> Self {
-        Self::rest(SoilField::flat(wetness))
+        Self::rest(SoilField::flat(wetness), 0.0, 0.0)
     }
 
     /// Niva settled across wet clay and gravel. The bed starts flat.
     pub fn surface_split() -> Self {
-        Self::rest(SoilField::surface_split())
+        Self::rest(SoilField::surface_split(), 0.0, 0.0)
     }
 
-    fn rest(soil: SoilField) -> Self {
+    /// Niva settled on a wet clay pad with no standing water.
+    pub fn on_mud() -> Self {
+        Self::rest(SoilField::mud_pad(), 0.0, 0.0)
+    }
+
+    /// Niva settled at a world XZ on a field that is already built.
+    pub fn at_soil(soil: SoilField, x: f32, z: f32) -> Self {
+        Self::rest(soil, x, z)
+    }
+
+    fn rest(soil: SoilField, x: f32, z: f32) -> Self {
         let mut world = Self {
             soil,
             vehicle: Vehicle::new(),
@@ -204,7 +214,7 @@ impl World {
             bike_spawn_yaw: 0.0,
             coat_in_rut: 0.0,
         };
-        world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
+        world.vehicle.pos = Vec3::new(x, 0.8, z);
         world.vehicle.yaw = 0.0;
         world.place_on_soil();
         for _ in 0..90 {
@@ -276,6 +286,8 @@ impl World {
         for _ in 0..substeps {
             self.substep(h, input);
         }
+        // Placed spoil on a steep bed walks downhill. The cut does not.
+        self.soil.step_creep(dt);
         self.time += dt;
     }
 
@@ -1343,6 +1355,80 @@ mod tests {
             "the settled pose is not on its side, roll {}",
             world.vehicle.roll
         );
+    }
+
+    #[test]
+    fn wet_clay_slides_under_a_sideways_force() {
+        use crate::soil::SurfaceKind;
+
+        const PUSH: f32 = 1_500.0;
+        const SECONDS: f32 = 1.25;
+        let mut wet = World::on_mud();
+        let mut dry = World::flat(0.12);
+        assert_eq!(
+            wet.soil.sample(6.0, 6.0).kind(),
+            SurfaceKind::WetMud,
+            "the pad is not wet clay"
+        );
+        let under = wet.soil.sample(wet.vehicle.pos.x, wet.vehicle.pos.z);
+        assert!(
+            crate::soil::lateral_slick(under.kind(), under.wetness),
+            "the tire is not on wet clay, kind {:?} wet {:.2}",
+            under.kind(),
+            under.wetness
+        );
+        assert_eq!(
+            dry.soil.sample(6.0, 6.0).kind(),
+            SurfaceKind::DryCrust,
+            "the firm pad is not a crust"
+        );
+        let under_dry = dry.soil.sample(dry.vehicle.pos.x, dry.vehicle.pos.z);
+        assert!(
+            !crate::soil::lateral_slick(under_dry.kind(), under_dry.wetness),
+            "the firm tire is slick, kind {:?} wet {:.2}",
+            under_dry.kind(),
+            under_dry.wetness
+        );
+        let wet_slide = push_sideways(&mut wet, PUSH, SECONDS);
+        let dry_slide = push_sideways(&mut dry, PUSH, SECONDS);
+        eprintln!(
+            "wet slide  {wet_slide:.4} m    dry slide  {dry_slide:.4} m    push {PUSH:.0} N  for {SECONDS:.2} s"
+        );
+        assert!(
+            wet_slide > 0.45,
+            "wet clay did not slide, {wet_slide:.4} m"
+        );
+        assert!(
+            dry_slide < 0.10,
+            "the crust slid under the same push, {dry_slide:.4} m"
+        );
+        assert!(
+            wet_slide > dry_slide * 5.0,
+            "wet clay should slide much farther than the crust, wet {wet_slide:.4} dry {dry_slide:.4}"
+        );
+        let support: f32 = wet.vehicle.wheels.iter().map(|w| w.normal).sum();
+        assert!(
+            support > MASS * 9.81 * 0.5,
+            "the slid Niva is not sitting on the soil, support {support:.0} N"
+        );
+        let (n, amp) = wet.soil.tread_imprint_stats();
+        assert!(n > 0 && amp > 0.01, "the slide wiped the tread imprint");
+        assert_eq!(
+            wet.soil.sample(6.0, 6.0).kind(),
+            SurfaceKind::WetMud,
+            "the slide retagged clay it never touched"
+        );
+    }
+
+    fn push_sideways(world: &mut World, push: f32, seconds: f32) -> f32 {
+        world.vehicle.vel = Vec3::ZERO;
+        world.vehicle.yaw_rate = 0.0;
+        world.vehicle.side_force = push;
+        let start = world.vehicle.pos;
+        world.run_seconds(seconds, |_| Input::default());
+        world.vehicle.side_force = 0.0;
+        let d = world.vehicle.pos - start;
+        d.x.hypot(d.z)
     }
 }
 

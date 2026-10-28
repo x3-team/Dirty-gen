@@ -512,6 +512,8 @@ struct CaptureArgs {
     surfaces_proof: PathBuf,
     roll: bool,
     roll_proof: PathBuf,
+    creep: bool,
+    creep_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -572,6 +574,10 @@ fn capture(args: &[String]) {
     }
     if parsed.roll {
         capture_roll(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.creep {
+        capture_creep(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -717,6 +723,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut niva_realism = false;
     let mut surfaces = false;
     let mut roll = false;
+    let mut creep = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -746,6 +753,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let niva_tread_side = PathBuf::from(format!("{MEDIA}/niva-tread-side.png"));
     let mut surfaces_proof = PathBuf::from(format!("{MEDIA}/surfaces-proof.png"));
     let mut roll_proof = PathBuf::from(format!("{MEDIA}/roll-proof.png"));
+    let mut creep_proof = PathBuf::from(format!("{MEDIA}/creep-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -780,6 +788,13 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 roll = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     roll_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--creep" => creep = true,
+            "--creep-proof" => {
+                creep = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    creep_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -857,6 +872,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         surfaces_proof,
         roll,
         roll_proof,
+        creep,
+        creep_proof,
     }
 }
 
@@ -1556,6 +1573,73 @@ fn capture_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
         parsed,
         roll_camera(&world),
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_creep(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::SoilField;
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut soil = SoilField::creep_scene();
+    let before = soil.placed_volume();
+    let (x0, _) = soil.placed_centroid();
+    let hole0 = soil.sample(1.45, 1.25).rut;
+    soil.advance_creep(48.0);
+    let after = soil.placed_volume();
+    let (x1, _) = soil.placed_centroid();
+    let shift = x0 - x1;
+    let hole1 = soil.sample(1.45, 1.25).rut;
+    println!(
+        "berm shift {shift:.4} m downhill  volume {before:.4} -> {after:.4} m3  hole bed {hole0:.4} -> {hole1:.4} m"
+    );
+
+    let mut world = World::at_soil(soil, -1.7, 2.35);
+    world.bike.pos = Vec3::new(16.0, 0.5, 16.0);
+    world.bike.vel = Vec3::ZERO;
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.side_force = -1_500.0;
+    let start = world.vehicle.pos;
+    world.run_seconds(1.25, |_| Input::default());
+    let slide = {
+        let d = world.vehicle.pos - start;
+        d.x.hypot(d.z)
+    };
+    world.vehicle.side_force = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    println!(
+        "wet slide {slide:.4} m  from ({:.2},{:.2}) to ({:.2},{:.2})",
+        start.x,
+        start.z,
+        world.vehicle.pos.x,
+        world.vehicle.pos.z
+    );
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "creep",
+        &parsed.creep_proof,
+        parsed,
+        creep_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn creep_camera(world: &World) -> CameraPose {
+    let p = world.vehicle.pos;
+    let ground = world.soil.sample(p.x, p.z).height;
+    let look = Vec3::new(-0.15, ground + 0.15, 1.15);
+    let eye = look + Vec3::new(-2.4, 3.4, 4.6);
+    let ortho = 9.4;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
