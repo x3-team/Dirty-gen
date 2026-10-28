@@ -1248,52 +1248,32 @@ fn capture_rut_water(renderer: &mut Renderer, parsed: &CaptureArgs) {
     world.soil = SoilField::rut_water();
     world.bike.pos = Vec3::new(18.0, 0.5, 18.0);
     world.bike.vel = Vec3::ZERO;
-    // Far enough back that the nose does not cover the hole. The right tires
-    // stay in the rut; the pool ahead of them is the thing in frame.
-    let park = Vec3::new(0.0, 0.55, -1.45);
-    world.vehicle.pos = park;
+    // Right tires in the rut, nose short of the hole. Hubs are seated on the
+    // mud. A physics settle dug the bed and left the body in the air.
+    world.vehicle.pos = Vec3::new(0.0, 0.5, -1.45);
     world.vehicle.yaw = 0.0;
     world.vehicle.vel = Vec3::ZERO;
-    let dt = 1.0 / 60.0;
-    let brake = Input {
-        throttle: 0.0,
-        brake: 1.0,
-        steer: 0.0,
-    };
-    for _ in 0..50 {
-        world.step(dt, &brake);
-        world.vehicle.pos.x = park.x;
-        world.vehicle.pos.z = park.z;
-        world.vehicle.vel = Vec3::ZERO;
-        world.vehicle.yaw = 0.0;
-        world.vehicle.yaw_rate = 0.0;
-    }
-    // The settle dug and scooped. Pour the free surface back so the first
-    // frame is the resting pool, then the tire push is the only wave.
-    world.soil.fill_to_line(-0.03);
-    for _ in 0..60 {
-        world.soil.step_water(dt);
-    }
+    world.vehicle.seat_on(&world.soil);
     let before = world.soil.water_volume();
     silence_chunks(&mut world);
-    let pose = water_camera(&world);
+    let pose = water_camera();
     write_cc0_still(renderer, &world, "water-rut", &parsed.water_rut, parsed, pose);
 
     let wheel = world.vehicle.pos
         + world.vehicle.orientation() * world.vehicle.wheel_center_local(1);
-    let fwd = world.vehicle.forward();
-    for _ in 0..14 {
-        world.soil.displace_water(wheel.x, wheel.z, fwd, 0.22);
-    }
+    print_hubs(&world);
+    world.soil.throw_crest(wheel.x, wheel.z);
     let wave = world.soil.water_volume();
-    let crest = crest_depth(&world.soil, -0.03);
-    let hole = world.soil.sample(0.74, 1.9);
+    let (crest_at, crest_y, crest_depth) = tallest_water(&world.soil);
     println!(
-        "water before {before:.5} m3  wave {wave:.5} m3  crest {crest:.4} m  wheel ({:.2},{:.2}) depth {:.3}  hole {:.3}",
+        "water before {before:.5} m3  wave {wave:.5} m3  crest ({:.2},{:.2}) surface {:.3} depth {:.3}  wheel ({:.2},{:.2},{:.3})",
+        crest_at.x,
+        crest_at.y,
+        crest_y,
+        crest_depth,
         wheel.x,
         wheel.z,
-        world.soil.sample(wheel.x, wheel.z).water,
-        hole.water
+        wheel.y
     );
     silence_chunks(&mut world);
     write_cc0_still(
@@ -1305,12 +1285,14 @@ fn capture_rut_water(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose,
     );
 
-    for _ in 0..150 {
-        world.soil.step_water(dt);
+    let dt = 1.0 / 60.0;
+    for _ in 0..240 {
+        world.soil.step_standing(dt);
     }
     let settled = world.soil.water_volume();
+    let bed = world.soil.water_above(-0.03);
     println!(
-        "water settle {settled:.5} m3  picture reads soil.water (drag, buoyancy, and this surface)"
+        "water settle {settled:.5} m3  on the bank {bed:.5} m3  picture reads soil.water (the same column as drag and buoyancy)"
     );
     silence_chunks(&mut world);
     write_cc0_still(
@@ -1323,21 +1305,46 @@ fn capture_rut_water(renderer: &mut Renderer, parsed: &CaptureArgs) {
     );
 }
 
-fn crest_depth(soil: &silt::soil::SoilField, line: f32) -> f32 {
-    soil.height
-        .iter()
-        .zip(soil.water.iter())
-        .filter(|(h, _)| **h >= line)
-        .map(|(_, w)| *w)
-        .fold(0.0_f32, f32::max)
+fn print_hubs(world: &World) {
+    use silt::vehicle::WHEEL_RADIUS;
+    for i in 0..4 {
+        let hub = world.vehicle.pos
+            + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+        let ground = world.soil.sample(hub.x, hub.z).height;
+        let gap = hub.y - WHEEL_RADIUS - ground;
+        println!(
+            "hub {i} ({:.2},{:.2},{:.3}) ground {:.3} gap {:.3}",
+            hub.x, hub.z, hub.y, ground, gap
+        );
+    }
 }
 
-fn water_camera(_world: &World) -> CameraPose {
-    // Clay bank, above the hole, looking back along the rut at the Niva.
-    // The free surface sits between the camera and the tire.
+fn tallest_water(soil: &silt::soil::SoilField) -> (Vec3, f32, f32) {
+    let half = soil.size * 0.5;
+    let mut best = (Vec3::ZERO, -10.0_f32, 0.0_f32);
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let idx = j * soil.res + i;
+            if soil.water[idx] < 0.02 {
+                continue;
+            }
+            let surf = soil.height[idx] + soil.water[idx];
+            if surf > best.1 {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                best = (Vec3::new(x, z, 0.0), surf, soil.water[idx]);
+            }
+        }
+    }
+    best
+}
+
+fn water_camera() -> CameraPose {
+    // Close on the crest in front of the tire, from the hole. The mound
+    // fills the frame so its height reads against the pool around it.
     CameraPose {
-        eye: Vec3::new(2.85, 2.55, 3.7),
-        target: Vec3::new(0.45, 0.0, -0.15),
+        eye: Vec3::new(1.30, 0.60, 1.95),
+        target: Vec3::new(0.62, 0.04, 0.20),
         ortho_width: None,
     }
 }

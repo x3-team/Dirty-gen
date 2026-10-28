@@ -209,6 +209,63 @@ impl Vehicle {
         Vec3::new(hp.x, hp.y - REST_LEN + c, hp.z)
     }
 
+    /// Drop the chassis until each hub is on the mud.
+    ///
+    /// The tread bites `SINK` metres into the soil under that hub. A rut is
+    /// taken by suspension travel, then by roll and pitch. The body is not
+    /// left hanging above the groove.
+    pub fn seat_on(&mut self, soil: &SoilField) {
+        const SINK: f32 = 0.03;
+        self.vel = Vec3::ZERO;
+        self.yaw_rate = 0.0;
+        self.pitch_rate = 0.0;
+        self.roll_rate = 0.0;
+        self.pitch = 0.0;
+        self.roll = 0.0;
+        let h0 = soil.sample(self.pos.x, self.pos.z).height;
+        self.pos.y = h0 + 0.48;
+        for w in &mut self.wheels {
+            w.compression = 0.10;
+            w.sinkage = SINK;
+            w.omega = 0.0;
+        }
+        let hps = hardpoints();
+        for _ in 0..20 {
+            let q = self.orientation();
+            let up = q * Vec3::Y;
+            let uy = up.y.max(0.35);
+            let mut res = [0.0_f32; 4];
+            for i in 0..4 {
+                let hp = hps[i];
+                let droop = Vec3::new(hp.x, HARD_Y - REST_LEN, hp.z);
+                let hub0 = self.pos + q * droop;
+                let ground = soil.sample(hub0.x, hub0.z).height;
+                let target = ground + WHEEL_RADIUS - SINK;
+                let c = ((target - hub0.y) / uy).clamp(0.012, SUSP_TRAVEL - 0.008);
+                self.wheels[i].compression = c;
+                self.wheels[i].sinkage = SINK;
+                let hub_y = hub0.y + uy * c;
+                res[i] = target - hub_y;
+            }
+            let mean = 0.25 * (res[0] + res[1] + res[2] + res[3]);
+            let left = 0.5 * (res[0] + res[2]);
+            let right = 0.5 * (res[1] + res[3]);
+            let front = 0.5 * (res[0] + res[1]);
+            let rear = 0.5 * (res[2] + res[3]);
+            self.pos.y += mean;
+            // Positive roll lifts +X. A low right hub needs more roll.
+            self.roll += (right - left) / 1.48;
+            // Positive pitch lowers +Z. A low front hub needs less pitch.
+            self.pitch -= (front - rear) / 2.26;
+            self.roll = self.roll.clamp(-0.28, 0.28);
+            self.pitch = self.pitch.clamp(-0.18, 0.18);
+        }
+        self.vel = Vec3::ZERO;
+        self.yaw_rate = 0.0;
+        self.pitch_rate = 0.0;
+        self.roll_rate = 0.0;
+    }
+
     pub fn update_steer(&mut self, steer: f32, dt: f32) {
         let target = steer.clamp(-1.0, 1.0) * MAX_STEER;
         let blend = 1.0 - (-dt * 6.0).exp();

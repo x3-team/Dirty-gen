@@ -1645,7 +1645,7 @@ impl SoilField {
         let area = self.cell * self.cell;
         let half = self.size * 0.5;
         let res = self.res as isize;
-        let reach = 1.15_f32;
+        let reach = 1.35_f32;
         let i0 = (((x - reach) + half) / self.cell).floor() as isize;
         let i1 = (((x + reach) + half) / self.cell).floor() as isize;
         let j0 = (((z - reach) + half) / self.cell).floor() as isize;
@@ -1661,7 +1661,9 @@ impl SoilField {
                 let rel_z = cz - z;
                 let along = rel_x * fwd.x + rel_z * fwd.z;
                 let lat = rel_x * right.x + rel_z * right.z;
-                if along < -0.22 || along > 0.28 || lat.abs() > 0.22 {
+                // Under the tire and back along the groove, so one scoop can
+                // feed a crest instead of skimming a single cell.
+                if along < -0.95 || along > 0.18 || lat.abs() > 0.32 {
                     continue;
                 }
                 let idx = j as usize * self.res + i as usize;
@@ -1708,8 +1710,8 @@ impl SoilField {
                 let rel_z = cz - z;
                 let along = rel_x * fwd.x + rel_z * fwd.z;
                 let lat = rel_x * right.x + rel_z * right.z;
-                // Ahead of the contact, on the bank as well as in the groove.
-                if !(0.22..1.05).contains(&along) || lat.abs() > 0.72 {
+                // A mound just ahead of the contact, not a film smeared up the bank.
+                if !(0.26..0.78).contains(&along) || lat.abs() > 0.40 {
                     continue;
                 }
                 let idx = j as usize * self.res + i as usize;
@@ -1719,10 +1721,10 @@ impl SoilField {
                     continue;
                 }
                 let climb = (self.height[idx] - bed_ref).max(0.0);
-                let along_w = (-((along - 0.48) * (along - 0.48)) / (2.0 * 0.16 * 0.16)).exp();
-                let lat_w = (-(lat * lat) / (2.0 * 0.28 * 0.28)).exp();
-                let w = along_w * lat_w * (0.35 + climb * 7.0);
-                if w > 0.02 {
+                let along_w = (-((along - 0.42) * (along - 0.42)) / (2.0 * 0.10 * 0.10)).exp();
+                let lat_w = (-(lat * lat) / (2.0 * 0.16 * 0.16)).exp();
+                let w = along_w * lat_w * (1.0 + climb * 2.2);
+                if w > 0.04 {
                     crest.push((idx, w));
                 }
             }
@@ -1790,6 +1792,51 @@ impl SoilField {
                 left -= put;
             }
         }
+        // Still holding water. It goes into the low bed, not off the field.
+        if left > 1.0e-7 {
+            self.pour_metres(left);
+        }
+    }
+
+    /// Put cubic metres onto the lowest cells that can hold them. Gravel and
+    /// sand are skipped so a wave is not poured into a drain.
+    fn pour_metres(&mut self, mut left: f32) {
+        let area = self.cell * self.cell;
+        for _ in 0..6 {
+            if left <= 1.0e-7 {
+                break;
+            }
+            let mut order: Vec<usize> = Vec::new();
+            for (i, w) in self.water.iter().enumerate() {
+                if *w >= WATER_CAP - 1.0e-4 {
+                    continue;
+                }
+                let kind = SurfaceKind::from_u8(self.kind[i]);
+                if matches!(kind, SurfaceKind::Gravel | SurfaceKind::Sand) {
+                    continue;
+                }
+                order.push(i);
+            }
+            if order.is_empty() {
+                break;
+            }
+            order.sort_by(|&a, &b| {
+                let sa = self.height[a] + self.water[a];
+                let sb = self.height[b] + self.water[b];
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n = order.len().min(64);
+            let share = left / n as f32;
+            for &idx in order.iter().take(n) {
+                let room = (WATER_CAP - self.water[idx]).max(0.0) * area;
+                let put = share.min(room);
+                if put <= 0.0 {
+                    continue;
+                }
+                self.water[idx] += put / area;
+                left -= put;
+            }
+        }
     }
 
     /// Virtual-pipe shallow water, then pore moisture. `rain` is metres per
@@ -1846,11 +1893,66 @@ impl SoilField {
                 }
             }
         }
-        for w in &mut next {
-            *w = w.clamp(0.0, WATER_CAP);
-        }
+        pour_depth_excess(&self.height, &self.kind, &mut next);
         self.water = next;
         self.step_moisture(dt, rain);
+    }
+
+    /// The pipe only. A crest runs back into the low bed. Overflow is poured
+    /// into cells that can hold it. Nothing is clamped off the field, and the
+    /// film is not evaporated, so a short settle keeps the volume.
+    pub fn step_standing(&mut self, dt: f32) {
+        self.infiltrate(dt);
+        let res = self.res;
+        let dx = self.cell;
+        let area = dx * dx;
+        let mut next = self.water.clone();
+        let cond = 1.35;
+        for j in 0..res {
+            for i in 0..res {
+                let a = j * res + i;
+                if i + 1 < res {
+                    transfer(
+                        &self.height,
+                        &self.water,
+                        &self.kind,
+                        &mut next,
+                        a,
+                        a + 1,
+                        dt,
+                        dx,
+                        area,
+                        cond,
+                    );
+                }
+                if j + 1 < res {
+                    transfer(
+                        &self.height,
+                        &self.water,
+                        &self.kind,
+                        &mut next,
+                        a,
+                        a + res,
+                        dt,
+                        dx,
+                        area,
+                        cond,
+                    );
+                }
+            }
+        }
+        pour_depth_excess(&self.height, &self.kind, &mut next);
+        self.water = next;
+    }
+
+    /// Step the contact forward through the groove so the scoops stack into
+    /// one crest ahead of the tire. Each step is the same volume-conserving
+    /// push the solver uses for a rolling tire.
+    pub fn throw_crest(&mut self, x: f32, z: f32) {
+        for step in 0..10 {
+            let pz = z - 0.55 + step as f32 * 0.12;
+            self.displace_water(x, pz, Vec3::Z, 0.55);
+        }
     }
 
     /// Advance weather in quarter-second bites so a long dry spell stays stable.
@@ -2544,6 +2646,58 @@ pub struct SoilVolumes {
     pub clods: f32,
     pub max_rut: f32,
     pub max_berm: f32,
+}
+
+/// Cap overflow goes to the lowest bed that can hold it. A clamp here used
+/// to delete the crest when the pipe stacked a cell past the cap.
+fn pour_depth_excess(height: &[f32], kind: &[u8], next: &mut [f32]) {
+    let mut excess = 0.0_f32;
+    for w in next.iter_mut() {
+        if *w > WATER_CAP {
+            excess += *w - WATER_CAP;
+            *w = WATER_CAP;
+        } else if *w < 0.0 {
+            *w = 0.0;
+        }
+    }
+    if excess <= 1.0e-5 {
+        return;
+    }
+    for _ in 0..4 {
+        if excess <= 1.0e-5 {
+            break;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        for i in 0..next.len() {
+            if next[i] >= WATER_CAP - 1.0e-4 {
+                continue;
+            }
+            let k = SurfaceKind::from_u8(kind[i]);
+            if matches!(k, SurfaceKind::Gravel | SurfaceKind::Sand) {
+                continue;
+            }
+            order.push(i);
+        }
+        if order.is_empty() {
+            break;
+        }
+        order.sort_by(|&a, &b| {
+            let sa = height[a] + next[a];
+            let sb = height[b] + next[b];
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let n = order.len().min(64);
+        let share = excess / n as f32;
+        for &i in order.iter().take(n) {
+            let room = (WATER_CAP - next[i]).max(0.0);
+            let put = share.min(room);
+            if put <= 0.0 {
+                continue;
+            }
+            next[i] += put;
+            excess -= put;
+        }
+    }
 }
 
 fn transfer(
@@ -3826,6 +3980,96 @@ mod tests {
             pool.wetness > 0.5,
             "the bed under the pool should be wet, {}",
             pool.wetness
+        );
+    }
+
+    #[test]
+    fn hubs_meet_the_mud_in_the_rut() {
+        use crate::vehicle::{Vehicle, WHEEL_RADIUS};
+        let soil = SoilField::rut_water();
+        let mut vehicle = Vehicle::new();
+        vehicle.pos = Vec3::new(0.0, 0.55, -1.45);
+        vehicle.yaw = 0.0;
+        vehicle.seat_on(&soil);
+        for i in 0..4 {
+            let hub = vehicle.pos + vehicle.orientation() * vehicle.wheel_center_local(i);
+            let ground = soil.sample(hub.x, hub.z).height;
+            let gap = hub.y - WHEEL_RADIUS - ground;
+            eprintln!(
+                "hub {i} ({:.2},{:.2},{:.3}) ground {:.3} gap {:.3} compression {:.3}",
+                hub.x,
+                hub.z,
+                hub.y,
+                ground,
+                gap,
+                vehicle.wheels[i].compression
+            );
+            assert!(
+                (gap + 0.03).abs() < 0.015,
+                "wheel {i} does not meet the mud, gap {gap:.3} m"
+            );
+        }
+    }
+
+    #[test]
+    fn throw_crest_stands_above_the_pool_then_returns() {
+        let mut soil = SoilField::rut_water();
+        let before = soil.water_volume();
+        let line = -0.03_f32;
+        soil.throw_crest(0.74, -0.37);
+        let wave = soil.water_volume();
+        assert!(
+            (wave - before).abs() < before * 0.02 + 1.0e-4,
+            "the push dropped volume {before:.5} -> {wave:.5}"
+        );
+        let half = soil.size * 0.5;
+        let mut best_surf = -10.0_f32;
+        let mut best_depth = 0.0_f32;
+        let mut at = (0.0_f32, 0.0_f32);
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let idx = j * soil.res + i;
+                if soil.water[idx] < 0.02 {
+                    continue;
+                }
+                let surf = soil.height[idx] + soil.water[idx];
+                if surf > best_surf {
+                    best_surf = surf;
+                    best_depth = soil.water[idx];
+                    at = (
+                        (i as f32 + 0.5) * soil.cell - half,
+                        (j as f32 + 0.5) * soil.cell - half,
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "throw crest at ({:.2},{:.2}) surface {:.3} depth {:.3}  pool line {line:.3}  volume {wave:.5}",
+            at.0, at.1, best_surf, best_depth
+        );
+        assert!(
+            best_surf > line + 0.12,
+            "the crest is not above the pool, surface {best_surf:.3}"
+        );
+        assert!(
+            best_depth > 0.10,
+            "the crest is a film, depth {best_depth:.3}"
+        );
+        for _ in 0..240 {
+            soil.step_standing(1.0 / 60.0);
+        }
+        let settled = soil.water_volume();
+        let high = soil.water_above(line);
+        eprintln!(
+            "throw settle {settled:.5} m3  before {before:.5}  high {high:.5}"
+        );
+        assert!(
+            (settled - before).abs() < before * 0.02 + 1.0e-3,
+            "settle deleted water {before:.5} -> {settled:.5}"
+        );
+        assert!(
+            high < wave * 0.15,
+            "the crest did not return to the low bed, high {high:.5} of {wave:.5}"
         );
     }
 }
