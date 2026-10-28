@@ -678,7 +678,13 @@ impl SoilField {
         }
     }
 
-    /// Virtual-pipe shallow water. Dry cells are skipped.
+    /// Virtual-pipe shallow water.
+    ///
+    /// A tire sloshes depth out of its footprint. These sweeps then walk that
+    /// water toward the lower free surface, in place, so a film on a sloping
+    /// rut drains along the cut and stacks at the low bed instead of sitting
+    /// where the tire left it. Each edge pays the receiver from the donor, and
+    /// nothing is clamped off, so the volume stays.
     pub fn step_water(&mut self, dt: f32) {
         // The field clock lives here so a tire that has rolled away can be
         // told from one that is still on the same cell.
@@ -686,29 +692,14 @@ impl SoilField {
             *rest = (*rest + dt).min(30.0);
         }
         let res = self.res;
-        // A single eager step sloshed. Several small sweeps walk a cut channel
-        // in a few seconds and settle to a flat surface instead of a wave.
-        let sweeps = ((dt * 240.0).round() as u32).clamp(1, 6);
-        let gain = 0.16_f32;
-        for _ in 0..sweeps {
-            let mut next = self.water.clone();
-            for j in 0..res {
-                for i in 0..res {
-                    let a = j * res + i;
-                    if i + 1 < res {
-                        transfer(&self.height, &self.water, &mut next, a, a + 1, gain);
-                    }
-                    if j + 1 < res {
-                        transfer(&self.height, &self.water, &mut next, a, a + res, gain);
-                    }
-                }
-            }
-            for w in &mut next {
-                // The old 0.34 cap threw away water that had pooled in a bowl.
-                // A metre and a half is deeper than any bank on this map.
-                *w = w.clamp(0.0, 1.5);
-            }
-            self.water = next;
+        // Half a head would flatten one pair in a single edge. Stay under
+        // that so a berm is not jumped. The sweep is in place and flips
+        // direction, so water cascades downhill. A Jacobi copy of the same
+        // gain cancels in the middle of a uniform slope and the film sits.
+        let sweeps = ((dt * 360.0).round() as u32).clamp(2, 8);
+        let gain = 0.32_f32;
+        for s in 0..sweeps {
+            self.sweep_pipes(s % 2 == 1, gain);
         }
 
         let n = res * res;
@@ -718,6 +709,23 @@ impl SoilField {
             } else {
                 let base = self.base_wetness[idx];
                 self.wetness[idx] += (base - self.wetness[idx]) * (dt * 0.12).min(0.25);
+            }
+        }
+    }
+
+    fn sweep_pipes(&mut self, flip: bool, gain: f32) {
+        let res = self.res;
+        for n in 0..res {
+            let j = if flip { res - 1 - n } else { n };
+            for m in 0..res {
+                let i = if flip { res - 1 - m } else { m };
+                let a = j * res + i;
+                if i + 1 < res {
+                    relax(&self.height, &mut self.water, a, a + 1, gain);
+                }
+                if j + 1 < res {
+                    relax(&self.height, &mut self.water, a, a + res, gain);
+                }
             }
         }
     }
@@ -867,27 +875,30 @@ impl SoilField {
     }
 }
 
-fn transfer(height: &[f32], water: &[f32], next: &mut [f32], a: usize, b: usize, gain: f32) {
-    if water[a] < 1.0e-5 && water[b] < 1.0e-5 {
+/// Move water from the higher free surface to the lower one.
+///
+/// `gain` is a fraction of the head and must stay under 0.5. The donor cannot
+/// give water it does not have, and the same amount is added next door, so
+/// this edge does not create or delete volume.
+fn relax(height: &[f32], water: &mut [f32], a: usize, b: usize, gain: f32) {
+    let wa = water[a];
+    let wb = water[b];
+    if wa < 1.0e-6 && wb < 1.0e-6 {
         return;
     }
-    let sa = height[a] + water[a];
-    let sb = height[b] + water[b];
-    let dh = sa - sb;
+    let dh = (height[a] + wa) - (height[b] + wb);
     if dh.abs() < 1.0e-4 {
         return;
     }
-    // Fraction of the head, capped so one sweep cannot drain the donor.
-    // Four neighbours at this gain stay under the water that is there.
-    let mut depth = dh.abs() * gain;
+    let flow = dh.abs() * gain;
     if dh > 0.0 {
-        depth = depth.min(water[a] * 0.20);
-        next[a] -= depth;
-        next[b] += depth;
+        let flow = flow.min(wa);
+        water[a] = wa - flow;
+        water[b] = wb + flow;
     } else {
-        depth = depth.min(water[b] * 0.20);
-        next[b] -= depth;
-        next[a] += depth;
+        let flow = flow.min(wb);
+        water[b] = wb - flow;
+        water[a] = wa + flow;
     }
 }
 
@@ -1226,6 +1237,173 @@ mod tests {
         assert!(
             after > stored * 0.92,
             "water was deleted: {stored:.2} -> {after:.2}"
+        );
+    }
+
+    fn water_sum(soil: &SoilField) -> f32 {
+        soil.water.iter().sum()
+    }
+
+    /// Grade down toward +x, a tire groove, and a bowl that is the bottom.
+    fn lay_sloping_rut(soil: &mut SoilField) {
+        let res = soil.res;
+        let half = soil.size * 0.5;
+        let cell = soil.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let t = ((x + 4.0) / 6.4).clamp(0.0, 1.0);
+                let mut h = 0.34 - t * 0.22;
+                // Past the bowl the ground rises, so the bowl is the low point.
+                if x > 4.15 {
+                    h = h.max(0.20);
+                }
+                let dx = x - 3.15;
+                let r = (dx * dx + z * z).sqrt() / 1.15;
+                if r < 1.0 {
+                    h -= (1.0 - r).powf(1.45) * 0.20;
+                }
+                let idx = j * res + i;
+                soil.height[idx] = h;
+                soil.initial_height[idx] = h;
+                soil.water[idx] = 0.0;
+                soil.wetness[idx] = 0.22;
+                soil.base_wetness[idx] = 0.22;
+                soil.loose[idx] = 0.0;
+                soil.darken[idx] = 0.05;
+                soil.roughness[idx] = 0.9;
+                soil.rest[idx] = PASS_GAP + 1.0;
+                soil.passes[idx] = 0;
+            }
+        }
+        soil.roll_pass(Vec3::new(-3.7, 0.0, 0.0), Vec3::X, 6.3, 0.09, 0.0);
+        // The tire crosses the lip. Put the bowl back under the groove so the
+        // pool has a bed the rut drains into.
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let dx = x - 3.15;
+                let r = (dx * dx + z * z).sqrt() / 1.15;
+                if r < 1.0 {
+                    let t = ((x + 4.0) / 6.4).clamp(0.0, 1.0);
+                    let bed = 0.34 - t * 0.22 - (1.0 - r).powf(1.45) * 0.20;
+                    let idx = j * res + i;
+                    if soil.height[idx] > bed {
+                        soil.height[idx] = bed;
+                        soil.initial_height[idx] = bed;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slosh_drains_downhill_inside_the_rut() {
+        let mut soil = SoilField::flat(0.22);
+        lay_sloping_rut(&mut soil);
+        let res = soil.res;
+        let half = soil.size * 0.5;
+        let cell = soil.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let rut = soil.initial_height[idx] - soil.height[idx];
+                // Standing water in the upper and middle groove, not in the bowl.
+                if rut > 0.025 && (-3.4..1.7).contains(&x) && z.abs() < 0.35 {
+                    soil.water[idx] = 0.05;
+                    soil.wetness[idx] = 1.0;
+                }
+            }
+        }
+        let stored = water_sum(&soil);
+        assert!(stored > 1.0, "rut was not filled, sum {stored:.3}");
+
+        // A tire drives downhill through the film and shoves it around.
+        let mut x = -3.2_f32;
+        while x < 1.5 {
+            soil.displace_water(x, 0.0, Vec3::X, 0.025);
+            x += cell * 0.7;
+        }
+        let after_slosh = water_sum(&soil);
+        let high_idx = soil.idx_at(-2.6, 0.0).expect("high cell");
+        let high_after_slosh = soil.water[high_idx];
+        eprintln!(
+            "slosh high {high_after_slosh:.4}  volume {stored:.3} -> {after_slosh:.3}"
+        );
+        assert!(
+            high_after_slosh > 0.012,
+            "the tire emptied the high end before the water could drain, depth {high_after_slosh:.4}"
+        );
+
+        soil.age_water(5.0);
+        let mut pool_idx = high_idx;
+        let mut pool_bed = f32::MAX;
+        let mut high_vol = 0.0_f32;
+        let mut low_vol = 0.0_f32;
+        let mut side_vol = 0.0_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let w = soil.water[idx];
+                if x < 0.0 && z.abs() < 0.55 {
+                    high_vol += w;
+                }
+                if x > 2.3 && z.abs() < 1.4 {
+                    low_vol += w;
+                    if soil.height[idx] < pool_bed {
+                        pool_bed = soil.height[idx];
+                        pool_idx = idx;
+                    }
+                }
+                if z.abs() > 0.55 && x < 2.0 {
+                    side_vol += w;
+                }
+            }
+        }
+        let high = soil.water[high_idx];
+        let pool = soil.water[pool_idx];
+        let after = water_sum(&soil);
+        let high_bed = soil.height[high_idx];
+        let pool_surface = soil.height[pool_idx] + pool;
+        eprintln!(
+            "drained high {high:.4} (bed {high_bed:.3}) pool {pool:.4} surface {pool_surface:.3}  \
+             high_vol {high_vol:.3} low_vol {low_vol:.3} side {side_vol:.3}  volume {after_slosh:.3} -> {after:.3}"
+        );
+        assert!(
+            high < 0.004,
+            "high end of the rut did not dry, depth {high:.4}"
+        );
+        assert!(
+            pool > 0.04,
+            "low end did not hold the water, depth {pool:.4}"
+        );
+        assert!(
+            high_bed > pool_surface + 0.02,
+            "pool climbed the rut: bed {high_bed:.3} surface {pool_surface:.3}"
+        );
+        assert!(
+            high_vol < after * 0.08,
+            "water stayed as a sheet up the rut, high sum {high_vol:.3} of {after:.3}"
+        );
+        assert!(
+            low_vol > after * 0.75,
+            "water did not pool at the bottom, low sum {low_vol:.3} of {after:.3}"
+        );
+        assert!(
+            side_vol < pool,
+            "water left the rut onto the bank: side {side_vol:.3} pool cell {pool:.3}"
+        );
+        assert!(soil.water.iter().all(|w| *w >= 0.0 && w.is_finite()));
+        let drift = (after - after_slosh).abs();
+        assert!(
+            drift < after_slosh * 0.005 + 1.0e-3,
+            "water step did not conserve volume: {after_slosh:.4} -> {after:.4}"
         );
     }
 
