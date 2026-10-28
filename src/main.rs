@@ -2,7 +2,9 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod cc0;
 mod mesh;
+mod picture;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,6 +15,7 @@ use std::time::Instant;
 use web_time::Instant;
 
 use glam::Vec3;
+use silt::course;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -222,7 +225,19 @@ impl App {
         surface.configure(&device, &config);
         let name = adapter.get_info().name;
         let formats = render::gpu_formats(&adapter);
-        let mut renderer = Renderer::new(device, queue, name, config.width, config.height, formats);
+        eprintln!("loading course ground and the Niva");
+        let scene = cc0::load();
+        let picture = picture::load();
+        let mut renderer = Renderer::new(
+            device,
+            queue,
+            name,
+            config.width,
+            config.height,
+            formats,
+            scene,
+            picture,
+        );
         renderer.set_present_format(format);
         self.window = Some(window);
         self.surface = Some(surface);
@@ -268,9 +283,10 @@ impl App {
             let buggy_input = if self.player_drove && !self.drive_bike {
                 self.keys.input(self.world.vehicle.speed())
             } else {
-                demo_drive(&self.world)
+                let v = &self.world.vehicle;
+                course::drive(v.pos, v.yaw, v.speed())
             };
-            self.world.step_bike(step, &bike_input);
+            let _ = bike_input;
             self.world.step(step, &buggy_input);
             self.acc -= step;
         }
@@ -288,11 +304,7 @@ impl App {
         let pose = if self.chase_cam {
             chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
         } else {
-            demo_camera(
-                self.world.time,
-                self.world.vehicle.pos,
-                self.world.vehicle.yaw,
-            )
+            track_iso_camera()
         };
         let pose = lift_camera(&self.world, pose);
         let frame = match surface.get_current_texture() {
@@ -373,6 +385,92 @@ fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
     }
 }
 
+fn track_iso_camera() -> CameraPose {
+    // Oblique daylight. Close enough that the ribbon fills the frame,
+    // high enough that the whole lap, the hole and the whoops are in it.
+    CameraPose {
+        eye: Vec3::new(0.0, 17.5, -40.0),
+        target: Vec3::new(0.2, 4.2, 1.0),
+        ortho_width: None,
+    }
+}
+
+fn track_rut_camera(world: &World) -> CameraPose {
+    let (x, z, yaw) = course::hero();
+    let h = world.soil.sample(x, z).height;
+    let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+    let eye = Vec3::new(x, h + 1.85, z) + right * 4.8 - fwd * 3.4;
+    let target = Vec3::new(x, h + 0.65, z) + fwd * 1.4;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+fn track_puddle_camera(world: &World) -> CameraPose {
+    let (x, z) = course::hole_center();
+    let bed = world.soil.sample(x, z).height;
+    let away = Vec3::new(x - 0.2, 0.0, z - 0.6);
+    let out = if away.length() > 0.2 {
+        away.normalize()
+    } else {
+        Vec3::X
+    };
+    // Step out of the bowl. The lip is the first ground that sits above the water.
+    let mut lip_x = x + out.x * 6.5;
+    let mut lip_z = z + out.z * 6.5;
+    let mut lip_h = world.soil.sample(lip_x, lip_z).height;
+    for k in 1..16 {
+        let d = 2.2 + k as f32 * 0.4;
+        let sx = x + out.x * d;
+        let sz = z + out.z * d;
+        let sh = world.soil.sample(sx, sz).height;
+        lip_x = sx;
+        lip_z = sz;
+        lip_h = sh;
+        if sh > bed + 0.45 {
+            break;
+        }
+    }
+    CameraPose {
+        // Across the near bank, wide enough that the whole rim is the shoreline.
+        eye: Vec3::new(lip_x, lip_h + 2.05, lip_z) + out * 2.6,
+        target: Vec3::new(x, bed + 0.12, z),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_track(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    let world = World::course();
+    let iso = PathBuf::from(format!("{MEDIA}/track-iso.png"));
+    let rut = PathBuf::from(format!("{MEDIA}/track-rut.png"));
+    let puddle = PathBuf::from(format!("{MEDIA}/track-puddle.png"));
+    println!(
+        "track niva ({:.2}, {:.2}) yaw {:.2}",
+        world.vehicle.pos.x, world.vehicle.pos.z, world.vehicle.yaw
+    );
+    write_cc0_still(renderer, &world, "track-iso", &iso, parsed, track_iso_camera());
+    write_cc0_still(
+        renderer,
+        &world,
+        "track-rut",
+        &rut,
+        parsed,
+        track_rut_camera(&world),
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "track-puddle",
+        &puddle,
+        parsed,
+        track_puddle_camera(&world),
+    );
+}
+
 fn lift_camera(world: &World, mut pose: CameraPose) -> CameraPose {
     let h = world.soil.sample(pose.eye.x, pose.eye.z).height;
     // Clearance stays small so the rut still can sit just above the soil.
@@ -390,7 +488,7 @@ fn run_window() {
         surface: None,
         config: None,
         renderer: None,
-        world: World::demo(),
+        world: World::course(),
         keys: Keys {
             throttle: false,
             reverse: false,
@@ -430,10 +528,15 @@ struct CaptureArgs {
     fps: u32,
     seconds: f32,
     stills_only: bool,
+    cc0: bool,
+    track: bool,
     video: PathBuf,
     still_start: PathBuf,
     still_puddle: PathBuf,
     still_ruts: PathBuf,
+    cc0_iso: PathBuf,
+    cc0_tire: PathBuf,
+    cc0_puddle: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -444,6 +547,9 @@ fn capture(args: &[String]) {
     }
     let (_instance, adapter, device, queue) = open_adapter(parsed.software, None);
     let formats = render::gpu_formats(&adapter);
+    eprintln!("loading course ground and the Niva");
+    let scene = cc0::load();
+    let picture = picture::load();
     let mut renderer = Renderer::new(
         device,
         queue,
@@ -451,7 +557,17 @@ fn capture(args: &[String]) {
         parsed.width,
         parsed.height,
         formats,
+        scene,
+        picture,
     );
+    if parsed.track {
+        capture_track(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.cc0 {
+        capture_cc0(&mut renderer, &parsed);
+        return;
+    }
     let mut world = World::demo();
     let frames = (parsed.seconds * parsed.fps as f32).round() as u32;
     let steps = (60.0 / parsed.fps as f32).round().max(1.0) as u32;
@@ -584,10 +700,15 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut fps = 30u32;
     let mut seconds = 12.0f32;
     let mut stills_only = false;
+    let mut cc0 = false;
+    let mut track = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
     let mut still_ruts = PathBuf::from(format!("{MEDIA}/mud-demo-ruts.png"));
+    let mut cc0_iso = PathBuf::from(format!("{MEDIA}/cc0-iso.png"));
+    let mut cc0_tire = PathBuf::from(format!("{MEDIA}/cc0-tire.png"));
+    let mut cc0_puddle = PathBuf::from(format!("{MEDIA}/cc0-puddle.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -604,6 +725,11 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--fps" => fps = val(&mut i).parse().expect("fps"),
             "--seconds" => seconds = val(&mut i).parse().expect("seconds"),
             "--stills-only" => stills_only = true,
+            "--cc0" => cc0 = true,
+            "--track" => track = true,
+            "--cc0-iso" => cc0_iso = PathBuf::from(val(&mut i)),
+            "--cc0-tire" => cc0_tire = PathBuf::from(val(&mut i)),
+            "--cc0-puddle" => cc0_puddle = PathBuf::from(val(&mut i)),
             "--video" => video = PathBuf::from(val(&mut i)),
             "--still-start" => still_start = PathBuf::from(val(&mut i)),
             "--still-puddle" => still_puddle = PathBuf::from(val(&mut i)),
@@ -620,10 +746,224 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         fps,
         seconds,
         stills_only,
+        cc0,
+        track,
         video,
         still_start,
         still_puddle,
         still_ruts,
+        cc0_iso,
+        cc0_tire,
+        cc0_puddle,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_cc0(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    let mut world = World::demo();
+    let dt = 1.0 / 60.0;
+    let steps = (12.0f32 / dt).round() as u32;
+    println!("cc0 drive {steps} steps");
+    let mut iso_done = false;
+    for _ in 0..steps {
+        let bike = demo_drive_bike(&world);
+        world.step_bike(dt, &bike);
+        let input = demo_drive(&world);
+        world.step(dt, &input);
+        if !iso_done && world.time >= 3.2 {
+            write_cc0_still(renderer, &world, "iso", &parsed.cc0_iso, parsed, cc0_iso_camera());
+            // Same moment: the tires are on the lane, not buried in the north pond.
+            write_cc0_still(
+                renderer,
+                &world,
+                "tire",
+                &parsed.cc0_tire,
+                parsed,
+                cc0_tire_camera(&world),
+            );
+            iso_done = true;
+        }
+    }
+    if !iso_done {
+        write_cc0_still(renderer, &world, "iso", &parsed.cc0_iso, parsed, cc0_iso_camera());
+        write_cc0_still(
+            renderer,
+            &world,
+            "tire",
+            &parsed.cc0_tire,
+            parsed,
+            cc0_tire_camera(&world),
+        );
+    }
+    println!(
+        "cc0 t={:.2} pos=({:.2},{:.2}) yaw={:.2} rut={:.3}",
+        world.time,
+        world.vehicle.pos.x,
+        world.vehicle.pos.z,
+        world.vehicle.yaw,
+        world.soil.max_rut_depth()
+    );
+    write_cc0_still(
+        renderer,
+        &world,
+        "puddle",
+        &parsed.cc0_puddle,
+        parsed,
+        cc0_puddle_camera(&world),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_cc0_still(
+    renderer: &mut Renderer,
+    world: &World,
+    name: &str,
+    dest: &Path,
+    parsed: &CaptureArgs,
+    pose: CameraPose,
+) {
+    let pose = lift_camera(world, pose);
+    let rgba = renderer.draw(world, pose, None, true).expect("readback");
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(dest, parsed.width, parsed.height, &rgba).expect("cc0 still");
+    println!(
+        "cc0 {name} {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        dest.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cc0_iso_camera() -> CameraPose {
+    let target = Vec3::new(0.0, 0.55, 1.4);
+    let eye = target + Vec3::new(-16.8, 13.6, -15.0);
+    CameraPose {
+        eye,
+        target,
+        ortho_width: Some(36.0),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cc0_tire_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    // Rear tire: the tread blocks are larger. Sit outside the body, above the berm.
+    let local = vehicle.wheel_center_local(2);
+    let center = vehicle.pos + vehicle.orientation() * local;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Side-on, near hub height, so the tread blocks face the lens.
+    let mut eye = center - right * 0.92 - fwd * 0.16 + Vec3::Y * 0.05;
+    let h = world.soil.sample(eye.x, eye.z).height;
+    if eye.y < h + 0.06 {
+        eye.y = h + 0.06;
+    }
+    CameraPose {
+        eye,
+        target: center,
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cc0_puddle_camera(world: &World) -> CameraPose {
+    let (x, z, surface) = standing_rut(&world.soil, &world.vehicle, &world.bike, &world.particles);
+    // Clear the rut lips. A camera inside the groove looks at the underside of the mesh.
+    let crown = |x: f32, z: f32| -> f32 {
+        let mut h = world.soil.sample(x, z).height;
+        for (dx, dz) in [
+            (0.8, 0.0),
+            (-0.8, 0.0),
+            (0.0, 0.8),
+            (0.0, -0.8),
+            (1.4, 0.0),
+            (-1.4, 0.0),
+            (0.0, 1.4),
+            (0.0, -1.4),
+        ] {
+            h = h.max(world.soil.sample(x + dx, z + dz).height);
+        }
+        h
+    };
+    // Steep look down into the groove. A low angle hits the rut lip and the buggy.
+    let mut eye = Vec3::new(x + 0.42, 0.0, z - 0.62);
+    eye.y = crown(x, z).max(crown(eye.x, eye.z)) + 1.85;
+    CameraPose {
+        eye,
+        target: Vec3::new(x, surface + 0.02, z),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn standing_rut(
+    soil: &silt::soil::SoilField,
+    vehicle: &silt::vehicle::Vehicle,
+    bike: &silt::bike::Bike,
+    particles: &silt::particles::Particles,
+) -> (f32, f32, f32) {
+    let res = soil.res;
+    let clear_of = |x: f32, z: f32, min_d: f32| -> bool {
+        let dv = (x - vehicle.pos.x).hypot(z - vehicle.pos.z);
+        let db = (x - bike.pos.x).hypot(z - bike.pos.z);
+        dv >= min_d && db >= min_d
+    };
+    let pick = |min_d: f32, min_water: f32, min_rut: f32| -> Option<(f32, f32, f32, f32)> {
+        let mut best_score = -1.0f32;
+        let mut best = None;
+        for j in 1..res - 1 {
+            for i in 1..res - 1 {
+                let idx = j * res + i;
+                let water = soil.water[idx];
+                let rut = (soil.initial_height[idx] - soil.height[idx]).max(0.0);
+                if water < min_water || rut < min_rut {
+                    continue;
+                }
+                let x = (i as f32 + 0.5) * soil.cell - soil.size * 0.5;
+                let z = (j as f32 + 0.5) * soil.cell - soil.size * 0.5;
+                if !clear_of(x, z, min_d) {
+                    continue;
+                }
+                let mut pond = 0.0f32;
+                for dj in -2isize..=2 {
+                    for di in -2isize..=2 {
+                        let n = ((j as isize + dj) as usize) * res + (i as isize + di) as usize;
+                        if soil.water[n] > 0.015 {
+                            pond += 1.0;
+                        }
+                    }
+                }
+                let mut clods = 0.0f32;
+                for p in &particles.items {
+                    if p.alive && (p.pos.x - x).hypot(p.pos.z - z) < 1.2 {
+                        clods += 1.0;
+                    }
+                }
+                let score = water * 3.2 + rut * 1.6 + pond * 0.045 - clods * 0.55;
+                if score > best_score {
+                    best_score = score;
+                    best = Some((x, z, soil.height[idx] + water.min(0.06) * 0.2, score));
+                }
+            }
+        }
+        best
+    };
+    if let Some((x, z, y, score)) = pick(5.5, 0.018, 0.01)
+        .or_else(|| pick(3.6, 0.015, 0.008))
+        .or_else(|| pick(2.2, 0.012, 0.006))
+    {
+        println!("cc0 puddle score={score:.3} at ({x:.2},{z:.2})");
+        (x, z, y)
+    } else {
+        println!("cc0 puddle fallback");
+        (1.15, 9.25, 0.04)
     }
 }
 
@@ -782,6 +1122,9 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
     };
     surface.configure(&device, &config);
     let formats = render::gpu_formats(&adapter);
+    set_web_status("грунт…");
+    let scene = cc0::load().await;
+    let picture = picture::load();
     let mut renderer = Renderer::new(
         device,
         queue,
@@ -789,6 +1132,8 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
         config.width,
         config.height,
         formats,
+        scene,
+        picture,
     );
     renderer.set_present_format(format);
     Ok(WebGpu {

@@ -52,7 +52,7 @@ pub struct CpuMesh {
 }
 
 impl CpuMesh {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -746,8 +746,8 @@ fn hash(n: u32) -> f32 {
 fn add_horizon(mesh: &mut CpuMesh) {
     let segs = 72usize;
     let rings = 7usize;
-    let r0 = 26.0;
-    let r1 = 58.0;
+    let r0 = 48.0;
+    let r1 = 86.0;
     let mut crest = vec![0.0_f32; segs];
     for i in 0..segs {
         let a = hash(i as u32 * 17 + 3);
@@ -792,8 +792,8 @@ pub fn environment_mesh() -> CpuMesh {
     let mut m = CpuMesh::new();
     let y = -0.02;
     // Skirt outside the 40 m heightfield so the world does not end in a void.
-    let far = 78.0;
-    let edge = 20.0;
+    let far = 96.0;
+    let edge = 31.6;
     add_quad(
         &mut m,
         [
@@ -836,39 +836,9 @@ pub fn environment_mesh() -> CpuMesh {
     );
 
     // Low rolling silhouette. The inner ring is tucked into the skirt so it
-    // sits on the ground instead of floating as boxes.
+    // sits on the ground instead of floating as boxes. Trees, rocks and grass
+    // are the Gobkit meshes placed around the oval.
     add_horizon(&mut m);
-
-    let trees = [
-        Vec3::new(-16.0, 0.0, 14.0),
-        Vec3::new(18.0, 0.0, -16.0),
-        Vec3::new(14.0, 0.0, 16.0),
-        Vec3::new(-18.0, 0.0, -11.0),
-        Vec3::new(20.0, 0.0, 6.0),
-    ];
-    for (k, p) in trees.iter().enumerate() {
-        let trunk_h = 1.35 + hash(20 + k as u32) * 0.7;
-        add_tube(&mut m, *p, *p + Vec3::Y * trunk_h, 0.09, PANEL_TRUNK, 6);
-        // Stacked cones so the crown has volume instead of a flat card.
-        let layers = [
-            (trunk_h * 0.42, 1.25, 1.45),
-            (trunk_h * 0.85, 1.0, 1.2),
-            (trunk_h * 1.25, 0.72, 0.95),
-        ];
-        for (i, (y, radius, height)) in layers.iter().enumerate() {
-            let j = hash(40 + k as u32 * 3 + i as u32);
-            let jx = (j - 0.5) * 0.2;
-            let jz = (hash(90 + k as u32 * 3 + i as u32) - 0.5) * 0.2;
-            add_cone(
-                &mut m,
-                *p + Vec3::new(jx, *y, jz),
-                *height,
-                *radius * (0.9 + j * 0.2),
-                PANEL_TREE,
-                6,
-            );
-        }
-    }
     m
 }
 

@@ -5,6 +5,7 @@
 //! shear and a Bingham-like drag. Rendering lives in the `silt` binary.
 
 pub mod bike;
+pub mod course;
 pub mod particles;
 pub mod soil;
 pub mod vehicle;

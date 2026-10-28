@@ -188,6 +188,61 @@ impl World {
         world
     }
 
+    /// Niva parked in the slope ruts of the motocross course. The bike is off the map.
+    /// Authored water is put back after the settle so the pond stays a pond.
+    pub fn course() -> Self {
+        let mut world = Self {
+            soil: crate::course::field(),
+            vehicle: crate::vehicle::Vehicle::new(),
+            bike: crate::bike::Bike::new(),
+            particles: Particles::new(),
+            time: 0.0,
+            telemetry: Telemetry {
+                min_speed_in_soft: 99.0,
+                ..Telemetry::default()
+            },
+            drip_acc: 0.0,
+            crest_armed: false,
+            air_time: 0.0,
+            impact_latched: false,
+            did_launch: false,
+        };
+        let (x, z, yaw) = crate::course::hero();
+        world.vehicle.pos = Vec3::new(x, 0.0, z);
+        world.vehicle.yaw = yaw;
+        world.vehicle.vel = Vec3::ZERO;
+        world.place_on_soil();
+        world.bike.pos = Vec3::new(180.0, -12.0, 180.0);
+        world.bike.vel = Vec3::ZERO;
+        let water = world.soil.water.clone();
+        let wet = world.soil.wetness.clone();
+        let base = world.soil.base_wetness.clone();
+        let held = Input {
+            throttle: 0.0,
+            brake: 1.0,
+            steer: 0.0,
+        };
+        for _ in 0..40 {
+            world.step(1.0 / 60.0, &held);
+        }
+        world.soil.water = water;
+        world.soil.wetness = wet;
+        world.soil.base_wetness = base;
+        world.vehicle.vel = Vec3::ZERO;
+        world.vehicle.yaw_rate = 0.0;
+        world.vehicle.pitch_rate = 0.0;
+        world.vehicle.roll_rate = 0.0;
+        world.vehicle.clear_loose_mud();
+        world.particles.clear();
+        world.time = 0.0;
+        world.telemetry = Telemetry {
+            min_speed_in_soft: 99.0,
+            ..Telemetry::default()
+        };
+        world.drip_acc = 0.0;
+        world
+    }
+
     fn place_on_soil(&mut self) {
         let sample = self.soil.sample(self.vehicle.pos.x, self.vehicle.pos.z);
         // CG about half a metre above undisturbed ground before the springs settle.
