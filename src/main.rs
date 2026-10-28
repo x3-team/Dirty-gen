@@ -1326,7 +1326,8 @@ fn reveal_spoil(world: &mut World, wheel: usize) {
             }
             let idx = j as usize * soil.res + i as usize;
             let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
-            if depth > 0.01 && soil.placed[idx] > 0.012 {
+            // Only the thick ridge. A thin smear of placed soil was the flat sheet.
+            if depth > 0.02 && soil.placed[idx] > 0.025 {
                 soil.tread_amp[idx] = 0.0;
                 soil.kind[idx] = SurfaceKind::PlacedClod as u8;
             }
@@ -1433,10 +1434,18 @@ fn niva_shed_camera(world: &World, wheel: usize) -> CameraPose {
         .height;
     // Across the rut, above the lip, so the ridge's side is the subject.
     // In the empty rut beyond the pile, looking back at the step.
-    let look = Vec3::new(pile.x, pile.y, pile.z);
-    let eye = pile - fwd * 0.46 + right * side * 0.22;
-    let eye = Vec3::new(eye.x, lip + 0.22, eye.z);
-    let ortho = 0.38;
+    // Three-quarter, above the lip. The old eye sat on the rut wall and
+    // the ridge smeared into the grazing mip.
+    // Past the tail, looking back down into the rut. High enough that the
+    // ridge face is a step under the lip, not a grazing tile.
+    // Across the rut. Looking back along the car put a body panel in frame
+    // and it read as a flat card. The car stays out of this frustum.
+    // Far enough that the mud grain stays sharp, close enough that the
+    // ridge's step under the lip is the subject.
+    let look = Vec3::new(pile.x, lip - 0.025, pile.z);
+    let eye = pile - fwd * 0.32 + right * side * 0.52;
+    let eye = Vec3::new(eye.x, lip + 0.68, eye.z);
+    let ortho = 0.92;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
@@ -1444,19 +1453,19 @@ fn niva_shed_camera(world: &World, wheel: usize) -> CameraPose {
     }
 }
 
-/// Tallest coat on the center of the rut behind this tire.
+/// Middle of the shed ridge, not the single cell at the tail.
+/// The tail bilinear-ramps to empty rut and reads as a flat card.
 #[cfg(not(target_arch = "wasm32"))]
 fn spoil_focus(world: &World, _wheel: usize, center: Vec3, fwd: Vec3, right: Vec3) -> Vec3 {
     let soil = &world.soil;
     let half = soil.size * 0.5;
-    let mut best = center - fwd * 0.7;
-    let mut best_h = -1.0_f32;
     let res = soil.res as isize;
     let reach = 4.2_f32;
     let i0 = (((center.x - reach) + half) / soil.cell).floor() as isize;
     let i1 = (((center.x + reach) + half) / soil.cell).floor() as isize;
     let j0 = (((center.z - reach) + half) / soil.cell).floor() as isize;
     let j1 = (((center.z + reach) + half) / soil.cell).floor() as isize;
+    let mut piled: Vec<(f32, f32, Vec3)> = Vec::new();
     for j in j0.max(0)..j1.min(res - 1) {
         for i in i0.max(0)..i1.min(res - 1) {
             let cx = (i as f32 + 0.5) * soil.cell - half;
@@ -1466,16 +1475,30 @@ fn spoil_focus(world: &World, _wheel: usize, center: Vec3, fwd: Vec3, right: Vec
             let along = rel_x * fwd.x + rel_z * fwd.z;
             let lat = rel_x * right.x + rel_z * right.z;
             let behind = -along;
-            if !(1.05..=3.6).contains(&behind) || lat.abs() > 0.22 {
+            if !(1.2..=3.4).contains(&behind) || lat.abs() > 0.16 {
                 continue;
             }
             let idx = j as usize * soil.res + i as usize;
             let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
-            // The tail of the pile, where the empty rut meets the spoil.
-            if depth > 0.01 && soil.placed[idx] > 0.018 && behind > best_h {
-                best_h = behind;
-                best = Vec3::new(cx, soil.height[idx], cz);
+            let placed = soil.placed[idx];
+            if depth > 0.02 && placed > 0.02 {
+                piled.push((behind, placed, Vec3::new(cx, soil.height[idx], cz)));
             }
+        }
+    }
+    if piled.is_empty() {
+        return center - fwd * 1.6;
+    }
+    let min_b = piled.iter().map(|c| c.0).fold(f32::MAX, f32::min);
+    let max_b = piled.iter().map(|c| c.0).fold(0.0_f32, f32::max);
+    let mid = (min_b + max_b) * 0.5;
+    let mut best = piled[0].2;
+    let mut best_s = f32::MAX;
+    for (behind, placed, pos) in &piled {
+        let score = (behind - mid).abs() + (placed - 0.033).abs() * 8.0;
+        if score < best_s {
+            best_s = score;
+            best = *pos;
         }
     }
     best
@@ -1649,9 +1672,9 @@ fn niva_sink_side_camera(world: &World) -> CameraPose {
     let fwd = world.vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
     let ground = world.soil.sample(p.x + right.x * 1.6, p.z + right.z * 1.6).height;
-    let look = Vec3::new(p.x, ground + 0.50, p.z) - fwd * 0.05;
-    let eye = look + right * 2.7 + Vec3::Y * 0.95;
-    let ortho = 3.55;
+    let look = Vec3::new(p.x, ground + 0.16, p.z);
+    let eye = look + right * 2.75 + fwd * 0.28 + Vec3::Y * 0.48;
+    let ortho = 3.05;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
@@ -1671,9 +1694,12 @@ fn niva_sink_front_camera(world: &World) -> CameraPose {
         .height;
     // In front and above, looking down onto the tread. The old eye sat in
     // the ortho slice, so the bottom of the frame was the clear color.
-    let look = Vec3::new(axle.x, ground + 0.06, axle.z);
-    let eye = look + fwd * 2.15 + right * 0.28 + Vec3::Y * 0.62;
-    let ortho = 1.9;
+    // Above the bumper, so the buried tread is in frame and the carcass
+    // is not cropped on the mud.
+    // The contact sits in the frame, with ground in front of both tires.
+    let look = Vec3::new(axle.x, ground - 0.08, axle.z - 0.12);
+    let eye = look + fwd * 2.15 + right * 0.06 + Vec3::Y * 0.72;
+    let ortho = 2.15;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
@@ -1684,12 +1710,12 @@ fn niva_sink_front_camera(world: &World) -> CameraPose {
 #[cfg(not(target_arch = "wasm32"))]
 fn niva_imprint_top_camera(world: &World, spot: Vec3) -> CameraPose {
     let h = world.soil.sample(spot.x, spot.z).height;
-    let look = Vec3::new(spot.x, h + 0.02, spot.z);
-    // Off vertical. A straight-down look is parallel to the camera up axis.
+    let look = Vec3::new(spot.x, h + 0.01, spot.z);
+    // Along one rut, off vertical. A straight-down look is parallel to up.
     CameraPose {
-        eye: look + Vec3::new(0.16, 1.35, -0.62),
+        eye: look + Vec3::new(0.34, 2.55, -0.46),
         target: look,
-        ortho_width: Some(0.92),
+        ortho_width: Some(1.18),
     }
 }
 
@@ -1699,9 +1725,9 @@ fn niva_imprint_side_camera(world: &World, spot: Vec3) -> CameraPose {
     let lip = world.soil.sample(spot.x + 0.85, spot.z).height.max(h);
     // Beside the rut and above the lip, along the lug row. The tire stays
     // out of frame, and the eye stays off the underside of the mesh.
-    let look = Vec3::new(spot.x, h + 0.01, spot.z + 0.22);
-    let eye = Vec3::new(spot.x + 0.62, lip + 0.38, spot.z - 0.72);
-    let ortho = 0.92;
+    let look = Vec3::new(spot.x, h + 0.01, spot.z + 0.12);
+    let eye = Vec3::new(spot.x + 0.58, lip + 0.92, spot.z - 0.40);
+    let ortho = 1.02;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,

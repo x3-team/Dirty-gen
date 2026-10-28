@@ -231,8 +231,8 @@ fn cell_center(ij: vec2<i32>) -> vec2<f32> {
     return vec2<f32>((f32(ij.x) + 0.5) * cell - half, (f32(ij.y) + 0.5) * cell - half);
 }
 
-// Lug blocks pressed into the mud. Grooves stay at the rut floor.
-// This is the stored contact, not a blur across the cell.
+// One pressed track. A shallow ribbon ties the lugs into the rut floor,
+// and each lug is a deeper void in that ribbon. Stored amplitude is unchanged.
 fn tread_delta(xz: vec2<f32>) -> f32 {
     let ij = vec2<i32>(round(world_to_ij(xz)));
     let rec = imprint_at(ij);
@@ -250,13 +250,18 @@ fn tread_delta(xz: vec2<f32>) -> f32 {
     let u = fract(along / pitch);
     let row = select(0.0, 0.5, lat > 0.0);
     let lug = abs(fract(u + row) - 0.5);
-    let block = 1.0 - smoothstep(0.22, 0.34, lug);
-    let band = smoothstep(0.006, 0.022, abs(lat)) * (1.0 - smoothstep(0.11, 0.16, abs(lat)));
-    return -amp * block * band;
+    // Visual crown, not the wider physics lane. The edge fades into the rut.
+    // One groove the width of the crown. The lugs bite deeper into that floor
+    // so the print stays a track when the tire has moved on.
+    let ribbon = 1.0 - smoothstep(0.088, 0.142, abs(lat));
+    let block = 1.0 - smoothstep(0.11, 0.36, lug);
+    let floor = ribbon * 0.46;
+    return -amp * max(floor, block * ribbon);
 }
 
 // x = patch weight, y = carcass underside, z = hide the square stamp.
-// The bowl stays on the rubber. A wider shelf was cutting the sidewall.
+// The bowl follows the circle across the contact, then fades at the crown
+// so it does not cut a shelf through the sidewall.
 fn tire_contact(xz: vec2<f32>, a: vec4<f32>, b: vec4<f32>) -> vec3<f32> {
     if (b.w < 0.5) {
         return vec3<f32>(0.0, 0.0, 0.0);
@@ -264,65 +269,59 @@ fn tire_contact(xz: vec2<f32>, a: vec4<f32>, b: vec4<f32>) -> vec3<f32> {
     let center = a.xyz;
     let radius = max(a.w, 0.05);
     let fwd = vec2<f32>(b.x, b.y);
-    let fl = length(fwd);
-    let fwd_n = fwd / max(fl, 1e-4);
+    let fwd_n = fwd / max(length(fwd), 1e-4);
     let rel = xz - center.xz;
     let along = dot(rel, fwd_n);
     let lat = length(rel - fwd_n * along);
-    let chord = sqrt(max(2.0 * radius * max(b.z, 0.004) - b.z * b.z, 0.0));
-    let reach = max(chord, 0.06);
-    // Visual crown. The physics lane is wider and reads as a square pit.
-    let half_w = 0.112;
-    let along_n = abs(along) / reach;
-    let lat_n = lat / half_w;
+    let sink = max(b.z, 0.004);
+    let chord = sqrt(max(2.0 * radius * sink - sink * sink, 0.0));
+    let reach = max(chord, 0.08);
+    let half_w = 0.102;
+    let ell = length(vec2<f32>(along / reach, lat / half_w));
     var weight = 0.0;
     var underside = center.y - radius;
-    if (along_n < 1.2 && lat_n < 1.2) {
+    if (ell < 1.25) {
         let radial2 = radius * radius - along * along;
-        if (radial2 > 0.01) {
-            underside = center.y - sqrt(radial2) - 0.0015;
+        if (radial2 > 0.002) {
+            underside = center.y - sqrt(radial2) - 0.002;
             let rise = underside - (center.y - radius);
-            // The mud stays on the patch. Climbing the circle cut a card
-            // through the sidewall.
-            let crown = 1.0 - smoothstep(0.010, 0.040, rise);
-            weight = (1.0 - smoothstep(0.35, 0.98, along_n))
-                * (1.0 - smoothstep(0.58, 1.02, lat_n))
-                * crown;
+            let buried = 1.0 - smoothstep(sink * 0.72, sink * 1.15, rise);
+            // Full depth across the crown, then a short wall up to the lip
+            // so the mud meets the rubber instead of leaving a moat.
+            weight = (1.0 - smoothstep(0.78, 1.04, ell)) * buried;
         }
     }
-    // Tuck the lane rectangle back to the lip while the tire is on it.
-    // Leave the rut behind the contact: that is where the tread negative sits.
-    let ahead = 1.0 - smoothstep(0.30, 0.52, along);
-    let not_behind = 1.0 - smoothstep(0.04, 0.18, -along);
-    let across = 1.0 - smoothstep(0.16, 0.46, lat);
-    let closure = ahead * not_behind * across * (1.0 - smoothstep(0.12, 0.5, weight));
+    // Hide the stamp and the berms beside the rubber. The rut further
+    // behind stays, so the pressed track is still there after the pass.
+    let ahead = 1.0 - smoothstep(0.22, 0.72, along);
+    let not_behind = 1.0 - smoothstep(0.10, 0.55, -along);
+    let across = 1.0 - smoothstep(0.12, 0.55, lat);
+    let closure = ahead * not_behind * across * (1.0 - weight);
     return vec3<f32>(clamp(weight, 0.0, 1.0), underside, clamp(closure, 0.0, 1.0));
 }
 
-// x = seated height, y = how fully a tire owns this column, z = stamp closure.
-// Inside the patch the mud is the tread. The square cut around it is filled
-// back to the lip so it is not a pit the carcass floats over.
+// x = carcass underside of the strongest tire, y = weight, z = stamp closure.
 fn tire_seat(xz: vec2<f32>, base_h: f32) -> vec3<f32> {
-    var h = base_h;
+    var under = base_h;
     var w = 0.0;
     var close = 0.0;
     let c0 = tire_contact(xz, frame.tires[0], frame.tires[1]);
-    h = mix(h, c0.y, c0.x);
+    if (c0.x > w) { under = c0.y; }
     w = max(w, c0.x);
     close = max(close, c0.z);
     let c1 = tire_contact(xz, frame.tires[2], frame.tires[3]);
-    h = mix(h, c1.y, c1.x);
+    if (c1.x > w) { under = c1.y; }
     w = max(w, c1.x);
     close = max(close, c1.z);
     let c2 = tire_contact(xz, frame.tires[4], frame.tires[5]);
-    h = mix(h, c2.y, c2.x);
+    if (c2.x > w) { under = c2.y; }
     w = max(w, c2.x);
     close = max(close, c2.z);
     let c3 = tire_contact(xz, frame.tires[6], frame.tires[7]);
-    h = mix(h, c3.y, c3.x);
+    if (c3.x > w) { under = c3.y; }
     w = max(w, c3.x);
     close = max(close, c3.z);
-    return vec3<f32>(h, w, close);
+    return vec3<f32>(under, w, close);
 }
 
 // Metres the stamp added. Negative is soil the tire removed.
@@ -416,15 +415,58 @@ fn stamp_bilinear(xz: vec2<f32>) -> f32 {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
-// Fill the square lane back to the lip. The bed stamp stays in the field;
-// this is only the mesh under a live tire.
+// The sill sits between the hubs. Per-tire closure never reached it, so the
+// cut and the berms stayed as blocks and a hole under the body.
+fn body_cover(xz: vec2<f32>) -> f32 {
+    let live = frame.tires[1].w + frame.tires[3].w + frame.tires[5].w + frame.tires[7].w;
+    if (live < 0.5) {
+        return 0.0;
+    }
+    var minx = 1e9;
+    var maxx = -1e9;
+    var minz = 1e9;
+    var maxz = -1e9;
+    if (frame.tires[1].w > 0.5) {
+        minx = min(minx, frame.tires[0].x);
+        maxx = max(maxx, frame.tires[0].x);
+        minz = min(minz, frame.tires[0].z);
+        maxz = max(maxz, frame.tires[0].z);
+    }
+    if (frame.tires[3].w > 0.5) {
+        minx = min(minx, frame.tires[2].x);
+        maxx = max(maxx, frame.tires[2].x);
+        minz = min(minz, frame.tires[2].z);
+        maxz = max(maxz, frame.tires[2].z);
+    }
+    if (frame.tires[5].w > 0.5) {
+        minx = min(minx, frame.tires[4].x);
+        maxx = max(maxx, frame.tires[4].x);
+        minz = min(minz, frame.tires[4].z);
+        maxz = max(maxz, frame.tires[4].z);
+    }
+    if (frame.tires[7].w > 0.5) {
+        minx = min(minx, frame.tires[6].x);
+        maxx = max(maxx, frame.tires[6].x);
+        minz = min(minz, frame.tires[6].z);
+        maxz = max(maxz, frame.tires[6].z);
+    }
+    let dx = max(minx - 1.35 - xz.x, xz.x - (maxx + 1.35));
+    let dz = max(minz - 0.88 - xz.y, xz.y - (maxz + 0.88));
+    return 1.0 - smoothstep(0.0, 0.22, max(dx, dz));
+}
+
+// Put the pad back under the carcass. The stamp stays in the field.
+// x = drawn height, y = bowl weight, z = how fully this column is covered.
 fn apply_seat(xz: vec2<f32>, base_h: f32) -> vec3<f32> {
     let seated = tire_seat(xz, base_h);
-    if (seated.z <= 0.001) {
-        return seated;
+    let cover = max(seated.z, body_cover(xz));
+    if (cover < 0.001 && seated.y < 0.001) {
+        return vec3<f32>(base_h, 0.0, 0.0);
     }
-    let pre = base_h - min(stamp_bilinear(xz), 0.0);
-    return vec3<f32>(mix(seated.x, max(seated.x, pre), seated.z), seated.y, seated.z);
+    let pre = height_bilinear(xz) - stamp_bilinear(xz);
+    var h = mix(base_h, pre, cover);
+    h = mix(h, seated.x, seated.y);
+    return vec3<f32>(h, seated.y, cover);
 }
 
 // Same samples as height_bilinear, but the step sits in a short wall.
@@ -465,8 +507,20 @@ fn sample_h(xz: vec2<f32>, torn: bool) -> f32 {
     return height_bilinear(xz);
 }
 
+// The pressed track and the shed spoil are one surface. height_sharp turns
+// every 20 cm cell into a flat tile, which reads as loose boxes.
+fn track_near(xz: vec2<f32>) -> bool {
+    let ij = vec2<i32>(round(world_to_ij(xz)));
+    if (imprint_at(ij).a > 0.5) { return true; }
+    if (imprint_at(ij + vec2<i32>(1, 0)).a > 0.5) { return true; }
+    if (imprint_at(ij + vec2<i32>(-1, 0)).a > 0.5) { return true; }
+    if (imprint_at(ij + vec2<i32>(0, 1)).a > 0.5) { return true; }
+    if (imprint_at(ij + vec2<i32>(0, -1)).a > 0.5) { return true; }
+    return false;
+}
+
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
-    let torn = lip_near(xz);
+    let torn = lip_near(xz) && !track_near(xz);
     // Short step. A wider sample flattens a tyre-width cut into the lane slope.
     let e = max(frame.params.z * select(0.28, 0.16, torn), 0.04);
     let h_l = sample_h(xz - vec2<f32>(e, 0.0), torn);
@@ -516,7 +570,7 @@ fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
         let te = 0.025;
         let dx = tread_delta(xz + vec2<f32>(te, 0.0)) - tread_delta(xz - vec2<f32>(te, 0.0));
         let dz = tread_delta(xz + vec2<f32>(0.0, te)) - tread_delta(xz - vec2<f32>(0.0, te));
-        n = normalize(n + vec3<f32>(-dx, 0.0, -dz) * (0.5 / te));
+        n = normalize(n + vec3<f32>(-dx, 0.0, -dz) * (0.85 / te));
     }
     return n;
 }
@@ -545,6 +599,9 @@ fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
 }
 
 fn terrain_height(xz: vec2<f32>) -> f32 {
+    if (track_near(xz)) {
+        return height_bilinear(xz);
+    }
     // The lip is a step. Everywhere else stays bilinear so a berm is not a stair.
     if (lip_near(xz)) {
         return height_sharp(xz);
@@ -576,9 +633,12 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     let seated = apply_seat(in.xz, base);
     // Under the carcass the cylinder is the surface. The stored lugs show once the tire has left.
     // Closure is the lip beside the rubber, not another tread.
-    let on_tire = seated.y > 0.35 || seated.z > 0.45;
+    let on_tire = seated.y > 0.25 || seated.z > 0.40;
     let pattern = select(tread_delta(in.xz), 0.0, on_tire);
-    let h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - seated.y);
+    let quiet = clamp(max(seated.y, seated.z), 0.0, 1.0);
+    // The print and the spoil are the height. The gravel map was breaking them into tiles.
+    let calm = select(0.0, 1.0, track_near(in.xz));
+    let h = seated.x + pattern + (disp - 0.5) * disp_scale(kind) * (1.0 - quiet) * (1.0 - 0.85 * calm);
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -597,7 +657,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // as the pad, not as the clay card the stamp kind would leave there.
     let seat = apply_seat(xz, terrain_height(xz));
     var kind = kind_nearest(xz);
-    if (seat.z > 0.35 && seat.y < 0.3) {
+    if (seat.z > 0.22) {
         kind = 4u;
     }
 
@@ -645,7 +705,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     var ts = ntex * 2.0 - vec3<f32>(1.0);
     // Dry crust and gravel stay flatter. The torn lip keeps the mud normal.
     var n_gain = 1.0;
-    if (kind == 2u || kind == 3u || kind == 10u || kind == 11u) { n_gain = 0.28; }
+    if (track_near(xz)) { n_gain = 0.22; }
+    else if (kind == 2u || kind == 3u || kind == 10u || kind == 11u) { n_gain = 0.28; }
     else if (kind == 6u) { n_gain = 1.7; }
     else if (kind == 8u) { n_gain = 1.35; }
     else if (kind == 5u) { n_gain = 1.35; }
@@ -710,9 +771,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (kind == 10u) { rough_out = max(rough_out, 0.74); }
     if (kind == 11u) { rough_out = mix(rough_out, 0.2, smoothstep(0.35, 0.85, wet)); }
     let lug_h = tread_delta(xz);
-    if (lug_h < -0.004) {
-        let k = clamp(-lug_h / 0.028, 0.0, 1.0);
-        albedo = mix(albedo, albedo * vec3<f32>(0.38, 0.26, 0.18), 0.42 + 0.4 * k);
+    // A steep rut wall stretched in xz becomes one flat color. Sample the
+    // wall in the vertical plane so the ridge keeps the mud grain.
+    if (n.y < 0.42) {
+        let wall = textureSampleLevel(ground_diff, ground_samp, vec2<f32>(in.world.x + in.world.z, in.world.y) / 0.8, 0, 0.0).rgb;
+        albedo = mix(albedo, wall * vec3<f32>(0.62, 0.48, 0.36), 0.72);
+    }
+    if (lug_h < -0.003) {
+        let k = clamp(-lug_h / 0.045, 0.0, 1.0);
+        albedo *= mix(1.0, 0.52, k);
     }
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
