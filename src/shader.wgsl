@@ -238,6 +238,94 @@ fn stamp_bilinear(xz: vec2<f32>) -> f32 {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
+// Cells. Wide enough that a one-cell tyre lip becomes an S, narrow enough
+// that a flat rut floor stays within a few millimetres of the solver.
+const DRAW_SIGMA: f32 = 0.64;
+
+fn draw_gauss(d: f32) -> f32 {
+    let q = d / DRAW_SIGMA;
+    return exp(-0.5 * q * q);
+}
+
+struct DrawAxis {
+    w: array<f32, 5>,
+    dw: array<f32, 5>,
+};
+
+// Normalized gaussian and its derivative in index space. Radius 2 cells.
+// Kept in lockstep with `draw_axis` in mesh.rs tests.
+fn draw_axis(f: f32) -> DrawAxis {
+    var g: array<f32, 5>;
+    var dg: array<f32, 5>;
+    var sum = 0.0;
+    var dsum = 0.0;
+    let inv_s2 = 1.0 / (DRAW_SIGMA * DRAW_SIGMA);
+    for (var i = 0; i < 5; i++) {
+        let d = f - (f32(i) - 2.0);
+        let gi = draw_gauss(d);
+        let dgi = gi * (-d * inv_s2);
+        g[i] = gi;
+        dg[i] = dgi;
+        sum += gi;
+        dsum += dgi;
+    }
+    var ax: DrawAxis;
+    let inv = 1.0 / sum;
+    let inv2 = inv * inv;
+    for (var i = 0; i < 5; i++) {
+        ax.w[i] = g[i] * inv;
+        ax.dw[i] = (dg[i] * sum - g[i] * dsum) * inv2;
+    }
+    return ax;
+}
+
+fn height_draw(xz: vec2<f32>) -> f32 {
+    let ij = world_to_ij(xz);
+    let o = vec2<i32>(floor(ij));
+    let fx = draw_axis(fract(ij).x);
+    let fz = draw_axis(fract(ij).y);
+    var h = 0.0;
+    for (var j = 0; j < 5; j++) {
+        var row = 0.0;
+        for (var i = 0; i < 5; i++) {
+            row += fx.w[i] * height_at(o + vec2<i32>(i - 2, j - 2));
+        }
+        h += fz.w[j] * row;
+    }
+    return h;
+}
+
+// xy: dh/dx, dh/dz in metres. zw: stamp slope, same kernel, same units.
+fn draw_grads(xz: vec2<f32>) -> vec4<f32> {
+    let ij = world_to_ij(xz);
+    let o = vec2<i32>(floor(ij));
+    let fx = draw_axis(fract(ij).x);
+    let fz = draw_axis(fract(ij).y);
+    let cell = max(frame.params.z, 1e-4);
+    var dhdx = 0.0;
+    var dhdz = 0.0;
+    var dsdx = 0.0;
+    var dsdz = 0.0;
+    for (var j = 0; j < 5; j++) {
+        var row_h = 0.0;
+        var row_s = 0.0;
+        var drow_h = 0.0;
+        var drow_s = 0.0;
+        for (var i = 0; i < 5; i++) {
+            let hs = load_height_stamp(o + vec2<i32>(i - 2, j - 2));
+            row_h += fx.w[i] * hs.x;
+            row_s += fx.w[i] * hs.y;
+            drow_h += fx.dw[i] * hs.x;
+            drow_s += fx.dw[i] * hs.y;
+        }
+        dhdx += fz.w[j] * drow_h;
+        dsdx += fz.w[j] * drow_s;
+        dhdz += fz.dw[j] * row_h;
+        dsdz += fz.dw[j] * row_s;
+    }
+    return vec4<f32>(dhdx, dhdz, dsdx, dsdz) / cell;
+}
+
 // Same samples as height_bilinear, but the step sits in a short wall.
 // A linear blend across a 20 cm cell shades a 10 cm rut as a tint.
 fn height_sharp(xz: vec2<f32>) -> f32 {
@@ -266,25 +354,33 @@ fn mat_bilinear(xz: vec2<f32>) -> vec4<f32> {
     return mix(mix(m00, m10, f.x), mix(m01, m11, f.x), f.y);
 }
 
-// Continuous slope of the real displaced height. Not the triangle normal,
-// which is constant across a 20 cm cell and flattens a 14 cm groove.
+// Slope of the curved draw height. A finite difference of the bilinear
+// ramp still kinks on the solver-cell edge the tyre lip sits on.
 // `grit_amp` is the dry grain. Wet mud passes a small value so the sheen
 // follows this slope instead of breaking into gravel.
-fn slope_normal(xz: vec2<f32>, step: f32) -> vec3<f32> {
+fn slope_draw(xz: vec2<f32>) -> vec3<f32> {
+    let g = draw_grads(xz);
+    return normalize(vec3<f32>(-g.x, 1.0, -g.y));
+}
+
+// Wider sample of the same curved height. The short gaussian still rings
+// once per solver cell under the low sun, and that ring draws the sheen
+// as a stair. Water stays on this wider slope. The tyre lip stays on
+// slope_draw.
+fn slope_draw_wide(xz: vec2<f32>, step: f32) -> vec3<f32> {
     let e = max(step, 0.05);
-    let h_l = height_bilinear(xz - vec2<f32>(e, 0.0));
-    let h_r = height_bilinear(xz + vec2<f32>(e, 0.0));
-    let h_d = height_bilinear(xz - vec2<f32>(0.0, e));
-    let h_u = height_bilinear(xz + vec2<f32>(0.0, e));
+    let h_l = height_draw(xz - vec2<f32>(e, 0.0));
+    let h_r = height_draw(xz + vec2<f32>(e, 0.0));
+    let h_d = height_draw(xz - vec2<f32>(0.0, e));
+    let h_u = height_draw(xz + vec2<f32>(0.0, e));
     return normalize(vec3<f32>(h_l - h_r, e * 2.0, h_d - h_u));
 }
 
 fn terrain_normal(xz: vec2<f32>, grit_amp: f32) -> vec3<f32> {
-    // Short step. A wider sample flattens a tyre-width cut into the lane slope.
-    // The slope is only the height difference. Amplifying the stamp on its own
-    // turned a centimetre of noise into a cliff, and the sheen into rings.
-    // About a cell wide, so the bilinear kink does not draw a grid under the low sun.
-    var n = slope_normal(xz, frame.params.z * 0.8);
+    // The slope is the curved height difference. Amplifying the stamp on
+    // its own turned a centimetre of noise into a cliff, and the sheen
+    // into rings.
+    var n = slope_draw(xz);
     let grit = noise(xz * 2.4);
     let grit_x = noise(xz * 2.4 + vec2<f32>(0.45, 0.0));
     let grit_z = noise(xz * 2.4 + vec2<f32>(0.0, 0.45));
@@ -384,15 +480,16 @@ fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
 }
 
 fn terrain_height(xz: vec2<f32>) -> f32 {
-    // Bilinear across the cell. The per-cell step that keeps a rut wall
-    // turns a smooth berm into a corrugated ring from the isometric camera.
-    return height_bilinear(xz);
+    // Curved reconstruction of the solver samples. Bilinear leaves the tyre
+    // lip as a straight ramp with a corner on the cell boundary. Water stays
+    // on height_bilinear so the sheet does not pay for this gather.
+    return height_draw(xz);
 }
 
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
-    // Sample the same heightfield. Integer ij would flatten every subdivided
-    // vertex inside a cell, so a 9 cm rut stays one kink.
+    // Draw height, not the solver bilinear. Integer ij would flatten every
+    // subdivided vertex back onto one ramp per cell.
     let h = terrain_height(in.xz);
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     var o: TerrOut;
@@ -461,11 +558,13 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let rough_out = mix(dry_r, mix(wet_r, 0.09, film), max(wet_face, film));
 
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
-    // Standing water uses a wider slope so a smooth bowl does not stair-step.
-    // A rut keeps the short sample, or the tyre wall disappears.
+    // Sheen follows the curved height, not the bilinear kink. Standing
+    // water uses the wider sample so the bowl does not stair. A rut keeps
+    // the short slope, or the tyre wall disappears. Grit stays off this
+    // normal so the streak is the slope.
     let n_sheen = normalize(mix(
-        slope_normal(xz, frame.params.z * 0.45),
-        slope_normal(xz, frame.params.z * 2.1),
+        slope_draw(xz),
+        slope_draw_wide(xz, frame.params.z * 2.1),
         film,
     ));
     lit += mud_sheen(in.world, n_sheen, rough_out, wet, water);
@@ -579,7 +678,7 @@ struct ShadowOut {
 
 @vertex
 fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
-    let h = height_bilinear(in.xz);
+    let h = height_draw(in.xz);
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     let clip = frame.light_vp * vec4<f32>(world, 1.0);
     var o: ShadowOut;
