@@ -419,6 +419,8 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
         disp = d0;
     }
     let h = terrain_height(in.xz) + (disp - 0.5) * disp_scale(kind);
+    // World Y at this column's XZ. Adding the rut along the normal would
+    // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     var o: TerrOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);

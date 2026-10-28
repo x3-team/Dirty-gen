@@ -443,6 +443,7 @@ struct CaptureArgs {
     stills_only: bool,
     cc0: bool,
     states: bool,
+    volume: bool,
     video: PathBuf,
     still_start: PathBuf,
     still_puddle: PathBuf,
@@ -453,6 +454,9 @@ struct CaptureArgs {
     states_edge: PathBuf,
     states_grip: PathBuf,
     states_water: PathBuf,
+    volume_berm: PathBuf,
+    volume_slope: PathBuf,
+    volume_second: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -480,6 +484,10 @@ fn capture(args: &[String]) {
     }
     if parsed.states {
         capture_states(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.volume {
+        capture_volume(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -616,6 +624,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut stills_only = false;
     let mut cc0 = false;
     let mut states = false;
+    let mut volume = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -626,6 +635,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut states_edge = PathBuf::from(format!("{MEDIA}/states-edge.png"));
     let mut states_grip = PathBuf::from(format!("{MEDIA}/states-grip.png"));
     let mut states_water = PathBuf::from(format!("{MEDIA}/states-water.png"));
+    let mut volume_berm = PathBuf::from(format!("{MEDIA}/volume-berm.png"));
+    let mut volume_slope = PathBuf::from(format!("{MEDIA}/volume-slope.png"));
+    let mut volume_second = PathBuf::from(format!("{MEDIA}/volume-second.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -644,6 +656,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--stills-only" => stills_only = true,
             "--cc0" => cc0 = true,
             "--states" => states = true,
+            "--volume" => volume = true,
+            "--volume-berm" => volume_berm = PathBuf::from(val(&mut i)),
+            "--volume-slope" => volume_slope = PathBuf::from(val(&mut i)),
+            "--volume-second" => volume_second = PathBuf::from(val(&mut i)),
             "--states-edge" => states_edge = PathBuf::from(val(&mut i)),
             "--states-grip" => states_grip = PathBuf::from(val(&mut i)),
             "--states-water" => states_water = PathBuf::from(val(&mut i)),
@@ -668,6 +684,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         stills_only,
         cc0,
         states,
+        volume,
         video,
         still_start,
         still_puddle,
@@ -678,6 +695,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         states_edge,
         states_grip,
         states_water,
+        volume_berm,
+        volume_slope,
+        volume_second,
     }
 }
 
@@ -751,6 +771,109 @@ fn states_water_camera() -> CameraPose {
     CameraPose {
         eye: Vec3::new(-0.42, 2.05, -1.72),
         target: Vec3::new(0.02, -0.08, -1.22),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_volume(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::SoilField;
+
+    let mut world = World::flat(0.45);
+    world.bike.pos = Vec3::new(14.0, 0.4, -14.0);
+    park_off(&mut world);
+
+    world.soil = SoilField::berm_scene(false);
+    print_volumes("berm", &world.soil);
+    write_cc0_still(
+        renderer,
+        &world,
+        "berm",
+        &parsed.volume_berm,
+        parsed,
+        volume_berm_camera(),
+    );
+
+    world.soil = SoilField::berm_scene(true);
+    print_volumes("second", &world.soil);
+    write_cc0_still(
+        renderer,
+        &world,
+        "second",
+        &parsed.volume_second,
+        parsed,
+        volume_second_camera(),
+    );
+
+    world.soil = SoilField::slope_scene();
+    print_volumes("slope", &world.soil);
+    // The grooves stay on the lower face. The buggy is up the ramp, so the
+    // rut is not under the tires.
+    let grade = 0.42_f32;
+    let x = 1.55;
+    let z = 0.0;
+    let h = world.soil.sample(x, z).height;
+    world.vehicle.pos = Vec3::new(x, h + 0.62, z);
+    world.vehicle.yaw = std::f32::consts::FRAC_PI_2;
+    world.vehicle.pitch = -grade.atan();
+    world.vehicle.roll = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    write_cc0_still(
+        renderer,
+        &world,
+        "slope",
+        &parsed.volume_slope,
+        parsed,
+        volume_slope_camera(),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn park_off(world: &mut World) {
+    world.vehicle.pos = Vec3::new(14.0, 0.4, 14.0);
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.pitch_rate = 0.0;
+    world.vehicle.roll_rate = 0.0;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn print_volumes(label: &str, soil: &silt::soil::SoilField) {
+    let v = soil.volumes();
+    println!(
+        "{label} cut {:.4} m3  placed {:.4} m3  berm {:.4} m3  clods {:.4} m3  rut {:.4} m  berm height {:.4} m",
+        v.cut, v.placed, v.berm, v.clods, v.max_rut, v.max_berm
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn volume_berm_camera() -> CameraPose {
+    // Three-quarter view so the pile beside the cut reads as a berm.
+    CameraPose {
+        eye: Vec3::new(-1.35, 0.78, 1.7),
+        target: Vec3::new(0.18, 0.02, -0.15),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn volume_second_camera() -> CameraPose {
+    CameraPose {
+        eye: Vec3::new(-1.45, 0.95, 1.8),
+        target: Vec3::new(0.16, 0.08, -0.15),
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn volume_slope_camera() -> CameraPose {
+    // Down the ramp. Grooves sit on the lower face and stop; the buggy is above them.
+    CameraPose {
+        eye: Vec3::new(-2.85, 2.25, 2.15),
+        target: Vec3::new(-0.2, 0.32, 0.05),
         ortho_width: None,
     }
 }

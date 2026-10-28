@@ -4,6 +4,10 @@
 //! carved. `placed` is soil that has already been put somewhere else (berm,
 //! crest clod, impact ring). The visible height is their sum, and a cell's
 //! kind says which one the tire is on.
+//!
+//! A rut is a vertical cut at a fixed world XZ. The tire does not push the
+//! column along the ground normal, so a groove on a slope stays where the
+//! wheel was instead of climbing the mesh.
 
 use glam::Vec3;
 
@@ -560,8 +564,10 @@ impl SoilField {
         let right = Vec3::X;
         let mut z = -2.55;
         while z <= 2.55 {
+            // Hub, not the contact. Y = 0 put the axle in the ground and the
+            // slope test then treated the whole chord as uphill of the tire.
             field.stamp_wheel(
-                Vec3::new(0.0, 0.0, z),
+                Vec3::new(0.0, 0.30, z),
                 0.38,
                 0.28,
                 forward,
@@ -863,16 +869,15 @@ impl SoilField {
         // Spoil sits in the cell against the lip. A wider band flattened
         // the pile into the crust, so the berm disappeared beside the step.
         let berm_band = self.cell * 0.9;
+        // The contact chord, in world XZ. A ribbon of a couple of cells
+        // past the tire cuts the slope in front of the hub, and that cut
+        // walks up the mesh on the next step.
         let half_l = if lane {
-            (len * 0.5).max(self.cell * 2.2)
+            (len * 0.5 + self.cell * 0.25).max(self.cell * 1.05)
         } else {
             len * 0.5
         };
-        let along_reach = if lane {
-            half_l + self.cell * 0.8
-        } else {
-            half_l + self.cell * 0.35
-        };
+        let along_reach = half_l + self.cell * 0.35;
         let lateral_reach = if lane {
             half_w + lip_band + berm_band + self.cell * 0.4
         } else {
@@ -891,6 +896,8 @@ impl SoilField {
         let mut n_clod = 0usize;
         let mut berms = [0usize; 192];
         let mut n_berm = 0usize;
+        let mut cuts = [0usize; 160];
+        let mut n_cut = 0usize;
         let area = self.cell * self.cell;
 
         for j in j0.max(1)..j1.min(res - 1) {
@@ -915,6 +922,15 @@ impl SoilField {
                     continue;
                 }
                 let idx = j as usize * self.res + i as usize;
+                // Vertical column at this world XZ. `penetration` is how far
+                // the surface sits below the hub, measured in world Y.
+                // On the contact it equals the sink. A column up the slope
+                // is higher, ahead of the hub, and is not this tire's rut.
+                let penetration = self.height[idx] - (center.y - radius);
+                let up_the_slope = penetration > sinkage + 0.03 && lz.abs() > self.cell * 0.5;
+                if up_the_slope {
+                    continue;
+                }
                 let ax = lx.abs();
                 let across = if lane {
                     if ax <= half_w {
@@ -941,6 +957,10 @@ impl SoilField {
                         let rate = if already < local_groove { 48.0 } else { 2.2 };
                         let drop = room * (1.0 - (-dt * rate).exp()) * along;
                         let removed = self.excavate(idx, drop);
+                        if removed > 0.0 && n_cut < cuts.len() {
+                            cuts[n_cut] = idx;
+                            n_cut += 1;
+                        }
                         self.loose[idx] = (self.loose[idx] + removed * 0.45).min(0.16);
                         vol += removed * area;
                     }
@@ -989,6 +1009,10 @@ impl SoilField {
                         let drop = (bite - already).max(0.0).min(0.06) * along;
                         if drop > 0.001 {
                             let removed = self.excavate(idx, drop);
+                            if removed > 0.0 && n_cut < cuts.len() {
+                                cuts[n_cut] = idx;
+                                n_cut += 1;
+                            }
                             self.loose[idx] = (self.loose[idx] + removed * 0.3).min(0.16);
                             vol += removed * area;
                         }
@@ -1009,7 +1033,46 @@ impl SoilField {
         if vol <= 1.0e-8 {
             return;
         }
+        if n_berm == 0 {
+            // The cut mass still has to land. A stamp with no shoulder
+            // cell would otherwise throw that soil away.
+            self.pile_spoil(&mut berms, &mut n_berm, &cuts[..n_cut]);
+        }
         self.deposit_spoil(vol, &clods[..n_clod], &berms[..n_berm]);
+    }
+
+    /// Lateral neighbours of the cut, in world XZ, used when the shoulder
+    /// band itself was empty. Does not mint cells that are off the field.
+    fn pile_spoil(&self, berms: &mut [usize], n_berm: &mut usize, seeds: &[usize]) {
+        let res = self.res as isize;
+        for seed in seeds {
+            let i = (*seed % self.res) as isize;
+            let j = (*seed / self.res) as isize;
+            for (di, dj) in [
+                (2, 0),
+                (-2, 0),
+                (0, 2),
+                (0, -2),
+                (3, 0),
+                (-3, 0),
+                (2, 1),
+                (-2, 1),
+                (2, -1),
+                (-2, -1),
+            ] {
+                let ii = i + di;
+                let jj = j + dj;
+                if ii < 1 || jj < 1 || ii >= res - 1 || jj >= res - 1 {
+                    continue;
+                }
+                let idx = jj as usize * self.res + ii as usize;
+                if *n_berm >= berms.len() || berms[..*n_berm].contains(&idx) {
+                    continue;
+                }
+                berms[*n_berm] = idx;
+                *n_berm += 1;
+            }
+        }
     }
 
     /// Put every cubic metre of cut soil onto crest clods and then the berm.
@@ -1329,6 +1392,157 @@ impl SoilField {
         }
         acc / self.darken.len() as f32
     }
+
+    /// Cubic metres. `berm` is the spoil sitting on berm cells.
+    pub fn volumes(&self) -> SoilVolumes {
+        let area = self.cell * self.cell;
+        let mut berm = 0.0_f32;
+        let mut clods = 0.0_f32;
+        let mut max_berm = 0.0_f32;
+        for idx in 0..self.kind.len() {
+            match SurfaceKind::from_u8(self.kind[idx]) {
+                SurfaceKind::Berm => {
+                    berm += self.placed[idx];
+                    max_berm = max_berm.max(self.placed[idx]);
+                }
+                SurfaceKind::PlacedClod => clods += self.placed[idx],
+                _ => {}
+            }
+        }
+        SoilVolumes {
+            cut: self.cut_volume(),
+            placed: self.placed_volume(),
+            berm: berm * area,
+            clods: clods * area,
+            max_rut: self.max_rut_depth(),
+            max_berm,
+        }
+    }
+
+    fn initial_at(&self, x: f32, z: f32) -> f32 {
+        let half = self.size * 0.5;
+        let u = (x + half) / self.cell - 0.5;
+        let v = (z + half) / self.cell - 0.5;
+        if u < 0.0 || v < 0.0 || u >= self.res as f32 - 1.0 || v >= self.res as f32 - 1.0 {
+            return 0.0;
+        }
+        let i = u.floor() as usize;
+        let j = v.floor() as usize;
+        let tx = u - i as f32;
+        let ty = v - j as f32;
+        let res = self.res;
+        bilerp(
+            self.initial_height[j * res + i],
+            self.initial_height[j * res + i + 1],
+            self.initial_height[(j + 1) * res + i],
+            self.initial_height[(j + 1) * res + i + 1],
+            tx,
+            ty,
+        )
+    }
+
+    /// One tire from `from` to `to` in world XZ. The hub is one radius above
+    /// the original surface, so the contact follows the slope.
+    pub fn roll_lane(&mut self, from: Vec3, to: Vec3, sink: f32, slip: f32) {
+        let from = Vec3::new(from.x, 0.0, from.z);
+        let to = Vec3::new(to.x, 0.0, to.z);
+        let delta = to - from;
+        let len = delta.length();
+        if len < 1.0e-3 {
+            return;
+        }
+        let forward = delta / len;
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let n = (len / 0.1).round().max(1.0) as i32;
+        let radius = 0.38;
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let p = from.lerp(to, t);
+            let h = self.initial_at(p.x, p.z);
+            let hub = Vec3::new(p.x, h + radius - sink, p.z);
+            self.stamp_wheel(hub, radius, 0.28, forward, right, sink, slip, 0.12, true);
+        }
+    }
+
+    /// Wet mud, no standing water. The berm still is this pad.
+    pub fn mud_pad() -> Self {
+        let mut field = Self::flat(0.45);
+        for i in 0..field.kind.len() {
+            field.kind[i] = SurfaceKind::WetMud as u8;
+            field.wetness[i] = 0.82;
+            field.base_wetness[i] = 0.78;
+            field.water[i] = 0.0;
+            field.loose[i] = 0.02;
+            field.roughness[i] = 0.48;
+            field.darken[i] = 0.08;
+        }
+        field
+    }
+
+    /// Ramp along +X. The ends flatten so the height stays in the texture range.
+    pub fn sloped(grade: f32) -> Self {
+        let mut field = Self::mud_pad();
+        let half = field.size * 0.5;
+        let grade = grade.clamp(-0.7, 0.7);
+        for j in 0..field.res {
+            for i in 0..field.res {
+                let x = (i as f32 + 0.5) * field.cell - half;
+                let h = 0.62 + grade * x.clamp(-2.5, 2.5);
+                let idx = j * field.res + i;
+                field.height[idx] = h;
+                field.bed[idx] = h;
+                field.initial_height[idx] = h;
+                field.placed[idx] = 0.0;
+            }
+        }
+        field
+    }
+
+    /// One groove. `second_pass` drives it again, deeper, and the berm takes
+    /// that extra soil.
+    pub fn berm_scene(second_pass: bool) -> Self {
+        let mut field = Self::mud_pad();
+        field.roll_lane(
+            Vec3::new(0.0, 0.0, -1.15),
+            Vec3::new(0.0, 0.0, 1.15),
+            0.085,
+            0.32,
+        );
+        if second_pass {
+            field.roll_lane(
+                Vec3::new(0.0, 0.0, -1.15),
+                Vec3::new(0.0, 0.0, 1.15),
+                0.16,
+                0.85,
+            );
+        }
+        field
+    }
+
+    /// Two grooves on the lower face of a 0.42 ramp. The upper face is untouched.
+    pub fn slope_scene() -> Self {
+        let mut field = Self::sloped(0.42);
+        for z in [-0.74_f32, 0.74] {
+            field.roll_lane(
+                Vec3::new(-1.65, 0.0, z),
+                Vec3::new(-0.45, 0.0, z),
+                0.09,
+                0.3,
+            );
+        }
+        field
+    }
+}
+
+/// Cut soil against the pile that received it.
+#[derive(Clone, Copy, Debug)]
+pub struct SoilVolumes {
+    pub cut: f32,
+    pub placed: f32,
+    pub berm: f32,
+    pub clods: f32,
+    pub max_rut: f32,
+    pub max_berm: f32,
 }
 
 fn transfer(
@@ -1677,7 +1891,7 @@ mod tests {
         let before_cut = soil.cut_volume();
         let before_placed = soil.placed_volume();
         soil.stamp_wheel(
-            Vec3::new(0.2, 0.0, -0.4),
+            Vec3::new(0.2, 0.30, -0.4),
             0.38,
             0.28,
             Vec3::Z,
@@ -1736,7 +1950,7 @@ mod tests {
         let mut z = -1.4;
         while z <= 1.4 {
             soil.stamp_wheel(
-                Vec3::new(0.0, 0.0, z),
+                Vec3::new(0.0, 0.30, z),
                 0.38,
                 0.28,
                 Vec3::Z,
@@ -1842,5 +2056,145 @@ mod tests {
             "water left the rut"
         );
         assert!(gallery.sample(0.7, -1.0).water < 0.004, "the berm is wet");
+    }
+
+    fn volumes_match(soil: &SoilField, label: &str) -> SoilVolumes {
+        let v = soil.volumes();
+        eprintln!(
+            "{label} cut {:.4} m3  placed {:.4} m3  berm {:.4} m3  clods {:.4} m3  rut {:.4} m  berm height {:.4} m",
+            v.cut, v.placed, v.berm, v.clods, v.max_rut, v.max_berm
+        );
+        assert!(
+            (v.cut - v.placed).abs() < v.cut * 0.02 + 1.0e-5,
+            "{label} volume drifted cut {} placed {}",
+            v.cut,
+            v.placed
+        );
+        assert!(v.berm > v.clods, "{label} berm did not receive the spoil");
+        assert!(v.berm > v.cut * 0.5, "{label} berm holds too little of the cut");
+        v
+    }
+
+    #[test]
+    fn cut_soil_lands_on_the_berm() {
+        let soil = SoilField::berm_scene(false);
+        let v = volumes_match(&soil, "berm");
+        assert!(v.max_rut > 0.04, "rut {}", v.max_rut);
+        assert!(v.max_berm > 0.02, "berm height {}", v.max_berm);
+        assert!(v.cut > 1.0e-3, "cut {}", v.cut);
+    }
+
+    #[test]
+    fn second_pass_deepens_the_rut_and_raises_the_berm() {
+        let mut soil = SoilField::berm_scene(false);
+        let first = volumes_match(&soil, "pass1");
+        soil.roll_lane(
+            Vec3::new(0.0, 0.0, -1.15),
+            Vec3::new(0.0, 0.0, 1.15),
+            0.16,
+            0.85,
+        );
+        let second = volumes_match(&soil, "pass2");
+        assert!(
+            second.max_rut > first.max_rut + 0.025,
+            "second pass did not dig, {} -> {}",
+            first.max_rut,
+            second.max_rut
+        );
+        assert!(
+            second.max_berm > first.max_berm + 0.012,
+            "berm did not rise, {} -> {}",
+            first.max_berm,
+            second.max_berm
+        );
+        assert!(second.cut > first.cut, "cut volume did not grow");
+        assert!(second.berm > first.berm, "berm volume did not grow");
+    }
+
+    #[test]
+    fn rut_on_a_slope_stays_in_world_columns() {
+        let mut soil = SoilField::slope_scene();
+        let v = volumes_match(&soil, "slope");
+        assert!(v.max_rut > 0.03, "slope rut {}", v.max_rut);
+        let half = soil.size * 0.5;
+        let res = soil.res;
+        let cell = soil.cell;
+        let x_of = |idx: usize| {
+            let i = idx % res;
+            (i as f32 + 0.5) * cell - half
+        };
+        let mut max_x = f32::MIN;
+        let mut upper = 0.0_f32;
+        for idx in 0..soil.bed.len() {
+            let dug = soil.initial_height[idx] - soil.bed[idx];
+            if dug > 0.02 {
+                max_x = max_x.max(x_of(idx));
+            }
+            if x_of(idx) > 0.05 {
+                upper = upper.max(dug);
+            }
+        }
+        assert!(
+            max_x < -0.15,
+            "rut climbed the slope, leading edge at x {max_x}"
+        );
+        assert!(
+            upper < 0.01,
+            "soil above the pass was cut, dug {upper}"
+        );
+        let mean_bed = |x0: f32, x1: f32, zc: f32| {
+            let mut acc = 0.0_f32;
+            let mut n = 0.0_f32;
+            for j in 0..res {
+                for i in 0..res {
+                    let x = (i as f32 + 0.5) * cell - half;
+                    let z = (j as f32 + 0.5) * soil.cell - half;
+                    if x < x0 || x > x1 || (z - zc).abs() > 0.16 {
+                        continue;
+                    }
+                    let idx = j * soil.res + i;
+                    if soil.initial_height[idx] - soil.bed[idx] > 0.02 {
+                        acc += soil.bed[idx];
+                        n += 1.0;
+                    }
+                }
+            }
+            assert!(n > 0.0, "no floor between {x0} and {x1}");
+            acc / n
+        };
+        let low = mean_bed(-1.5, -1.2, 0.74);
+        let high = mean_bed(-0.85, -0.55, 0.74);
+        assert!(
+            high > low + 0.15,
+            "floor is a shelf, not the slope: {low} -> {high}"
+        );
+        let mut snap = Vec::new();
+        for idx in 0..soil.bed.len() {
+            if x_of(idx) < -0.55 {
+                snap.push((idx, soil.bed[idx], soil.placed[idx]));
+            }
+        }
+        soil.roll_lane(
+            Vec3::new(0.95, 0.0, 0.74),
+            Vec3::new(1.55, 0.0, 0.74),
+            0.09,
+            0.3,
+        );
+        for (idx, bed, placed) in snap {
+            assert!(
+                (soil.bed[idx] - bed).abs() < 1.0e-5 && (soil.placed[idx] - placed).abs() < 1.0e-5,
+                "column {} moved after the wheel climbed",
+                x_of(idx)
+            );
+        }
+        let mut upper_rut = 0.0_f32;
+        for idx in 0..soil.bed.len() {
+            if x_of(idx) > 1.05 {
+                upper_rut = upper_rut.max(soil.initial_height[idx] - soil.bed[idx]);
+            }
+        }
+        assert!(upper_rut > 0.02, "the upper pass did not cut");
+        let after = volumes_match(&soil, "slope-after");
+        assert!(after.cut > v.cut, "the upper pass added no volume");
     }
 }
