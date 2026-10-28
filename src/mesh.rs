@@ -1121,60 +1121,46 @@ fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
-/// A liquid drop: pointed tail, round belly, hemispherical nose. The long
-/// axis follows the velocity, so it is not a sphere, a cube, or a tablet.
+/// A small liquid drop torn off with the ribbons. A short pinched fleck.
+/// The ledger volume stays on the particle; this mark does not swell into a
+/// teardrop blob, a sphere, or a tablet.
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let mut axis = p.vel;
-    if axis.length_squared() < 1.0e-6 {
-        axis = Vec3::Y;
+    // Long axis in the horizontal plane, width vertical, thickness to the side.
+    // A side camera then sees a small fleck instead of an edge-on hair.
+    let mut dir = Vec3::new(p.vel.x * 0.2, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-4 {
+        dir = Vec3::new(p.vel.x, 0.0, -1.0);
     }
-    axis = axis.normalize();
-    let mut side = axis.cross(Vec3::Y);
-    if side.length_squared() < 1.0e-6 {
-        side = axis.cross(Vec3::X);
+    dir = dir.normalize();
+    let up = Vec3::Y;
+    let side = dir.cross(up).normalize();
+    let wobble = (p.seed % 5) as f32;
+    let length = 0.048 + wobble * 0.003;
+    let width = 0.016;
+    let thick = 0.0026;
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (t * (1.0 - t) * 4.0).powf(0.7).clamp(0.16, 1.0);
+        let arc = (t * std::f32::consts::PI).sin();
+        let c = p.pos + dir * (length * (t - 0.5)) + up * (arc - 0.5) * length * 0.06;
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * (0.55 + 0.45 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
     }
-    side = side.normalize();
-    let bin = side.cross(axis).normalize();
-    let radius = (p.volume / 1.6).cbrt().clamp(0.014, 0.048);
-    let body = radius * 3.4;
-    let stacks = 8usize;
-    let slices = 8usize;
-    let mut pts = Vec::with_capacity((stacks + 1) * slices);
-    let mut nrm = Vec::with_capacity(pts.capacity());
-    for s in 0..=stacks {
-        let t = s as f32 / stacks as f32;
-        let (y, rad, n_axis) = if t < 0.70 {
-            let u = t / 0.70;
-            let rad = radius * u.powf(0.62);
-            let y = u * body - body * 0.55;
-            // The tail narrows toward -axis.
-            (y, rad, -0.55 + u * 0.9)
-        } else {
-            let u = ((t - 0.70) / 0.30).clamp(0.0, 1.0);
-            let rad = radius * (1.0 - u * u).sqrt();
-            let y = body * 0.45 + u * radius;
-            (y, rad, 0.35 + u * 0.9)
-        };
-        for i in 0..slices {
-            let th = i as f32 / slices as f32 * std::f32::consts::TAU;
-            let radial = side * th.cos() + bin * th.sin();
-            let pos = p.pos + axis * y + radial * rad;
-            let n = (radial * rad.max(radius * 0.15) + axis * n_axis * radius).normalize_or_zero();
-            pts.push(pos);
-            nrm.push(if n.length_squared() < 1.0e-8 { axis } else { n });
-        }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
     }
-    let center = p.pos;
-    for s in 0..stacks {
-        for i in 0..slices {
-            let a = s * slices + i;
-            let b = s * slices + (i + 1) % slices;
-            let c = (s + 1) * slices + i;
-            let d = (s + 1) * slices + (i + 1) % slices;
-            add_tri_smooth(mesh, pts[a], nrm[a], pts[c], nrm[c], pts[b], nrm[b], PANEL_CLOD, center);
-            add_tri_smooth(mesh, pts[b], nrm[b], pts[c], nrm[c], pts[d], nrm[d], PANEL_CLOD, center);
-        }
-    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 #[cfg(test)]
@@ -1231,14 +1217,16 @@ mod slurry_shapes {
             r[1] / r[0] < 0.42,
             "ribbon reads as a tablet {r:?}"
         );
+        assert!(d[0] < 0.075, "drop is a teardrop blob {d:?}");
         assert!(
-            d[0] > d[1] * 1.65,
+            d[0] > d[1] * 2.2,
             "drop is round like a sphere {d:?}"
         );
         assert!(
-            d[1] / d[2] < 1.45,
-            "drop cross-section is a block {d:?}"
+            d[1] / d[0] < 0.45,
+            "drop reads as a tablet {d:?}"
         );
+        assert!(d[1] > d[2] * 1.8, "drop is a bar {d:?}");
         assert!(d[0] / d[1] < 6.0, "drop is a needle {d:?}");
     }
 

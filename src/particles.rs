@@ -9,7 +9,7 @@ use crate::soil::SoilField;
 
 /// Liquid mud torn off a slurry seal. A curled sheet, not a block.
 pub const KIND_SLURRY_RIBBON: u8 = 5;
-/// Liquid mud torn off a slurry seal. A teardrop, not a ball.
+/// Liquid mud torn off a slurry seal. A small fleck, not a teardrop blob.
 pub const KIND_SLURRY_DROP: u8 = 6;
 
 /// Volume accepted into ribbon pieces and drop pieces.
@@ -209,15 +209,21 @@ impl Particles {
             let vel = -forward * (2.4 + t * 0.45) + Vec3::Y * (3.1 + t * 0.25) + right * (1.8 + t * 0.35);
             ribbons += self.spawn_slurry(pos, vel, share, KIND_SLURRY_RIBBON);
         }
+        // Beside the ribbons, in the air. A stack on the hub read as teardrop blobs.
+        let drop_at = [
+            (0.26_f32, 0.32, 0.22),
+            (-0.20, 0.30, 0.26),
+            (0.30, 0.34, 0.38),
+            (-0.22, 0.32, 0.44),
+            (0.18, 0.36, 0.50),
+        ];
         for i in 0..n_d {
             let t = i as f32;
             let share = drop_vol / n_d as f32;
-            let side = if i % 2 == 0 { 1.0 } else { 0.55 };
-            let pos = origin
-                + forward * (0.10 - t * 0.03)
-                + right * side * (0.28 + (i % 3) as f32 * 0.05)
-                + Vec3::Y * (0.34 + t * 0.07);
-            let vel = -forward * (1.2 + t * 0.18) + Vec3::Y * (2.8 - t * 0.12) + right * side * 1.3;
+            let (along, out, up) = drop_at[i];
+            let pos = origin + forward * along + right * out + Vec3::Y * up;
+            // Mostly rearward, so the fleck's long axis lies across the side view.
+            let vel = -forward * (2.4 + t * 0.25) + Vec3::Y * 0.35 + right * 0.12;
             drops += self.spawn_slurry(pos, vel, share, KIND_SLURRY_DROP);
         }
         SlurryThrow { ribbons, drops }
