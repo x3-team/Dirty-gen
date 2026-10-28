@@ -38,15 +38,15 @@ cargo test
 | W / Up | Throttle |
 | S / Down | Brake, then reverse once the buggy is slow |
 | A / Left, D / Right | Steer |
-| V | Switch which vehicle the pedals drive. The other one keeps riding the lap |
-| C | Toggle the chase camera. The default is a fixed isometric view of the loop. Chase follows whichever vehicle V selected |
+| V | Switch which vehicle the pedals drive: the Lada Niva or the dirt bike. The dune buggy mesh is not drawn. The bike is drawn only while V has selected it |
+| C | Toggle the chase camera. The default follows the Niva. Chase follows whichever vehicle V selected |
 | Q / E | Orbit the chase camera |
 | R / F | Raise / lower the chase camera |
 | Esc | Quit |
 
-The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V.
+The default camera follows the Niva. The chase camera follows the vehicle selected with V.
 
-Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
+Opening the window or the page plays that lap. The Niva is the only vehicle drawn. V draws the dirt bike and hands it the pedals; the Niva keeps the lap. The first drive key (W, S, A, D, or the arrows) takes the selected one. The capture is the same lap, with nobody at the wheel.
 
 ## Браузер
 

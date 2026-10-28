@@ -10,12 +10,14 @@ use silt::bike::{Bike, BIKE_RADIUS};
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS};
 use silt::world::{CameraPose, World};
 
+use crate::cc0::RgbaTex;
 use crate::mesh::{
-    bike_body, bike_suspension, buggy_body, environment_mesh, mud_chunks, suspension_mesh,
-    terrain_mesh, wheel_mesh, CpuMesh, MeshVertex, ParticleVertex, TerrainVertex,
+    bike_body, bike_suspension, environment_mesh, mud_chunks, terrain_mesh, wheel_mesh, CpuMesh,
+    MeshVertex, ParticleVertex, TerrainVertex,
 };
 
-const SHADOW: u32 = 2048;
+const SHADOW: u32 = 4096;
+const COLOR_SAMPLES: u32 = 4;
 const MODEL_SLOTS: u64 = 12;
 
 #[repr(C)]
@@ -66,6 +68,11 @@ pub struct Renderer {
     mat_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    msaa_color: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    fxaa: wgpu::Texture,
+    fxaa_view: wgpu::TextureView,
+    fxaa_bg: wgpu::BindGroup,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     #[allow(dead_code)]
@@ -78,11 +85,21 @@ pub struct Renderer {
     padded_row: u32,
     terrain: GpuMesh,
     body: GpuMesh,
+    glass: GpuMesh,
+    wheels: [GpuMesh; 4],
+    #[allow(dead_code)]
+    buggy_body: GpuMesh,
+    #[allow(dead_code)]
+    buggy_glass: GpuMesh,
+    #[allow(dead_code)]
+    buggy_wheels: [GpuMesh; 4],
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
-    susp_v: wgpu::Buffer,
-    susp_i: wgpu::Buffer,
+    props: GpuMesh,
+    #[allow(dead_code)]
+    resident: Vec<wgpu::Texture>,
+    paint_bg: wgpu::BindGroup,
     bike_susp_v: wgpu::Buffer,
     bike_susp_i: wgpu::Buffer,
     #[allow(dead_code)]
@@ -93,6 +110,8 @@ pub struct Renderer {
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
+    pipe_mesh_blend: wgpu::RenderPipeline,
+    pipe_mesh_double: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
@@ -100,6 +119,9 @@ pub struct Renderer {
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
+    pipe_fxaa: wgpu::RenderPipeline,
+    credit_bg: wgpu::BindGroup,
+    pipe_credit: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
@@ -214,6 +236,7 @@ impl Renderer {
         width: u32,
         height: u32,
         formats: GpuFormats,
+        cc0: crate::cc0::Cc0Scene,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
@@ -271,6 +294,25 @@ impl Renderer {
                     },
                     count: None,
                 },
+                filter_tex(4, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(5, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(6, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                filter_samp(7, wgpu::ShaderStages::VERTEX_FRAGMENT),
+            ],
+        });
+        let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paint"),
+            entries: &[
+                filter_tex(0, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(1, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(2, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(3, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(4, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(5, wgpu::ShaderStages::FRAGMENT),
+                filter_samp(6, wgpu::ShaderStages::FRAGMENT),
+                array_tex(7),
+                array_tex(8),
+                array_tex(9),
             ],
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -420,6 +462,56 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let ground_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ground"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let paint_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("paint"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let (ground_diff, ground_diff_view) = upload_rgba(&device, &queue, "ground-diff", &cc0.ground_diff);
+        let (ground_nor, ground_nor_view) = upload_rgba(&device, &queue, "ground-nor", &cc0.ground_nor);
+        let (ground_pack, ground_pack_view) = upload_rgba(&device, &queue, "ground-pack", &cc0.ground_pack);
+        let (buggy_base, buggy_base_view) = upload_rgba(&device, &queue, "buggy-base", &cc0.buggy_base);
+        let (buggy_nor, buggy_nor_view) = upload_rgba(&device, &queue, "buggy-nor", &cc0.buggy_nor);
+        let (buggy_mr, buggy_mr_view) = upload_rgba(&device, &queue, "buggy-mr", &cc0.buggy_mr);
+        let (tire_base, tire_base_view) = upload_rgba(&device, &queue, "tire-base", &cc0.tire_base);
+        let (tire_nor, tire_nor_view) = upload_rgba(&device, &queue, "tire-nor", &cc0.tire_nor);
+        let (prop_tex, prop_view) = upload_rgba(&device, &queue, "prop", &cc0.prop_tex);
+        let mut niva = crate::niva::load();
+        let (niva_base, niva_base_view) = upload_array(&device, &queue, "niva-base", &niva.base);
+        niva.base = Vec::new();
+        let (niva_nor, niva_nor_view) = upload_array(&device, &queue, "niva-nor", &niva.nor);
+        niva.nor = Vec::new();
+        let (niva_mr, niva_mr_view) = upload_array(&device, &queue, "niva-mr", &niva.mr);
+        niva.mr = Vec::new();
+        let mut resident = vec![
+            ground_diff,
+            ground_nor,
+            ground_pack,
+            buggy_base,
+            buggy_nor,
+            buggy_mr,
+            tire_base,
+            tire_nor,
+            prop_tex,
+            niva_base,
+            niva_nor,
+            niva_mr,
+        ];
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tex-bg"),
             layout: &tex_bgl,
@@ -444,6 +536,68 @@ impl Renderer {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&shadow_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&ground_diff_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&ground_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&ground_pack_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&ground_samp),
+                },
+            ],
+        });
+        let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint-bg"),
+            layout: &paint_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&buggy_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&buggy_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&buggy_mr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&tire_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&tire_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&prop_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&paint_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&niva_base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&niva_nor_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&niva_mr_view),
+                },
             ],
         });
         let height_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -457,22 +611,22 @@ impl Renderer {
             }],
         });
 
-        let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&device, width, height, formats.depth);
-        let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit-bg"),
-            layout: &blit_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
-                },
-            ],
-        });
+        let (
+            color,
+            color_view,
+            msaa_color,
+            msaa_view,
+            fxaa,
+            fxaa_view,
+            depth,
+            depth_view,
+            readback,
+            padded_row,
+        ) = make_targets(&device, width, height, formats.depth);
+        // Resolve is 8-bit. FXAA runs before the credit so the glyph stays sharp
+        // and the readback matches the window.
+        let fxaa_bg = view_bind(&device, &blit_bgl, &color_view, &nearest, "fxaa-bg");
+        let blit_bg = view_bind(&device, &blit_bgl, &fxaa_view, &nearest, "blit-bg");
 
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain-layout"),
@@ -481,7 +635,7 @@ impl Renderer {
         });
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
-            bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl],
+            bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl],
             push_constant_ranges: &[],
         });
         let solo_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -552,6 +706,38 @@ impl Renderer {
             )),
             false,
             Some(wgpu::Face::Back),
+        );
+        let pipe_mesh_blend = pipeline(
+            &device,
+            &shader,
+            mesh_layout_ref,
+            "vs_mesh",
+            Some("fs_mesh"),
+            mesh_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
+        let pipe_mesh_double = pipeline(
+            &device,
+            &shader,
+            mesh_layout_ref,
+            "vs_mesh",
+            Some("fs_mesh"),
+            mesh_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                true,
+                wgpu::CompareFunction::Less,
+            )),
+            false,
+            None,
         );
         let pipe_sky = pipeline(
             &device,
@@ -633,6 +819,60 @@ impl Renderer {
             false,
             None,
         );
+        let pipe_fxaa = pipeline(
+            &device,
+            &blit_shader,
+            &blit_layout,
+            "vs_blit",
+            Some("fs_fxaa"),
+            &[],
+            color_format,
+            None,
+            false,
+            None,
+        );
+        let (credit_w, credit_h, credit_px) = credit_banner();
+        let credit_tex = upload_rgba(
+            &device,
+            &queue,
+            "credits",
+            &RgbaTex {
+                width: credit_w,
+                height: credit_h,
+                rgba: credit_px,
+            },
+        );
+        let credit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("credit-bg"),
+            layout: &blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&credit_tex.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&paint_samp),
+                },
+            ],
+        });
+        let credit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("credits"),
+            source: wgpu::ShaderSource::Wgsl(CREDIT_WGSL.into()),
+        });
+        let pipe_credit = pipeline(
+            &device,
+            &credit_shader,
+            &blit_layout,
+            "vs_credit",
+            Some("fs_credit"),
+            &[],
+            color_format,
+            None,
+            true,
+            None,
+        );
+        resident.push(credit_tex.0);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -649,23 +889,27 @@ impl Renderer {
 
         let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
         let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
-        let body_cpu = buggy_body();
-        let body = upload_cpu(&device, &body_cpu, "body");
+        let body = upload_cpu(&device, &niva.body, "niva-body");
+        let glass = upload_cpu(&device, &niva.glass, "niva-glass");
+        let wheels = [
+            upload_cpu(&device, &niva.wheels[0], "niva-fl"),
+            upload_cpu(&device, &niva.wheels[1], "niva-fr"),
+            upload_cpu(&device, &niva.wheels[2], "niva-rl"),
+            upload_cpu(&device, &niva.wheels[3], "niva-rr"),
+        ];
+        // The Grab3D buggy stays loaded. The demo draws the Niva instead.
+        let buggy_body = upload_cpu(&device, &cc0.body, "buggy-body");
+        let buggy_glass = upload_cpu(&device, &cc0.glass, "buggy-glass");
+        let buggy_wheels = [
+            upload_cpu(&device, &cc0.wheels[0], "buggy-fl"),
+            upload_cpu(&device, &cc0.wheels[1], "buggy-fr"),
+            upload_cpu(&device, &cc0.wheels[2], "buggy-rl"),
+            upload_cpu(&device, &cc0.wheels[3], "buggy-rr"),
+        ];
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
-        let susp_v = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("susp-v"),
-            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let susp_i = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("susp-i"),
-            size: (32768 * 4) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let props = upload_cpu(&device, &cc0.props, "props");
         let bike_susp_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bike-susp-v"),
             size: (8192 * std::mem::size_of::<MeshVertex>()) as u64,
@@ -714,6 +958,11 @@ impl Renderer {
             mat_tex,
             color,
             color_view,
+            msaa_color,
+            msaa_view,
+            fxaa,
+            fxaa_view,
+            fxaa_bg,
             depth,
             depth_view,
             shadow,
@@ -724,11 +973,17 @@ impl Renderer {
             padded_row,
             terrain,
             body,
+            glass,
+            wheels,
+            buggy_body,
+            buggy_glass,
+            buggy_wheels,
             wheel,
             bike_body,
             env,
-            susp_v,
-            susp_i,
+            props,
+            resident,
+            paint_bg,
             bike_susp_v,
             bike_susp_i,
             particles,
@@ -738,12 +993,17 @@ impl Renderer {
             pipe_terrain,
             pipe_water,
             pipe_mesh,
+            pipe_mesh_blend,
+            pipe_mesh_double,
             pipe_particle,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
+            pipe_fxaa,
+            credit_bg,
+            pipe_credit,
             blit_shader,
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
@@ -789,10 +1049,24 @@ impl Renderer {
         }
         self.width = width;
         self.height = height;
-        let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&self.device, width, height, self.depth_format);
+        let (
+            color,
+            color_view,
+            msaa_color,
+            msaa_view,
+            fxaa,
+            fxaa_view,
+            depth,
+            depth_view,
+            readback,
+            padded_row,
+        ) = make_targets(&self.device, width, height, self.depth_format);
         self.color = color;
         self.color_view = color_view;
+        self.msaa_color = msaa_color;
+        self.msaa_view = msaa_view;
+        self.fxaa = fxaa;
+        self.fxaa_view = fxaa_view;
         self.depth = depth;
         self.depth_view = depth_view;
         self.readback = readback;
@@ -801,24 +1075,27 @@ impl Renderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
+        // Rebuild the resolve bind groups against the new views.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
-        self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit-bg"),
-            layout: &blit_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.color_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
-                },
-            ],
-        });
+        self.fxaa_bg = view_bind(
+            &self.device,
+            &blit_bgl,
+            &self.color_view,
+            &nearest,
+            "fxaa-bg",
+        );
+        self.blit_bg = view_bind(
+            &self.device,
+            &blit_bgl,
+            &self.fxaa_view,
+            &nearest,
+            "blit-bg",
+        );
     }
 
     pub fn draw(
@@ -827,14 +1104,9 @@ impl Renderer {
         cam: CameraPose,
         present: Option<(&wgpu::TextureView, bool)>,
         readback: bool,
+        show_bike: bool,
     ) -> Option<Vec<u8>> {
         self.upload_soil(&world.soil);
-        let susp = suspension_mesh(&world.vehicle);
-        let susp_index_count = susp.indices.len() as u32;
-        self.queue
-            .write_buffer(&self.susp_v, 0, bytemuck::cast_slice(&susp.vertices));
-        self.queue
-            .write_buffer(&self.susp_i, 0, bytemuck::cast_slice(&susp.indices));
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
         self.queue
@@ -932,8 +1204,11 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
-            self.draw_bike(&mut pass, bike_susp_count);
+            draw_indexed(&mut pass, &self.props);
+            self.draw_vehicle(&mut pass);
+            if show_bike {
+                self.draw_bike(&mut pass, bike_susp_count);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_chunks(&mut pass, chunk_count);
         }
@@ -942,11 +1217,11 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    resolve_target: None,
+                    view: &self.msaa_view,
+                    resolve_target: Some(&self.color_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -969,16 +1244,71 @@ impl Renderer {
             draw_indexed(&mut pass, &self.terrain);
 
             pass.set_pipeline(&self.pipe_mesh);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             draw_indexed(&mut pass, &self.env);
-            self.draw_vehicle(&mut pass, susp_index_count);
-            self.draw_bike(&mut pass, bike_susp_count);
+            pass.set_pipeline(&self.pipe_mesh_double);
+            self.draw_vehicle(&mut pass);
+            pass.set_pipeline(&self.pipe_mesh);
+            if show_bike {
+                self.draw_bike(&mut pass, bike_susp_count);
+            }
+
+            pass.set_pipeline(&self.pipe_mesh_double);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            draw_indexed(&mut pass, &self.props);
 
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
             pass.set_pipeline(&self.pipe_mesh);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_chunks(&mut pass, chunk_count);
+
+            pass.set_pipeline(&self.pipe_mesh_blend);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            self.draw_glass(&mut pass);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fxaa"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.fxaa_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipe_fxaa);
+            pass.set_bind_group(0, &self.fxaa_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("credits"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.fxaa_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipe_credit);
+            pass.set_bind_group(0, &self.credit_bg, &[]);
+            pass.draw(0..6, 0..1);
         }
 
         if let Some((view, srgb)) = present {
@@ -1008,7 +1338,7 @@ impl Renderer {
         if readback {
             encoder.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture {
-                    texture: &self.color,
+                    texture: &self.fxaa,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -1133,7 +1463,9 @@ impl Renderer {
     }
 
     fn write_models(&self, vehicle: &Vehicle) {
-        let body = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
+        let chassis = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
+        // The Niva mesh is already fitted onto the hardpoints.
+        let body = chassis;
         let mut mud = [[0.0; 4]; PANEL_COUNT];
         for (i, panel) in vehicle.panels.iter().enumerate() {
             mud[i] = [
@@ -1145,10 +1477,10 @@ impl Renderer {
         }
         let slots = [
             model(body, mud, [0.0, 0.0, 0.0, 0.0]),
-            wheel_model(vehicle, body, mud, 0),
-            wheel_model(vehicle, body, mud, 1),
-            wheel_model(vehicle, body, mud, 2),
-            wheel_model(vehicle, body, mud, 3),
+            wheel_model(vehicle, chassis, mud, 0),
+            wheel_model(vehicle, chassis, mud, 1),
+            wheel_model(vehicle, chassis, mud, 2),
+            wheel_model(vehicle, chassis, mud, 3),
             model(Mat4::IDENTITY, [[0.0; 4]; 12], [0.0, 0.0, 0.0, 0.0]),
             model(body, mud, [0.0, 0.0, 0.0, 0.0]),
         ];
@@ -1161,17 +1493,21 @@ impl Renderer {
         }
     }
 
-    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>, susp_indices: u32) {
+    fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(2, &self.model_bg, &[0]);
         draw_indexed(pass, &self.body);
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
-            draw_indexed(pass, &self.wheel);
+            draw_indexed(pass, &self.wheels[i]);
         }
-        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 6]);
-        pass.set_vertex_buffer(0, self.susp_v.slice(..));
-        pass.set_index_buffer(self.susp_i.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..susp_indices, 0, 0..1);
+    }
+
+    fn draw_glass(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.glass.count == 0 {
+            return;
+        }
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        draw_indexed(pass, &self.glass);
     }
 
     fn write_bike_models(&self, bike: &Bike) {
@@ -1244,6 +1580,8 @@ fn bike_wheel_model(bike: &Bike, body: Mat4, mud: [[f32; 4]; 12], index: usize) 
 fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize) -> ModelData {
     let local = vehicle.wheel_center_local(index);
     let wheel = vehicle.wheels[index];
+    // Authored front radius is 0.30 and rear is 0.36. Scale onto the physics
+    // radius so the tread meets the soil at the same hub the fender was fit to.
     let world = body
         * Mat4::from_translation(local)
         * Mat4::from_rotation_y(wheel.steer)
@@ -1251,7 +1589,7 @@ fn wheel_model(vehicle: &Vehicle, body: Mat4, mud: [[f32; 4]; 12], index: usize)
     model(
         world,
         mud,
-        [1.0, (wheel.mud / 1.5).clamp(0.0, 1.4), 0.0, 0.0],
+        [1.0, (wheel.mud / 1.5).clamp(0.0, 1.4), 1.0, 0.0],
     )
 }
 
@@ -1271,6 +1609,217 @@ fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.count, 0, 0..1);
+}
+
+fn filter_tex(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn array_tex(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn upload_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    layers: &[RgbaTex],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let width = layers[0].width;
+    let height = layers[0].height;
+    let mips = mip_count(width.max(height));
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: layers.len() as u32,
+        },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (i, layer) in layers.iter().enumerate() {
+        let mut rgba = layer.rgba.clone();
+        let mut mw = width;
+        let mut mh = height;
+        for level in 0..mips {
+            let (padded, stride) = pad_rows(&rgba, mw, mh);
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &padded,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(mh),
+                },
+                wgpu::Extent3d {
+                    width: mw,
+                    height: mh,
+                    depth_or_array_layers: 1,
+                },
+            );
+            if level + 1 == mips {
+                break;
+            }
+            rgba = box_down(&rgba, mw, mh);
+            mw = (mw / 2).max(1);
+            mh = (mh / 2).max(1);
+        }
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some(label),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+fn mip_count(size: u32) -> u32 {
+    let mut n = 1u32;
+    let mut s = size.max(1);
+    while s > 1 {
+        s /= 2;
+        n += 1;
+    }
+    n
+}
+
+fn box_down(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let nw = (w / 2).max(1);
+    let nh = (h / 2).max(1);
+    let mut dst = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut acc = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let sx = (x * 2 + dx).min(w - 1);
+                    let sy = (y * 2 + dy).min(h - 1);
+                    let i = ((sy * w + sx) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += src[i + c] as u32;
+                    }
+                }
+            }
+            let o = ((y * nw + x) * 4) as usize;
+            for c in 0..4 {
+                dst[o + c] = (acc[c] / 4) as u8;
+            }
+        }
+    }
+    dst
+}
+
+fn pad_rows(src: &[u8], w: u32, h: u32) -> (Vec<u8>, u32) {
+    let tight = w * 4;
+    let stride = tight.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    if stride == tight {
+        return (src.to_vec(), stride);
+    }
+    let mut dst = vec![0u8; (stride * h) as usize];
+    for y in 0..h as usize {
+        let s = y * tight as usize;
+        let d = y * stride as usize;
+        dst[d..d + tight as usize].copy_from_slice(&src[s..s + tight as usize]);
+    }
+    (dst, stride)
+}
+
+fn filter_samp(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn upload_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    tex: &RgbaTex,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: tex.width,
+            height: tex.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = tex.width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = stride.div_ceil(align) * align;
+    let data: Vec<u8> = if padded == stride {
+        tex.rgba.clone()
+    } else {
+        let mut out = vec![0u8; (padded * tex.height) as usize];
+        for y in 0..tex.height as usize {
+            let src = y * stride as usize;
+            let dst = y * padded as usize;
+            out[dst..dst + stride as usize].copy_from_slice(&tex.rgba[src..src + stride as usize]);
+        }
+        out
+    };
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(padded),
+            rows_per_image: Some(tex.height),
+        },
+        wgpu::Extent3d {
+            width: tex.width,
+            height: tex.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 fn upload_cpu(device: &wgpu::Device, mesh: &CpuMesh, label: &str) -> GpuMesh {
@@ -1311,6 +1860,10 @@ fn make_targets(
     wgpu::TextureView,
     wgpu::Texture,
     wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
     wgpu::Buffer,
     u32,
 ) {
@@ -1331,6 +1884,38 @@ fn make_targets(
         view_formats: &[],
     });
     let color_view = color.create_view(&Default::default());
+    let fxaa = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fxaa"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let fxaa_view = fxaa.create_view(&Default::default());
+    let msaa_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("color-msaa"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: COLOR_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let msaa_view = msaa_color.create_view(&Default::default());
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
         size: wgpu::Extent3d {
@@ -1339,7 +1924,7 @@ fn make_targets(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: COLOR_SAMPLES,
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1354,7 +1939,41 @@ fn make_targets(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    (color, color_view, depth, depth_view, readback, padded_row)
+    (
+        color,
+        color_view,
+        msaa_color,
+        msaa_view,
+        fxaa,
+        fxaa_view,
+        depth,
+        depth_view,
+        readback,
+        padded_row,
+    )
+}
+
+fn view_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    samp: &wgpu::Sampler,
+    label: &'static str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+        ],
+    })
 }
 
 fn uniform_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {
@@ -1517,7 +2136,18 @@ fn pipeline(
             conservative: false,
         },
         depth_stencil: depth,
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: if matches!(
+                vs,
+                "vs_shadow_terrain" | "vs_shadow_mesh" | "vs_blit" | "vs_credit"
+            ) {
+                1
+            } else {
+                COLOR_SAMPLES
+            },
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         fragment: fs.map(|entry| wgpu::FragmentState {
             module: shader,
             entry_point: Some(entry),
@@ -1544,6 +2174,105 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::
         .write_image_data(rgba)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
 }
+
+const CREDIT: &str =
+    "Lada Niva by Greg McKechnie (https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2) — CC BY 4.0";
+
+fn credit_banner() -> (u32, u32, Vec<u8>) {
+    let line1 = "Lada Niva by Greg McKechnie";
+    let line2 = "(https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2) — CC BY 4.0";
+    let _ = CREDIT;
+    let w = 1024u32;
+    let h = 48u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = 16;
+        px[1] = 10;
+        px[2] = 7;
+        px[3] = 196;
+    }
+    stamp_text(&mut rgba, w, 12, 4, line1, 2);
+    stamp_text(&mut rgba, w, 12, 24, line2, 1);
+    (w, h, rgba)
+}
+
+fn stamp_text(rgba: &mut [u8], width: u32, x0: u32, y0: u32, text: &str, scale: u32) {
+    let mut x = x0;
+    for ch in text.chars() {
+        let bits = glyph(ch);
+        for row in 0..8u32 {
+            let bits = bits[row as usize];
+            for col in 0..8u32 {
+                if (bits >> col) & 1 == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = x + col * scale + sx;
+                        let py = y0 + row * scale + sy;
+                        if px >= width {
+                            continue;
+                        }
+                        let i = ((py * width + px) * 4) as usize;
+                        if i + 3 >= rgba.len() {
+                            continue;
+                        }
+                        rgba[i] = 244;
+                        rgba[i + 1] = 232;
+                        rgba[i + 2] = 214;
+                        rgba[i + 3] = 255;
+                    }
+                }
+            }
+        }
+        x += 8 * scale + scale;
+    }
+}
+
+fn glyph(ch: char) -> [u8; 8] {
+    use font8x8::UnicodeFonts;
+    if ch == '\u{2014}' || ch == '\u{2013}' {
+        return [0x00, 0x00, 0x00, 0x7E, 0x7E, 0x00, 0x00, 0x00];
+    }
+    font8x8::BASIC_FONTS
+        .get(ch)
+        .or_else(|| font8x8::LATIN_FONTS.get(ch))
+        .unwrap_or([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+}
+
+const CREDIT_WGSL: &str = r#"
+struct V {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@group(0) @binding(0) var credit_tex: texture_2d<f32>;
+@group(0) @binding(1) var credit_samp: sampler;
+
+@vertex
+fn vs_credit(@builtin(vertex_index) vid: u32) -> V {
+    var p = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(-1.0, -0.84),
+        vec2<f32>(-1.0, -0.84),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, -0.84),
+    );
+    let xy = p[vid];
+    var o: V;
+    o.clip = vec4<f32>(xy, 0.0, 1.0);
+    let u = xy.x * 0.5 + 0.5;
+    let v = (xy.y - (-1.0)) / 0.16;
+    o.uv = vec2<f32>(u, 1.0 - v);
+    return o;
+}
+
+@fragment
+fn fs_credit(in: V) -> @location(0) vec4<f32> {
+    return textureSample(credit_tex, credit_samp, in.uv);
+}
+"#;
 
 const BLIT_WGSL: &str = r#"
 struct V {
@@ -1573,5 +2302,41 @@ fn fs_blit(in: V) -> @location(0) vec4<f32> {
 fn fs_blit_tosrgb(in: V) -> @location(0) vec4<f32> {
     let c = textureSample(blit_tex, blit_samp, in.uv);
     return vec4<f32>(pow(c.rgb, vec3<f32>(2.2)), c.a);
+}
+
+fn fxaa_luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.299, 0.587, 0.114));
+}
+
+@fragment
+fn fs_fxaa(in: V) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(blit_tex));
+    let px = 1.0 / dims;
+    let c = textureSampleLevel(blit_tex, blit_samp, in.uv, 0.0);
+    let l = fxaa_luma(c.rgb);
+    let n = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(0.0, -px.y), 0.0).rgb);
+    let s = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(0.0, px.y), 0.0).rgb);
+    let e = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(px.x, 0.0), 0.0).rgb);
+    let w = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(-px.x, 0.0), 0.0).rgb);
+    let lne = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(px.x, -px.y), 0.0).rgb);
+    let lnw = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(-px.x, -px.y), 0.0).rgb);
+    let lse = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(px.x, px.y), 0.0).rgb);
+    let lsw = fxaa_luma(textureSampleLevel(blit_tex, blit_samp, in.uv + vec2<f32>(-px.x, px.y), 0.0).rgb);
+    let edge_h = abs(lnw + 2.0 * n + lne - (lsw + 2.0 * s + lse));
+    let edge_v = abs(lnw + 2.0 * w + lsw - (lne + 2.0 * e + lse));
+    let contrast = max(edge_h, edge_v);
+    // Dithered gradients stay put. A hard glyph is left alone. A rim stair
+    // sits between those, and a short blend across the edge knocks it down.
+    let thresh = max(0.08, l * 0.15);
+    if (contrast < thresh || contrast > 1.2) {
+        return c;
+    }
+    let horizontal = edge_h >= edge_v;
+    let step = select(vec2<f32>(px.x, 0.0), vec2<f32>(0.0, px.y), horizontal);
+    let a = textureSampleLevel(blit_tex, blit_samp, in.uv - step, 0.0);
+    let b = textureSampleLevel(blit_tex, blit_samp, in.uv + step, 0.0);
+    let span = clamp((contrast - thresh) / max(contrast, 1e-3), 0.0, 1.0);
+    let cap = mix(0.4, 0.12, smoothstep(0.35, 0.9, contrast));
+    return vec4<f32>(mix(c.rgb, (a.rgb + b.rgb) * 0.5, span * cap), c.a);
 }
 "#;

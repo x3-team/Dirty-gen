@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Silt</title>
     <link data-trunk rel="rust" data-bin="silt" data-wasm-opt="0" />
+    <link data-trunk rel="copy-dir" href="assets" />
     <style>
       html,
       body {
@@ -39,7 +40,8 @@
   <body>
     <canvas id="silt" tabindex="0"></canvas>
     <div id="hud">
-      Обе машины едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте, C камера.
+      Нива и мотоцикл едут круг, пока вы не возьмёте руль. Кликните по сцене. W / ↑ газ, S / ↓ тормоз, A / ← и D / → руль, V кого ведёте (Нива или мотоцикл), C камера.
+      Lada Niva by Greg McKechnie (https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2) — CC BY 4.0.
       <span id="backend">загрузка…</span>
     </div>
     <script>

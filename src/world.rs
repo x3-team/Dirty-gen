@@ -619,14 +619,14 @@ pub fn dig_input(t: f32) -> Input {
     }
 }
 
-/// Fixed oblique orthographic view of the whole loop. The chase camera is a toggle.
-pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
-    let target = Vec3::new(0.0, 0.4, 1.4);
-    let eye = target + Vec3::new(-14.5, 12.2, -13.0);
+/// Default view stays on the Niva. The chase camera is the C toggle.
+pub fn demo_camera(_t: f32, pos: Vec3, _yaw: f32) -> CameraPose {
+    let target = Vec3::new(pos.x, pos.y.max(0.45), pos.z);
+    let eye = target + Vec3::new(-9.2, 6.8, -7.6);
     CameraPose {
         eye,
         target,
-        ortho_width: Some(25.5),
+        ortho_width: Some(12.0),
     }
 }
 
