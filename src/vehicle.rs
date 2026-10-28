@@ -4,7 +4,8 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, terramech, SoilField, SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
+    terramech_for, wheel_buoyancy, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -224,7 +225,13 @@ impl Vehicle {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
                 ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(z0, up_y, self.wheels[i].slip, sample.softness)
+                solve_suspension(
+                    z0,
+                    up_y,
+                    self.wheels[i].slip,
+                    terramech_for(sample.kind(), sample.softness, sample.water),
+                    sample.water,
+                )
             };
 
             let wheel_center = wc0 + up * compression;
@@ -263,7 +270,7 @@ impl Vehicle {
             let mut fling = 0.0;
 
             if active {
-                let tm = terramech(sample.softness);
+                let tm = terramech_for(sample.kind(), sample.softness, sample.water);
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -335,7 +342,7 @@ impl Vehicle {
                     let dir_a = v_lat / speed_h;
                     chassis_long = blended_long - dir_l * (breakaway + f_visc);
                     chassis_lat = blended_lat - dir_a * (breakaway + f_visc);
-                    let rr = 0.025 * normal;
+                    let rr = rolling_resistance(normal, sample.water);
                     chassis_long -= v_long.signum() * rr;
                 }
 
@@ -544,7 +551,7 @@ impl Vehicle {
         for c in contacts.iter() {
             let w = &mut self.wheels[c.index];
             if c.active {
-                let wet = c.sample.wetness;
+                let wet = c.sample.wetness * stick_scale(c.sample.kind(), c.sample.wetness);
                 let loose = c.sample.loose;
                 let pressure = (c.normal / 1_500.0).clamp(0.0, 2.5);
                 let room = (1.0 - w.mud / WHEEL_MUD_CAP).clamp(0.0, 1.0);
@@ -645,6 +652,8 @@ impl Default for Contact {
                 roughness: 0.8,
                 softness: 0.0,
                 rut: 0.0,
+                kind: 0,
+                placed: 0.0,
             },
             speed: 0.0,
             fling: 0.0,
@@ -663,34 +672,43 @@ fn wrap_angle(mut a: f32) -> f32 {
     a
 }
 
-fn solve_suspension(z0: f32, up_y: f32, slip: f32, softness: f32) -> (f32, f32, f32) {
-    let tm = terramech(softness);
+fn solve_suspension(
+    z0: f32,
+    up_y: f32,
+    slip: f32,
+    tm: crate::soil::Terramech,
+    water: f32,
+) -> (f32, f32, f32) {
     // Slip-sinkage: a spinning tire sees a softer modulus and sinks further.
     let k_eq = tm.k_eq / (1.0 + 0.18 * slip.abs());
     let spring = |c: f32| SUSP_PRELOAD + SUSP_K * c;
     let z_of = |c: f32| (z0 - up_y * c).max(0.0);
     let soil_n = |c: f32| bekker_load(z_of(c), WHEEL_RADIUS, WHEEL_WIDTH, k_eq, tm.n);
+    // The spring balances soil plus the water the tread displaces, so a
+    // deeper sheet rides the tire higher.
+    let buoy = wheel_buoyancy(water, WHEEL_RADIUS, WHEEL_WIDTH);
+    let support = |c: f32| soil_n(c) + buoy;
 
     let at_droop = soil_n(0.0);
-    if at_droop <= 1.0 {
+    if at_droop <= 1.0 && buoy <= 1.0 {
         return (0.0, 0.0, 0.0);
     }
     // Droop stop: the ground is softer than the preloaded spring, so the arm
     // stays extended and only the soil force is passed into the chassis.
-    if at_droop < spring(0.0) {
-        return (0.0, z_of(0.0), at_droop.min(22_000.0));
+    if support(0.0) < spring(0.0) {
+        return (0.0, z_of(0.0), support(0.0).min(22_000.0));
     }
     // Bump stop: full compression and the soil is still harder than the spring.
-    if soil_n(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
+    if support(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
         let z = z_of(SUSP_TRAVEL);
-        return (SUSP_TRAVEL, z, soil_n(SUSP_TRAVEL).min(22_000.0));
+        return (SUSP_TRAVEL, z, support(SUSP_TRAVEL).min(22_000.0));
     }
 
     let mut lo = 0.0;
     let mut hi = SUSP_TRAVEL;
     for _ in 0..14 {
         let mid = 0.5 * (lo + hi);
-        if spring(mid) > soil_n(mid) {
+        if spring(mid) > support(mid) {
             hi = mid;
         } else {
             lo = mid;
