@@ -469,6 +469,10 @@ struct CaptureArgs {
     persist_first: PathBuf,
     persist_second: PathBuf,
     persist_reload: PathBuf,
+    niva_tread: bool,
+    niva_groove_roll: PathBuf,
+    niva_groove_spin: PathBuf,
+    niva_sidewall_shed: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -512,6 +516,10 @@ fn capture(args: &[String]) {
     }
     if parsed.persist {
         capture_persist(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.niva_tread {
+        capture_niva_tread(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -652,6 +660,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut moisture = false;
     let mut patch = false;
     let mut persist = false;
+    let mut niva_tread = false;
     let mut video = PathBuf::from(format!("{MEDIA}/mud-demo.mp4"));
     let mut still_start = PathBuf::from(format!("{MEDIA}/mud-demo-start.png"));
     let mut still_puddle = PathBuf::from(format!("{MEDIA}/mud-demo-puddle.png"));
@@ -672,6 +681,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut persist_first = PathBuf::from(format!("{MEDIA}/persist-first.png"));
     let mut persist_second = PathBuf::from(format!("{MEDIA}/persist-second.png"));
     let mut persist_reload = PathBuf::from(format!("{MEDIA}/persist-reload.png"));
+    let mut niva_groove_roll = PathBuf::from(format!("{MEDIA}/niva-groove-roll.png"));
+    let mut niva_groove_spin = PathBuf::from(format!("{MEDIA}/niva-groove-spin.png"));
+    let mut niva_sidewall_shed = PathBuf::from(format!("{MEDIA}/niva-sidewall-shed.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -694,6 +706,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
             "--moisture" => moisture = true,
             "--patch" => patch = true,
             "--persist" => persist = true,
+            "--niva-tread" => niva_tread = true,
+            "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
+            "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
+            "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
             "--persist-first" => persist_first = PathBuf::from(val(&mut i)),
             "--persist-second" => persist_second = PathBuf::from(val(&mut i)),
             "--persist-reload" => persist_reload = PathBuf::from(val(&mut i)),
@@ -752,6 +768,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         persist_first,
         persist_second,
         persist_reload,
+        niva_tread,
+        niva_groove_roll,
+        niva_groove_spin,
+        niva_sidewall_shed,
     }
 }
 
@@ -1076,6 +1096,228 @@ fn capture_patch(renderer: &mut Renderer, parsed: &CaptureArgs) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn capture_niva_tread(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::flat(0.72);
+    world.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+    world.bike.vel = Vec3::ZERO;
+    for w in &mut world.soil.water {
+        *w = 0.0;
+    }
+    for loose in &mut world.soil.loose {
+        *loose = loose.max(0.06);
+    }
+    let before = world.soil.volumes();
+    let dt = 1.0 / 60.0;
+    // The mud bog either drags the carcass or lights the tires up. Prescribe a
+    // matched roll so the contact patch, not a throttle hunt, packs the tread.
+    // The soil stamp and the tread ODE are unchanged.
+    let mut steps = 0;
+    while steps < 220 {
+        prescribe_roll(&mut world, 1.15);
+        world.step(dt, &Input::default());
+        steps += 1;
+        if steps % 30 == 0 {
+            let w = world.vehicle.wheels[3];
+            println!(
+                "roll t={:.2} slip {:.2} speed {:.2} groove {:.2} sidewall {:.2} coat {:.5}",
+                world.time, w.slip, world.vehicle.speed(), w.groove, w.sidewall, world.coat_in_rut
+            );
+        }
+        let w = world.vehicle.wheels[3];
+        if steps > 80 && w.groove > 0.75 && w.sidewall > 0.60 && w.slip.abs() < 0.22 {
+            break;
+        }
+    }
+    print_patch("niva-roll", &world);
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-roll",
+        &parsed.niva_groove_roll,
+        parsed,
+        niva_tread_camera(&world, 3),
+    );
+
+    for _ in 0..36 {
+        world.step(
+            dt,
+            &Input {
+                throttle: 0.0,
+                brake: 1.0,
+                steer: 0.0,
+            },
+        );
+        hold_chassis(&mut world);
+    }
+    let spin = Input {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    let mut spun = 0;
+    while spun < 200 {
+        world.step(dt, &spin);
+        hold_chassis(&mut world);
+        spun += 1;
+        if spun > 24 && world.vehicle.wheels[3].groove < 0.22 {
+            break;
+        }
+    }
+    print_patch("niva-spin", &world);
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-spin",
+        &parsed.niva_groove_spin,
+        parsed,
+        niva_tread_camera(&world, 3),
+    );
+
+    while spun < 420 {
+        let w = world.vehicle.wheels[3];
+        if w.sidewall < 0.18 && world.coat_in_rut > 1.0e-4 {
+            break;
+        }
+        world.step(dt, &spin);
+        hold_chassis(&mut world);
+        spun += 1;
+    }
+    print_patch("niva-shed", &world);
+    let after = world.soil.volumes();
+    let pile = rut_pile(&world, 3);
+    println!(
+        "niva shed coat_in_rut {:.5} m3  placed {:.5} -> {:.5}  cut {:.5} -> {:.5}  placed-cut {:.5} -> {:.5}  \
+         pile {:.3} m on {} rut cells",
+        world.coat_in_rut,
+        before.placed,
+        after.placed,
+        before.cut,
+        after.cut,
+        before.placed - before.cut,
+        after.placed - after.cut,
+        pile.0,
+        pile.1
+    );
+    silence_chunks(&mut world);
+    write_cc0_still(
+        renderer,
+        &world,
+        "niva-shed",
+        &parsed.niva_sidewall_shed,
+        parsed,
+        niva_shed_camera(&world, 3),
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prescribe_roll(world: &mut World, speed: f32) {
+    use silt::vehicle::WHEEL_RADIUS;
+    world.vehicle.yaw = 0.0;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.vel.x = 0.0;
+    world.vehicle.vel.z = speed;
+    let omega = speed * 1.08 / WHEEL_RADIUS;
+    for w in &mut world.vehicle.wheels {
+        w.omega = omega;
+    }
+}
+
+/// Tallest placed thickness on rut cells in the sidewall deposit window.
+fn rut_pile(world: &World, wheel: usize) -> (f32, u32) {
+    let vehicle = &world.vehicle;
+    let center = vehicle.pos + vehicle.orientation() * vehicle.wheel_center_local(wheel);
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let soil = &world.soil;
+    let half = soil.size * 0.5;
+    let mut best = 0.0_f32;
+    let mut n = 0u32;
+    let res = soil.res as isize;
+    let reach = 1.2_f32;
+    let i0 = (((center.x - reach) + half) / soil.cell).floor() as isize;
+    let i1 = (((center.x + reach) + half) / soil.cell).floor() as isize;
+    let j0 = (((center.z - reach) + half) / soil.cell).floor() as isize;
+    let j1 = (((center.z + reach) + half) / soil.cell).floor() as isize;
+    for j in j0.max(0)..j1.min(res - 1) {
+        for i in i0.max(0)..i1.min(res - 1) {
+            let cx = (i as f32 + 0.5) * soil.cell - half;
+            let cz = (j as f32 + 0.5) * soil.cell - half;
+            let rel_x = cx - center.x;
+            let rel_z = cz - center.z;
+            let along = rel_x * fwd.x + rel_z * fwd.z;
+            let lat = rel_x * right.x + rel_z * right.z;
+            let behind = -along;
+            if !(0.38..=0.95).contains(&behind) || lat.abs() > 0.22 {
+                continue;
+            }
+            let idx = j as usize * soil.res + i as usize;
+            let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            if depth > 0.01 {
+                n += 1;
+                best = best.max(soil.placed[idx]);
+            }
+        }
+    }
+    (best, n)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn hold_chassis(world: &mut World) {
+    world.vehicle.vel.x = 0.0;
+    world.vehicle.vel.z = 0.0;
+    world.vehicle.yaw_rate *= 0.2;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn silence_chunks(world: &mut World) {
+    for p in &mut world.particles.items {
+        p.alive = false;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_tread_camera(world: &World, wheel: usize) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let local = vehicle.wheel_center_local(wheel);
+    let center = vehicle.pos + vehicle.orientation() * local;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let side = if local.x >= 0.0 { 1.0 } else { -1.0 };
+    // Behind the shoulder, so the crown grooves face the camera and the
+    // sidewall coat is the near edge rather than the whole frame.
+    let eye = center - fwd * 1.02 + right * side * 0.46 + Vec3::Y * 0.30;
+    CameraPose {
+        eye,
+        target: center - Vec3::Y * 0.08 + right * side * 0.02,
+        ortho_width: Some(0.88),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn niva_shed_camera(world: &World, wheel: usize) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let local = vehicle.wheel_center_local(wheel);
+    let center = vehicle.pos + vehicle.orientation() * local;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let side = if local.x >= 0.0 { 1.0 } else { -1.0 };
+    // Tire on the left, the rut it just shed into filling the middle.
+    let eye = center - fwd * 1.42 + right * side * 0.78 + Vec3::Y * 0.46;
+    CameraPose {
+        eye,
+        target: center - fwd * 0.62 - Vec3::Y * 0.16,
+        ortho_width: Some(1.32),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn print_patch(label: &str, world: &World) {
     use silt::patch::{contact_patch, TreadCoat};
     use silt::vehicle::{WHEEL_RADIUS, WHEEL_WIDTH};
@@ -1095,6 +1337,7 @@ fn print_patch(label: &str, world: &World) {
         TreadCoat {
             groove: w.groove,
             smear: w.smear,
+            sidewall: w.sidewall,
         },
     );
     let mut kinds = [0u32; 5];
@@ -1105,13 +1348,14 @@ fn print_patch(label: &str, world: &World) {
     }
     let thrown = (kinds[0] + kinds[1]) as usize;
     println!(
-        "{label} slip {:.2}  speed {:.2}  sink {:.3}  groove {:.2}  smear {:.2}  mud {:.2}  \
-         grip {:.0} N  mu {:.3}  scale {:.2}  len {:.3} m  pull {:.2}  clods {thrown}  \
-         kinds {kinds:?}  soil {:?}",
+        "{label} slip {:.2}  speed {:.2}  sink {:.3}  groove {:.2}  sidewall {:.2}  smear {:.2}  mud {:.2}  \
+         grip {:.0} N  mu {:.3}  scale {:.2}  len {:.3} m  pull {:.2}  coat_in_rut {:.5} m3  \
+         clods {thrown}  kinds {kinds:?}  soil {:?}",
         w.slip,
         world.vehicle.speed(),
         w.sinkage,
         w.groove,
+        w.sidewall,
         w.smear,
         w.mud,
         patch.grip,
@@ -1119,6 +1363,7 @@ fn print_patch(label: &str, world: &World) {
         patch.scale,
         patch.length,
         patch.pull,
+        world.coat_in_rut,
         sample.kind()
     );
 }

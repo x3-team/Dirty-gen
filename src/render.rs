@@ -1529,8 +1529,15 @@ fn wheel_model(
             * Mat4::from_scale(Vec3::splat(fit))
     };
     let mud_n = (wheel.mud / 1.5).clamp(0.0, 1.4);
+    // Niva kind 2 carries the contact patch: sidewall, groove fill, lug smear.
+    // The procedural tire stays kind 1. Its grooves are the mesh, not this carcass.
     let extra = if niva {
-        [0.0, mud_n, 0.0, 0.0]
+        [
+            2.0,
+            wheel.sidewall.clamp(0.0, 1.0),
+            wheel.groove.clamp(0.0, 1.0),
+            wheel.smear.clamp(0.0, 1.0),
+        ]
     } else {
         [
             1.0,

@@ -3,7 +3,7 @@
 
 use glam::{EulerRot, Quat, Vec3};
 
-use crate::patch::{contact_patch, step_tread, TreadCoat};
+use crate::patch::{contact_patch, step_tread, TreadCoat, TreadStep};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
     terramech_for, wheel_buoyancy, SoilField, SoilSample,
@@ -64,6 +64,8 @@ pub struct Wheel {
     pub groove: f32,
     /// Mud film on the lug faces, 0..1. This is the coat that cuts grip.
     pub smear: f32,
+    /// Sidewall coat, 0..1 of one tire's carcass volume.
+    pub sidewall: f32,
     pub sinkage: f32,
     pub normal: f32,
     pub in_water: bool,
@@ -81,6 +83,7 @@ impl Default for Wheel {
             slip: 0.0,
             groove: 0.0,
             smear: 0.0,
+            sidewall: 0.0,
             sinkage: 0.0,
             normal: 0.0,
             in_water: false,
@@ -195,6 +198,7 @@ impl Vehicle {
             w.mud = 0.0;
             w.groove = 0.0;
             w.smear = 0.0;
+            w.sidewall = 0.0;
         }
         self.panels = [PanelMud::default(); PANEL_COUNT];
     }
@@ -342,6 +346,7 @@ impl Vehicle {
                 let coat = TreadCoat {
                     groove: self.wheels[i].groove,
                     smear: self.wheels[i].smear,
+                    sidewall: self.wheels[i].sidewall,
                 };
                 let patch = contact_patch(
                     WHEEL_RADIUS,
@@ -610,17 +615,25 @@ impl Vehicle {
 
     /// Adhesion ODE. Pickup grows with wet contact and agitation; spin flings
     /// mud onto panels; gravity drips it back off.
-    pub fn step_adhesion(&mut self, contacts: &[Contact; 4], dt: f32) {
+    pub fn step_adhesion(&mut self, contacts: &[Contact; 4], dt: f32) -> [TreadStep; 4] {
+        let mut tread = [TreadStep {
+            thrown: 0.0,
+            shed: 0.0,
+            picked: 0.0,
+        }; 4];
         for c in contacts.iter() {
             let w = &mut self.wheels[c.index];
             if c.active {
                 let mut coat = TreadCoat {
                     groove: w.groove,
                     smear: w.smear,
+                    sidewall: w.sidewall,
                 };
-                let _thrown = step_tread(&mut coat, c.slip, c.squeeze, c.pull, dt);
+                let step = step_tread(&mut coat, c.slip, c.squeeze, c.pull, dt);
                 w.groove = coat.groove;
                 w.smear = coat.smear;
+                w.sidewall = coat.sidewall;
+                tread[c.index] = step;
                 let wet = c.sample.wetness * stick_scale(c.sample.kind(), c.sample.wetness);
                 let loose = c.sample.loose;
                 let pressure = (c.normal / 1_500.0).clamp(0.0, 2.5);
@@ -693,6 +706,7 @@ impl Vehicle {
                 (p.streak * (1.0 - dt * 0.15) + add * 6.0 + speed * dt * 0.15).clamp(0.0, 1.0);
             p.drip = (p.mass / PANEL_MUD_CAP).clamp(0.0, 1.0);
         }
+        tread
     }
 }
 

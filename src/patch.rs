@@ -4,8 +4,9 @@
 //! The voids between them take mud when the wheel rolls, and a spinning
 //! tread pulls that mud back out. Mud left on the lug face is a slicker
 //! interface than the bare soil, so the same ground grips less once the
-//! tread is coated. The cut/placed budget is not this mass: packed mud is
-//! skimmed from the loose smear.
+//! tread is coated. A coat also climbs the sidewall. That thickness is real
+//! volume, skimmed from the loose smear, and when it sheds it is placed
+//! back on the rut. It is not deleted. The cut itself is a different budget.
 
 use crate::soil::{
     contact_length, softness_of, stick_scale, terramech_for, SurfaceKind,
@@ -17,13 +18,21 @@ pub const LUG_FRAC: f32 = 0.62;
 pub const GROOVE_DEPTH: f32 = 0.016;
 /// Slip where the patch is at peak shear. Past this the tread is spinning.
 pub const PEAK_SLIP: f32 = 0.18;
+/// Both sidewalls of one tire, square metres.
+pub const SIDEWALL_AREA: f32 = 0.34;
+/// Thickness of a full sidewall coat, metres.
+pub const SIDEWALL_THICK: f32 = 0.025;
+/// Cubic metres on one tire when `TreadCoat::sidewall` is 1.
+pub const SIDEWALL_VOLUME: f32 = SIDEWALL_AREA * SIDEWALL_THICK;
 
 /// Mud the tread is holding. `groove` is packed in the voids. `smear` is the
-/// film on the lug faces, and that film is what changes grip.
+/// film on the lug faces, and that film is what changes grip. `sidewall` is
+/// the coat on the carcass, 0..1 of [`SIDEWALL_VOLUME`].
 #[derive(Clone, Copy, Debug)]
 pub struct TreadCoat {
     pub groove: f32,
     pub smear: f32,
+    pub sidewall: f32,
 }
 
 impl TreadCoat {
@@ -31,8 +40,26 @@ impl TreadCoat {
         Self {
             groove: 0.0,
             smear: 0.0,
+            sidewall: 0.0,
         }
     }
+
+    pub fn sidewall_volume(self) -> f32 {
+        self.sidewall.clamp(0.0, 1.0) * SIDEWALL_VOLUME
+    }
+}
+
+/// What [`step_tread`] moved this step. Fractions of the tread, not cubic metres.
+#[derive(Clone, Copy, Debug)]
+pub struct TreadStep {
+    /// Void fraction thrown off the tire. The existing clods carry this.
+    pub thrown: f32,
+    /// Sidewall fraction that left the carcass. Multiply by [`SIDEWALL_VOLUME`]
+    /// and place that soil back on the bed.
+    pub shed: f32,
+    /// Sidewall fraction that stuck. Multiply by [`SIDEWALL_VOLUME`] and take
+    /// that soil from the loose smear.
+    pub picked: f32,
 }
 
 /// One tire's footprint and the force it can pass this step.
@@ -185,11 +212,13 @@ pub fn contact_patch(
     }
 }
 
-/// Move mud between the voids and the lug faces.
+/// Move mud between the voids, the lug faces, and the sidewall.
 ///
-/// Returns the void fraction thrown off the tire this step. Rolling squeezes
-/// loose soil in and wipes the face clean. Spinning drags the pack out.
-pub fn step_tread(coat: &mut TreadCoat, slip: f32, squeeze: f32, pull: f32, dt: f32) -> f32 {
+/// Rolling squeezes loose soil into the voids and wipes the lug clean, and
+/// a share of that clay climbs the carcass. Spinning drags the pack out of
+/// the voids and throws the sidewall coat off. The shed fraction is volume
+/// the caller places back on the rut.
+pub fn step_tread(coat: &mut TreadCoat, slip: f32, squeeze: f32, pull: f32, dt: f32) -> TreadStep {
     let dt = dt.max(0.0);
     let slip_n = slip.abs();
     // A gentle roll still wipes the lug. The wipe dies once the tread is
@@ -205,7 +234,26 @@ pub fn step_tread(coat: &mut TreadCoat, slip: f32, squeeze: f32, pull: f32, dt: 
     let wipe = (2.8 * rolling * coat.smear * dt).min(coat.smear.max(0.0));
     coat.smear = (coat.smear + to_face - wipe).clamp(0.0, 1.0);
     coat.groove = (coat.groove + wipe * 0.85).min(1.0);
-    thrown
+
+    let before = coat.sidewall.max(0.0);
+    let room = (1.0 - before).max(0.0);
+    // The packed void wets the carcass while the tire is rolling. A spin
+    // sheds that coat. The two do not run together, so a roll can hold clay
+    // in the grooves and on the sidewall at the same time.
+    let picked = (squeeze
+        * 0.48
+        * (0.30 + 0.70 * coat.groove.clamp(0.0, 1.0))
+        * rolling
+        * room
+        * dt)
+        .min(room);
+    let shedding = (7.5 * spinning * (before + picked) * dt).min(before + picked);
+    coat.sidewall = (before + picked - shedding).clamp(0.0, 1.0);
+    TreadStep {
+        thrown,
+        shed: shedding,
+        picked,
+    }
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -267,12 +315,20 @@ mod tests {
 
     #[test]
     fn mud_on_the_lug_lowers_grip_at_the_same_slip() {
-        let clean = wet_patch(0.40, TreadCoat { groove: 0.4, smear: 0.0 });
+        let clean = wet_patch(
+            0.40,
+            TreadCoat {
+                groove: 0.4,
+                smear: 0.0,
+                sidewall: 0.0,
+            },
+        );
         let caked = wet_patch(
             0.40,
             TreadCoat {
                 groove: 0.4,
                 smear: 0.85,
+                sidewall: 0.0,
             },
         );
         assert!(caked.mu < clean.mu * 0.8, "mu {} -> {}", clean.mu, caked.mu);
@@ -295,8 +351,8 @@ mod tests {
         for _ in 0..(60 * 2) {
             let r = wet_patch(0.08, roll);
             let s = wet_patch(1.05, spin);
-            roll_thrown += step_tread(&mut roll, 0.08, r.squeeze, r.pull, dt);
-            spin_thrown += step_tread(&mut spin, 1.05, s.squeeze, s.pull, dt);
+            roll_thrown += step_tread(&mut roll, 0.08, r.squeeze, r.pull, dt).thrown;
+            spin_thrown += step_tread(&mut spin, 1.05, s.squeeze, s.pull, dt).thrown;
         }
         let roll_grip = wet_patch(0.08, roll).grip;
         let spin_grip = wet_patch(1.05, spin).grip;
@@ -414,5 +470,149 @@ mod tests {
             loose_after < loose_before,
             "loose smear should have entered the tread, {loose_before} -> {loose_after}"
         );
+    }
+
+    #[test]
+    fn roll_fills_grooves_and_sidewall_shed_returns_to_the_rut() {
+        let mut roll = TreadCoat::clean();
+        let mut shed = 0.0_f32;
+        let mut picked = 0.0_f32;
+        let dt = 1.0 / 60.0;
+        for _ in 0..(60 * 2) {
+            let patch = wet_patch(0.08, roll);
+            let step = step_tread(&mut roll, 0.08, patch.squeeze, patch.pull, dt);
+            picked += step.picked;
+            shed += step.shed;
+        }
+        let roll_grip = wet_patch(0.08, roll).grip;
+        assert!(
+            roll.groove > 0.55,
+            "rolling should pack the voids, groove {}",
+            roll.groove
+        );
+        assert!(
+            roll.sidewall > 0.55,
+            "rolling should build a sidewall coat, {}",
+            roll.sidewall
+        );
+        assert!(
+            shed < 0.08,
+            "a roll should keep the coat, shed fraction {shed}"
+        );
+        let held = roll.sidewall;
+        // The spin starts from that coated tire, which is the picture:
+        // grooves full and a carcass coat, then the tread empties and the
+        // coat falls off.
+        let mut spin = roll;
+        for _ in 0..(60 * 2) {
+            let patch = wet_patch(1.05, spin);
+            let step = step_tread(&mut spin, 1.05, patch.squeeze, patch.pull, dt);
+            picked += step.picked;
+            shed += step.shed;
+        }
+        let spin_grip = wet_patch(1.05, spin).grip;
+        eprintln!(
+            "roll groove {:.3} sidewall {:.3} grip {:.0} N",
+            roll.groove, held, roll_grip
+        );
+        eprintln!(
+            "spin groove {:.3} sidewall {:.3} smear {:.3} grip {:.0} N  shed {:.3}",
+            spin.groove, spin.sidewall, spin.smear, spin_grip, shed
+        );
+        assert!(
+            spin.groove < roll.groove * 0.45,
+            "spinning should empty the voids, roll {} spin {}",
+            roll.groove,
+            spin.groove
+        );
+        assert!(
+            spin_grip < roll_grip * 0.72,
+            "spinning should grip less, roll {roll_grip} spin {spin_grip}"
+        );
+        assert!(
+            spin.sidewall < held * 0.25,
+            "spinning should shed the sidewall, {held} -> {}",
+            spin.sidewall
+        );
+        assert!(
+            (picked - shed - spin.sidewall).abs() < 1.0e-3,
+            "coat fraction drifted picked {picked} shed {shed} held {}",
+            spin.sidewall
+        );
+        let shed_vol = shed * SIDEWALL_VOLUME;
+        assert!(shed_vol > 1.0e-4, "shed volume {shed_vol} m3");
+
+        let mut soil = SoilField::mud_pad();
+        soil.roll_lane(
+            glam::Vec3::new(0.0, 0.0, -1.2),
+            glam::Vec3::new(0.0, 0.0, 1.2),
+            0.09,
+            0.0,
+        );
+        for loose in &mut soil.loose {
+            *loose = loose.max(0.08);
+        }
+        let cut = soil.cut_volume();
+        let placed = soil.placed_volume();
+        let loose_before = loose_volume(&soil);
+        let got = soil.take_loose(
+            glam::Vec3::new(0.0, 0.3, 0.0),
+            glam::Vec3::Z,
+            glam::Vec3::X,
+            1.6,
+            0.8,
+            picked * SIDEWALL_VOLUME,
+        );
+        let land = soil.return_coat(
+            glam::Vec3::new(0.0, 0.3, 0.6),
+            glam::Vec3::Z,
+            glam::Vec3::X,
+            shed_vol,
+        );
+        let loose_after = loose_volume(&soil);
+        eprintln!(
+            "sidewall shed {shed_vol:.5} m3  took {got:.5}  landed {:.5} in rut {:.5}  \
+             cut {:.5} placed {:.5} -> {:.5}",
+            land.volume,
+            land.in_rut,
+            cut,
+            placed,
+            soil.placed_volume()
+        );
+        assert!(
+            (got - picked * SIDEWALL_VOLUME).abs() < 1.0e-5,
+            "the coat was not skimmed from loose, want {} got {got}",
+            picked * SIDEWALL_VOLUME
+        );
+        assert!(
+            (loose_before - loose_after - got).abs() < 1.0e-4,
+            "loose volume drifted"
+        );
+        assert!(
+            (soil.cut_volume() - cut).abs() < 1.0e-5,
+            "returning the coat cut the bed, {cut} -> {}",
+            soil.cut_volume()
+        );
+        assert!(
+            (land.volume - shed_vol).abs() < 1.0e-5,
+            "shed volume was deleted, want {shed_vol} landed {}",
+            land.volume
+        );
+        assert!(
+            land.in_rut > shed_vol * 0.9,
+            "shed volume missed the rut, in rut {} of {shed_vol}",
+            land.in_rut
+        );
+        assert!(
+            (soil.placed_volume() - placed - land.volume).abs() < 1.0e-4,
+            "placed spoil did not take the coat, delta {} want {}",
+            soil.placed_volume() - placed,
+            land.volume
+        );
+    }
+
+    fn loose_volume(soil: &SoilField) -> f32 {
+        let area = soil.cell * soil.cell;
+        soil.loose.iter().sum::<f32>() * area
     }
 }

@@ -209,6 +209,7 @@ impl Bike {
                 let coat = TreadCoat {
                     groove: self.wheels[i].groove,
                     smear: self.wheels[i].smear,
+                    sidewall: self.wheels[i].sidewall,
                 };
                 let patch = contact_patch(
                     BIKE_RADIUS,
@@ -232,9 +233,10 @@ impl Bike {
                 }
                 drive -= long_f * BIKE_RADIUS;
                 let mut next = coat;
-                let _thrown = step_tread(&mut next, slip, patch.squeeze, patch.pull, dt);
+                let _step = step_tread(&mut next, slip, patch.squeeze, patch.pull, dt);
                 self.wheels[i].groove = next.groove;
                 self.wheels[i].smear = next.smear;
+                self.wheels[i].sidewall = next.sidewall;
                 let _ = tm;
             }
             let held = self.jump_hold > 0.0;

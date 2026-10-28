@@ -4,12 +4,14 @@ use glam::Vec3;
 
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
+use crate::patch::SIDEWALL_VOLUME;
 use crate::soil::{
     on_launch_crest, stick_scale, track_offset, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
     hardpoints, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
     PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
+    WHEEL_WIDTH,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +72,8 @@ pub struct World {
     spawn_yaw: f32,
     bike_spawn: Vec3,
     bike_spawn_yaw: f32,
+    /// Cubic metres of sidewall coat that landed back in a rut.
+    pub coat_in_rut: f32,
 }
 
 /// Wheels on one side of the axle, averaged into a single groove.
@@ -147,11 +151,13 @@ impl World {
             spawn_yaw: 0.0,
             bike_spawn: Vec3::ZERO,
             bike_spawn_yaw: 0.0,
+            coat_in_rut: 0.0,
         };
         world.place_on_soil();
         for _ in 0..120 {
             world.step(1.0 / 60.0, &Input::default());
         }
+        world.restore_sidewall_skim();
         world.vehicle.clear_loose_mud();
         world.particles.clear();
         world.time = 0.0;
@@ -160,6 +166,7 @@ impl World {
             ..Telemetry::default()
         };
         world.drip_acc = 0.0;
+        world.coat_in_rut = 0.0;
         world.bike.place_on(&world.soil);
         world.remember_spawn();
         world
@@ -186,6 +193,7 @@ impl World {
             spawn_yaw: 0.0,
             bike_spawn: Vec3::ZERO,
             bike_spawn_yaw: 0.0,
+            coat_in_rut: 0.0,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -193,8 +201,10 @@ impl World {
         for _ in 0..90 {
             world.step(1.0 / 60.0, &Input::default());
         }
+        world.restore_sidewall_skim();
         world.vehicle.clear_loose_mud();
         world.particles.clear();
+        world.coat_in_rut = 0.0;
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -228,6 +238,21 @@ impl World {
         self.impact_latched = false;
         self.did_launch = false;
         self.drip_acc = 0.0;
+    }
+
+    /// The spawn settle can pack a coat. That is not a shed. Put the skim
+    /// back into the loose smear so the parking step does not delete it
+    /// and does not leave a pile that the cutter did not make.
+    fn restore_sidewall_skim(&mut self) {
+        for i in 0..4 {
+            let vol = self.vehicle.wheels[i].sidewall.clamp(0.0, 1.0) * SIDEWALL_VOLUME;
+            if vol > 1.0e-8 {
+                let center = self.vehicle.pos
+                    + self.vehicle.orientation() * self.vehicle.wheel_center_local(i);
+                self.soil.give_loose(center, vol);
+            }
+            self.vehicle.wheels[i].sidewall = 0.0;
+        }
     }
 
     fn place_on_soil(&mut self) {
@@ -333,7 +358,34 @@ impl World {
         let planted = contacts.iter().filter(|c| c.active).count();
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
-        self.vehicle.step_adhesion(&contacts, dt);
+        let tread = self.vehicle.step_adhesion(&contacts, dt);
+        for c in &contacts {
+            if !c.active {
+                continue;
+            }
+            let step = tread[c.index];
+            if step.picked > 1.0e-7 {
+                let want = step.picked * SIDEWALL_VOLUME;
+                let got = self.soil.take_loose(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    c.patch_length.max(0.08),
+                    WHEEL_WIDTH,
+                    want,
+                );
+                if want - got > 1.0e-8 {
+                    let short = (want - got) / SIDEWALL_VOLUME;
+                    let w = &mut self.vehicle.wheels[c.index];
+                    w.sidewall = (w.sidewall - short).max(0.0);
+                }
+            }
+            if step.shed > 1.0e-7 {
+                let vol = step.shed * SIDEWALL_VOLUME;
+                let land = self.soil.return_coat(c.wheel_center, c.forward, c.right, vol);
+                self.coat_in_rut += land.in_rut;
+            }
+        }
         for c in &contacts {
             if c.active && c.squeeze > 0.02 {
                 // Loose smear only. The cut still lands on the berm.

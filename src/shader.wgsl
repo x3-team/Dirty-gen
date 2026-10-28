@@ -29,7 +29,10 @@ struct Model {
     mud9: vec4<f32>,
     mud10: vec4<f32>,
     mud11: vec4<f32>,
-    extra: vec4<f32>, // is_wheel, wheel mud 0..1, groove fill, lug smear
+    // x: 0 body, 1 procedural tire, 2 Niva carcass.
+    // y: sidewall coat on a Niva tire, wheel mud on the others.
+    // z: groove fill. w: lug smear.
+    extra: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -713,6 +716,8 @@ struct MeshOut {
     @location(2) uv: vec2<f32>,
     @location(3) panel: f32,
     @location(4) recess: f32,
+    // x: tread void on the Niva crown. y: sidewall band. Both from the mesh.
+    @location(5) carcass: vec2<f32>,
 }
 
 // 1 inside a tread void, 0 on a lug face. uv.x winds around the tire,
@@ -747,6 +752,48 @@ fn displace_tread(pos: vec3<f32>, uv: vec2<f32>, panel: f32) -> vec3<f32> {
     return pos - radial / len * depth;
 }
 
+// Crown voids and the sidewall band of the Lada carcass. The mesh is a
+// smooth barrel, so the grooves are this mask, driven by the contact patch.
+fn niva_carcass(pos: vec3<f32>, nrm: vec3<f32>, panel: f32) -> vec2<f32> {
+    if (model.extra.x < 1.5 || panel < 84.5 || panel > 85.5) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let radial = length(pos.yz);
+    let axle = abs(pos.x);
+    let rubber = smoothstep(0.27, 0.33, radial);
+    let facing_out = smoothstep(0.40, 0.72, length(nrm.yz));
+    let facing_side = smoothstep(0.40, 0.75, abs(nrm.x));
+    let side = smoothstep(0.060, 0.082, axle);
+    let crown = rubber * (1.0 - smoothstep(0.046, 0.074, axle)) * facing_out;
+    let u = atan2(pos.z, pos.y) / 6.2831853;
+    let row = select(0.0, 0.5, pos.x > 0.0);
+    let lug = abs(fract(u * 12.0 + row + 1.0) - 0.5);
+    let gap = smoothstep(0.22, 0.06, lug);
+    let shoulder = smoothstep(0.010, 0.028, axle);
+    let channel = 1.0 - smoothstep(0.006, 0.022, axle);
+    let void = crown * max(gap * shoulder, channel * 0.65);
+    let crown_band = 1.0 - smoothstep(0.046, 0.074, axle);
+    let wall = rubber * side * (1.0 - crown_band) * max(facing_side, facing_out);
+    return vec2<f32>(clamp(void, 0.0, 1.0), clamp(wall, 0.0, 1.0));
+}
+
+fn displace_niva(pos: vec3<f32>, nrm: vec3<f32>, panel: f32) -> vec3<f32> {
+    let void = niva_carcass(pos, nrm, panel).x;
+    let fill = clamp(model.extra.z, 0.0, 1.0);
+    // Empty void sits under the lug. Packed clay rises back to the crown.
+    let depth = 0.020 * void * (1.0 - 0.90 * fill);
+    let radial = vec3<f32>(0.0, pos.y, pos.z);
+    let len = length(radial);
+    if (len < 1e-4) {
+        return pos;
+    }
+    return pos - radial / len * depth;
+}
+
+fn displace_mesh(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>, panel: f32) -> vec3<f32> {
+    return displace_niva(displace_tread(pos, uv, panel), nrm, panel);
+}
+
 fn tread_recess(pos: vec3<f32>, panel: f32) -> f32 {
     // Procedural tire only. Its grooves are cut into the mesh. The CC0 tire
     // is a smooth barrel; its voids come from the uv, not the radius.
@@ -763,7 +810,7 @@ fn tread_recess(pos: vec3<f32>, panel: f32) -> f32 {
 
 @vertex
 fn vs_mesh(in: MeshIn) -> MeshOut {
-    let pos = displace_tread(in.pos, in.uv, in.panel);
+    let pos = displace_mesh(in.pos, in.nrm, in.uv, in.panel);
     let world = model.world * vec4<f32>(pos, 1.0);
     var o: MeshOut;
     o.clip = frame.view_proj * world;
@@ -772,6 +819,7 @@ fn vs_mesh(in: MeshIn) -> MeshOut {
     o.uv = in.uv;
     o.panel = in.panel;
     o.recess = tread_recess(pos, in.panel);
+    o.carcass = niva_carcass(in.pos, in.nrm, in.panel);
     return o;
 }
 
@@ -793,7 +841,7 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
 
 @vertex
 fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
-    let pos = displace_tread(in.pos, in.uv, in.panel);
+    let pos = displace_mesh(in.pos, in.nrm, in.uv, in.panel);
     let world = model.world * vec4<f32>(pos, 1.0);
     let clip = frame.light_vp * world;
     var o: ShadowOut;
@@ -915,6 +963,26 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
             alpha = clamp(max(base.a, 0.22), 0.22, 0.62);
             albedo = mix(albedo, vec3<f32>(0.62, 0.78, 0.84), 0.35);
             rough = 0.05;
+        } else if (model.extra.x > 1.5) {
+            // The Niva carcass reads the patch. extra.y is the sidewall coat,
+            // extra.z the groove fill. Body mud does not tint this tire.
+            let void = in.carcass.x;
+            let wall = in.carcass.y;
+            let fill = clamp(model.extra.z, 0.0, 1.0);
+            let side = clamp(model.extra.y, 0.0, 1.0);
+            let grit = noise(in.uv * vec2<f32>(37.0, 11.0) + vec2<f32>(in.world.y, 0.4));
+            let empty = void * (1.0 - smoothstep(0.22, 0.62, fill));
+            albedo = albedo * mix(1.0, 0.22, empty);
+            let packed = void * smoothstep(0.22, 0.62, fill);
+            // Wet clay. A strong emit turned the coat into a flat orange shell.
+            let clay = vec3<f32>(0.11, 0.038, 0.012) * (0.75 + 0.55 * grit);
+            albedo = mix(albedo, clay, packed);
+            rough = mix(rough, 0.16, packed);
+            emit = vec3<f32>(0.045, 0.016, 0.005) * packed;
+            let coat = wall * smoothstep(0.18, 0.55, side);
+            albedo = mix(albedo, clay, coat * 0.92);
+            rough = mix(rough, 0.20, coat);
+            emit = emit + vec3<f32>(0.035, 0.012, 0.004) * coat;
         } else if (layer != 7) {
             let mud = clamp(model.extra.y, 0.0, 1.2);
             let cover = max(mud, max(model.mud5.x, max(model.mud1.x, max(model.mud4.x, max(model.mud2.x, model.mud3.x)))));

@@ -1015,6 +1015,256 @@ impl SoilField {
         }
     }
 
+    /// Take up to `volume` cubic metres of loose smear from the footprint.
+    /// The bed and the placed pile stay where they are. Returns the cubic
+    /// metres actually removed.
+    pub fn take_loose(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        length: f32,
+        width: f32,
+        volume: f32,
+    ) -> f32 {
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return 0.0;
+        }
+        let half_l = (length * 0.5).max(self.cell * 0.4);
+        let half_w = (width * 0.5).max(self.cell * 0.25);
+        let reach = half_l + half_w + self.cell;
+        let half = self.size * 0.5;
+        let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        let area = self.cell * self.cell;
+        let mut left = volume;
+        let mut taken = 0.0_f32;
+        for j in j0.max(0)..j1.min(res - 1) {
+            if left <= 1.0e-8 {
+                break;
+            }
+            for i in i0.max(0)..i1.min(res - 1) {
+                if left <= 1.0e-8 {
+                    break;
+                }
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - center.x;
+                let rel_z = cz - center.z;
+                let lx = rel_x * right.x + rel_z * right.z;
+                let lz = rel_x * forward.x + rel_z * forward.z;
+                if lx.abs() > half_w || lz.abs() > half_l {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let room = (self.loose[idx] * 0.85).max(0.0) * area;
+                let grab = left.min(room);
+                if grab <= 0.0 {
+                    continue;
+                }
+                self.loose[idx] -= grab / area;
+                taken += grab;
+                left -= grab;
+            }
+        }
+        taken
+    }
+
+    /// Put loose smear back. Used when a coat was skimmed and then cleared
+    /// without shedding, so that thickness is not lost.
+    pub fn give_loose(&mut self, center: Vec3, volume: f32) {
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return;
+        }
+        let Some(origin) = self.idx_at(center.x, center.z) else {
+            return;
+        };
+        let area = self.cell * self.cell;
+        let res = self.res;
+        let di = (origin % res) as isize;
+        let dj = (origin / res) as isize;
+        let mut cells = [0usize; 9];
+        let mut n = 0usize;
+        for dj2 in -1..=1 {
+            for di2 in -1..=1 {
+                let i = di + di2;
+                let j = dj + dj2;
+                if i < 0 || j < 0 || i >= res as isize || j >= res as isize {
+                    continue;
+                }
+                cells[n] = j as usize * res + i as usize;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        let add = volume / (n as f32 * area);
+        for idx in &cells[..n] {
+            self.loose[*idx] = (self.loose[*idx] + add).min(0.18);
+        }
+    }
+
+    /// Put a sidewall coat back on the bed. The rut behind the tire takes it.
+    /// If that groove is not there yet, the shoulder keeps it as placed spoil.
+    /// None of `volume` is discarded when a cell can be found.
+    pub fn return_coat(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        volume: f32,
+    ) -> CoatLanding {
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return CoatLanding {
+                volume: 0.0,
+                in_rut: 0.0,
+            };
+        }
+        let fwd = Vec3::new(forward.x, 0.0, forward.z);
+        let fwd = if fwd.length_squared() < 1.0e-8 {
+            Vec3::Z
+        } else {
+            fwd.normalize()
+        };
+        let rt = Vec3::new(right.x, 0.0, right.z);
+        let rt = if rt.length_squared() < 1.0e-8 {
+            Vec3::new(fwd.z, 0.0, -fwd.x)
+        } else {
+            rt.normalize()
+        };
+        let half = self.size * 0.5;
+        let reach = 1.35_f32;
+        let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        let mut rut = [(0usize, 0.0f32); 64];
+        let mut n_rut = 0usize;
+        let mut shoulder = [0usize; 64];
+        let mut n_sh = 0usize;
+        for j in j0.max(1)..j1.min(res - 1) {
+            for i in i0.max(1)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - center.x;
+                let rel_z = cz - center.z;
+                let along = rel_x * fwd.x + rel_z * fwd.z;
+                let lat = rel_x * rt.x + rel_z * rt.z;
+                let behind = -along;
+                if !(0.38..=0.95).contains(&behind) {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                if lat.abs() <= 0.20 && depth > 0.01 {
+                    if n_rut < rut.len() {
+                        rut[n_rut] = (idx, behind);
+                        n_rut += 1;
+                    }
+                } else if (0.20..0.48).contains(&lat.abs()) && n_sh < shoulder.len() {
+                    shoulder[n_sh] = idx;
+                    n_sh += 1;
+                }
+            }
+        }
+        let into_rut = n_rut > 0;
+        // The nearest cells in the groove. Spreading the same volume over the
+        // whole window leaves a film the still cannot read.
+        if n_rut > 1 {
+            rut[..n_rut].sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let n_use = n_rut.min(2);
+        let mut chosen = [0usize; 64];
+        let n = if into_rut {
+            for i in 0..n_use {
+                chosen[i] = rut[i].0;
+            }
+            n_use
+        } else if n_sh > 0 {
+            chosen[..n_sh].copy_from_slice(&shoulder[..n_sh]);
+            n_sh
+        } else if let Some(idx) = self.idx_at(center.x, center.z) {
+            chosen[0] = idx;
+            1
+        } else {
+            return CoatLanding {
+                volume: 0.0,
+                in_rut: 0.0,
+            };
+        };
+        let wrote = self.lay_coat(&chosen[..n], volume, into_rut);
+        CoatLanding {
+            volume: wrote,
+            in_rut: if into_rut { wrote } else { 0.0 },
+        }
+    }
+
+    /// Spread `volume` across `cells` as placed thickness. A rut cell keeps
+    /// its kind. A bare cell becomes spoil. The bed is not cut.
+    fn lay_coat(&mut self, cells: &[usize], volume: f32, into_rut: bool) -> f32 {
+        if cells.is_empty() || volume <= 0.0 {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let cap = 0.06_f32;
+        let mut left = volume;
+        let mut wrote = 0.0_f32;
+        for _ in 0..4 {
+            if left <= 1.0e-8 {
+                break;
+            }
+            let open = cells
+                .iter()
+                .filter(|idx| self.placed[**idx] < cap - 1.0e-4)
+                .count();
+            if open == 0 {
+                break;
+            }
+            let share = left / (open as f32 * area);
+            for &idx in cells {
+                let room = (cap - self.placed[idx]).max(0.0);
+                let add = share.min(room);
+                if add <= 0.0 {
+                    continue;
+                }
+                self.note_coat(idx, add, into_rut);
+                left -= add * area;
+                wrote += add * area;
+            }
+        }
+        if left > 1.0e-8 {
+            let add = left / (cells.len() as f32 * area);
+            for &idx in cells {
+                self.note_coat(idx, add, into_rut);
+                wrote += add * area;
+            }
+        }
+        wrote
+    }
+
+    fn note_coat(&mut self, idx: usize, add: f32, into_rut: bool) {
+        self.placed[idx] += add;
+        let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+        if into_rut && depth > 0.01 {
+            // The shed coat is the clay that was on the carcass. Packed clay is
+            // the field the ground shader already uses for a pressed tread.
+            self.kind[idx] = SurfaceKind::PackedClay as u8;
+            self.wetness[idx] = self.wetness[idx].max(0.88);
+            self.darken[idx] = self.darken[idx].max(0.82);
+        } else {
+            self.kind[idx] = SurfaceKind::Berm as u8;
+            self.wetness[idx] = self.wetness[idx].max(0.7);
+            self.darken[idx] = lerp(self.darken[idx], 0.4, 0.35);
+            self.roughness[idx] = lerp(self.roughness[idx], 0.86, 0.3);
+        }
+        self.sync(idx);
+    }
+
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {
         let half = self.size * 0.5;
         if x < -half || z < -half || x >= half || z >= half {
@@ -2029,6 +2279,14 @@ impl SoilField {
         }
         field
     }
+}
+
+/// Where a shed sidewall coat landed. Volumes are cubic metres.
+#[derive(Clone, Copy, Debug)]
+pub struct CoatLanding {
+    pub volume: f32,
+    /// Share that sat down on cells that were already a rut.
+    pub in_rut: f32,
 }
 
 /// Cut soil against the pile that received it.
