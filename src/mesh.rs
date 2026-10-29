@@ -1076,38 +1076,33 @@ fn spin_ribbon(vel: Vec3) -> bool {
     vel.length() > 6.0
 }
 
-/// Arch film. The long axis is the fall. Width runs along the opening.
-/// Thickness faces the side, so the sheet is a film in the arch, not a board.
+/// Look axis of the ford-exit still. Width is built across this view so the
+/// sheet faces that camera. A horizontal width turned the same film edge-on.
+fn ford_exit_view() -> Vec3 {
+    Vec3::new(0.827, -0.374, 0.420)
+}
+
+/// Arch film. The long axis is the fall out of the opening. The sheet faces
+/// the still, so it reads as a film instead of a post or an edge-on sliver.
 fn arch_film_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
     let dir = if vel.length_squared() < 1.0e-6 {
         Vec3::new(0.0, -1.0, -0.2)
     } else {
         vel.normalize()
     };
-    let mut side = Vec3::new(dir.z, 0.0, -dir.x);
+    let mut side = dir.cross(ford_exit_view());
     if side.length_squared() < 1.0e-4 {
-        side = Vec3::X;
+        side = dir.cross(Vec3::Y);
     }
     side = side.normalize();
     let thin = side.cross(dir).normalize();
     (dir, side, thin)
 }
 
-/// Tread ribbon. Long axis is the throw. A little of the fall stays, so the
-/// ribbon leaves the tread instead of lying as a bar on the water.
+/// Tread ribbon. Long axis is the throw off the carcass. Same facing sheet
+/// as the arch film, so the ribbon stays in frame.
 fn tread_ribbon_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
-    let mut dir = Vec3::new(vel.x, vel.y * 0.7, vel.z);
-    if dir.length_squared() < 1.0e-6 {
-        dir = Vec3::new(0.0, 0.0, -1.0);
-    }
-    dir = dir.normalize();
-    let mut side = Vec3::new(dir.z, 0.0, -dir.x);
-    if side.length_squared() < 1.0e-4 {
-        side = Vec3::X;
-    }
-    side = side.normalize();
-    let thin = side.cross(dir).normalize();
-    (dir, side, thin)
+    arch_film_axes(vel)
 }
 
 /// Two faces only. No rim, so the mark has no box edge.
@@ -1127,7 +1122,8 @@ fn add_open_sheet(
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
         let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
-        let taper = edge.powf(0.28).clamp(tip, 1.0);
+        // Narrows toward both ends. A flat clamp reads as a sawn board.
+        let taper = edge.powf(0.75).clamp(tip, 1.0);
         let c = p.pos + dir * (length * (t - 0.5));
         let w = side * width * 0.5 * taper;
         let h = up * thick * 0.5;
@@ -1150,23 +1146,23 @@ fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
         add_open_sheet(
             mesh,
             p,
-            0.38,
-            0.034,
-            0.0015,
+            0.64,
+            0.060,
+            0.0024,
             PANEL_WATER_FILM,
             tread_ribbon_axes(p.vel),
-            0.22,
+            0.36,
         );
     } else {
         add_open_sheet(
             mesh,
             p,
-            0.36,
-            0.052,
-            0.0020,
+            0.72,
+            0.093,
+            0.0040,
             PANEL_WATER_FILM,
             arch_film_axes(p.vel),
-            0.30,
+            0.36,
         );
     }
 }

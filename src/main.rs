@@ -2598,25 +2598,30 @@ fn sculpt_ford_exit_still(world: &mut World) {
                 soil.bed[idx] -= delta;
             }
 
-            // Wet track on the bank under the front tires, running ahead
-            // onto the ground this camera can see. No dig: a trench is a cut.
+            // Wet track on the bank ahead of the front tires. The open
+            // ground in this camera is outboard of the left tire. No dig.
             for &wi in &[0usize, 1] {
                 let hub = hubs[wi];
                 let ahead = z - hub.z;
                 let dx = x - hub.x;
-                if !(-0.20..1.55).contains(&ahead) {
+                if !(-0.05..1.85).contains(&ahead) {
                     continue;
                 }
-                let along = smooth(-0.20, 0.05, ahead) * (1.0 - smooth(1.05, 1.55, ahead));
-                let across = 1.0 - smooth(0.05, 0.32, dx.abs());
+                let along = smooth(-0.05, 0.10, ahead) * (1.0 - smooth(1.20, 1.85, ahead));
+                let outward = if hub.x < 0.0 { -dx } else { dx };
+                let across = if outward >= 0.0 {
+                    1.0 - smooth(0.04, 0.95, outward)
+                } else {
+                    1.0 - smooth(0.02, 0.26, -outward)
+                };
                 let mask = along * across;
-                if mask < 0.08 {
+                if mask < 0.05 {
                     continue;
                 }
-                soil.wetness[idx] = 1.0_f32.min(soil.wetness[idx].max(0.35 + 0.65 * mask));
-                if mask > 0.45 {
+                soil.wetness[idx] = 1.0;
+                if mask > 0.20 {
                     soil.kind[idx] = SurfaceKind::Silt as u8;
-                } else if mask > 0.16 {
+                } else if mask > 0.08 {
                     soil.kind[idx] = SurfaceKind::FreshCut as u8;
                 }
             }
@@ -2627,13 +2632,44 @@ fn sculpt_ford_exit_still(world: &mut World) {
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
     for &wi in &[0usize, 1] {
         let hub = hubs[wi];
-        for s in 0..9 {
-            let ahead = -0.05 + s as f32 * 0.14;
-            let center = hub + fwd * ahead + Vec3::Y * 0.2;
-            world.soil.imprint_tread(center, fwd, right, WHEEL_RADIUS, WHEEL_WIDTH, 0.052);
+        let out = if hub.x < 0.0 { -1.0 } else { 1.0 };
+        for s in 0..12 {
+            let ahead = 0.06 + s as f32 * 0.13;
+            for side in [0.06_f32, 0.24, 0.42, 0.62] {
+                let center = hub + fwd * ahead + right * (out * side) + Vec3::Y * 0.2;
+                world
+                    .soil
+                    .imprint_tread(center, fwd, right, WHEEL_RADIUS, WHEEL_WIDTH, 0.055);
+            }
         }
     }
     world.soil.rebuild_height();
+
+    // Standing water in the low ford. The column rides the solved bed, so
+    // the surface climbs the slope and thins out before the front tires.
+    // A constant world height was the flat card. Deep enough that the pool
+    // crosses the rear rims. After the ledger print.
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let idx = j * res + i;
+            let climb = climb_of(z);
+            let side = smooth(-3.8, -2.4, x) * (1.0 - smooth(2.2, 3.4, x));
+            let shore = 0.58
+                + (x * 1.15).sin() * 0.07
+                + (x * 0.37 + 0.6).sin() * 0.05;
+            let up = smooth(-0.02, shore, climb);
+            let column = 0.32 * (1.0 - up) * side;
+            // Below ~0.05 the packed column leaves the free surface and the
+            // old sheet path draws a card.
+            world.soil.water[idx] = if column >= 0.05 { column } else { 0.0 };
+            if column >= 0.05 {
+                world.soil.kind[idx] = SurfaceKind::WetMud as u8;
+                world.soil.wetness[idx] = world.soil.wetness[idx].max(0.95);
+            }
+        }
+    }
 
     // Films were spawned on the unpitched pose. Drain falls out of the
     // camera-side arches. Spray rises off the rear tread. Volumes stay.
@@ -2649,56 +2685,59 @@ fn sculpt_ford_exit_still(world: &mut World) {
             spray_i.push(i);
         }
     }
-    let arches = [2usize, 2, 0, 0];
+    // Drain falls out of the camera-side arches into the pool and onto the
+    // bank. The long axis is the velocity. Volumes stay.
+    // Two collinear sheets per arch. The rear pair sits in front of the
+    // fender, from the lip of that arch down the sidewall into the pool.
+    // The front pair is the strip that leaves the front arch onto the bank.
+    let drains = [
+        (
+            Vec3::new(-1.280, 0.190, 1.435),
+            Vec3::new(0.0, -0.728, 0.685),
+        ),
+        (
+            Vec3::new(-1.420, -0.057, 1.656),
+            Vec3::new(0.0, -0.728, 0.685),
+        ),
+        (
+            Vec3::new(-0.793, 0.666, 4.018),
+            Vec3::new(-0.676, -0.624, 0.392),
+        ),
+        (
+            Vec3::new(-1.177, 0.312, 4.240),
+            Vec3::new(-0.676, -0.624, 0.392),
+        ),
+    ];
     for (n, pi) in drain_i.iter().enumerate() {
-        let wi = arches[n % arches.len()];
-        let hub = hubs[wi];
-        let out = if hub.x >= 0.0 { 1.0 } else { -1.0 };
-        let rear_arch = wi >= 2;
-        // Off the rubber. An outboard shift is mostly depth in this camera,
-        // so a sheet there is painted across the rim.
-        let (lip, vel) = if rear_arch {
-            let odd = n % 2 == 1;
-            let local = if odd {
-                Vec3::new(out * 0.10, 0.16, -0.62)
-            } else {
-                Vec3::new(0.0, 0.28, -0.45)
-            };
-            let vel = if odd {
-                right * out * 0.22 - Vec3::Y * 1.25 - fwd * 0.30
-            } else {
-                right * out * 0.18 - Vec3::Y * 1.35 - fwd * 0.22
-            };
-            (hub + ori * local, vel)
-        } else {
-            let odd = n % 2 == 1;
-            let shift = if odd {
-                Vec3::new(out * 0.94, -0.12, 0.02)
-            } else {
-                Vec3::new(out * 0.70, -0.11, 0.15)
-            };
-            let vel = right * out * 0.12 - Vec3::Y * 1.30 + fwd * 0.18;
-            (hub + shift, vel)
-        };
         let p = &mut world.particles.items[*pi];
-        p.pos = lip;
+        let (pos, vel) = drains[n % drains.len()];
+        p.pos = pos;
         p.vel = vel;
     }
-    let hub = hubs[2];
-    let out = if hub.x >= 0.0 { 1.0 } else { -1.0 };
+    // One ribbon on the rear tread. It runs down the camera-side
+    // sidewall and off the rubber into the pool, clear of the arch drain.
+    let sprays = [
+        (
+            Vec3::new(-1.360, 0.096, 0.755),
+            Vec3::new(0.0, -0.807, -0.591),
+        ),
+        (
+            Vec3::new(-1.420, 0.123, 0.725),
+            Vec3::new(0.0, -0.807, -0.591),
+        ),
+        (
+            Vec3::new(-1.500, 0.159, 0.684),
+            Vec3::new(0.0, -0.807, -0.591),
+        ),
+        (
+            Vec3::new(-1.560, 0.186, 0.654),
+            Vec3::new(0.0, -0.807, -0.591),
+        ),
+    ];
     for (n, pi) in spray_i.iter().enumerate() {
-        let fan = (n as f32 - 1.5) * 0.07;
-        // Behind the rear tread, in the air, clear of the rim.
-        let bite = hub
-            + ori
-                * Vec3::new(
-                    out * 0.05 + fan * 0.4,
-                    0.10 + fan.abs(),
-                    -0.55 - fan.abs() * 0.4,
-                );
-        let vel = -fwd * 0.50 + Vec3::Y * 1.55 + right * (out * 0.15 + fan * 1.5);
+        let (pos, vel) = sprays[n % sprays.len()];
         let p = &mut world.particles.items[*pi];
-        p.pos = bite;
+        p.pos = pos;
         p.vel = vel;
     }
 }
