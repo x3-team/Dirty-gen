@@ -3211,6 +3211,30 @@ impl SoilField {
         self.slurry.iter().sum::<f32>() * area
     }
 
+    /// Clear placed spoil inside the pool. Sidewall smear and crest clods
+    /// read as orange tablets in a slurry still.
+    pub fn clear_placed_in_pool(&mut self, x0: f32, x1: f32, z0: f32, z1: f32) {
+        let half = self.size * 0.5;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.placed[idx] <= 1.0e-6 {
+                    continue;
+                }
+                self.placed[idx] = 0.0;
+                if self.kind[idx] == SurfaceKind::PlacedClod as u8 {
+                    self.kind[idx] = SurfaceKind::WetMud as u8;
+                }
+                self.sync(idx);
+            }
+        }
+    }
+
     /// Move slurry on the heightfield so a wide still reads a crest ahead of
     /// the front treads and a thinned lane behind the rears. Column volume is
     /// unchanged; bow and wake ledger lines are not touched.
@@ -3228,98 +3252,125 @@ impl SoilField {
     ) {
         let forward = horizontal(forward);
         let right = Vec3::new(forward.z, 0.0, -forward.x);
-        let area = self.cell * self.cell;
-        let margin = self.cell * 1.2;
+        let cell = self.cell;
+        let area = cell * cell;
+        let lip = 0.52_f32;
+        let inner_margin = cell * 1.4;
         let half = self.size * 0.5;
+        let rear_z = rear_left.1.min(rear_right.1);
+        let front_z = front_hub.1;
+        let wake_top = rear_z - 0.14;
+        let wake_floor = pool_z0 + inner_margin;
+        let bow_near = front_z + 0.18;
+        let bow_far = (front_z + 0.95).min(pool_z1 - lip);
+        if bow_far <= bow_near + 0.04 || wake_top <= wake_floor + 0.04 {
+            return;
+        }
+        let in_pool = |cx: f32, cz: f32| {
+            cx >= pool_x0 + inner_margin
+                && cx < pool_x1 - inner_margin
+                && cz >= pool_z0 + inner_margin
+                && cz < pool_z1 - inner_margin
+        };
+        let on_rut = |cx: f32| {
+            (cx - rear_left.0).abs() <= track_half + cell * 0.2
+                || (cx - rear_right.0).abs() <= track_half + cell * 0.2
+        };
+        let near_lip = |cx: f32, cz: f32| {
+            cx >= pool_x1 - lip
+                || cz >= pool_z1 - lip
+                || cx <= pool_x0 + lip
+                || cz <= pool_z0 + lip
+        };
+        let wake_target = 0.048_f32;
+        let bow_peak = 0.265_f32;
         let mut moved = 0.0_f32;
         let mut donors: Vec<(usize, f32)> = Vec::new();
         let mut crests: Vec<(usize, f32)> = Vec::new();
-        let rear_z = rear_left.1.min(rear_right.1);
-        let front_z = front_hub.1;
-        let wake_front = rear_z - self.cell * 0.35;
-        let wake_back = rear_z - 1.45;
-        let bow_near = front_z + self.cell * 0.45;
-        let bow_far = (front_z + 1.05).min(pool_z1 - margin);
-        if bow_far <= bow_near + 0.05 || wake_front <= wake_back + 0.05 {
-            return;
-        }
-        let on_rut = |cx: f32| {
-            (cx - rear_left.0).abs() <= track_half || (cx - rear_right.0).abs() <= track_half
-        };
-        let min_film = 0.058_f32;
+        let mut touched: Vec<usize> = Vec::new();
         for j in 0..self.res {
             for i in 0..self.res {
-                let cx = (i as f32 + 0.5) * self.cell - half;
-                let cz = (j as f32 + 0.5) * self.cell - half;
-                if cx < pool_x0 + margin
-                    || cx >= pool_x1 - margin
-                    || cz < pool_z0 + margin
-                    || cz >= pool_z1 - margin
-                {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz >= pool_z1 {
                     continue;
                 }
                 let idx = j * self.res + i;
-                if self.slurry[idx] <= min_film + 0.01 {
+                if self.slurry[idx] <= 0.008 {
                     continue;
                 }
                 let mut take = 0.0_f32;
-                if cz >= wake_back && cz <= wake_front && on_rut(cx) {
-                    let u = ((wake_front - cz) / (wake_front - wake_back).max(0.05)).clamp(0.0, 1.0);
-                    take = (self.slurry[idx] - min_film) * (0.22 + 0.42 * u);
-                } else if cz >= rear_z + 0.05 && cz <= front_z - 0.05 && on_rut(cx) {
-                    take = self.slurry[idx] * 0.16;
+                if cz <= wake_top && cz >= wake_floor && on_rut(cx) {
+                    take = (self.slurry[idx] - wake_target).max(0.0);
+                } else if near_lip(cx, cz) && in_pool(cx, cz) {
+                    take = (self.slurry[idx] - 0.13).max(0.0);
+                } else if cz >= rear_z + 0.08 && cz <= front_z - 0.08 && on_rut(cx) {
+                    take = self.slurry[idx] * 0.12;
                 }
                 if take > 1.0e-6 {
                     donors.push((idx, take));
                     moved += take * area;
+                    touched.push(idx);
                 }
             }
         }
-        if moved <= 1.0e-6 {
-            return;
-        }
         for j in 0..self.res {
             for i in 0..self.res {
-                let cx = (i as f32 + 0.5) * self.cell - half;
-                let cz = (j as f32 + 0.5) * self.cell - half;
-                if cx < pool_x0 + margin
-                    || cx >= pool_x1 - margin
-                    || cz < pool_z0 + margin
-                    || cz >= pool_z1 - margin
-                {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if !in_pool(cx, cz) || near_lip(cx, cz) {
                     continue;
                 }
                 let rel_x = cx - front_hub.0;
                 let rel_z = cz - front_z;
                 let lat = rel_x * right.x + rel_z * right.z;
                 let along = rel_x * forward.x + rel_z * forward.z;
-                if !(bow_near..=bow_far).contains(&along) || lat.abs() > track_half + self.cell {
+                if !(bow_near..=bow_far).contains(&along) || lat.abs() > track_half + cell * 0.65 {
                     continue;
                 }
                 let idx = j * self.res + i;
                 let span = (bow_far - bow_near).max(0.05);
                 let u = ((along - bow_near) / span).clamp(0.0, 1.0);
-                let crest = (1.0 - (u - 0.38).abs() / 0.62).max(0.0);
-                let across = 1.0 - (lat.abs() / (track_half + self.cell)).clamp(0.0, 1.0);
-                let w = crest * across;
-                if w > 0.04 {
+                let crest = (1.0 - (u - 0.42).abs() / 0.58).max(0.0);
+                let across = 1.0 - (lat.abs() / (track_half + cell * 0.5)).clamp(0.0, 1.0);
+                let w = crest * crest * across;
+                if w > 0.05 {
                     crests.push((idx, w));
                 }
             }
         }
-        let wsum: f32 = crests.iter().map(|(_, w)| *w).sum();
-        if wsum <= 1.0e-6 {
+        if moved <= 1.0e-6 || crests.is_empty() {
             return;
         }
         for (idx, take) in &donors {
             self.slurry[*idx] -= *take;
         }
-        let add_depth = moved / area;
+        let wsum: f32 = crests.iter().map(|(_, w)| *w).sum();
         for (idx, w) in &crests {
-            self.slurry[*idx] += add_depth * (*w / wsum);
+            let add = moved * (*w / wsum) / area;
+            self.slurry[*idx] = (self.slurry[*idx] + add).min(bow_peak);
+            touched.push(*idx);
         }
-        for (idx, _) in donors.iter().chain(crests.iter()) {
-            self.sync(*idx);
+        for idx in touched {
+            self.sync(idx);
+        }
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz >= pool_z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.slurry[idx] <= 0.008 {
+                    continue;
+                }
+                if cz <= wake_top && cz >= wake_floor && on_rut(cx) {
+                    self.darken[idx] = (self.darken[idx] + 0.12).min(1.0);
+                } else if cz >= bow_near && cz <= bow_far && on_rut(cx) {
+                    self.darken[idx] = (self.darken[idx] - 0.10).max(0.18);
+                }
+            }
         }
     }
 

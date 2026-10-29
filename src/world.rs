@@ -1134,6 +1134,8 @@ impl World {
         let rear_l = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
         let rear_r = self.vehicle.pos + ori * self.vehicle.wheel_center_local(3);
         let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
+        self.soil
+            .clear_placed_in_pool(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
         self.soil.accentuate_plow_bow_wake(
             pool_x.0,
             pool_x.1,
@@ -1145,27 +1147,37 @@ impl World {
             half_track,
             fwd,
         );
-        let air_base = rear + right * 1.05 + Vec3::Y * 0.72 - fwd * 0.45;
-        let mut n = 0usize;
+        let ribbon_base = rear_r + right * 0.58 + Vec3::Y * 0.52 - fwd * 0.08;
+        let spray_base = rear_r + right * 0.44 + Vec3::Y * 0.62 - fwd * 0.05;
+        let mut ri = 0usize;
+        let mut di = 0usize;
         for p in &mut self.particles.items {
             if !p.alive {
                 continue;
             }
-            if p.kind != crate::particles::KIND_SLURRY_RIBBON
-                && p.kind != crate::particles::KIND_SLURRY_DROP
-            {
-                continue;
-            }
-            if p.pos.y < rear.y + 0.35 {
-                p.alive = false;
-                continue;
-            }
             p.grounded = false;
             p.deposited = false;
-            p.life = p.life.max(3.8);
-            p.vel = right * 1.6 + Vec3::Y * 0.55 - fwd * 0.35;
-            p.pos = air_base + Vec3::Y * (n as f32 * 0.07) + right * (n as f32 * 0.04);
-            n += 1;
+            p.life = p.life.max(4.2);
+            p.max_life = p.max_life.max(4.2);
+            if p.kind == crate::particles::KIND_SLURRY_RIBBON {
+                p.pos = ribbon_base
+                    + Vec3::Y * (ri as f32 * 0.09)
+                    + right * (ri as f32 * 0.05)
+                    + fwd * (ri as f32 * -0.03);
+                p.vel = right * 0.35 + Vec3::Y * 0.08;
+                p.size = (p.volume * 55.0).cbrt().clamp(0.085, 0.14);
+                p.spin = Vec3::new(0.4, 0.2, 0.5);
+                ri += 1;
+            } else if p.kind == crate::particles::KIND_SLURRY_DROP {
+                p.pos = spray_base
+                    + Vec3::Y * (di as f32 * 0.05)
+                    + right * ((di as f32 * 0.03) - 0.04);
+                p.vel = right * 0.25 + Vec3::Y * 0.12;
+                p.size = (p.volume * 90.0).cbrt().clamp(0.035, 0.06);
+                di += 1;
+            } else if p.kind != crate::particles::KIND_SLURRY_SHEET {
+                p.alive = false;
+            }
         }
         SlurryPlowWake {
             pool,

@@ -1129,7 +1129,7 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     } else {
         width.clamp(0.012, 0.048)
     };
-    let thick = (p.volume / (length * width * 0.55)).clamp(0.004, 0.014);
+    let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.022);
     let segs = 8usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
