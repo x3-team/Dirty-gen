@@ -4192,6 +4192,8 @@ pub struct ThroughDrive {
     coat: DriveCoat,
     pub report: ThroughReport,
     dust_in: f32,
+    /// Steps between tread curls, so the ones in the air can fall onto the track.
+    ribbon_tick: u32,
 }
 
 impl ThroughDrive {
@@ -4221,9 +4223,6 @@ impl ThroughDrive {
         fluid.scale_columns(|x, z| (puddle_mask(x, z), slurry_rut_mask(x, z)));
         fluid.soften_rims(1.7);
         mirror_fluid(&fluid, &mut world.soil);
-        for tire in crate::dust::tires_at(-20.0, 8.0, 1.6) {
-            raise_bow(&mut world.soil, tire.contact.x, tire.contact.z);
-        }
         world.vehicle.pos.x = 0.0;
         world.vehicle.pos.z = -20.0;
         world.vehicle.yaw = 0.0;
@@ -4258,6 +4257,7 @@ impl ThroughDrive {
                 end_z: -20.0,
             },
             dust_in: 0.0,
+            ribbon_tick: 0,
         }
     }
 
@@ -4265,7 +4265,7 @@ impl ThroughDrive {
         self.world
             .particles
             .items
-            .retain(|p| p.kind != KIND_DUST_MARK && p.kind != 10);
+            .retain(|p| p.kind != KIND_DUST_MARK);
         let mut left = dt.max(0.0);
         let sub = 1.0 / 60.0;
         while left > 1.0e-6 {
@@ -4306,10 +4306,33 @@ impl ThroughDrive {
                 slip: 1.6,
             });
             self.stick_and_dust(tire.index as usize, tire.contact, 1.6, dt, forward);
+            let peel = self.ribbon_tick % 4 == 0;
             if (-18.8..-11.6).contains(&self.chassis_z)
                 && (-19.2..-11.2).contains(&tire.contact.z)
             {
                 self.report.saw_wave = true;
+                if peel {
+                    let side = if tire.contact.x < 0.0 { -1.0 } else { 1.0 };
+                    let ground = self.world.soil.sample(tire.contact.x, tire.contact.z).height;
+                    self.world.particles.shed_tread_ribbon(
+                        tire.contact,
+                        forward,
+                        right,
+                        side,
+                        ground,
+                    );
+                }
+            }
+            if peel && (-11.2..-1.2).contains(&z) {
+                let side = if tire.contact.x < 0.0 { -1.0 } else { 1.0 };
+                let ground = self.world.soil.sample(tire.contact.x, tire.contact.z).height;
+                self.world.particles.shed_tread_ribbon(
+                    tire.contact,
+                    forward,
+                    right,
+                    side,
+                    ground,
+                );
             }
             if (-13.5..-1.0).contains(&z) {
                 cut_rut_groove(&mut self.world.soil, tire.contact.x, tire.contact.z);
@@ -4319,63 +4342,8 @@ impl ThroughDrive {
                 self.report.wet_track = true;
             }
         }
-        if (-18.6..-11.6).contains(&z) {
-            self.world.particles.spawn(
-                self.world.vehicle.pos,
-                Vec3::ZERO,
-                0.2,
-                0.2,
-                10,
-            );
-            // Droplets off the crest, not flecks on the ground.
-            for i in 0..8 {
-                let side = (i as f32 - 3.5) / 3.5;
-                let bow = 1.0 - side * side;
-                let origin = Vec3::new(
-                    self.world.vehicle.pos.x + side * 2.15,
-                    0.22 + bow * 0.46,
-                    self.world.vehicle.pos.z + 1.15 + bow * 0.85,
-                );
-                let vel = right * side * 1.6 + Vec3::Y * (2.4 + bow * 1.6) - forward * 0.45;
-                self.world.particles.spawn(origin, vel, 0.32, 0.16, 0);
-            }
-        }
         if (-11.2..-1.2).contains(&z) {
             self.coat_body(1.0);
-            let ori = self.world.vehicle.orientation();
-            // Outboard of each crown, and the lip of the arch above that tire.
-            // The sheet falls back. It does not leave the door.
-            let stations = [
-                (Vec3::new(-0.78, 0.00, 0.62), -1.0_f32),
-                (Vec3::new(0.78, 0.00, 0.62), 1.0),
-                (Vec3::new(-0.70, 0.30, 0.50), -1.0),
-                (Vec3::new(0.70, 0.30, 0.50), 1.0),
-                (Vec3::new(-0.78, 0.00, -1.32), -1.0),
-                (Vec3::new(0.78, 0.00, -1.32), 1.0),
-                (Vec3::new(-0.70, 0.32, -1.12), -1.0),
-                (Vec3::new(0.70, 0.32, -1.12), 1.0),
-            ];
-            for (local, side) in stations {
-                self.world.particles.shed_wheel_ribbon(
-                    self.world.vehicle.pos + ori * local,
-                    forward,
-                    right,
-                    side,
-                );
-            }
-        }
-        if (-0.8..7.2).contains(&z) {
-            let ori = self.world.vehicle.orientation();
-            let arches = [
-                Vec3::new(-0.78, 0.18, -1.02),
-                Vec3::new(0.78, 0.18, -1.02),
-            ];
-            for local in arches {
-                self.world.particles.arch_drip(
-                    self.world.vehicle.pos + ori * local,
-                    -forward,
-                );
-            }
         }
         if z > -18.0 && z < 2.0 {
             let ahead = self.fluid.sample(0.0, z + 1.2);
@@ -4383,13 +4351,14 @@ impl ThroughDrive {
                 self.report.saw_wave = true;
             }
         }
+        self.ribbon_tick = self.ribbon_tick.wrapping_add(1);
         let spray = self.fluid.step(dt);
         self.report.spray_m3 = self.fluid.ledger().spray_m3;
         self.spawn_spray(&spray, forward);
         mirror_fluid(&self.fluid, &mut self.world.soil);
         if (-18.6..-11.5).contains(&z) {
             // One crescent ahead of the bumper, wider than the body.
-            raise_bow(&mut self.world.soil, 0.0, z + 1.08);
+            raise_bow(&mut self.world.soil, 0.0, z);
         }
         self.world.particles.update(&mut self.world.soil, dt);
         // Ledger ribbons are spawned first and used to fill the cap, so the
@@ -4405,7 +4374,7 @@ impl ThroughDrive {
                 .filter(|(_, p)| p.alive && p.kind == 5 && !p.ledger && !p.grounded)
                 .map(|(i, _)| i)
                 .collect();
-            const KEEP: usize = 20;
+            const KEEP: usize = 32;
             if picture.len() > KEEP {
                 let drop = picture.len() - KEEP;
                 for i in picture.drain(..drop) {
@@ -4436,8 +4405,11 @@ impl ThroughDrive {
                 return false;
             }
             if p.kind == 5 {
+                // A picture curl stays after it lands, so the strip is on the
+                // track and not only in the air beside the door. Ledger pieces
+                // are the volume and leave when they sit.
                 if p.grounded {
-                    return false;
+                    return !p.ledger;
                 }
                 if p.ledger {
                     return p.pos.y > 0.08;
@@ -4491,26 +4463,44 @@ impl ThroughDrive {
         let mut tex = crate::dust::DensityTexture::empty();
         self.dust.publish(&mut tex);
         let z_car = self.chassis_z;
-        let mut splats = tex.splats(0.00012);
-        // The wake in front of the chase camera. The back of the window is
-        // behind the lens, which is why a corner wisp vanished.
-        splats.retain(|(p, _)| {
-            p.z < z_car - 1.45
-                && p.z > z_car - 10.6
-                && p.x > -1.6
-                && p.x < 5.8
-                && p.y > 0.18
-                && p.y < 1.75
-        });
-        splats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        splats.truncate(140);
-        let wind = Vec3::new(1.5, 0.08, -0.9);
-        for (pos, vol) in splats {
-            let size = (0.38 + vol * 70.0).clamp(0.38, 0.82);
-            self.world.particles.spawn(pos, wind, 1.0, size, KIND_DUST_MARK);
+        if z_car < 0.6 {
+            return;
         }
-        // Settled dust stays in the ledger. A light card on the ground was a
-        // pale rectangle. The wet track is the darkened rut already drawn.
+        let mut splats = tex.splats(0.00008);
+        splats.retain(|(p, _)| p.z < z_car - 0.3 && p.z > z_car - 12.0 && p.y > 0.05 && p.y < 1.9);
+        if splats.is_empty() {
+            return;
+        }
+        let mut mass = 0.0_f32;
+        let mut sx = 0.0_f32;
+        let mut sy = 0.0_f32;
+        for (p, v) in &splats {
+            mass += *v;
+            sx += p.x * *v;
+            sy += p.y * *v;
+        }
+        let cx = if mass > 0.0 { sx / mass } else { 0.8 };
+        let cy = if mass > 0.0 {
+            (sy / mass).clamp(0.35, 1.05)
+        } else {
+            0.55
+        };
+        // One trail behind the car, shifted to +X with the wind. Marks overlap
+        // and shrink, so the tail fades. Two large cards read as two discs.
+        let wind = Vec3::new(1.5, 0.04, -0.9);
+        let n = 18u32;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let pos = Vec3::new(
+                0.55 + cx * 0.45 + t * 2.8,
+                0.38 + cy * 0.22 * (1.0 - t * 0.65),
+                z_car - 2.4 - t * 7.2,
+            );
+            let size = 0.70 * (1.0 - t).powf(0.55) + 0.12;
+            self.world
+                .particles
+                .spawn(pos, wind, 1.0, size, KIND_DUST_MARK);
+        }
     }
 
     fn advance_dust(&mut self, dt: f32) {
@@ -4584,23 +4574,9 @@ impl ThroughDrive {
     }
 
     fn spawn_spray(&mut self, spray: &[SprayEvent], forward: Vec3) {
-        // Sheet spray belongs on the puddle. Later events became white flecks in the rut.
-        if !(-18.8..-11.6).contains(&self.chassis_z) {
-            return;
-        }
-        let right = Vec3::new(forward.z, 0.0, -forward.x);
-        for (n, s) in spray.iter().enumerate() {
-            if n > 6 {
-                break;
-            }
-            self.world.particles.spray(
-                Vec3::new(s.x, s.y, s.z),
-                forward,
-                right,
-                2.0,
-                s.volume,
-            );
-        }
+        // The picture spray is the tread ribbons. White dots around the bow
+        // were a ring, not water leaving the tire.
+        let _ = (spray, forward);
     }
 
     fn note_rut(&mut self) {
@@ -4784,15 +4760,14 @@ fn darken_track(soil: &mut SoilField, x: f32, z: f32) {
     }
 }
 
-fn raise_bow(soil: &mut SoilField, x: f32, z: f32) {
-    let bow = bow_height_m(8.0, 0.08).max(0.42);
+fn raise_bow(soil: &mut SoilField, _x: f32, chassis_z: f32) {
+    // The crest has to stand beside the body. A ridge only ahead of the
+    // bumper sits under the hood from the chase camera, and the pool looks flat.
+    let bow = bow_height_m(8.0, 0.08).max(0.58);
     let half = soil.size * 0.5;
-    // A short crescent ahead of the bumper, wider than the body, so the
-    // curl shows beside the fenders from a camera behind the car.
-    let cz = z + 0.55;
-    let reach = (3.3 / soil.cell).ceil() as i32 + 1;
-    let ci = ((x + half) / soil.cell).floor() as i32;
-    let cj = ((cz + half) / soil.cell).floor() as i32;
+    let reach = (3.8 / soil.cell).ceil() as i32 + 1;
+    let ci = ((half) / soil.cell).floor() as i32;
+    let cj = ((chassis_z + 1.2 + half) / soil.cell).floor() as i32;
     for dj in -reach..=reach {
         for di in -reach..=reach {
             let i = ci + di;
@@ -4802,17 +4777,23 @@ fn raise_bow(soil: &mut SoilField, x: f32, z: f32) {
             }
             let px = (i as f32 + 0.5) * soil.cell - half;
             let pz = (j as f32 + 0.5) * soil.cell - half;
-            let e = ((px - x) / 2.55).powi(2) + ((pz - cz) / 0.72).powi(2);
-            if e > 1.05 {
+            let dx = px / 2.6;
+            let dz = (pz - (chassis_z + 1.9)) / 1.2;
+            let front = smooth01(1.2 - dx * dx - dz * dz);
+            // Shoulders beside the doors, where the chase camera can see the water.
+            let along = ((chassis_z + 1.5) - pz) / 2.3;
+            let flank = (px.abs() - 1.85).abs() / 1.15;
+            let arm = smooth01(1.05 - flank) * smooth01(1.25 - along) * smooth01(along + 0.45);
+            let w = front.max(arm);
+            if w < 0.04 {
                 continue;
             }
             let idx = (j as usize) * soil.res + i as usize;
             if soil.water[idx] < 0.010 {
                 continue;
             }
-            let w = smooth01(1.0 - e / 1.05);
             let crest = bow * w;
-            soil.water[idx] = soil.water[idx].max(0.06 + crest);
+            soil.water[idx] = soil.water[idx].max(soil.water[idx].min(0.15) + crest);
         }
     }
 }
@@ -5073,6 +5054,40 @@ mod tests {
         assert!(report.stuck_kg > 20.0, "stuck mass {}", report.stuck_kg);
         assert!(report.arch_brake_nm > 40.0, "arch brake {}", report.arch_brake_nm);
         assert!(report.imbalance_n > 15.0, "imbalance {}", report.imbalance_n);
+    }
+
+    #[test]
+    fn picture_bow_rises_beside_the_body() {
+        let mut drive = ThroughDrive::new();
+        for _ in 0..18 {
+            drive.step(1.0 / 30.0);
+        }
+        let z = drive.chassis_z;
+        let soil = &drive.world.soil;
+        let half = soil.size * 0.5;
+        let mut beside = 0.0_f32;
+        let mut ahead = 0.0_f32;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let pz = (j as f32 + 0.5) * soil.cell - half;
+                let w = soil.water[j * soil.res + i];
+                if (x.abs() - 1.85).abs() < 0.55 && (pz - (z + 0.5)).abs() < 0.8 {
+                    beside = beside.max(w);
+                }
+                if x.abs() < 0.5 && (pz - (z + 1.8)).abs() < 0.5 {
+                    ahead = ahead.max(w);
+                }
+            }
+        }
+        assert!(
+            beside > 0.45,
+            "shoulder beside the body is flat: {beside:.3} at z {z:.2}"
+        );
+        assert!(
+            ahead > 0.40,
+            "no crest ahead of the nose: {ahead:.3} at z {z:.2}"
+        );
     }
 
     #[test]

@@ -1118,13 +1118,16 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     if (free) {
         // Dark water, soft at the rim. The bow face is the lighter slope.
         // A bed-colored fill read as a flat tan disc.
-        let slope_amt = clamp((1.0 - nrm.y) * 6.0, 0.0, 1.0);
-        let deep = vec3<f32>(0.012, 0.028, 0.034);
-        let thin = vec3<f32>(0.04, 0.055, 0.052);
+        let slope_amt = clamp((1.0 - nrm.y) * 4.0, 0.0, 1.0);
+        let deep = vec3<f32>(0.015, 0.034, 0.038);
+        let thin = vec3<f32>(0.032, 0.052, 0.048);
         let depth_mix = smoothstep(0.02, 0.10, in.depth);
         col = mix(thin, deep, depth_mix);
-        col += vec3<f32>(0.62, 0.52, 0.34) * slope_amt;
-        col += vec3<f32>(0.22, 0.18, 0.12) * spec;
+        // The tilted face is the same water, lighter where it rises.
+        // A white lip on top of the pool was a crescent.
+        let face = vec3<f32>(0.10, 0.15, 0.13);
+        col = mix(col, face, smoothstep(0.08, 0.42, slope_amt));
+        col += vec3<f32>(0.035, 0.032, 0.022) * spec;
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
@@ -1580,25 +1583,20 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let belly = smoothstep(0.2, -0.45, n.y);
         lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
     }
-    if (in.panel > 45.0 && in.panel < 46.0) {
-        let lip = smoothstep(0.40, 0.96, in.uv.y);
-        let body = vec3<f32>(0.025, 0.055, 0.060);
-        let shine = vec3<f32>(0.78, 0.68, 0.46);
-        let col = mix(body, shine, lip * lip);
-        return vec4<f32>(present(col).rgb, 1.0);
-    }
     if (in.panel > 46.5 && in.panel < 47.5) {
         let d = length(in.uv - vec2<f32>(0.5, 0.5));
-        let soft = smoothstep(0.52, 0.0, d);
-        if (soft < 0.03) {
+        // A gaussian, so overlapping marks are one cloud. A hard radial
+        // falloff read as a disc.
+        let soft = exp(-d * d * 7.0);
+        if (soft < 0.05) {
             discard;
         }
         let g = noise(in.world.xz * 1.6 + vec2<f32>(in.world.y * 0.8, 0.3));
-        let col = mix(vec3<f32>(0.34, 0.27, 0.18), vec3<f32>(0.52, 0.42, 0.28), g);
+        let col = mix(vec3<f32>(0.20, 0.15, 0.09), vec3<f32>(0.32, 0.24, 0.15), g);
         let sun = normalize(frame.sun_dir.xyz);
         let ndl = clamp(dot(normalize(in.nrm), sun), 0.0, 1.0);
-        let film = in.panel > 47.15;
-        let strength = select(0.50, 0.18, film);
+        let tail = smoothstep(47.08, 47.34, in.panel);
+        let strength = mix(0.46, 0.10, tail);
         let mapped_dust = present(col * (0.72 + 0.28 * ndl));
         return vec4<f32>(mapped_dust.rgb, soft * strength);
     }
@@ -1608,8 +1606,8 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
     if (in.panel > 48.5 && in.panel < 49.5) {
         let g = noise(in.world.xz * 4.0 + vec2<f32>(in.world.y * 2.0, 0.2));
-        let clay = mix(vec3<f32>(0.07, 0.026, 0.010), vec3<f32>(0.13, 0.048, 0.016), g);
-        let lit_rib = shade(in.world, in.nrm, clay, 0.28, vec3<f32>(0.05, 0.018, 0.006));
+        let clay = mix(vec3<f32>(0.22, 0.13, 0.06), vec3<f32>(0.38, 0.24, 0.11), g);
+        let lit_rib = shade(in.world, in.nrm, clay, 0.42, vec3<f32>(0.02, 0.008, 0.003));
         return vec4<f32>(present(lit_rib).rgb, 1.0);
     }
     let mapped = present(lit);

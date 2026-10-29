@@ -494,24 +494,26 @@ impl Particles {
         }
     }
 
-    /// Sheets leaving a tire or an arch. They hang down and back. They are not
-    /// planks through the door. Volume is only the mesh. It is not soil.
-    pub fn shed_wheel_ribbon(&mut self, origin: Vec3, forward: Vec3, right: Vec3, side: f32) {
-        let vel = -forward * 1.4 + Vec3::Y * -0.85 + right * side * 0.22;
-        for k in 0..2 {
-            let age = k as f32 * 0.16;
-            let pos = origin
-                + right * side * (0.06 + k as f32 * 0.04)
-                + Vec3::Y * (0.10 - k as f32 * 0.05)
-                - forward * (0.05 + age);
-            if pos.y < 0.12 {
-                continue;
-            }
-            self.spawn(pos, vel, 0.48, 0.24, KIND_SLURRY_RIBBON);
-            if let Some(p) = self.items.last_mut() {
-                p.volume = 0.016;
-                p.ledger = false;
-            }
+    /// A short curl leaving the rear of the tread. `ground` is the soil under
+    /// the contact. The contact itself is at y = 0, under the heightfield, so
+    /// a lift from the contact buries the strip and it never draws.
+    /// The volume is a picture width, not soil. It does not hang off the door.
+    pub fn shed_tread_ribbon(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        side: f32,
+        ground: f32,
+    ) {
+        let pos = Vec3::new(origin.x, ground + 0.30, origin.z)
+            - forward * 0.14
+            + right * side * 0.04;
+        let vel = -forward * 0.85 - right * side * 0.40 + Vec3::Y * 0.22;
+        self.spawn(pos, vel, 0.48, 0.07, KIND_SLURRY_RIBBON);
+        if let Some(p) = self.items.last_mut() {
+            p.volume = 0.0024;
+            p.ledger = false;
         }
     }
 
@@ -626,11 +628,16 @@ impl Particles {
             p.rot = Quat::from_scaled_axis(p.spin * dt) * p.rot;
             let h = soil.sample(p.pos.x, p.pos.z).height;
             // Belly in the crater, the wet cap still above the soil.
-            let belly = match p.kind {
-                3 => 0.12,
-                1 | KIND_SLURRY_RIBBON => 0.22,
-                KIND_SLURRY_DROP => 0.28,
-                _ => 0.32,
+            let belly = if p.kind == KIND_SLURRY_RIBBON && !p.ledger {
+                // Sit the curl on the track. The ledger pieces stay low.
+                0.85
+            } else {
+                match p.kind {
+                    3 => 0.12,
+                    1 | KIND_SLURRY_RIBBON => 0.22,
+                    KIND_SLURRY_DROP => 0.28,
+                    _ => 0.32,
+                }
             };
             let sit = h + p.size * belly;
             if p.pos.y <= sit {
