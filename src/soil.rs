@@ -3011,9 +3011,10 @@ impl SoilField {
         let bow_near = radius * 0.95;
         let bow_far = radius * 2.2;
 
+        let area = self.cell * self.cell;
         let mut taken: Vec<(usize, f32)> = Vec::new();
         let mut weights: Vec<(usize, f32)> = Vec::new();
-        let mut wake_drop = 0.0_f32;
+        let mut wake_m3 = 0.0_f32;
         for j in j0.max(0)..=j1.min(res - 1) {
             for i in i0.max(0)..=i1.min(res - 1) {
                 let cx = (i as f32 + 0.5) * self.cell - half;
@@ -3032,7 +3033,7 @@ impl SoilField {
                     let take = self.slurry[idx] * 0.40;
                     if take > 1.0e-6 {
                         taken.push((idx, take));
-                        wake_drop = wake_drop.max(take);
+                        wake_m3 += take * area;
                     }
                 } else if (bow_near..=bow_far).contains(&along) && lat.abs() <= half_bow {
                     let span = (bow_far - bow_near).max(0.05);
@@ -3054,16 +3055,52 @@ impl SoilField {
         for (idx, take) in &taken {
             self.slurry[*idx] -= *take;
         }
-        let mut bow = 0.0_f32;
+        let mut bow_m3 = 0.0_f32;
         for (idx, w) in &weights {
             let add = removed * (*w / wsum);
             self.slurry[*idx] += add;
-            bow = bow.max(add);
+            bow_m3 += add * area;
         }
         for (idx, _) in taken.iter().chain(weights.iter()) {
             self.sync(*idx);
         }
-        BowWakePass { bow, wake: wake_drop }
+        BowWakePass { bow_m3, wake_m3 }
+    }
+
+    /// Slurry scraped from under a rolling tread for ribbons and fine spray.
+    /// The bed is not cut. Returns cubic metres taken from the column.
+    pub fn scrape_slurry_from_tread(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        radius: f32,
+        width: f32,
+        want: f32,
+    ) -> f32 {
+        let want = want.max(0.0);
+        if want <= 1.0e-8 {
+            return 0.0;
+        }
+        let cells = self.slurry_under_tread(x, z, forward, radius, width);
+        if cells.is_empty() {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let available: f32 = cells.iter().map(|idx| self.slurry[*idx] * area).sum();
+        if available <= 1.0e-8 {
+            return 0.0;
+        }
+        let take = want.min(available * 0.08);
+        let frac = (take / available).clamp(0.0, 1.0);
+        let mut got = 0.0_f32;
+        for idx in cells {
+            let depth = self.slurry[idx] * frac;
+            self.slurry[idx] -= depth;
+            got += depth * area;
+            self.sync(idx);
+        }
+        got
     }
 
     /// Lower the bed under a rolling tire in deep slurry. The slurry column
@@ -5226,10 +5263,10 @@ pub struct SlurryFlowBed {
 /// Slurry moved on one tire pass through deep slurry.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BowWakePass {
-    /// Metres added on the highest bow cell.
-    pub bow: f32,
-    /// Metres removed on the deepest wake cell.
-    pub wake: f32,
+    /// Cubic metres piled ahead in the bow wave.
+    pub bow_m3: f32,
+    /// Cubic metres thinned behind the tread in the wake.
+    pub wake_m3: f32,
 }
 
 /// Water plus soil, split into the solid, the free column, and the slurry.
@@ -7086,13 +7123,13 @@ mod tests {
         let pass = soil.raise_bow_wave(tire.1, tire.2, Vec3::Z, 0.38, 0.28);
         let track1 = soil.slurry[idx];
         eprintln!(
-            "bow wave height {:.4} m  wake {:.4} m   splash track {track0:.4} -> {track1:.4} m   ahead {ahead0:.4} -> {:.4} m",
-            pass.bow,
-            pass.wake,
+            "bow wave {:.4} m3  wake {:.4} m3   splash track {track0:.4} -> {track1:.4} m   ahead {ahead0:.4} -> {:.4} m",
+            pass.bow_m3,
+            pass.wake_m3,
             soil.slurry[ahead]
         );
-        assert!(pass.bow > 0.01, "the tire did not raise a bow wave, {:.4} m", pass.bow);
-        assert!(pass.wake > 0.004, "the tire did not thin a wake, {:.4} m", pass.wake);
+        assert!(pass.bow_m3 > 0.002, "the tire did not raise a bow wave, {:.4} m3", pass.bow_m3);
+        assert!(pass.wake_m3 > 0.0008, "the tire did not thin a wake, {:.4} m3", pass.wake_m3);
         assert!(
             track1 < track0 - 0.008,
             "the splash track is not in the slurry, {track0:.4} -> {track1:.4}"

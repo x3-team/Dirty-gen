@@ -1834,20 +1834,18 @@ fn capture_slurry_plow(renderer: &mut Renderer, parsed: &CaptureArgs) {
     renderer.niva_picture = true;
 
     let mut world = World::wet_clay();
-    let out = world.plow_through_deep_slurry(2.15);
+    let out = world.plow_through_deep_slurry(3.6);
     silence_soil_clods(&mut world);
+    let sum = out.slurry + out.groove + out.ribbons + out.spray;
     println!(
-        "slurry-plow pool {:.4} m3  slurry0 {:.4}  slurry {:.4}  groove {:.4}  \
-         bow {:.4} m  wake {:.4} m  rut {:.4}->{:.4} m  ribbons {:.4}  spray {:.4}  \
-         clay drag {:.0} N  silt {:.0}  sand {:.0}",
+        "slurry-plow pool {:.4} m3  slurry {:.4}  groove {:.4}  bow {:.4}  wake {:.4}  \
+         sum {:.4}  ribbons {:.4}  spray {:.4}  clay {:.0}  silt {:.0}  sand {:.0}",
         out.pool,
-        out.slurry0,
         out.slurry,
         out.groove,
-        out.bow,
-        out.wake,
-        out.rut_before,
-        out.rut_after,
+        out.bow_m3,
+        out.wake_m3,
+        sum,
         out.ribbons,
         out.spray,
         out.drag_clay,
@@ -1855,20 +1853,19 @@ fn capture_slurry_plow(renderer: &mut Renderer, parsed: &CaptureArgs) {
         out.drag_sand,
     );
     let lines = [
-        format!("pool {:.4}", out.pool),
-        format!("slurry {:.4}", out.slurry),
-        format!("groove {:.4}", out.groove),
-        format!("bow {:.4}", out.bow),
-        format!("wake {:.4}", out.wake),
-        format!("rut {:.4}", out.rut_after),
-        format!("ribbons {:.4}", out.ribbons),
-        format!("spray {:.4}", out.spray),
+        format!("pool {:.4} m3", out.pool),
+        format!("bow {:.4} m3", out.bow_m3),
+        format!("wake {:.4} m3", out.wake_m3),
+        format!("groove {:.4} m3", out.groove),
+        format!("sum {:.4} m3", sum),
+        format!("ribbons {:.4} m3", out.ribbons),
+        format!("spray {:.4} m3", out.spray),
         format!("clay {:.0} N", out.drag_clay),
         format!("silt {:.0} N", out.drag_silt),
         format!("sand {:.0} N", out.drag_sand),
     ];
     let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-    let pose = lift_camera(&world, slurry_plow_camera(&world));
+    let pose = slurry_plow_camera(&world);
     let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
     stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
     if let Some(parent) = parsed.slurry_plow_proof.parent() {
@@ -1898,17 +1895,11 @@ fn slurry_plow_camera(world: &World) -> CameraPose {
     let fwd = world.vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
     let p = world.vehicle.pos;
-    let wheel = p + fwd * 0.95 + right * 0.76;
-    let bow = wheel + fwd * 0.48;
-    let wake = wheel - fwd * 0.62;
-    let floor = world.soil.sample(bow.x, bow.z).height;
-    let look = Vec3::new(
-        wheel.x * 0.40 + bow.x * 0.35 + wake.x * 0.25,
-        floor - 0.02,
-        wheel.z * 0.35 + bow.z * 0.40 + wake.z * 0.25,
-    );
-    let eye = wheel + right * 1.65 + fwd * 0.12 + Vec3::Y * 0.32;
-    let ortho = 1.95;
+    let floor = world.soil.sample(p.x, p.z).height;
+    // Side-on to the whole Niva: bow ahead (+fwd) and wake behind (-fwd) in frame.
+    let look = p + fwd * 0.2 + Vec3::Y * (floor - p.y + 0.62);
+    let eye = p + right * 8.4 + fwd * (-3.2) + Vec3::Y * 3.6;
+    let ortho = 12.5;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
@@ -2264,10 +2255,10 @@ fn capture_slurry_flow(renderer: &mut Renderer, parsed: &CaptureArgs) {
             .soil
             .raise_bow_wave(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH);
         println!("wheel {i} slurry {depth:.4} m");
-        bow_max = bow_max.max(pass.bow);
+        bow_max = bow_max.max(pass.bow_m3);
         println!(
-            "bow wave wheel {i} {:.4} m  wake {:.4} m at ({x:.2}, {z:.2})",
-            pass.bow, pass.wake
+            "bow wave wheel {i} {:.4} m3  wake {:.4} m3 at ({x:.2}, {z:.2})",
+            pass.bow_m3, pass.wake_m3
         );
     }
     println!("bow wave height {bow_max:.4} m");
@@ -2416,10 +2407,10 @@ fn capture_slurry_drag(renderer: &mut Renderer, parsed: &CaptureArgs) {
         let pass = world
             .soil
             .raise_bow_wave(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH);
-        bow_max = bow_max.max(pass.bow);
+        bow_max = bow_max.max(pass.bow_m3);
         println!(
-            "wheel {i} slurry {:.4} m  bow {:.4} m  wake {:.4} m  at ({x:.2}, {z:.2})",
-            sample.slurry, pass.bow, pass.wake
+            "wheel {i} slurry {:.4} m  bow {:.4} m3  wake {:.4} m3  at ({x:.2}, {z:.2})",
+            sample.slurry, pass.bow_m3, pass.wake_m3
         );
     }
     println!("bow wave height {bow_max:.4} m");
@@ -3468,6 +3459,7 @@ fn glyph_rows(ch: char) -> Option<[u8; 7]> {
         't' => [0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00100, 0b00011],
         'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
         'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
+        'k' => [0b00000, 0b00000, 0b10101, 0b01100, 0b10100, 0b10100, 0b10101],
         'y' => [0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
         _ => return None,
     };
