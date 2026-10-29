@@ -1160,7 +1160,20 @@ impl World {
             fwd,
         );
         self.soil
-            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.62);
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
         let driver = -right;
         let ribbon_base = rear_l + driver * 0.92 + Vec3::Y * 0.46 - fwd * 0.05;
         let spray_base = rear_l + driver * 0.72 + Vec3::Y * 0.64 - fwd * 0.03;
@@ -1181,13 +1194,9 @@ impl World {
                 p.spin = Vec3::new(0.12, 0.28, 0.08);
                 ri += 1;
             } else if p.kind == crate::particles::KIND_SLURRY_DROP {
-                if p.pos.y < rear_l.y + 0.42 {
-                    p.alive = false;
-                    continue;
-                }
-                p.pos = spray_base + driver * (di as f32 * 0.07) + Vec3::Y * (di as f32 * 0.05);
-                p.vel = driver * 2.0 + Vec3::Y * 0.22;
-                p.size = (p.volume * 90.0).cbrt().clamp(0.032, 0.055);
+                p.pos = spray_base + driver * (di as f32 * 0.08) + Vec3::Y * (di as f32 * 0.06);
+                p.vel = driver * 1.6 + Vec3::Y * 0.35;
+                p.size = (p.volume * 120.0).cbrt().clamp(0.022, 0.038);
                 di += 1;
             } else if p.kind != crate::particles::KIND_SLURRY_SHEET {
                 p.alive = false;

@@ -1908,15 +1908,16 @@ fn slurry_plow_camera(world: &World) -> CameraPose {
     let wake_h = world.soil.sample(wake_x, wake_z).height;
     // Low on the driver’s side, sight line along the pool so the bow crest
     // and the wake trough share one grazing profile.
-    let target = Vec3::new(
-        (bow_x + wake_x) * 0.5,
-        (bow_h + wake_h) * 0.5 + 0.02,
-        (bow_z + wake_z) * 0.5,
+    let target = Vec3::new(bow_x, bow_h + 0.025, bow_z);
+    let eye = Vec3::new(
+        rear.x + driver.x * 3.4 + fwd.x * (-1.25),
+        wake_h + 0.14,
+        rear.z + driver.z * 3.4 + fwd.z * (-1.25),
     );
-    let eye = rear + driver * 3.6 + fwd * (-1.35) + Vec3::Y * (wake_h + 0.22);
-    let ortho = 7.8;
+    let ortho = 7.6;
+    // Do not lift the eye: clear_ortho_eye pushes this back to a high isometric.
     CameraPose {
-        eye: clear_ortho_eye(world, eye, target, ortho),
+        eye,
         target,
         ortho_width: Some(ortho),
     }
