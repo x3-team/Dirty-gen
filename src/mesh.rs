@@ -23,6 +23,8 @@ pub const PANEL_TRUNK: f32 = 45.0;
 pub const PANEL_CLOD: f32 = 46.0;
 /// Dry dust lofted off the track. A pale film, not wet mud.
 pub const PANEL_DUST: f32 = 47.0;
+/// Water fleck. Not a clod and not body paint.
+pub const PANEL_SPRAY: f32 = 48.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -86,6 +88,28 @@ fn add_tri(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32) {
 fn add_quad(mesh: &mut CpuMesh, p: [Vec3; 4], panel: f32) {
     add_tri(mesh, p[0], p[1], p[2], panel);
     add_tri(mesh, p[0], p[2], p[3], panel);
+}
+
+fn add_quad_uv(mesh: &mut CpuMesh, p: [Vec3; 4], uv: [[f32; 2]; 4], panel: f32) {
+    let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+    if n.length_squared() < 1.0e-8 {
+        return;
+    }
+    let push = |mesh: &mut CpuMesh, pos: Vec3, uv: [f32; 2]| {
+        mesh.vertices.push(MeshVertex {
+            pos: pos.to_array(),
+            nrm: n.to_array(),
+            uv,
+            panel,
+        });
+    };
+    let base = mesh.vertices.len() as u32;
+    push(mesh, p[0], uv[0]);
+    push(mesh, p[1], uv[1]);
+    push(mesh, p[2], uv[2]);
+    push(mesh, p[3], uv[3]);
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 fn add_box(mesh: &mut CpuMesh, c: Vec3, h: Vec3, panel: f32) {
@@ -793,54 +817,50 @@ fn add_horizon(mesh: &mut CpuMesh) {
 /// Horizon ring so the mud has somewhere to sit.
 pub fn environment_mesh() -> CpuMesh {
     let mut m = CpuMesh::new();
-    let y = -0.02;
-    // Skirt outside the 40 m heightfield so the world does not end in a void.
-    let far = 78.0;
-    let edge = 20.0;
-    add_quad(
+    let y = 0.0;
+    // Skirt outside the 40 m heightfield. Winding is +Y so it is a floor,
+    // not a back face, and the field does not end as a wall.
+    let far = 90.0;
+    let edge = 19.6;
+    let quad = |m: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+        add_quad(m, [a, b, c, d], PANEL_SKIRT);
+    };
+    // +Y: a -> b -> c is counter-clockwise when looking down.
+    quad(
         &mut m,
-        [
-            Vec3::new(-far, y, edge),
-            Vec3::new(far, y, edge),
-            Vec3::new(far, y, far),
-            Vec3::new(-far, y, far),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(-far, y, edge),
+        Vec3::new(-far, y, far),
+        Vec3::new(far, y, far),
+        Vec3::new(far, y, edge),
     );
-    add_quad(
+    quad(
         &mut m,
-        [
-            Vec3::new(-far, y, -far),
-            Vec3::new(far, y, -far),
-            Vec3::new(far, y, -edge),
-            Vec3::new(-far, y, -edge),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(-far, y, -far),
+        Vec3::new(-far, y, -edge),
+        Vec3::new(far, y, -edge),
+        Vec3::new(far, y, -far),
     );
-    add_quad(
+    quad(
         &mut m,
-        [
-            Vec3::new(edge, y, -edge),
-            Vec3::new(far, y, -edge),
-            Vec3::new(far, y, edge),
-            Vec3::new(edge, y, edge),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(edge, y, -edge),
+        Vec3::new(edge, y, edge),
+        Vec3::new(far, y, edge),
+        Vec3::new(far, y, -edge),
     );
-    add_quad(
+    quad(
         &mut m,
-        [
-            Vec3::new(-far, y, -edge),
-            Vec3::new(-edge, y, -edge),
-            Vec3::new(-edge, y, edge),
-            Vec3::new(-far, y, edge),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(-far, y, -edge),
+        Vec3::new(-far, y, edge),
+        Vec3::new(-edge, y, edge),
+        Vec3::new(-edge, y, -edge),
     );
 
-    // Low rolling silhouette. The inner ring is tucked into the skirt so it
-    // sits on the ground instead of floating as boxes. Trees, rocks and grass
-    // are the Gobkit meshes placed around the oval.
+    m
+}
+
+/// Faceted distance hills. Off for a proof that must not end in a wall.
+pub fn horizon_mesh() -> CpuMesh {
+    let mut m = CpuMesh::new();
     add_horizon(&mut m);
     m
 }
@@ -1106,8 +1126,8 @@ fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
 /// roll sheet, not a flat tablet, a ground stamp, or a box.
 fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet: bool) {
-    // Long axis stays in the XZ plane so a side camera sees a ribbon, not a
-    // vertical sheet or a tablet on the tread.
+    // Long axis stays in the XZ plane. A roll sheet lies down. A ribbon stands
+    // up so a camera behind the car sees the face and not the thin edge.
     let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::new(p.vel.x.max(0.2), 0.0, -1.0);
@@ -1118,28 +1138,34 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
         side = dir.cross(Vec3::X);
     }
     side = side.normalize();
-    let up = side.cross(dir).normalize();
+    let mut up = side.cross(dir).normalize();
+    if !roll_sheet {
+        side = Vec3::Y;
+        up = dir.cross(side).normalize();
+    }
     let speed = p.vel.length();
+    let picture = !roll_sheet && p.size > 0.14;
     let length = if roll_sheet {
         (0.44 + speed * 0.022).clamp(0.48, 0.68)
-    } else if p.size > 0.14 {
-        (0.62 + speed * 0.03).clamp(0.66, 0.88)
+    } else if picture {
+        (1.05 + speed * 0.05).clamp(1.10, 1.45)
     } else {
         (0.44 + speed * 0.035).clamp(0.48, 0.72)
     };
     let width = (p.volume / length).sqrt();
     let width = if roll_sheet {
         width.clamp(0.09, 0.17)
-    } else if p.size > 0.14 {
-        width.clamp(0.028, 0.062)
+    } else if picture {
+        width.clamp(0.07, 0.11)
     } else {
         width.clamp(0.012, 0.048)
     };
     let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.028);
-    let length = length.min(width * 7.2);
+    let length = if picture { length } else { length.min(width * 7.2) };
     let segs = 8usize;
-    let side_sweep = if roll_sheet { 0.10 } else { 0.35 };
-    let twist_scale = if roll_sheet { 0.42 } else { 0.7 };
+    let panel = if roll_sheet { PANEL_CLOD } else { 49.0 };
+    let side_sweep = if roll_sheet { 0.10 } else { 0.55 };
+    let twist_scale = if roll_sheet { 0.42 } else { 0.55 };
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
@@ -1159,15 +1185,15 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     for s in 0..segs {
         let a = ring[s];
         let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], panel);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], panel);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], panel);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], panel);
     }
     let a = ring[0];
     let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], panel);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
 }
 
 /// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
@@ -1210,83 +1236,128 @@ fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     // A short fleck. The long axis follows the horizontal throw, and it stays
     // under 7.5 cm so it is not a bar, a tablet, or a teardrop blob.
-    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
+    // Arch water falls, so its long axis is the fall and not a flat coin.
+    let falling = p.kind == 9 && p.vel.y < -0.4;
+    let mut dir = if falling {
+        p.vel
+    } else {
+        Vec3::new(p.vel.x, 0.0, p.vel.z)
+    };
     if dir.length_squared() < 1.0e-4 {
         dir = Vec3::X;
     }
     dir = dir.normalize();
-    let mut side = dir.cross(Vec3::Y);
+    let mut side = if falling {
+        Vec3::new(-dir.z, 0.0, dir.x)
+    } else {
+        dir.cross(Vec3::Y)
+    };
     if side.length_squared() < 1.0e-6 {
         side = Vec3::Z;
     }
     side = side.normalize();
-    let length = 0.058_f32;
-    let width = 0.020_f32;
-    let thick = 0.010_f32;
+    let width_axis = if falling { side } else { Vec3::Y };
+    let thick_axis = dir.cross(width_axis).normalize_or_zero();
+    let thick_axis = if thick_axis.length_squared() < 1.0e-6 {
+        side
+    } else {
+        thick_axis
+    };
+    let scale = if p.kind == 9 {
+        (p.size / 0.05).clamp(0.7, 1.2)
+    } else if p.kind == 0 {
+        (p.size / 0.05).clamp(0.7, 1.4)
+    } else {
+        1.0
+    };
+    let panel = if p.kind == 0 || p.kind == 9 {
+        PANEL_SPRAY
+    } else {
+        PANEL_CLOD
+    };
+    let length = if p.kind == 9 { 0.11 } else { 0.058 } * scale;
+    let width = if p.kind == 9 { 0.016 } else { 0.020 } * scale;
+    let thick = 0.010_f32 * scale;
     let segs = 5usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
         let taper = (0.28 + 0.72 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.28, 1.0);
-        let c = p.pos + dir * (length * (t - 0.5)) + Vec3::Y * (t - 0.5) * 0.002;
-        let w = Vec3::Y * width * 0.5 * taper;
-        let h = side * thick * 0.5 * taper;
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = width_axis * width * 0.5 * taper;
+        let h = thick_axis * thick * 0.5 * taper;
         ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
     }
     for s in 0..segs {
         let a = ring[s];
         let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], panel);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], panel);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], panel);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], panel);
     }
     let a = ring[0];
     let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], panel);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
 }
 
-/// A wisp of the air-grid dust. The volume stays on the grid. This mark is
-/// a short fleck along the wind, not a sphere and not a bar.
-fn add_dust_wisp(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
-    if dir.length_squared() < 1.0e-4 {
-        let a = p.pos.x * 12.7 + p.pos.z * 4.1;
-        dir = Vec3::new(a.cos(), 0.0, a.sin());
+fn puff_quad(mesh: &mut CpuMesh, center: Vec3, axis_u: Vec3, axis_v: Vec3, ru: f32, rv: f32, panel: f32) {
+    let u = axis_u * ru;
+    let v = axis_v * rv;
+    let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    add_quad_uv(
+        mesh,
+        [center - u - v, center + u - v, center + u + v, center - u + v],
+        uv,
+        panel,
+    );
+}
+
+/// Soft dust from the air grid. Crossed puffs with a radial fade, stretched
+/// a little along the wind. Ground film is one flat puff. Not a tube, a
+/// sphere, or a hard card.
+pub fn dust_cloud(items: &[silt::particles::Particle]) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    const MAX_VERTS: usize = 12000;
+    for p in items {
+        if !p.alive || p.life <= 0.0 || p.kind != 8 {
+            continue;
+        }
+        if mesh.vertices.len() + 48 > MAX_VERTS {
+            break;
+        }
+        let film = p.pos.y < 0.10;
+        let panel = if film { 47.2 } else { PANEL_DUST };
+        let mut wind = Vec3::new(p.vel.x, 0.0, p.vel.z);
+        if wind.length_squared() < 1.0e-4 {
+            wind = Vec3::new(0.86, 0.0, -0.51);
+        }
+        wind = wind.normalize();
+        let side = Vec3::new(-wind.z, 0.0, wind.x);
+        if film {
+            // One soft stain, stretched with the wind. An axis-aligned quad
+            // on every cell tiled into boards.
+            let r = (0.62 + p.size).clamp(0.75, 1.45);
+            let jx = ((p.seed % 19) as f32 - 9.0) * 0.04;
+            let jz = (((p.seed / 19) % 17) as f32 - 8.0) * 0.04;
+            puff_quad(
+                &mut mesh,
+                p.pos + Vec3::new(jx, 0.0, jz),
+                wind,
+                side,
+                r * 1.45,
+                r * 0.95,
+                panel,
+            );
+            continue;
+        }
+        let r = p.size.clamp(0.45, 1.25);
+        // Crossed upright puffs. A flat card facing the camera read as a board.
+        puff_quad(&mut mesh, p.pos, wind, Vec3::Y, r * 1.45, r * 0.85, panel);
+        puff_quad(&mut mesh, p.pos, side, Vec3::Y, r * 1.05, r * 0.72, panel);
     }
-    dir = dir.normalize();
-    let mut side = dir.cross(Vec3::Y);
-    if side.length_squared() < 1.0e-6 {
-        side = Vec3::Z;
-    }
-    side = side.normalize();
-    let scale = (p.size / 0.05).clamp(1.2, 9.0);
-    let length = 0.046_f32 * scale;
-    let width = 0.012_f32 * scale;
-    let thick = 0.006_f32 * scale;
-    let segs = 4usize;
-    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
-    for s in 0..=segs {
-        let t = s as f32 / segs as f32;
-        let taper = (0.22 + 0.78 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.22, 1.0);
-        let c = p.pos + dir * (length * (t - 0.5));
-        let w = Vec3::Y * width * 0.5 * taper;
-        let h = side * thick * 0.5 * taper;
-        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
-    }
-    for s in 0..segs {
-        let a = ring[s];
-        let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_DUST);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_DUST);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_DUST);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_DUST);
-    }
-    let a = ring[0];
-    let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_DUST);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_DUST);
+    mesh
 }
 
 #[cfg(test)]
@@ -1487,20 +1558,25 @@ mod slurry_shapes {
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
+    // Picture sheets off the body. Ledger flecks are smaller and must not
+    // fill the mesh before these are drawn.
+    for p in items {
+        if !p.alive || p.life <= 0.0 || p.kind != silt::particles::KIND_SLURRY_RIBBON || p.ledger {
+            continue;
+        }
+        if mesh.vertices.len() + 400 >= MAX_VERTS {
+            break;
+        }
+        add_slurry_ribbon(&mut mesh, p);
+    }
     // Draw the big clumps first so a full splash cannot crowd them out.
     // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
-    for kind in [8u8, 7, 5, 6, 3, 1, 4, 0, 2] {
+    for kind in [7u8, 5, 6, 9, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
-            if p.kind == 8 {
-                if mesh.vertices.len() + 200 < MAX_VERTS {
-                    add_dust_wisp(&mut mesh, p);
-                }
-                continue;
-            }
-            if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 {
+            if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 || p.kind == 9 {
                 if mesh.vertices.len() + 200 < MAX_VERTS {
                     add_mud_drop(&mut mesh, p);
                 }
@@ -1513,6 +1589,14 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
                 continue;
             }
             if p.kind == silt::particles::KIND_SLURRY_RIBBON {
+                // Picture ribbons were drawn above. A tiny ledger piece is
+                // the volume in flight, not a sheet the camera should see.
+                if p.ledger && p.volume < 0.0015 {
+                    continue;
+                }
+                if !p.ledger {
+                    continue;
+                }
                 if mesh.vertices.len() + 400 < MAX_VERTS {
                     add_slurry_ribbon(&mut mesh, p);
                 }

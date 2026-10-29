@@ -459,6 +459,55 @@ impl Particles {
         }
     }
 
+    /// A fan of water flecks. Ledger stays off. Not clods.
+    pub fn spray_fan(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        speed: f32,
+        count: u32,
+    ) {
+        let n = count.clamp(1, 8);
+        for i in 0..n {
+            let side = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let spread = 0.20 + (i as f32) * 0.04;
+            let vel = -forward * (1.1 + speed * 0.04)
+                + right * side * (2.4 + self.rnd() * 0.7)
+                + Vec3::Y * (1.5 + self.rnd() * 0.7);
+            let life = 0.32 + self.rnd() * 0.08;
+            let pos = origin
+                + right * side * spread
+                + Vec3::Y * (0.32 + self.rnd() * 0.38)
+                - forward * self.rnd() * 0.08;
+            self.spawn(pos, vel, life, 0.05, 0);
+        }
+    }
+
+    /// Water leaving a wheel arch. Falls, does not dig.
+    pub fn arch_drip(&mut self, origin: Vec3, back: Vec3) {
+        for i in 0..3 {
+            let pos = origin + Vec3::Y * (0.08 - 0.05 * i as f32) + back * (0.04 * i as f32);
+            let vel = Vec3::Y * (-2.2 - i as f32 * 0.45) + back * 0.15;
+            self.spawn(pos, vel, 0.28, 0.05, 9);
+        }
+    }
+
+    /// Ribbons off the body. Volume is only the mesh width. It is not soil.
+    pub fn visual_ribbons(&mut self, origin: Vec3, forward: Vec3, right: Vec3) {
+        for side in [1.0_f32, -1.0] {
+            // Sill height, just outside the body. Length runs outboard so the
+            // chase camera sees a strip, and the throw peels it backward.
+            let pos = origin + right * side * 0.98 + Vec3::Y * 0.02 - forward * 0.12;
+            let vel = right * side * 2.1 - forward * 0.85 + Vec3::Y * 0.35;
+            self.spawn(pos, vel, 0.7, 0.24, KIND_SLURRY_RIBBON);
+            if let Some(p) = self.items.last_mut() {
+                p.volume = 0.010;
+                p.ledger = false;
+            }
+        }
+    }
+
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
         let _ = water;
         // One droplet, and not on top of one that is already in the air.

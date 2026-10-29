@@ -1066,6 +1066,20 @@ impl FluidCore {
         vol
     }
 
+    /// Multiply the coarse water and slurry by masks in 0..1. A pour can
+    /// start as a box and leave as an oval or a pair of ruts.
+    pub fn scale_columns(&mut self, mut mask: impl FnMut(f32, f32) -> (f32, f32)) {
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = self.coarse_xz(i, j);
+                let (mw, ms) = mask(x, z);
+                let idx = j * WINDOW_RES + i;
+                self.water[idx] *= mw.clamp(0.0, 1.0);
+                self.slurry[idx] *= ms.clamp(0.0, 1.0);
+            }
+        }
+    }
+
     /// Pull the rim of each sheet down to the bed over `feather_m`. The
     /// interior depth stays. A hard rectangle does not stay a wall of fluid.
     pub fn soften_rims(&mut self, feather_m: f32) {

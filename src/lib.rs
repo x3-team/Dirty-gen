@@ -14,6 +14,6 @@ pub mod vehicle;
 pub mod world;
 
 pub use world::{
-    demo_camera, demo_drive, demo_drive_bike, dig_input, CameraPose, Input, ThroughDrive,
-    ThroughReport, World,
+    demo_camera, demo_drive, demo_drive_bike, dig_input, BellyShelfReport, CameraPose, Input,
+    ThroughDrive, ThroughReport, World,
 };

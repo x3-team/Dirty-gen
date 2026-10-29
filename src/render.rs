@@ -13,7 +13,8 @@ use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
 use crate::mesh::{
-    bike_body, bike_suspension, environment_mesh, mud_chunks, terrain_mesh, wheel_mesh, CpuMesh,
+    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks, terrain_mesh,
+    wheel_mesh, CpuMesh,
     MeshVertex, ParticleVertex, TerrainVertex,
 };
 
@@ -88,6 +89,7 @@ pub struct Renderer {
     wheel: GpuMesh,
     bike_body: GpuMesh,
     env: GpuMesh,
+    hills: GpuMesh,
     props: GpuMesh,
     #[allow(dead_code)]
     resident: Vec<wgpu::Texture>,
@@ -98,12 +100,15 @@ pub struct Renderer {
     particles: wgpu::Buffer,
     chunk_v: wgpu::Buffer,
     chunk_i: wgpu::Buffer,
+    dust_v: wgpu::Buffer,
+    dust_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
     pipe_mesh: wgpu::RenderPipeline,
     pipe_mesh_blend: wgpu::RenderPipeline,
     pipe_mesh_double: wgpu::RenderPipeline,
+    pipe_dust: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
@@ -124,6 +129,8 @@ pub struct Renderer {
     pub show_props: bool,
     /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
     pub show_environment: bool,
+    /// Distance hills. Off when the horizon must stay a flat field.
+    pub show_hills: bool,
     pub show_bike: bool,
     /// Draw the fitted Lada Niva instead of the dune buggy mesh.
     pub niva_picture: bool,
@@ -761,6 +768,22 @@ impl Renderer {
             true,
             None,
         );
+        let pipe_dust = pipeline(
+            &device,
+            &shader,
+            mesh_layout_ref,
+            "vs_mesh",
+            Some("fs_mesh"),
+            mesh_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
         let pipe_mesh_double = pipeline(
             &device,
             &shader,
@@ -884,6 +907,7 @@ impl Renderer {
         let wheel = upload_cpu(&device, &wheel_mesh(), "wheel");
         let bike_body = upload_cpu(&device, &bike_body(), "bike");
         let env = upload_cpu(&device, &environment_mesh(), "env");
+        let hills = upload_cpu(&device, &horizon_mesh(), "hills");
         let props = upload_cpu(&device, &cc0.props, "props");
         let niva_body = upload_cpu(&device, &niva.body, "niva-body");
         let niva_glass = upload_cpu(&device, &niva.glass, "niva-glass");
@@ -923,6 +947,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dust_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dust-v"),
+            size: (16384 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dust_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dust-i"),
+            size: (48000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -957,6 +993,7 @@ impl Renderer {
             wheel,
             bike_body,
             env,
+            hills,
             props,
             resident,
             paint_bg,
@@ -965,12 +1002,15 @@ impl Renderer {
             particles,
             chunk_v,
             chunk_i,
+            dust_v,
+            dust_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
             pipe_mesh,
             pipe_mesh_blend,
             pipe_mesh_double,
+            pipe_dust,
             pipe_particle,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
@@ -988,6 +1028,7 @@ impl Renderer {
             daylight: false,
             show_props: true,
             show_environment: true,
+            show_hills: true,
             show_bike: true,
             niva_picture: false,
             water_column: false,
@@ -1156,6 +1197,14 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
+        let dust = dust_cloud(&world.particles.items);
+        let dust_count = dust.indices.len() as u32;
+        if dust_count > 0 {
+            self.queue
+                .write_buffer(&self.dust_v, 0, bytemuck::cast_slice(&dust.vertices));
+            self.queue
+                .write_buffer(&self.dust_i, 0, bytemuck::cast_slice(&dust.indices));
+        }
 
         let mut encoder = self
             .device
@@ -1195,6 +1244,9 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if self.show_environment {
                 draw_indexed(&mut pass, &self.env);
+                if self.show_hills {
+                    draw_indexed(&mut pass, &self.hills);
+                }
             }
             if self.show_props {
                 draw_indexed(&mut pass, &self.props);
@@ -1235,6 +1287,15 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_sky);
             pass.draw(0..3, 0..1);
 
+            // Floor outside the heightfield, under the terrain so the rim stays the field.
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_pipeline(&self.pipe_mesh);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            if self.show_environment {
+                draw_indexed(&mut pass, &self.env);
+            }
+
             pass.set_bind_group(1, &self.tex_bg, &[]);
             pass.set_pipeline(&self.pipe_terrain);
             draw_indexed(&mut pass, &self.terrain);
@@ -1242,8 +1303,8 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
-            if self.show_environment {
-                draw_indexed(&mut pass, &self.env);
+            if self.show_environment && self.show_hills {
+                draw_indexed(&mut pass, &self.hills);
             }
             self.draw_vehicle(&mut pass);
             if self.show_bike {
@@ -1260,10 +1321,17 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
-            pass.set_pipeline(&self.pipe_mesh);
+            // Sheets are thin. Back-face cull hides the side the camera sees.
+            pass.set_pipeline(&self.pipe_mesh_double);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             if chunk_count > 0 {
                 self.draw_chunks(&mut pass, chunk_count);
+            }
+
+            pass.set_pipeline(&self.pipe_dust);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            if dust_count > 0 {
+                self.draw_dust(&mut pass, dust_count);
             }
 
             pass.set_pipeline(&self.pipe_mesh_blend);
@@ -1568,6 +1636,16 @@ impl Renderer {
         pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
         pass.set_vertex_buffer(0, self.chunk_v.slice(..));
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..count, 0, 0..1);
+    }
+
+    fn draw_dust(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
+        if count == 0 {
+            return;
+        }
+        pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+        pass.set_vertex_buffer(0, self.dust_v.slice(..));
+        pass.set_index_buffer(self.dust_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
 }
