@@ -127,6 +127,8 @@ pub struct Renderer {
     pub show_bike: bool,
     /// Draw the fitted Lada Niva instead of the dune buggy mesh.
     pub niva_picture: bool,
+    /// Draw the solved water column, including a bow above the film range.
+    pub water_column: bool,
     niva_body: GpuMesh,
     niva_glass: GpuMesh,
     niva_wheels: [GpuMesh; 4],
@@ -988,6 +990,7 @@ impl Renderer {
             show_environment: true,
             show_bike: true,
             niva_picture: false,
+            water_column: false,
             niva_body,
             niva_glass,
             niva_wheels,
@@ -1136,7 +1139,7 @@ impl Renderer {
                 world.time,
                 SHADOW as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
-                0.0,
+                if self.water_column { 1.0 } else { 0.0 },
             ],
             tires: tire_frame(&world.vehicle),
         };
@@ -1401,7 +1404,8 @@ impl Renderer {
             // Free water and the mixed body share this channel. The mesh
             // already sits on the slurry, so the tint is that one surface.
             let liquid = soil.water[i] + soil.slurry[i];
-            px[1] = ((liquid / 0.34).clamp(0.0, 1.0) * 255.0) as u8;
+            let liquid_scale = if self.water_column { 0.90 } else { 0.34 };
+            px[1] = ((liquid / liquid_scale).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
         }

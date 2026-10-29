@@ -135,6 +135,12 @@ pub struct Vehicle {
     pub panels: [PanelMud; PANEL_COUNT],
     /// Seconds of free flight after the crest. A clipping tire must not erase the launch.
     pub jump_hold: f32,
+    /// Hull buoyancy from the water crossing, newtons. Zero off the water.
+    pub water_lift_n: f32,
+    /// Hull drag from the water crossing, newtons. Zero off the water.
+    pub water_drag_n: f32,
+    /// Set once the free surface reaches the air intake. Engine torque stays zero.
+    pub engine_stalled: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,7 +192,49 @@ impl Vehicle {
             wheels: [Wheel::default(); 4],
             panels: [PanelMud::default(); PANEL_COUNT],
             jump_hold: 0.0,
+            water_lift_n: 0.0,
+            water_drag_n: 0.0,
+            engine_stalled: false,
         }
+    }
+
+    /// Air intake on the right of the bay, above the belly. Local space.
+    pub fn air_intake_local() -> Vec3 {
+        Vec3::new(0.46, 0.10, 1.05)
+    }
+
+    pub fn air_intake_world(&self) -> Vec3 {
+        self.pos + self.orientation() * Self::air_intake_local()
+    }
+
+    /// `(water column, stall depth, flooded)`. Stall depth is the column that
+    /// puts the free surface on the intake. Deeper than that, the engine stalls.
+    pub fn intake_flood(&self, soil: &SoilField) -> (f32, f32, bool) {
+        let w = self.air_intake_world();
+        let s = soil.sample(w.x, w.z);
+        let stall = (w.y - s.height).max(0.0);
+        let flooded = s.water > stall + 0.004 && s.water > 0.05;
+        (s.water, stall, flooded)
+    }
+
+    /// How far the free surface stands above the belly, metres.
+    pub fn body_draft(&self, soil: &SoilField) -> f32 {
+        let ori = self.orientation();
+        let pts = [
+            Vec3::new(0.0, -0.16, 1.15),
+            Vec3::new(0.0, -0.20, 0.15),
+            Vec3::new(0.0, -0.18, -0.55),
+            Vec3::new(-0.36, -0.16, 0.40),
+            Vec3::new(0.36, -0.16, 0.40),
+        ];
+        let mut draft = 0.0_f32;
+        for p in pts {
+            let w = self.pos + ori * p;
+            let s = soil.sample(w.x, w.z);
+            let surface = s.height + s.water;
+            draft = draft.max(surface - w.y);
+        }
+        draft.max(0.0)
     }
 
     pub fn orientation(&self) -> Quat {
@@ -282,7 +330,11 @@ impl Vehicle {
         let ang_world = ori * Vec3::new(self.pitch_rate, self.yaw_rate, self.roll_rate);
         let mut out = [Contact::default(); 4];
         let hps = hardpoints();
-        let throttle = throttle.clamp(-1.0, 1.0);
+        let throttle = if self.engine_stalled {
+            0.0
+        } else {
+            throttle.clamp(-1.0, 1.0)
+        };
         let brake = brake.clamp(0.0, 1.0);
 
         for i in 0..4 {
@@ -542,7 +594,14 @@ impl Vehicle {
 
     pub fn integrate(&mut self, contacts: &[Contact; 4], soil: &SoilField, dt: f32) {
         let ori = self.orientation();
-        let mut force = Vec3::new(0.0, -MASS * 9.81, 0.0);
+        let mut force = Vec3::new(0.0, -MASS * 9.81 + self.water_lift_n, 0.0);
+        if self.water_drag_n > 1.0 {
+            let hv = Vec3::new(self.vel.x, 0.0, self.vel.z);
+            let spd = hv.length();
+            if spd > 0.05 {
+                force -= (hv / spd) * self.water_drag_n;
+            }
+        }
         let mut torque_local = Vec3::ZERO;
         let held = self.jump_hold > 0.0;
         if self.jump_hold > 0.0 {

@@ -11,9 +11,10 @@ use crate::patch::{
     MOISTURE_TRACTION_NORMAL, MOISTURE_TRACTION_SINK, MOISTURE_TRACTION_SLIP, SIDEWALL_VOLUME,
 };
 use crate::soil::{
-    moisture_state_fields, on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale,
-    surface_moisture, track_offset, wet_berm_creep_under_load_rate, SlurrySeal, SoilField,
-    SurfaceKind, SurfaceMoisture, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
+    moisture_state_fields, on_launch_crest,     slurry_motion_drag, slurry_settle_pace, stick_scale, surface_moisture, track_offset,
+    water_body_buoyancy, water_body_drag, water_bow_height, water_cloud_pace, water_scour_pace,
+    water_stick, wet_berm_creep_under_load_rate, SlurrySeal, SoilField, SurfaceKind,
+    SurfaceMoisture, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
     hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
@@ -1646,6 +1647,247 @@ impl World {
         }
     }
 
+    /// Drive the Niva through a pool. The bow crest scales with speed and depth,
+    /// the hull takes drag and buoyancy, and the intake stalls if the column
+    /// passes it. Scour moves bed soil into the cloud. Water and soil each stay
+    /// closed. The returned pose is the frame with the crest up.
+    pub fn cross_water(&mut self) -> WaterCrossingWake {
+        const X0: f32 = -2.7;
+        const X1: f32 = 2.7;
+        const Z0: f32 = -2.4;
+        const Z1: f32 = 4.6;
+        const BOWL: f32 = 0.16;
+        const DEPTH: f32 = 0.48;
+
+        self.soil = SoilField::mud_pad();
+        self.particles.clear();
+        let water0 = self
+            .soil
+            .fill_water_pool(X0, X1, Z0, Z1, BOWL, DEPTH, SurfaceKind::WetMud);
+        let cut0 = self.soil.cut_volume();
+        let placed0 = self.soil.placed_volume();
+        let cloud0 = self.soil.cloud_volume();
+
+        self.bike.pos = Vec3::new(18.0, 0.4, 18.0);
+        self.vehicle = Vehicle::new();
+        self.vehicle.pos = Vec3::new(0.0, 0.55, 0.15);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        self.vehicle.water_lift_n = 0.0;
+        self.vehicle.water_drag_n = 0.0;
+        self.vehicle.engine_stalled = false;
+        for w in &mut self.vehicle.wheels {
+            w.compression = 0.08;
+            w.omega = 0.0;
+            w.mud = 0.0;
+            w.groove = 0.0;
+            w.smear = 0.0;
+            w.sidewall = 0.0;
+            w.slurry_groove = 0.0;
+            w.slurry_sealed = false;
+        }
+        let dt = 1.0_f32 / 60.0;
+        for _ in 0..36 {
+            let contacts = self.vehicle.compute_contacts(&self.soil, 0.0, 0.0, dt);
+            if contacts.iter().filter(|c| c.active).count() >= 3 {
+                break;
+            }
+            self.vehicle.pos.y -= 0.018;
+        }
+        // Already rolling. Locked tires at this entry speed brake the hull
+        // before the bow can stand up.
+        let entry = 2.35_f32;
+        self.vehicle.vel = Vec3::new(0.0, 0.0, entry);
+        let roll = entry / WHEEL_RADIUS;
+        for w in &mut self.vehicle.wheels {
+            w.omega = roll;
+        }
+
+        struct Still {
+            bed: Vec<f32>,
+            placed: Vec<f32>,
+            water: Vec<f32>,
+            cloud: Vec<f32>,
+            vehicle: Vehicle,
+            bow: f32,
+            speed: f32,
+            depth: f32,
+            drag: f32,
+            buoy: f32,
+            stall: f32,
+            intake: f32,
+            draft: f32,
+            score: f32,
+        }
+        let mut best: Option<Still> = None;
+        let mut elapsed = 0.0_f32;
+        let mut water_end = water0;
+        let mut cut_end = cut0;
+        let mut placed_end = placed0;
+        let mut cloud_end = cloud0;
+        let steps = (2.5_f32 / dt).round() as u32;
+        for _ in 0..steps {
+            self.water_crossing_step(dt, DEPTH, X0, X1, Z0, Z1);
+            elapsed += dt;
+            water_end = self.soil.water_volume();
+            cut_end = self.soil.cut_volume();
+            placed_end = self.soil.placed_volume();
+            cloud_end = self.soil.cloud_volume();
+            let speed = self.vehicle.speed();
+            let nose = self.vehicle.pos + self.vehicle.forward() * 1.25;
+            let quiet = self.soil.quiet_water_surface(X0, X1, Z0, Z1, nose.x, nose.z);
+            let bow = self
+                .soil
+                .water_bow_crest(nose.x, nose.z, self.vehicle.forward(), quiet);
+            let in_pool = self.vehicle.pos.x > X0 + 0.3
+                && self.vehicle.pos.x < X1 - 0.3
+                && self.vehicle.pos.z > Z0 + 0.4
+                && self.vehicle.pos.z < Z1 - 0.8;
+            if elapsed < 0.35 || !in_pool || speed < 0.7 || bow < 0.05 {
+                continue;
+            }
+            let score = bow * (0.45 + speed);
+            let replace = best.as_ref().map(|b| score > b.score + 0.004).unwrap_or(true);
+            if !replace {
+                continue;
+            }
+            let (intake, stall, _) = self.vehicle.intake_flood(&self.soil);
+            best = Some(Still {
+                bed: self.soil.bed.clone(),
+                placed: self.soil.placed.clone(),
+                water: self.soil.water.clone(),
+                cloud: self.soil.cloud.clone(),
+                vehicle: self.vehicle.clone(),
+                bow,
+                speed,
+                depth: DEPTH,
+                drag: self.vehicle.water_drag_n,
+                buoy: self.vehicle.water_lift_n,
+                stall,
+                intake,
+                draft: self.vehicle.body_draft(&self.soil),
+                score,
+            });
+        }
+
+        let still = best.unwrap_or_else(|| Still {
+            bed: self.soil.bed.clone(),
+            placed: self.soil.placed.clone(),
+            water: self.soil.water.clone(),
+            cloud: self.soil.cloud.clone(),
+            vehicle: self.vehicle.clone(),
+            bow: 0.0,
+            speed: self.vehicle.speed(),
+            depth: DEPTH,
+            drag: self.vehicle.water_drag_n,
+            buoy: self.vehicle.water_lift_n,
+            stall: 0.0,
+            intake: 0.0,
+            draft: self.vehicle.body_draft(&self.soil),
+            score: 0.0,
+        });
+        self.soil.bed = still.bed;
+        self.soil.placed = still.placed;
+        self.soil.water = still.water;
+        self.soil.cloud = still.cloud;
+        self.soil.rebuild_height();
+        self.vehicle = still.vehicle;
+        self.vehicle.vel = Vec3::new(0.0, 0.0, still.speed.max(0.2));
+        self.vehicle.yaw_rate = 0.0;
+        self.vehicle.pitch_rate = 0.0;
+        self.vehicle.roll_rate = 0.0;
+        for p in &mut self.particles.items {
+            p.alive = false;
+        }
+
+        let cut = self.soil.cut_volume();
+        let placed = self.soil.placed_volume();
+        let cloud = self.soil.cloud_volume();
+        let water = self.soil.water_volume();
+        WaterCrossingWake {
+            bow: still.bow,
+            bow_formula: water_bow_height(still.speed, still.depth),
+            speed: still.speed,
+            depth: still.depth,
+            drag: still.drag,
+            buoy: still.buoy,
+            stall: still.stall,
+            intake: still.intake,
+            draft: still.draft,
+            scour: cloud - cloud0,
+            turbid: if water > 1.0e-4 { cloud / water } else { 0.0 },
+            water0,
+            water,
+            water_end,
+            cut0,
+            placed0,
+            cloud0,
+            cut,
+            placed,
+            cloud,
+            cut_end,
+            placed_end,
+            cloud_end,
+            scour_clay: water_scour_pace(SurfaceKind::WetMud),
+            scour_silt: water_scour_pace(SurfaceKind::Silt),
+            scour_sand: water_scour_pace(SurfaceKind::Sand),
+            cloud_clay: water_cloud_pace(SurfaceKind::WetMud),
+            cloud_silt: water_cloud_pace(SurfaceKind::Silt),
+            cloud_sand: water_cloud_pace(SurfaceKind::Sand),
+            stick_clay: water_stick(SurfaceKind::WetMud),
+            stick_silt: water_stick(SurfaceKind::Silt),
+            stick_sand: water_stick(SurfaceKind::Sand),
+        }
+    }
+
+    fn water_crossing_step(
+        &mut self,
+        dt: f32,
+        still_depth: f32,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+    ) {
+        let (_, _, flooded) = self.vehicle.intake_flood(&self.soil);
+        self.vehicle.engine_stalled = flooded;
+        let speed = self.vehicle.speed();
+        self.vehicle.water_lift_n = water_body_buoyancy(self.vehicle.body_draft(&self.soil));
+        // Drag uses the still column. The crest is piled water, not a deeper hull.
+        self.vehicle.water_drag_n = water_body_drag(speed, still_depth);
+        self.vehicle.update_steer(0.0, dt);
+        let throttle = if flooded { 0.0 } else { 1.0 };
+        // Fluid drag and buoyancy are already on the hull. The contact reads
+        // the bed, then the column and the bowl cut go back on the field.
+        let mask = self.soil.begin_ford_contacts(x0, x1, z0, z1);
+        let contacts = self
+            .vehicle
+            .compute_contacts(&self.soil, throttle, 0.0, dt);
+        self.soil.end_ford_contacts(mask);
+        self.vehicle.integrate(&contacts, &self.soil, dt);
+        self.vehicle.yaw *= 0.96;
+        self.vehicle.yaw_rate *= 0.4;
+        let nose = self.vehicle.pos + self.vehicle.forward() * 1.25;
+        self.soil.scour_water_wake(
+            self.vehicle.pos.x,
+            self.vehicle.pos.z,
+            self.vehicle.forward(),
+            self.vehicle.speed().max(speed * 0.5),
+            still_depth,
+            dt,
+        );
+        self.soil.level_pool_water(x0, x1, z0, z1);
+        self.soil.raise_water_bow(
+            nose.x,
+            nose.z,
+            self.vehicle.forward(),
+            self.vehicle.speed().max(0.0),
+            still_depth,
+        );
+    }
+
     fn stuck_lane_loose_volume(&self) -> f32 {
         self.soil.loose_volume_in(-0.55, 0.55, -1.05, 1.05)
     }
@@ -3145,6 +3387,50 @@ pub struct StuckRecoveryWake {
     pub sum: f32,
 }
 
+/// Niva crossing a pool. Metres, newtons, and cubic metres.
+///
+/// `water` is the column at the proof pose and matches `water0`. `water_end`
+/// is the column after the rest of the pass. `cut == placed + cloud` at the
+/// proof pose. `scour` is soil that left the bed for the cloud. `turbid` is
+/// that cloud divided by the water column. Bow height is the crest above the
+/// quiet surface. Clay scours and clouds slower than silt. Sand is faster
+/// and sticks less.
+#[derive(Clone, Copy, Debug)]
+pub struct WaterCrossingWake {
+    pub bow: f32,
+    pub bow_formula: f32,
+    pub speed: f32,
+    pub depth: f32,
+    pub drag: f32,
+    pub buoy: f32,
+    pub stall: f32,
+    pub intake: f32,
+    pub draft: f32,
+    pub scour: f32,
+    pub turbid: f32,
+    pub water0: f32,
+    pub water: f32,
+    pub water_end: f32,
+    pub cut0: f32,
+    pub placed0: f32,
+    pub cloud0: f32,
+    pub cut: f32,
+    pub placed: f32,
+    pub cloud: f32,
+    pub cut_end: f32,
+    pub placed_end: f32,
+    pub cloud_end: f32,
+    pub scour_clay: f32,
+    pub scour_silt: f32,
+    pub scour_sand: f32,
+    pub cloud_clay: f32,
+    pub cloud_silt: f32,
+    pub cloud_sand: f32,
+    pub stick_clay: f32,
+    pub stick_silt: f32,
+    pub stick_sand: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct StuckProofPose {
     pos: Vec3,
@@ -3633,6 +3919,9 @@ fn closest_s(pos: Vec3) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::soil::{
+        water_body_buoyancy, water_body_drag, water_bow_height, SoilField, SurfaceKind,
+    };
     use crate::vehicle::{MASS, WHEEL_RADIUS};
 
     #[test]
@@ -4722,6 +5011,186 @@ mod tests {
             "cut {:.4} placed {:.4}",
             m.cut,
             m.placed
+        );
+    }
+
+    #[test]
+    fn water_crossing_keeps_a_closed_ledger_and_a_speed_depth_bow() {
+        let mut world = World::wet_clay();
+        let m = world.cross_water();
+        eprintln!(
+            "crossing bow {:.4} formula {:.4} spd {:.3} depth {:.3} drag {:.0} buoy {:.0} \
+             stall {:.3} intake {:.3} draft {:.3} scour {:.4} turbid {:.4} \
+             water {:.4}->{:.4}->{:.4} cut {:.4} placed {:.4} cloud {:.4}",
+            m.bow,
+            m.bow_formula,
+            m.speed,
+            m.depth,
+            m.drag,
+            m.buoy,
+            m.stall,
+            m.intake,
+            m.draft,
+            m.scour,
+            m.turbid,
+            m.water0,
+            m.water,
+            m.water_end,
+            m.cut,
+            m.placed,
+            m.cloud
+        );
+        assert!(m.bow > 0.05, "bow crest {:.4}", m.bow);
+        assert!(
+            m.bow + 0.04 > m.bow_formula * 0.45,
+            "crest {:.4} formula {:.4}",
+            m.bow,
+            m.bow_formula
+        );
+        let slow = water_bow_height(0.4, m.depth);
+        let fast = water_bow_height(m.speed.max(1.6), m.depth);
+        let shallow = water_bow_height(m.speed.max(1.6), m.depth * 0.35);
+        assert!(fast > slow + 0.04, "fast {:.4} slow {:.4}", fast, slow);
+        assert!(fast > shallow + 0.03, "deep {:.4} shallow {:.4}", fast, shallow);
+        assert!(water_bow_height(0.0, 0.4) == 0.0);
+        assert!(m.drag > 150.0, "drag {:.0}", m.drag);
+        assert!(
+            water_body_drag(2.0, 0.4) > water_body_drag(1.0, 0.4) * 3.0,
+            "drag should grow with speed squared"
+        );
+        assert!(m.draft > 0.02, "draft {:.3}", m.draft);
+        assert!(m.buoy > 400.0, "buoyancy {:.0}", m.buoy);
+        assert!(
+            water_body_buoyancy(0.2) > water_body_buoyancy(0.05) + 200.0,
+            "deeper draft lifts harder"
+        );
+        assert!(m.stall > m.intake + 0.02, "stall {:.3} intake {:.3}", m.stall, m.intake);
+        assert!(m.scour > 0.002, "scour {:.4}", m.scour);
+        assert!(m.turbid > 1.0e-4, "turbid {:.5}", m.turbid);
+        assert!((m.water - m.water0).abs() < 2.0e-3, "water {:.4} vs {:.4}", m.water, m.water0);
+        assert!(
+            (m.water_end - m.water0).abs() < 2.0e-3,
+            "water end {:.4} vs {:.4}",
+            m.water_end,
+            m.water0
+        );
+        assert!(
+            (m.cut - m.placed - m.cloud).abs() < 2.0e-3,
+            "cut {:.4} placed {:.4} cloud {:.4}",
+            m.cut,
+            m.placed,
+            m.cloud
+        );
+        assert!(
+            (m.cut_end - m.placed_end - m.cloud_end).abs() < 2.0e-3,
+            "end cut {:.4} placed {:.4} cloud {:.4}",
+            m.cut_end,
+            m.placed_end,
+            m.cloud_end
+        );
+        assert!(
+            (m.cut0 - m.placed0 - m.cloud0).abs() < 2.0e-3,
+            "start cut {:.4} placed {:.4} cloud {:.4}",
+            m.cut0,
+            m.placed0,
+            m.cloud0
+        );
+        assert!(
+            m.scour_clay < m.scour_silt && m.scour_silt < m.scour_sand,
+            "scour clay {:.4} silt {:.4} sand {:.4}",
+            m.scour_clay,
+            m.scour_silt,
+            m.scour_sand
+        );
+        assert!(
+            m.cloud_clay < m.cloud_silt && m.cloud_silt < m.cloud_sand,
+            "cloud clay {:.4} silt {:.4} sand {:.4}",
+            m.cloud_clay,
+            m.cloud_silt,
+            m.cloud_sand
+        );
+        assert!(
+            m.stick_clay > m.stick_silt && m.stick_silt > m.stick_sand,
+            "stick clay {:.2} silt {:.2} sand {:.2}",
+            m.stick_clay,
+            m.stick_silt,
+            m.stick_sand
+        );
+        for p in &world.particles.items {
+            assert!(!p.alive || p.volume <= 1.0e-8, "crossing should not throw debris");
+        }
+    }
+
+    #[test]
+    fn stalled_engine_does_not_pull_and_a_deep_column_floods_the_intake() {
+        use crate::vehicle::Vehicle;
+
+        let soil = SoilField::flat(0.16);
+        let dt = 1.0_f32 / 60.0;
+        let mut stalled = Vehicle::new();
+        stalled.pos = Vec3::new(0.0, 0.85, 0.0);
+        stalled.engine_stalled = true;
+        for _ in 0..20 {
+            let c = stalled.compute_contacts(&soil, 0.0, 0.0, dt);
+            if c.iter().filter(|c| c.active).count() >= 3 {
+                break;
+            }
+            stalled.pos.y -= 0.02;
+        }
+        for _ in 0..50 {
+            stalled.update_steer(0.0, dt);
+            let c = stalled.compute_contacts(&soil, 1.0, 0.0, dt);
+            stalled.integrate(&c, &soil, dt);
+        }
+        assert!(
+            stalled.speed() < 0.12,
+            "stalled engine still moved {:.3} m/s",
+            stalled.speed()
+        );
+
+        let mut live = Vehicle::new();
+        live.pos = Vec3::new(0.0, 0.85, 0.0);
+        live.engine_stalled = false;
+        for _ in 0..20 {
+            let c = live.compute_contacts(&soil, 0.0, 0.0, dt);
+            if c.iter().filter(|c| c.active).count() >= 3 {
+                break;
+            }
+            live.pos.y -= 0.02;
+        }
+        for _ in 0..50 {
+            live.update_steer(0.0, dt);
+            let c = live.compute_contacts(&soil, 1.0, 0.0, dt);
+            live.integrate(&c, &soil, dt);
+        }
+        assert!(
+            live.speed() > stalled.speed() + 0.35,
+            "live {:.3} stalled {:.3}",
+            live.speed(),
+            stalled.speed()
+        );
+
+        let mut world = World::wet_clay();
+        world.soil = SoilField::mud_pad();
+        world
+            .soil
+            .fill_water_pool(-2.2, 2.2, -2.2, 2.2, 0.12, 0.92, SurfaceKind::WetMud);
+        world.vehicle = Vehicle::new();
+        world.vehicle.pos = Vec3::new(0.0, 0.4, 0.0);
+        world.vehicle.yaw = 0.0;
+        for _ in 0..40 {
+            let c = world.vehicle.compute_contacts(&world.soil, 0.0, 0.0, dt);
+            if c.iter().filter(|c| c.active).count() >= 2 {
+                break;
+            }
+            world.vehicle.pos.y -= 0.02;
+        }
+        let (water, stall, flooded) = world.vehicle.intake_flood(&world.soil);
+        assert!(
+            flooded && water > stall,
+            "deep column should reach the intake water {:.3} stall {:.3}",
+            water,
+            stall
         );
     }
 }
