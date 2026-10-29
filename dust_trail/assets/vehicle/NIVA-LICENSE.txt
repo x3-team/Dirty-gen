@@ -1,0 +1,8 @@
+Lada Niva by Greg McKechnie
+https://sketchfab.com/3d-models/lada-niva-26ebf5872bce4ff4ad2baee41882d6b2
+License: CC BY 4.0
+https://creativecommons.org/licenses/by/4.0/
+
+niva-exterior.bin is the exterior triangles of that mesh (body, glass, lamps,
+wheels, chassis). Textures are not included. The number plate is not included.
+Changes: centimetre scale, exterior-only selection, no materials.
