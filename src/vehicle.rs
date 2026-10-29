@@ -6,9 +6,9 @@ use glam::{EulerRot, Quat, Vec3};
 use crate::adhesion::{self, Adhesion};
 use crate::patch::{contact_patch, step_tread, stuck_compact_breakaway, TreadCoat, TreadStep};
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
-    slurry_motion_drag, slurry_suction_force, stick_scale, terramech_for, wheel_buoyancy, SoilField,
-    SoilSample,
+    bekker_load, contact_length, janosi_hanamoto, mech_for_sample, on_launch_crest,
+    rolling_resistance, slurry_motion_drag, slurry_suction_force, stick_scale, terramech_for,
+    track_harden_mul, wheel_buoyancy, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
@@ -418,13 +418,14 @@ impl Vehicle {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
                 ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
             } else {
-                solve_suspension(
-                    z0,
-                    up_y,
-                    self.wheels[i].slip,
-                    terramech_for(sample.kind(), sample.softness, local_water),
-                    local_water,
-                )
+                let mut mech = terramech_for(sample.kind(), sample.softness, local_water);
+                mech.k_eq *= track_harden_mul(
+                    sample.crust,
+                    sample.crack,
+                    sample.passes,
+                    sample.rest,
+                );
+                solve_suspension(z0, up_y, self.wheels[i].slip, mech, local_water)
             };
 
             let wheel_center = wc0 + up * compression;
@@ -469,7 +470,7 @@ impl Vehicle {
             let mut soil_push = 0.0;
 
             if active {
-                let tm = terramech_for(sample.kind(), sample.softness, sample.water);
+                let tm = mech_for_sample(&sample);
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -986,6 +987,10 @@ impl Default for Contact {
                 kind: 0,
                 placed: 0.0,
                 slurry: 0.0,
+                crust: 0.0,
+                crack: 0.0,
+                passes: 0,
+                rest: 0.0,
             },
             speed: 0.0,
             fling: 0.0,

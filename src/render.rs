@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use glam::{Mat4, Vec3};
-use silt::soil::{SoilField, MAP_RES, MAP_SIZE};
+use silt::soil::{crust_shader_texel, SoilField, MAP_RES, MAP_SIZE};
 use silt::bike::{Bike, BIKE_RADIUS};
 use silt::patch::groove_slurry_capacity;
 use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS, WHEEL_WIDTH};
@@ -69,6 +69,7 @@ pub struct Renderer {
     height_tex: wgpu::Texture,
     imprint_tex: wgpu::Texture,
     mat_tex: wgpu::Texture,
+    crust_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth: wgpu::Texture,
@@ -114,6 +115,7 @@ pub struct Renderer {
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     mat_scratch: Vec<u8>,
+    crust_scratch: Vec<u8>,
     imprint_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
     height_bytes: Vec<u8>,
@@ -311,6 +313,18 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Crust thickness (R) and crack opening (G). The soil shader
+                // samples this so a material can read it. It does not retint.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -423,6 +437,20 @@ impl Renderer {
         });
         let mat_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("material"),
+            size: wgpu::Extent3d {
+                width: MAP_RES as u32,
+                height: MAP_RES as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let crust_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("crust"),
             size: wgpu::Extent3d {
                 width: MAP_RES as u32,
                 height: MAP_RES as u32,
@@ -588,6 +616,12 @@ impl Renderer {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(
                         &imprint_tex.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(
+                        &crust_tex.create_view(&Default::default()),
                     ),
                 },
             ],
@@ -940,6 +974,7 @@ impl Renderer {
             height_tex,
             imprint_tex,
             mat_tex,
+            crust_tex,
             color,
             color_view,
             depth,
@@ -980,6 +1015,7 @@ impl Renderer {
             blit_shader,
             blit_layout,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
+            crust_scratch: vec![0; MAP_RES * MAP_RES * 4],
             imprint_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
@@ -1409,6 +1445,25 @@ impl Renderer {
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
         }
+        for (i, px) in self.crust_scratch.chunks_exact_mut(4).enumerate() {
+            let texel = crust_shader_texel(soil.crust[i], soil.crack[i]);
+            px.copy_from_slice(&texel);
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.crust_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.crust_scratch,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(res * 4),
+                rows_per_image: Some(res),
+            },
+            extent,
+        );
         for (i, px) in self.imprint_scratch.chunks_exact_mut(4).enumerate() {
             let amp = soil.tread_amp[i];
             if amp < 0.001 {

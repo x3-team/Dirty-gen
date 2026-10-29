@@ -50,6 +50,8 @@ struct Model {
 @group(1) @binding(6) var ground_pack: texture_2d_array<f32>;
 @group(1) @binding(7) var ground_samp: sampler;
 @group(1) @binding(8) var imprint_tex: texture_2d<f32>;
+// R: crust thickness / 0.04 m. G: crack opening / 0.02 m. Not a color.
+@group(1) @binding(9) var crust_tex: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -223,6 +225,12 @@ fn imprint_at(ij: vec2<i32>) -> vec4<f32> {
     let dims = vec2<i32>(textureDimensions(imprint_tex));
     let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
     return textureLoad(imprint_tex, c, 0);
+}
+
+fn crust_at(ij: vec2<i32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(crust_tex));
+    let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(crust_tex, c, 0);
 }
 
 fn cell_center(ij: vec2<i32>) -> vec2<f32> {
@@ -653,6 +661,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let wet = mat.r;
     let water = mat.g * 0.34;
     let darken = mat.b;
+    // Thickness and opening stay on the export. A zero weight does not retint.
+    let crust_px = crust_at(vec2<i32>(in.ij));
+    let crust_keep = (crust_px.r + crust_px.g) * 0.0;
 
     let uv0 = xz / 3.2;
     let uv1 = xz / 2.7;
@@ -764,6 +775,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let k = clamp(-lug_h / 0.045, 0.0, 1.0);
         albedo *= mix(1.0, 0.52, k);
     }
+    albedo = albedo * (1.0 + crust_keep);
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
     // A wide lobe on the shore is the wet sheen. Inside the cut it stays small

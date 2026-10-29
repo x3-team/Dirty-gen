@@ -550,6 +550,8 @@ struct CaptureArgs {
     solver_lod_proof: PathBuf,
     mud_adhesion: bool,
     mud_adhesion_proof: PathBuf,
+    drying_crust: bool,
+    drying_crust_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -692,6 +694,10 @@ fn capture(args: &[String]) {
     }
     if parsed.mud_adhesion {
         capture_mud_adhesion(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.drying_crust {
+        capture_drying_crust(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -914,6 +920,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         PathBuf::from(format!("{MEDIA}/water-crossing-proof.png"));
     let mut mud_adhesion = false;
     let mut mud_adhesion_proof = PathBuf::from(format!("{MEDIA}/mud-adhesion-proof.png"));
+    let mut drying_crust = false;
+    let mut drying_crust_proof =
+        PathBuf::from(format!("{MEDIA}/drying-crust-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1064,6 +1073,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     mud_adhesion_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--drying-crust-proof" => {
+                drying_crust = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    drying_crust_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1177,6 +1192,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         solver_lod_proof,
         mud_adhesion,
         mud_adhesion_proof,
+        drying_crust,
+        drying_crust_proof,
     }
 }
 
@@ -2588,6 +2605,87 @@ fn solver_lod_camera(world: &World) -> CameraPose {
         eye,
         target: look,
         ortho_width: Some(9.5),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_drying_crust(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.drying_crust_frame();
+    silence_chunks(&mut world);
+
+    println!(
+        "drying-crust wetness {:.3}->{:.3} crust {:.4} m crack mean {:.4} max {:.4} cells {}/{}",
+        out.wetness_before,
+        out.wetness_after,
+        out.crust_m,
+        out.crack_m,
+        out.crack_max,
+        out.crack_cells,
+        out.floor_cells
+    );
+    println!(
+        "drying-crust sink wet {:.4} crust {:.4} old {:.4} m harden {:.3} extra wet {:.4} old {:.4} m3",
+        out.wet_sink, out.crust_sink, out.old_sink, out.harden, out.wet_extra_cut, out.old_extra_cut
+    );
+    println!(
+        "drying-crust cut {:.4} placed {:.4} bed {:.6} placed {:.6} cloud {:.6} slurry {:.6} \
+         sand {:.6} silt {:.6}",
+        out.cut,
+        out.placed,
+        out.bed_gap,
+        out.placed_gap,
+        out.cloud_gap,
+        out.slurry_gap,
+        out.sand_crust,
+        out.silt_crust
+    );
+    println!(
+        "drying-crust east kind {} crust {:.4} crack {:.4} west kind {} wet {:.3}",
+        out.east_kind, out.east_crust, out.east_crack, out.west_kind, out.west_wetness
+    );
+
+    let pose = drying_crust_camera(&world);
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    if let Some(parent) = parsed.drying_crust_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.drying_crust_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("drying crust still");
+    println!(
+        "cc0 drying-crust {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.drying_crust_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drying_crust_camera(world: &World) -> CameraPose {
+    // West tracks stay wet. The Niva sits on the crusted pair to the east.
+    // High enough that the ortho window lands on the pad, not the clear color.
+    let ground = world.soil.sample(0.4, 0.1).height;
+    let look = Vec3::new(0.40, ground + 0.22, 0.15);
+    let eye = Vec3::new(-2.2, ground + 3.2, -5.8);
+    CameraPose {
+        eye,
+        target: look,
+        ortho_width: Some(8.2),
     }
 }
 
