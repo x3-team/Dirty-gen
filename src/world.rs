@@ -1015,32 +1015,37 @@ impl World {
             .soil
             .peel_slurry(-0.95, 0.95, -2.05, z.max(-0.35) + 0.25, 0.22);
 
-        let shed_origin = self.vehicle.pos + Vec3::new(0.22, 0.38, 0.12);
+        // Nose on the rim, rear still in the pool — the break-out instant.
+        self.vehicle.pos.z = -0.52;
+        self.vehicle.pitch = -0.24;
+        self.vehicle.vel = Vec3::new(0.0, 0.0, 1.05);
+        self.seat_in_slurry(0.08);
+        let ori = self.vehicle.orientation();
+        let shed_origin = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2)
+            + Vec3::Y * 0.22
+            + fwd * 0.08;
+
         if dug.thrown > 1.0e-8 {
             let _ = self
                 .particles
                 .throw_roll_sheets(shed_origin, fwd, right, dug.thrown);
         }
         if peel > 1.0e-8 {
-            let peel_origin = shed_origin + Vec3::new(-0.15, 0.08, -0.35);
+            let peel_origin = shed_origin + right * 0.18 + Vec3::Y * 0.12;
             let ribbon_vol = peel * 0.35;
             let _ = self.particles.throw_spin_ribbons(
-                peel_origin + Vec3::new(0.08, 0.0, 0.18),
+                peel_origin,
                 fwd,
                 right,
                 ribbon_vol,
             );
         }
         if seal_thrown > 1.0e-8 {
-            let break_origin = shed_origin + Vec3::new(0.05, 0.12, -0.22);
+            let break_origin = shed_origin + right * 0.32 + Vec3::Y * 0.28;
             let _ = self
                 .particles
                 .throw_slurry(break_origin, fwd, right, seal_thrown);
         }
-
-        self.vehicle.pos.z = 0.88;
-        self.vehicle.vel = Vec3::new(0.0, 0.0, 1.65);
-        self.seat_in_slurry(0.03);
 
         let mut groove_shed = 0.0_f32;
         let dt = 1.0 / 60.0;
@@ -1058,7 +1063,7 @@ impl World {
                 }
                 self.soil.airborne += left;
                 let local = ori * self.vehicle.wheel_center_local(i);
-                let wc = self.vehicle.pos + local;
+                let wc = self.vehicle.pos + local + Vec3::Y * 0.18 + right * 0.14;
                 groove_shed += self
                     .particles
                     .throw_groove_ribbons(wc, fwd, right, left);
@@ -2068,8 +2073,8 @@ mod tests {
         assert!(m.sheets > 0.004, "sheets {:.4}", m.sheets);
         assert!(m.spray > 0.001, "spray {:.4}", m.spray);
         assert!(
-            world.vehicle.pos.z > -0.35,
-            "the Niva did not exit the pool, z {:.2}",
+            world.vehicle.pos.z > -0.65 && world.vehicle.pos.z < 0.15,
+            "the Niva should be climbing the rim, z {:.2}",
             world.vehicle.pos.z
         );
         assert!(
