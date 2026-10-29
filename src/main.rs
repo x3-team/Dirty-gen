@@ -2902,6 +2902,8 @@ fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
     );
 
     let pose = snow_ruts_camera(&scene);
+    renderer.snow_bed = world.soil.bed[0];
+    renderer.snow_arc = scene.snow.arc;
     let rgba = renderer.draw(&world, pose, None, true).expect("readback");
     if let Some(parent) = parsed.snow_ruts_proof.parent() {
         std::fs::create_dir_all(parent).ok();

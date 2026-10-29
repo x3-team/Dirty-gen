@@ -35,6 +35,19 @@ pub const NIVA_WHEEL_LOAD_N: f32 = 2_850.0;
 pub const FOOT_LOAD_N: f32 = 780.0;
 pub const FOOT_LENGTH: f32 = 0.30;
 pub const FOOT_WIDTH: f32 = 0.11;
+/// Samples of the turn's radial profile. The picture follows this circle.
+pub const ARC_BINS: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SnowArc {
+    pub center: Vec2,
+    pub sweep: f32,
+    pub r_lo: f32,
+    pub r_hi: f32,
+    pub dr: f32,
+    /// Snow thickness at each radius, metres. Not the soil bed.
+    pub depth: [f32; ARC_BINS],
+}
 
 #[derive(Clone, Copy, Debug)]
 struct BermShape {
@@ -104,6 +117,8 @@ pub struct SnowField {
     pub held: f32,
     blanket: f32,
     initial_mass: f64,
+    /// Radial profile of the turn, once the crest has been laid on the circle.
+    pub arc: Option<SnowArc>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -160,6 +175,7 @@ impl SnowField {
             held: 0.0,
             blanket: depth,
             initial_mass: 0.0,
+            arc: None,
         };
         field.initial_mass = field.ledger_kg();
         field
@@ -652,6 +668,395 @@ impl SnowField {
         }
     }
 
+    /// A curved crest snaps from cell to cell, so the berm is a row of teeth.
+    /// Snow moves along the circle, from a pile into the next gap, and does
+    /// not cross into the packed floor or the straight track behind the arc.
+    fn smooth_turn_berms(&mut self, center: Vec2, _radii: [f32; 4], sweep: f32) {
+        let area = self.area() as f64;
+        let step = self.cell;
+        // One cell only reaches the next pile. The gap sits about two cells
+        // along the circle, so the stencil has to step past the tooth.
+        let hops = [1.15_f32, 2.05, 2.9];
+        for _ in 0..8 {
+            let depth = self.depth.clone();
+            let density = self.density.clone();
+            let mut delta = vec![0.0f64; depth.len()];
+            for idx in 0..depth.len() {
+                let h = depth[idx];
+                if h < self.blanket + 0.02 {
+                    continue;
+                }
+                let p = self.cell_xz(idx);
+                let rel = p - center;
+                let radius = rel.length();
+                if radius < 0.8 {
+                    continue;
+                }
+                let theta = rel.y.atan2(rel.x);
+                if theta < 0.02 || theta > sweep - 0.02 {
+                    continue;
+                }
+                let tangent = Vec2::new(-rel.y, rel.x) / radius;
+                let mut outflow = 0.0f64;
+                let mut sends: Vec<(usize, f64)> = Vec::new();
+                for sign in [-1.0_f32, 1.0] {
+                    for hop in hops {
+                        let q = p + tangent * (step * hop * sign);
+                        let Some(jdx) = self.idx_at(q.x, q.y) else {
+                            continue;
+                        };
+                        if jdx == idx {
+                            continue;
+                        }
+                        let hj = depth[jdx];
+                        // The packed floor stays a rut. Only the shoulder and the
+                        // gaps in the crest take snow.
+                        if hj < 0.22 {
+                            continue;
+                        }
+                        let dh = h - hj;
+                        if dh < 0.018 {
+                            continue;
+                        }
+                        let move_h = (dh * 0.34).min(0.09);
+                        let mass = move_h as f64 * density[idx] as f64 * area / hops.len() as f64;
+                        if mass <= 0.0 {
+                            continue;
+                        }
+                        outflow += mass;
+                        sends.push((jdx, mass));
+                    }
+                }
+                if sends.is_empty() {
+                    continue;
+                }
+                let have = depth[idx] as f64 * density[idx] as f64 * area;
+                let cap = have * 0.45;
+                let scale = if outflow > cap { cap / outflow } else { 1.0 };
+                for (jdx, mass) in sends {
+                    let m = mass * scale;
+                    delta[idx] -= m;
+                    delta[jdx] += m;
+                }
+            }
+            for idx in 0..delta.len() {
+                let m = delta[idx];
+                if m > 1.0e-8 {
+                    self.add_mass(idx, m as f32, RHO_BERM);
+                } else if m < -1.0e-8 {
+                    self.remove_mass(idx, (-m) as f32);
+                }
+            }
+        }
+        // A one-cell crest is a pyramid on the grid. Spread it radially so the
+        // shoulder is a few cells wide and the mesh can round it.
+        for _ in 0..5 {
+            let depth = self.depth.clone();
+            let density = self.density.clone();
+            let mut delta = vec![0.0f64; depth.len()];
+            for idx in 0..depth.len() {
+                let h = depth[idx];
+                if h < self.blanket + 0.03 {
+                    continue;
+                }
+                let p = self.cell_xz(idx);
+                let rel = p - center;
+                let radius = rel.length();
+                if radius < 0.8 {
+                    continue;
+                }
+                let theta = rel.y.atan2(rel.x);
+                if theta < 0.02 || theta > sweep - 0.02 {
+                    continue;
+                }
+                let radial = rel / radius;
+                let mut outflow = 0.0f64;
+                let mut sends: Vec<(usize, f64)> = Vec::new();
+                for sign in [-1.0_f32, 1.0] {
+                    let q = p + radial * (step * sign);
+                    let Some(jdx) = self.idx_at(q.x, q.y) else {
+                        continue;
+                    };
+                    if jdx == idx {
+                        continue;
+                    }
+                    let hj = depth[jdx];
+                    if hj < 0.20 {
+                        continue;
+                    }
+                    let dh = h - hj;
+                    if dh < 0.012 {
+                        continue;
+                    }
+                    let move_h = (dh * 0.38).min(0.06);
+                    let mass = move_h as f64 * density[idx] as f64 * area;
+                    outflow += mass;
+                    sends.push((jdx, mass));
+                }
+                if sends.is_empty() {
+                    continue;
+                }
+                let have = h as f64 * density[idx] as f64 * area;
+                let cap = have * 0.35;
+                let scale = if outflow > cap { cap / outflow } else { 1.0 };
+                for (jdx, mass) in sends {
+                    let m = mass * scale;
+                    delta[idx] -= m;
+                    delta[jdx] += m;
+                }
+            }
+            for idx in 0..delta.len() {
+                let m = delta[idx];
+                if m > 1.0e-8 {
+                    self.add_mass(idx, m as f32, RHO_BERM);
+                } else if m < -1.0e-8 {
+                    self.remove_mass(idx, (-m) as f32);
+                }
+            }
+        }
+        // Diffusion along the circle evens the height, but the crest still
+        // hops from cell to cell. Lay that same snow on the median circle.
+        self.round_turn_ridges(center, sweep);
+    }
+
+    /// The plow is a circle. On the grid its crest is a staircase. Replace the
+    /// arc with the radial profile the circle actually has, and keep the mass.
+    fn round_turn_ridges(&mut self, center: Vec2, sweep: f32) {
+        let r_lo = 2.15_f32;
+        let r_hi = 5.40_f32;
+        let dr = self.cell * 0.5;
+        let n_r = ((r_hi - r_lo) / dr).round().max(1.0) as usize + 1;
+        let th0 = 0.40_f32;
+        let th1 = (sweep - 0.28).max(th0 + 0.2);
+        let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); n_r];
+        for idx in 0..self.depth.len() {
+            let rel = self.cell_xz(idx) - center;
+            let radius = rel.length();
+            if !(r_lo..=r_hi).contains(&radius) {
+                continue;
+            }
+            let theta = rel.y.atan2(rel.x);
+            if theta < th0 || theta > th1 {
+                continue;
+            }
+            let bin = ((radius - r_lo) / dr).round() as isize;
+            if bin < 0 || bin >= n_r as isize {
+                continue;
+            }
+            buckets[bin as usize].push(self.depth[idx]);
+        }
+        let blanket = self.blanket;
+        let mut profile = vec![blanket; n_r];
+        for (bin, samples) in buckets.iter_mut().enumerate() {
+            if samples.len() < 6 {
+                continue;
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            profile[bin] = samples[samples.len() / 2];
+        }
+        for bin in 1..n_r - 1 {
+            if buckets[bin].len() < 6 {
+                profile[bin] = 0.5 * (profile[bin - 1] + profile[bin + 1]);
+            }
+        }
+        // A flat ring of cells still reads as a curb. Dome each shoulder so the
+        // crest is one soft ridge and the lip eases down toward the rut.
+        let mut rounded = profile.clone();
+        let mut i = 0usize;
+        while i < n_r {
+            if profile[i] < blanket + 0.04 {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < n_r && profile[i] >= blanket + 0.04 {
+                i += 1;
+            }
+            let end = i;
+            if end - start < 2 {
+                continue;
+            }
+            let n = (end - start) as f32;
+            let mean = profile[start..end].iter().sum::<f32>() / n;
+            let excess = mean - blanket;
+            if excess < 0.025 {
+                continue;
+            }
+            let mid = 0.5 * (start + end - 1) as f32;
+            let half = (0.5 * (end - start) as f32).max(0.5);
+            let mut weights = vec![0.0f32; end - start];
+            let mut wsum = 0.0f32;
+            for k in start..end {
+                let t = (k as f32 - mid) / half;
+                let lobe = 0.5 * (1.0 + (t * std::f32::consts::PI).cos());
+                let w = 0.35 + 0.65 * lobe.clamp(0.0, 1.0);
+                weights[k - start] = w;
+                wsum += w;
+            }
+            let amp = excess * n / wsum.max(1.0e-4);
+            for k in start..end {
+                rounded[k] = blanket + amp * weights[k - start];
+            }
+        }
+
+        let area = self.area();
+        let mut touched: Vec<(usize, f32, f32)> = Vec::new();
+        let mut old_mass = 0.0f64;
+        let edge = 0.22_f32;
+        let th_in = 0.08_f32;
+        let th_out = sweep - 0.06;
+        for idx in 0..self.depth.len() {
+            let rel = self.cell_xz(idx) - center;
+            let radius = rel.length();
+            if !(r_lo..=r_hi).contains(&radius) {
+                continue;
+            }
+            let theta = rel.y.atan2(rel.x);
+            if theta < th_in || theta > th_out {
+                continue;
+            }
+            let mut fade = 1.0f32;
+            if theta < th_in + edge {
+                fade = (theta - th_in) / edge;
+            } else if theta > th_out - edge {
+                fade = (th_out - theta) / edge;
+            }
+            fade = fade.clamp(0.0, 1.0);
+            fade = fade * fade * (3.0 - 2.0 * fade);
+            if fade < 0.002 {
+                continue;
+            }
+            let bin = ((radius - r_lo) / dr).round() as isize;
+            let bin = bin.clamp(0, n_r as isize - 1) as usize;
+            // Nearest bin. A blend into the rut bin next door was flattening the lip.
+            let tgt_h = rounded[bin];
+            let old_h = self.depth[idx];
+            let old_rho = self.density[idx].max(1.0);
+            let old_m = old_h * old_rho;
+            let tgt_rho = if tgt_h < blanket - 0.08 {
+                RHO_PACKED
+            } else if tgt_h > blanket + 0.015 {
+                RHO_BERM
+            } else {
+                RHO_FRESH
+            };
+            let h = old_h + (tgt_h - old_h) * fade;
+            let tgt_m = tgt_h * tgt_rho;
+            let m = old_m + (tgt_m - old_m) * fade;
+            let rho = if h > 1.0e-5 { m / h } else { RHO_FRESH };
+            old_mass += old_m as f64 * area as f64;
+            touched.push((idx, h, rho));
+        }
+        if touched.is_empty() {
+            return;
+        }
+        let mut new_mass = 0.0f64;
+        for &(_, h, rho) in &touched {
+            new_mass += h as f64 * rho.max(1.0) as f64 * area as f64;
+        }
+        let scale = if new_mass > 1.0e-6 {
+            (old_mass / new_mass) as f32
+        } else {
+            1.0
+        };
+        // Keep the ridge height. Density carries the mass difference, so a
+        // crest is not shrunk to pay for the circle.
+        let mut placed = 0.0f64;
+        let n = touched.len();
+        for (k, (idx, h, rho)) in touched.iter().copied().enumerate() {
+            let mut rho = (rho.max(1.0) * scale).max(1.0);
+            let h = h.max(0.0);
+            if k + 1 == n && h > 1.0e-5 {
+                let need = old_mass - placed;
+                let want = need / (h as f64 * area as f64);
+                if want > 1.0 {
+                    rho = want.clamp(rho as f64 * 0.5, rho as f64 * 1.5) as f32;
+                }
+            }
+            placed += h as f64 * rho as f64 * area as f64;
+            self.depth[idx] = h;
+            self.density[idx] = rho;
+        }
+        let residual = old_mass - placed;
+        if residual.abs() > 1.0e-6 {
+            self.held += residual as f32;
+        }
+        self.arc = Some(self.pack_arc(center, sweep, &rounded, r_lo, dr));
+    }
+
+    /// Continuous radial profile for the picture. The grid still holds the
+    /// ledger; this is the same ridge sampled so the mesh can follow the circle.
+    fn pack_arc(
+        &self,
+        center: Vec2,
+        sweep: f32,
+        rounded: &[f32],
+        r_lo: f32,
+        dr: f32,
+    ) -> SnowArc {
+        let r_hi = r_lo + dr * (rounded.len().saturating_sub(1) as f32);
+        let mut depth = [self.blanket; ARC_BINS];
+        for i in 0..ARC_BINS {
+            let radius = r_lo + (r_hi - r_lo) * (i as f32) / (ARC_BINS - 1) as f32;
+            let x = ((radius - r_lo) / dr).clamp(0.0, (rounded.len() - 1) as f32);
+            let bin = x.round() as usize;
+            let bin = bin.min(rounded.len() - 1);
+            depth[i] = rounded[bin];
+        }
+        // Soften the lip. A one-bin cliff is a smooth circle in the shader,
+        // but a wider shoulder reads as a ridge instead of a curb.
+        let src = depth;
+        let sigma = 1.15_f32;
+        for i in 0..ARC_BINS {
+            if src[i] < self.blanket - 0.22 {
+                continue;
+            }
+            let mut acc = 0.0f32;
+            let mut wsum = 0.0f32;
+            for k in -2isize..=2 {
+                let j = i as isize + k;
+                if j < 0 || j >= ARC_BINS as isize {
+                    continue;
+                }
+                if src[j as usize] < self.blanket - 0.22 {
+                    continue;
+                }
+                let w = (-0.5 * (k as f32 / sigma).powi(2)).exp();
+                acc += src[j as usize] * w;
+                wsum += w;
+            }
+            if wsum > 1.0e-6 {
+                depth[i] = acc / wsum;
+            }
+        }
+        SnowArc {
+            center,
+            sweep,
+            r_lo,
+            r_hi,
+            dr: (r_hi - r_lo) / (ARC_BINS - 1) as f32,
+            depth,
+        }
+    }
+
+
+    fn remove_mass(&mut self, idx: usize, mass: f32) {
+        let area = self.area();
+        let old = self.depth[idx] * self.density[idx] * area;
+        let new_m = (old - mass).max(0.0);
+        if new_m <= 1.0e-8 {
+            self.held += old - mass;
+            self.depth[idx] = 0.0;
+            self.density[idx] = RHO_FRESH;
+            return;
+        }
+        let rho = self.density[idx].max(1.0);
+        self.depth[idx] = new_m / (rho * area);
+        if (old - mass) < 0.0 {
+            self.held += old - mass;
+        }
+    }
+
     fn add_mass(&mut self, idx: usize, mass: f32, density: f32) {
         if mass <= 0.0 {
             return;
@@ -721,6 +1126,9 @@ pub fn niva_snow_scene() -> SnowScene {
     let straight_len = 6.2;
     let straight = snow.drive_straight(straight_from, Vec2::new(0.0, 1.0), straight_len, &wheels, tire);
     let turn = snow.drive_turn(straight.origin, straight.forward, 3.55, 1.7, &wheels, tire);
+    // The crest of a curve snaps between grid cells. Spread each arc slice
+    // back onto a smooth shoulder so the ridge follows the circle.
+    snow.smooth_turn_berms(turn.center, turn.radii, 1.7);
     let foot_origin = Vec2::new(straight_x + 2.15, -5.6);
     let (foot_at, foot_fresh) = snow.walk(foot_origin, Vec2::new(0.0, 1.0), 8, 0.58);
 
@@ -1086,5 +1494,63 @@ mod tests {
             rim = rim.max(snow.depth_nearest(scene.foot_at.x + dx, scene.foot_at.y + dz));
         }
         assert!(rim > center + 0.04, "rim {rim} print {center}");
+    }
+
+    #[test]
+    fn turn_berm_crest_follows_the_circle() {
+        let scene = scene();
+        let r = scene.report;
+        assert!(
+            (r.rut_drop_m - 0.4376).abs() < 0.001,
+            "rut drop {}",
+            r.rut_drop_m
+        );
+        assert!(
+            (r.berm_rise_m - 0.1863).abs() < 0.001,
+            "berm rise {}",
+            r.berm_rise_m
+        );
+        assert!(
+            (r.mass1_kg - r.mass0_kg).abs() < 0.05,
+            "mass {} -> {}",
+            r.mass0_kg,
+            r.mass1_kg
+        );
+        let snow = &scene.snow;
+        let center = scene.turn_center;
+        let blanket = snow.blanket_m();
+        // The crest used to hop between grid cells, so one radius was a pile
+        // and the next angle was a hole. On the circle it stays a ridge.
+        let crest_r = 4.55_f32;
+        let mut prev: Option<f32> = None;
+        let mut theta = 0.45_f32;
+        while theta < 1.40 {
+            let dir = Vec2::new(theta.cos(), theta.sin());
+            let mut crest = 0.0f32;
+            let mut s = crest_r - 0.12;
+            while s <= crest_r + 0.12 {
+                let p = center + dir * s;
+                crest = crest.max(snow.depth_nearest(p.x, p.y));
+                s += 0.04;
+            }
+            let rut_p = center + dir * 4.30;
+            let rut = snow.depth_nearest(rut_p.x, rut_p.y);
+            assert!(
+                crest > blanket + 0.04,
+                "theta {theta} crest {crest} blanket {blanket}"
+            );
+            assert!(
+                crest > rut + 0.20,
+                "theta {theta} crest {crest} rut {rut}"
+            );
+            if let Some(ph) = prev {
+                assert!(
+                    (crest - ph).abs() < 0.08,
+                    "tooth {ph} -> {crest} at theta {theta}"
+                );
+            }
+            prev = Some(crest);
+            theta += 0.06;
+        }
     }
 }

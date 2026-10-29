@@ -16,6 +16,12 @@ struct Frame {
     // Four tires. Even slot: center.xyz, radius.
     // Odd slot: forward.x, forward.z, sink, active.
     tires: array<vec4<f32>, 8>,
+    // Turn crest. snow_arc2.y is the bin count; 0 leaves the heightfield alone.
+    // snow_arc: center.x, center.z, sweep, r_lo
+    // snow_arc2: dr, bins, theta in, theta out
+    snow_arc: vec4<f32>,
+    snow_arc2: vec4<f32>,
+    snow_profile: array<vec4<f32>, 8>,
 }
 
 struct Model {
@@ -419,7 +425,7 @@ fn lip_near(xz: vec2<f32>) -> bool {
     return k00 == 6u || k10 == 6u || k01 == 6u || k11 == 6u;
 }
 
-fn height_bilinear(xz: vec2<f32>) -> f32 {
+fn height_raw(xz: vec2<f32>) -> f32 {
     let ij = world_to_ij(xz);
     let i = floor(ij);
     let f = fract(ij);
@@ -429,6 +435,58 @@ fn height_bilinear(xz: vec2<f32>) -> f32 {
     let h01 = height_at(i0 + vec2<i32>(0, 1));
     let h11 = height_at(i0 + vec2<i32>(1, 1));
     return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+fn snow_profile_at(i: i32) -> f32 {
+    let v = frame.snow_profile[i / 4];
+    let c = i % 4;
+    if (c == 0) { return v.x; }
+    if (c == 1) { return v.y; }
+    if (c == 2) { return v.z; }
+    return v.w;
+}
+
+// The turn lip is a circle. Sampling it from the cell grid draws a staircase.
+// Along the arc, follow the radial profile instead.
+fn snow_arc_height(xz: vec2<f32>) -> f32 {
+    let raw = height_raw(xz);
+    if (frame.snow_arc2.y < 1.5) {
+        return raw;
+    }
+    let rel = xz - frame.snow_arc.xy;
+    let radius = length(rel);
+    let r_lo = frame.snow_arc.w;
+    let dr = max(frame.snow_arc2.x, 1e-4);
+    let n = i32(frame.snow_arc2.y);
+    let r_hi = r_lo + dr * f32(n - 1);
+    let theta = atan2(rel.y, rel.x);
+    let th_in = frame.snow_arc2.z;
+    let th_out = frame.snow_arc2.w;
+    if (theta < th_in || theta > th_out || radius < r_lo || radius > r_hi) {
+        return raw;
+    }
+    let x = clamp((radius - r_lo) / dr, 0.0, f32(n - 1));
+    let i = i32(floor(x));
+    let f = fract(x);
+    let i1 = min(i + 1, n - 1);
+    let prof = mix(snow_profile_at(i), snow_profile_at(i1), f);
+    let edge = 0.22;
+    var fade = 1.0;
+    if (theta < th_in + edge) {
+        fade = (theta - th_in) / edge;
+    } else if (theta > th_out - edge) {
+        fade = (th_out - theta) / edge;
+    }
+    fade = clamp(fade, 0.0, 1.0);
+    fade = fade * fade * (3.0 - 2.0 * fade);
+    return mix(raw, prof, fade);
+}
+
+fn height_bilinear(xz: vec2<f32>) -> f32 {
+    if (frame.sun_dir.w > 0.5 && frame.snow_arc2.y > 1.5) {
+        return snow_arc_height(xz);
+    }
+    return height_raw(xz);
 }
 
 fn stamp_bilinear(xz: vec2<f32>) -> f32 {
