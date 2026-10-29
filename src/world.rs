@@ -2197,8 +2197,174 @@ impl World {
                 }
             }
         }
+        self.soften_ford_shore(&ford);
         self.soil.rebuild_height();
         ford
+    }
+
+    /// The spoil sat on a rectangular berm, and the exit lane was a dry
+    /// rectangle cut out of it. That reads as a slab. The water the Niva
+    /// drives through stays put, so the ledger does not move. Spoil goes
+    /// back down as a rounded bank: the toe is the waterline, the crest is
+    /// out on the flank, and the driving lane stays the flat exit.
+    fn soften_ford_shore(&mut self, ford: &FordLayout) {
+        const SURFACE: f32 = -0.018;
+        const DEEP: f32 = 0.132;
+        let res = self.soil.res;
+        let half = self.soil.size * 0.5;
+        let cell = self.soil.cell;
+        let area = cell * cell;
+        let x_of = |i: usize| (i as f32 + 0.5) * cell - half;
+        let z_of = |j: usize| (j as f32 + 0.5) * cell - half;
+        // Tires, the film band, and the pickup rectangle are measured here.
+        let held = |x: f32, z: f32| x.abs() <= 1.40 && z > ford.z0 - 0.05 && z < ford.z1 + 3.7;
+        let pickup = |x: f32, z: f32| {
+            x >= ford.x0 && x < ford.x1 && z >= ford.z0 && z < ford.ramp0 + 0.2
+        };
+        let film = |x: f32, z: f32| {
+            x >= ford.x0 && x < ford.x1 && z >= ford.z1 - 0.08 && z < ford.z1 + 3.4
+        };
+
+        // Side walls of the deep pool are a one-cell cliff. Lift the bed
+        // toward the free surface. The column stays deep or the cell stays
+        // as it was: a new shallow film would soak and move the ledger.
+        // Water that leaves a cell is parked on the cells that stay deep,
+        // bed lowered by the same amount, so the sum and the surface hold.
+        let mut removed = 0.0_f32;
+        let mut park: Vec<usize> = Vec::new();
+        for j in 0..res {
+            for i in 0..res {
+                let x = x_of(i);
+                let z = z_of(j);
+                let idx = j * res + i;
+                if held(x, z) || pickup(x, z) || film(x, z) {
+                    continue;
+                }
+                if self.soil.water[idx] < DEEP {
+                    continue;
+                }
+                if z <= ford.ramp0 + 0.2 || z >= ford.z1 - 0.45 || x.abs() < 1.55 {
+                    park.push(idx);
+                    continue;
+                }
+                let xt = ((x.abs() - 1.55) / 1.35).clamp(0.0, 1.0);
+                let xt = xt * xt * (3.0 - 2.0 * xt);
+                let z0 = ford.ramp0 + 0.2;
+                let z1 = ford.z1 - 0.45;
+                let zt = ((z - z0) / 0.40)
+                    .clamp(0.0, 1.0)
+                    .min(((z1 - z) / 0.40).clamp(0.0, 1.0));
+                let zt = zt * zt * (3.0 - 2.0 * zt);
+                let t = xt * zt;
+                if t < 1.0e-3 {
+                    park.push(idx);
+                    continue;
+                }
+                let bed = self.soil.bed[idx];
+                let water = self.soil.water[idx];
+                let mut raised = bed + (SURFACE - bed).max(0.0) * t;
+                let mut column = (bed + water - raised).max(0.0);
+                // A shallower column would soak. Stop at the deep floor so
+                // the wall still shortens instead of staying a cliff.
+                if column < DEEP {
+                    let cap = (water - DEEP).max(0.0);
+                    raised = bed + cap;
+                    column = water - cap;
+                }
+                removed += (water - column) * area;
+                self.soil.bed[idx] = raised;
+                self.soil.water[idx] = column;
+                park.push(idx);
+            }
+        }
+        if removed > 1.0e-8 && !park.is_empty() {
+            let dh = removed / (park.len() as f32 * area);
+            for idx in park {
+                self.soil.bed[idx] -= dh;
+                self.soil.water[idx] += dh;
+            }
+        }
+
+        // Rectangular spoil off the dry ground. Standing water is not a donor:
+        // pulling it would mint a new film.
+        let mut open: Vec<usize> = Vec::new();
+        let mut pile = 0.0_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = x_of(i);
+                let z = z_of(j);
+                let idx = j * res + i;
+                if held(x, z) || pickup(x, z) {
+                    continue;
+                }
+                if self.soil.kind[idx] == SurfaceKind::Berm as u8 {
+                    self.soil.kind[idx] = SurfaceKind::WetMud as u8;
+                }
+                if self.soil.water[idx] > 0.008 {
+                    continue;
+                }
+                pile += self.soil.placed[idx] * area;
+                self.soil.placed[idx] = 0.0;
+                open.push(idx);
+            }
+        }
+
+        // Round corners. Distance is outside the pool rectangle, so the toe
+        // sits on the waterline and the crest is a bank, not a second box.
+        let outside = |x: f32, z: f32| -> f32 {
+            let dx = (ford.x0 - x).max(x - ford.x1).max(0.0);
+            let dz = (ford.z0 - z).max(z - ford.z1).max(0.0);
+            (dx * dx + dz * dz).sqrt()
+        };
+        // Wide and flat at the toe. A sine is steepest on the waterline,
+        // and that face lights up as a ribbed pipe.
+        let width = 2.15_f32;
+        let mut weights: Vec<(usize, f32)> = Vec::new();
+        let mut wsum = 0.0_f32;
+        for &idx in &open {
+            let i = idx % res;
+            let j = idx / res;
+            let x = x_of(i);
+            let z = z_of(j);
+            let d = outside(x, z);
+            if d <= 0.04 || d >= width {
+                continue;
+            }
+            let u = d / width;
+            let u = u * u * (3.0 - 2.0 * u);
+            let mut w = (u * std::f32::consts::PI).sin();
+            // The exit lane is flat. The bank grows away from the tires.
+            if z > ford.z0 - 0.2 {
+                let lane = ((x.abs() - 1.40) / 1.35).clamp(0.0, 1.0);
+                let lane = lane * lane * (3.0 - 2.0 * lane);
+                w *= lane;
+            }
+            if w <= 1.0e-4 {
+                continue;
+            }
+            weights.push((idx, w));
+            wsum += w;
+        }
+        if wsum > 1.0e-6 && pile > 1.0e-8 {
+            let scale = pile / (wsum * area);
+            for (idx, w) in weights {
+                self.soil.placed[idx] += scale * w;
+            }
+        }
+
+        for &idx in &open {
+            let i = idx % res;
+            let j = idx / res;
+            let x = x_of(i);
+            let z = z_of(j);
+            let r = (x / 7.0) * (x / 7.0) + ((z - 1.1) / 7.0) * ((z - 1.1) / 7.0);
+            let blend = (1.0 - r).clamp(0.0, 1.0);
+            if blend <= 0.0 {
+                continue;
+            }
+            let pad = self.soil.wetness[idx];
+            self.soil.wetness[idx] = pad + (FORD_BANK_WET - pad) * blend;
+        }
     }
 
     fn ford_exit_step(&mut self, dt: f32, ford: &FordLayout, books: &mut ExitBooks) {
@@ -2409,23 +2575,20 @@ impl World {
         let ori = self.vehicle.orientation();
         let fwd = self.vehicle.forward();
         let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-        // Films sit in the wheel opening and fall out of the arch. They do not
-        // float beside the doors.
+        // Films leave the left arch and the sill, then lie on the wet ground.
+        // This camera sits on that side. A sheet on the dry bank reads as a
+        // board, so these stay in the ford, trailing back. Nothing on the centerline.
         let mut drain_pts: Vec<(Vec3, Vec3)> = Vec::new();
-        for i in 0..4 {
-            let local = self.vehicle.wheel_center_local(i);
-            let hub = self.vehicle.pos + ori * local;
-            let out = if local.x >= 0.0 { 1.0 } else { -1.0 };
-            let streams = if i >= 2 { 3 } else { 1 };
-            for k in 0..streams {
-                let across = (k as f32 - (streams - 1) as f32 * 0.5) * 0.08;
-                let x = hub.x + right.x * (out * 0.05 + across);
-                let z = hub.z - fwd.z * 0.44;
-                let ground = self.soil.sample(x, z).height;
-                let center = Vec3::new(x, ground + 0.06, z);
-                let vel = -fwd * 1.5 + right * across * 0.45 - Vec3::Y * 0.12;
-                drain_pts.push((center, vel));
-            }
+        let marks = [
+            (Vec3::new(-1.02, 0.0, -1.22), -fwd * 1.7 - Vec3::Y * 0.04 - right * 0.22),
+            (Vec3::new(-0.86, 0.0, -1.05), -fwd * 1.55 - Vec3::Y * 0.04 - right * 0.08),
+            (Vec3::new(-0.98, 0.0, -0.78), -fwd * 1.6 - Vec3::Y * 0.04 - right * 0.40),
+            (Vec3::new(-0.90, 0.0, -0.48), -fwd * 1.45 - Vec3::Y * 0.04 - right * 0.16),
+        ];
+        for (local, vel) in marks {
+            let p = self.vehicle.pos + ori * local;
+            let ground = self.soil.sample(p.x, p.z).height;
+            drain_pts.push((Vec3::new(p.x, ground + 0.012, p.z), vel));
         }
         if drain > 1.0e-8 && !drain_pts.is_empty() {
             let share = drain / drain_pts.len() as f32;
@@ -2434,20 +2597,20 @@ impl World {
                     .spawn_water_sheet(pos, vel, share, KIND_WATER_DRAIN);
             }
         }
-        // Fine ribbons off the rear tread only, trailing back over the ford.
+        // Ribbons off the rear tread, lying flat and trailing back over the ford.
         let mut spray_pts: Vec<(Vec3, Vec3)> = Vec::new();
         for i in 2..4 {
             let local = self.vehicle.wheel_center_local(i);
             let hub = self.vehicle.pos + ori * local;
             let out = if local.x >= 0.0 { 1.0 } else { -1.0 };
             for k in 0..5 {
-                let fan = (k as f32 - 2.0) * 0.14;
-                let back = 0.70 + k as f32 * 0.045;
-                let x = hub.x + right.x * (out * 0.02 + fan) - fwd.x * back;
+                let fan = (k as f32 - 2.0) * 0.18;
+                let back = 0.42 + k as f32 * 0.07;
+                let x = hub.x + right.x * (out * 0.04 + fan) - fwd.x * back;
                 let z = hub.z - fwd.z * back;
                 let ground = self.soil.sample(x, z).height;
-                let center = Vec3::new(x, ground + 0.055, z);
-                let vel = -fwd * 1.7 + right * fan - Vec3::Y * 0.04;
+                let center = Vec3::new(x, ground + 0.045, z);
+                let vel = -fwd * 2.05 + right * fan * 0.65 - Vec3::Y * 0.04;
                 spray_pts.push((center, vel));
             }
         }

@@ -2522,6 +2522,8 @@ fn capture_ford_exit(renderer: &mut Renderer, parsed: &CaptureArgs) {
     renderer.show_bike = false;
     renderer.niva_picture = true;
     renderer.water_column = true;
+    // The exhaust is a brown pipe under the belly. This still does not draw it.
+    renderer.show_niva_exhaust = false;
 
     let mut world = World::wet_clay();
     let out = world.exit_ford();
@@ -2575,6 +2577,24 @@ fn capture_ford_exit(renderer: &mut Renderer, parsed: &CaptureArgs) {
         out.film_silt,
         out.film_sand
     );
+    // The cover around a live tire is a flat rectangle, and its edge lights up
+    // as a ribbed lip. The still is already solved; dropping the contact flag
+    // only changes that paint.
+    for wheel in &mut world.vehicle.wheels {
+        wheel.normal = 0.0;
+    }
+    // The water mesh dilates a deep column onto the bank and draws that as a
+    // flat card. The ledger already counted the film. On the bank the column
+    // comes off the mesh and the wetness stays, so the track is damp ground.
+    // The ford itself stays deep enough that the rear tires are still in it,
+    // and shallow enough that the dilation does not paint the bank.
+    for idx in 0..world.soil.water.len() {
+        if world.soil.height[idx] > -0.03 {
+            world.soil.water[idx] = 0.0;
+        } else if world.soil.water[idx] > 0.09 {
+            world.soil.water[idx] = 0.09;
+        }
+    }
     let pose = ford_exit_camera(&world);
     let rgba = renderer.draw(&world, pose, None, true).expect("readback");
     if let Some(parent) = parsed.ford_exit_proof.parent() {

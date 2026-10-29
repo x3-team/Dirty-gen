@@ -1150,23 +1150,23 @@ fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
         add_open_sheet(
             mesh,
             p,
-            0.52,
-            0.050,
-            0.0015,
+            0.86,
+            0.088,
+            0.0020,
             PANEL_WATER_FILM,
             tread_ribbon_axes(p.vel),
-            0.28,
+            0.20,
         );
     } else {
         add_open_sheet(
             mesh,
             p,
-            0.48,
-            0.090,
-            0.0016,
+            0.58,
+            0.082,
+            0.0020,
             PANEL_WATER_FILM,
             arch_film_axes(p.vel),
-            0.40,
+            0.22,
         );
     }
 }
