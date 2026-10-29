@@ -1571,73 +1571,6 @@ fn silence_soil_clods(world: &mut World) {
     }
 }
 
-/// Lift slurry debris beside the rear tread so the ortho still reads ribbons,
-/// sheets, and spray in the air — not as a flat stamp on the bed.
-#[cfg(not(target_arch = "wasm32"))]
-fn hoist_slurry_debris_for_proof(world: &mut World) {
-    use silt::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
-    let ori = world.vehicle.orientation();
-    let fwd = world.vehicle.forward();
-    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    let hub = world.vehicle.pos + ori * world.vehicle.wheel_center_local(2);
-    let mut slot = 0_u32;
-    for p in &mut world.particles.items {
-        if !p.alive || !p.ledger || p.volume <= 1.0e-8 {
-            continue;
-        }
-        if p.kind != KIND_SLURRY_RIBBON && p.kind != KIND_SLURRY_SHEET && p.kind != KIND_SLURRY_DROP
-        {
-            continue;
-        }
-        let t = slot as f32;
-        slot += 1;
-        let phi = t * 2.399_963;
-        let along = -0.42 + ((t * 0.618_034).fract()) * 1.05;
-        let mut out = 0.95 + (phi.sin() * 0.5 + 0.5) * 1.55;
-        let mut up = 0.62 + (phi.cos() * 0.5 + 0.5) * 1.55;
-        if p.kind == KIND_SLURRY_DROP {
-            up += 0.35;
-            out *= 0.82;
-        }
-        p.pos = hub + fwd * along + right * out + Vec3::Y * up;
-        let floor = world.soil.sample(p.pos.x, p.pos.z).height;
-        if p.pos.y < floor + 0.38 {
-            p.pos.y = floor + 0.38 + (t * 0.06);
-        }
-        if p.kind == KIND_SLURRY_SHEET {
-            p.pos.y += 0.22;
-        }
-        // Non-zero velocity so sheet/ribbon meshes stay edge-on to the side camera,
-        // not a flat stamp on the bed.
-        let twist = t * 1.73;
-        let side = right * twist.cos() + fwd * twist.sin();
-        p.vel = match p.kind {
-            KIND_SLURRY_SHEET => side * 0.75 + Vec3::Y * 0.62 + right * 0.25,
-            KIND_SLURRY_RIBBON => side * 0.55 + Vec3::Y * 0.48 + right * 0.35,
-            _ => side * 0.4 + Vec3::Y * 1.15 + right * 0.5,
-        };
-        p.grounded = false;
-        p.deposited = false;
-        p.life = p.max_life;
-    }
-    for p in &mut world.particles.items {
-        if !p.alive || !p.ledger || p.volume <= 1.0e-8 {
-            continue;
-        }
-        if p.kind != KIND_SLURRY_RIBBON && p.kind != KIND_SLURRY_SHEET && p.kind != KIND_SLURRY_DROP
-        {
-            continue;
-        }
-        let floor = world.soil.sample(p.pos.x, p.pos.z).height;
-        if p.pos.y >= floor + 0.55 {
-            continue;
-        }
-        p.pos.y = floor + 0.58 + (p.volume * 80.0).fract() * 0.35;
-        p.deposited = false;
-        p.grounded = false;
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn niva_tread_camera(world: &World, wheel: usize) -> CameraPose {
     let vehicle = &world.vehicle;
@@ -1888,7 +1821,6 @@ fn capture_slurry_tear_out(renderer: &mut Renderer, parsed: &CaptureArgs) {
     let mut world = World::wet_clay();
     let out = world.tear_out_from_deep_slurry();
     silence_soil_clods(&mut world);
-    hoist_slurry_debris_for_proof(&mut world);
     println!(
         "slurry-tear-out pool {:.4} m3  rut {:.4} m3  groove {:.4} m3  shed {:.4} m3  \
          ribbons {:.4} m3  sheets {:.4} m3  spray {:.4} m3  slurry {:.4} m3  airborne {:.4} m3  \

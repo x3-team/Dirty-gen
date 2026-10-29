@@ -967,7 +967,6 @@ impl World {
 
         let fwd = Vec3::Z;
         let right = Vec3::X;
-        let z = self.vehicle.pos.z;
 
         let ori = self.vehicle.orientation();
         let mut seal_thrown = 0.0_f32;
@@ -1006,34 +1005,38 @@ impl World {
                 self.vehicle.wheels[i].slurry_sealed = false;
             }
         }
-        let lip_from = Vec3::new(0.52, 0.0, -1.05);
-        let lip_to = Vec3::new(0.52, 0.0, 0.55);
+        // Nose on the rim, rear still in the pool — the break-out instant.
+        self.vehicle.pos.z = -0.52;
+        self.vehicle.pitch = -0.24;
+        self.vehicle.vel = Vec3::new(0.0, 0.0, 1.05);
+        self.seat_in_slurry(0.08);
+        let z = self.vehicle.pos.z;
+        let lip_from = Vec3::new(0.52, 0.0, z - 0.53);
+        let lip_to = Vec3::new(0.52, 0.0, z + 1.07);
         let dug = self
             .soil
             .cut_lane_in_slurry(lip_from, lip_to, 0.46, 0.15, 0.36);
         let peel = self
             .soil
             .peel_slurry(-0.95, 0.95, -2.05, z.max(-0.35) + 0.25, 0.22);
-
-        // Nose on the rim, rear still in the pool — the break-out instant.
-        self.vehicle.pos.z = -0.52;
-        self.vehicle.pitch = -0.24;
-        self.vehicle.vel = Vec3::new(0.0, 0.0, 1.05);
-        self.seat_in_slurry(0.08);
         let ori = self.vehicle.orientation();
         let shed_origin = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2)
             + Vec3::Y * 0.22
             + fwd * 0.08;
 
         if dug.thrown > 1.0e-8 {
-            let _ = self
-                .particles
-                .throw_roll_sheets(shed_origin, fwd, right, dug.thrown);
+            // Sheets leave beside the rear tread in the air, not on the lip floor.
+            let _ = self.particles.throw_roll_sheets(
+                shed_origin + Vec3::Y * 0.52,
+                fwd,
+                right,
+                dug.thrown,
+            );
         }
         if peel > 1.0e-8 {
             let peel_origin = shed_origin + right * 0.18 + Vec3::Y * 0.12;
             let ribbon_vol = peel * 0.35;
-            let _ = self.particles.throw_spin_ribbons(
+            let _ = self.particles.throw_groove_ribbons(
                 peel_origin,
                 fwd,
                 right,
@@ -1048,6 +1051,7 @@ impl World {
         }
 
         let mut groove_shed = 0.0_f32;
+        let mut pending = [0.0_f32; 4];
         let dt = 1.0 / 60.0;
         for _ in 0..54 {
             for i in 0..4 {
@@ -1062,12 +1066,18 @@ impl World {
                     continue;
                 }
                 self.soil.airborne += left;
-                let local = ori * self.vehicle.wheel_center_local(i);
-                let wc = self.vehicle.pos + local + Vec3::Y * 0.18 + right * 0.14;
-                groove_shed += self
-                    .particles
-                    .throw_groove_ribbons(wc, fwd, right, left);
+                pending[i] += left;
             }
+        }
+        for i in 0..4 {
+            if pending[i] <= 1.0e-8 {
+                continue;
+            }
+            let local = ori * self.vehicle.wheel_center_local(i);
+            let wc = self.vehicle.pos + local + Vec3::Y * 0.18 + right * 0.14;
+            groove_shed += self
+                .particles
+                .throw_groove_ribbons(wc, fwd, right, pending[i]);
         }
 
         let groove: f32 = self

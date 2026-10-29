@@ -1105,14 +1105,9 @@ fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
-/// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
-/// is a ribbon rather than a box, a tablet, or a cube.
-fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    if spin_ribbon(p.vel) {
-        // Long, narrow, and flat. The roll still must not grow another crescent.
-        add_flat_strip(mesh, p, 0.90, 0.07, 0.004);
-        return;
-    }
+/// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
+/// roll sheet, not a flat tablet, a ground stamp, or a box.
+fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet: bool) {
     let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.35, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::Z;
@@ -1125,14 +1120,22 @@ fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     side = side.normalize();
     let up = side.cross(dir).normalize();
     let speed = p.vel.length();
-    let length = (0.34 + speed * 0.04).clamp(0.42, 0.78);
-    let width = (p.volume / length).sqrt().clamp(0.022, 0.10);
+    let length = if roll_sheet {
+        (0.52 + speed * 0.03).clamp(0.58, 0.96)
+    } else {
+        (0.34 + speed * 0.04).clamp(0.42, 0.78)
+    };
+    let width = (p.volume / length).sqrt();
+    let width = if roll_sheet {
+        width.clamp(0.15, 0.24)
+    } else {
+        width.clamp(0.022, 0.10)
+    };
     let thick = (p.volume / (length * width * 0.55)).clamp(0.004, 0.014);
     let segs = 8usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
-        // Pinched ends. A constant width would be a tablet.
         let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0);
         let arc = (t * std::f32::consts::PI).sin();
         let twist = (t - 0.5) * 0.7;
@@ -1160,6 +1163,12 @@ fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
+/// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
+/// is a ribbon rather than a box, a tablet, or a cube.
+fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    add_slurry_curl(mesh, p, false);
+}
+
 /// Length, width, and thickness for a roll sheet. The width stands up, so a
 /// camera looking along the lane sees the face and not the thin edge.
 fn slurry_sheet_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
@@ -1183,9 +1192,9 @@ fn slurry_sheet_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
     (dir, side, up.normalize())
 }
 
-/// A roll's slurry. A flat sheet, wider than the spin ribbon, with no bow.
+/// A roll's slurry. Wider than a tread ribbon, still curled — not a flat stamp.
 fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    add_flat_strip(mesh, p, 0.90, 0.22, 0.004);
+    add_slurry_curl(mesh, p, true);
 }
 
 /// A small liquid drop torn off with the ribbons. A short pinched fleck.
@@ -1252,22 +1261,18 @@ mod slurry_shapes {
 
     /// Length, width, thickness in the same frame the ribbon mesh uses.
     fn ribbon_frame(mesh: &CpuMesh, vel: Vec3) -> [f32; 3] {
-        let (dir, side, up) = if spin_ribbon(vel) {
-            slurry_sheet_axes(vel)
-        } else {
-            let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
-            if dir.length_squared() < 1.0e-6 {
-                dir = Vec3::Z;
-            }
-            dir = dir.normalize();
-            let mut side = dir.cross(Vec3::Y);
-            if side.length_squared() < 1.0e-6 {
-                side = dir.cross(Vec3::X);
-            }
-            side = side.normalize();
-            let up = side.cross(dir).normalize();
-            (dir, side, up)
-        };
+        let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
+        if dir.length_squared() < 1.0e-6 {
+            dir = Vec3::Z;
+        }
+        dir = dir.normalize();
+        let mut side = dir.cross(Vec3::Y);
+        if side.length_squared() < 1.0e-6 {
+            side = dir.cross(Vec3::X);
+        }
+        side = side.normalize();
+        let up = side.cross(dir).normalize();
+        let (dir, side, up) = (dir, side, up);
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(-f32::MAX);
         for v in &mesh.vertices {
@@ -1388,7 +1393,7 @@ mod slurry_shapes {
             let mut mesh = CpuMesh::new();
             let mut e = if p.kind == KIND_SLURRY_SHEET {
                 add_slurry_sheet(&mut mesh, p);
-                sheet_frame(&mesh, p.vel)
+                ribbon_frame(&mesh, p.vel)
             } else {
                 assert_eq!(p.kind, KIND_SLURRY_RIBBON);
                 add_slurry_ribbon(&mut mesh, p);
@@ -1404,7 +1409,7 @@ mod slurry_shapes {
             assert!(e[0] / e[2] > 4.0, "shed is a sphere or a chunk {e:?}");
             if p.kind == KIND_SLURRY_SHEET {
                 assert!(
-                    e[1] > 0.14 && e[1] > e[2] * 3.0,
+                    e[1] > 0.12 && e[1] > e[2] * 1.2 && e[0] > e[1] * 1.8,
                     "roll sheet is a hair or a tablet {e:?}"
                 );
             }
