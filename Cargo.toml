@@ -1,0 +1,10 @@
+[package]
+name = "dust_trail"
+version = "0.1.0"
+edition = "2021"
+description = "Dust trail solver: dry Niva tires loft a cloud, wind carries it, wet ground lofts none"
+license = "MIT"
+
+[dependencies]
+glam = "=0.29.3"
+png = "=0.17.16"
