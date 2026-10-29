@@ -1974,32 +1974,27 @@ fn capture_wet_berm_creep(renderer: &mut Renderer, parsed: &CaptureArgs) {
     let out = world.wet_berm_creep_under_load(2.8, 6.5);
     silence_soil_clods(&mut world);
     println!(
-        "wet-berm-creep pool {:.4} berm {:.4}->{:.4} rut {:.4}->{:.4} pool-slurry {:.4}->{:.4} \
-         sum {:.4} clay {:.4} silt {:.4} sand {:.4}",
-        out.pool,
+        "wet-berm-creep berm {:.4}->{:.4} rut {:.4}->{:.4} pool {:.4}->{:.4} sum {:.4} \
+         clay {:.4} silt {:.4} sand {:.4}",
         out.berm_before,
         out.berm_after,
         out.rut_before,
         out.rut_after,
         out.pool_slurry_before,
         out.pool_slurry_after,
-        out.sum,
+        out.sum_after,
         out.pace_clay,
         out.pace_silt,
         out.pace_sand,
     );
     let lines = [
-        format!("pool {:.4} m3", out.pool),
         format!("berm {:.4}->{:.4} m3", out.berm_before, out.berm_after),
         format!("rut {:.4}->{:.4} m3", out.rut_before, out.rut_after),
         format!(
-            "pool-slurry {:.4}->{:.4} m3",
+            "pool {:.4}->{:.4} m3",
             out.pool_slurry_before, out.pool_slurry_after
         ),
-        format!("sum {:.4} m3", out.sum),
-        format!("groove {:.4} m3", out.groove),
-        format!("bow {:.4} m3", out.bow_m3),
-        format!("wake {:.4} m3", out.wake_m3),
+        format!("sum {:.4}->{:.4} m3", out.sum_before, out.sum_after),
         format!("clay {:.4} m/s", out.pace_clay),
         format!("silt {:.4} m/s", out.pace_silt),
         format!("sand {:.4} m/s", out.pace_sand),

@@ -3126,15 +3126,29 @@ impl SoilField {
         &mut self,
         dt: f32,
         load_n: f32,
-        x0: f32,
-        x1: f32,
-        z0: f32,
-        z1: f32,
+        src_x0: f32,
+        src_x1: f32,
+        src_z0: f32,
+        src_z1: f32,
+        dest_x0: f32,
+        dest_x1: f32,
+        dest_z0: f32,
+        dest_z1: f32,
+        rut_lane_x: f32,
+        rut_z0: f32,
+        rut_z1: f32,
     ) {
         if dt <= 0.0 || load_n < 350.0 {
             return;
         }
         let half = self.size * 0.5;
+        let in_rect =
+            |x: f32, z: f32, x0: f32, x1: f32, z0: f32, z1: f32| {
+                x >= x0 && x < x1 && z >= z0 && z < z1
+            };
+        let in_rut_lane = |x: f32, z: f32| {
+            x.abs() <= rut_lane_x && z >= rut_z0 && z < rut_z1
+        };
         let placed0 = self.placed.clone();
         let slurry0 = self.slurry.clone();
         let mut take = vec![0.0_f32; placed0.len()];
@@ -3144,7 +3158,7 @@ impl SoilField {
             for i in 0..self.res {
                 let x = (i as f32 + 0.5) * self.cell - half;
                 let z = (j as f32 + 0.5) * self.cell - half;
-                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                if !in_rect(x, z, src_x0, src_x1, src_z0, src_z1) {
                     continue;
                 }
                 let idx = j * self.res + i;
@@ -3161,11 +3175,13 @@ impl SoilField {
                     continue;
                 }
                 let top = self.bed[idx] + placed0[idx] + slurry0[idx];
-                let mut dest: Option<usize> = None;
-                let mut dest_h = top;
+                let mut dest_rut: Option<usize> = None;
+                let mut dest_pool: Option<usize> = None;
+                let mut rut_h = top;
+                let mut pool_h = top;
                 let ii = i as isize;
                 let jj = j as isize;
-                for radius in 1isize..=2 {
+                for radius in 1isize..=3 {
                     for dj in -radius..=radius {
                         for di in -radius..=radius {
                             if di.abs() != radius && dj.abs() != radius {
@@ -3176,26 +3192,34 @@ impl SoilField {
                             if ni < 0 || nj < 0 || ni >= res || nj >= res {
                                 continue;
                             }
+                            let nx = (ni as f32 + 0.5) * self.cell - half;
+                            let nz = (nj as f32 + 0.5) * self.cell - half;
+                            if !in_rect(nx, nz, dest_x0, dest_x1, dest_z0, dest_z1) {
+                                continue;
+                            }
                             let nidx = nj as usize * self.res + ni as usize;
-                            let wet_dest = slurry0[nidx] > 0.004 || self.water[nidx] > 0.004;
-                            if !wet_dest {
+                            if slurry0[nidx] <= 0.004 && self.water[nidx] <= 0.004 {
                                 continue;
                             }
                             let surf = self.bed[nidx] + placed0[nidx] + slurry0[nidx];
-                            if surf < dest_h - 0.002
-                                || (slurry0[nidx] > 0.004 && surf <= top + 0.015)
-                            {
-                                dest_h = surf;
-                                dest = Some(nidx);
+                            if in_rut_lane(nx, nz) {
+                                if surf <= top + 0.02 && surf < rut_h {
+                                    rut_h = surf;
+                                    dest_rut = Some(nidx);
+                                }
+                            } else if surf <= top + 0.02 && surf < pool_h {
+                                pool_h = surf;
+                                dest_pool = Some(nidx);
                             }
                         }
                     }
                 }
-                let Some(nidx) = dest else {
+                let nidx = dest_rut.or(dest_pool);
+                let Some(nidx) = nidx else {
                     continue;
                 };
                 let depth = (wet_berm_creep_under_load_rate(kind, moisture, load_n) * dt)
-                    .min(placed0[idx] * 0.16)
+                    .min(placed0[idx] * 0.22)
                     .min(placed0[idx]);
                 if depth <= 1.0e-6 {
                     continue;
