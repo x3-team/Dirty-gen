@@ -303,6 +303,20 @@ impl Dust {
         self.settled as f32
     }
 
+    /// Settled dust as world `(x, z, m³)` for the picture. The ledger is unchanged.
+    pub fn settled_marks(&self) -> Vec<(f32, f32, f32)> {
+        let mut out = Vec::new();
+        for (&(ix, iz), &volume) in &self.settled_cells {
+            if volume <= 1.0e-8 {
+                continue;
+            }
+            let x = (ix as f32 + 0.5) * SETTLED_CELL_M;
+            let z = (iz as f32 + 0.5) * SETTLED_CELL_M;
+            out.push((x, z, volume as f32));
+        }
+        out
+    }
+
     /// Settled dust whose 0.5 m cell center matches `pred` (world x, world z).
     pub fn settled_m3_where(&self, mut pred: impl FnMut(f32, f32) -> bool) -> f32 {
         let mut sum = 0.0f64;

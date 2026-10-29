@@ -561,8 +561,24 @@ struct CaptureArgs {
 #[cfg(not(target_arch = "wasm32"))]
 fn through_chase(world: &World) -> CameraPose {
     let fwd = world.vehicle.forward();
-    let eye = world.vehicle.pos - fwd * 11.5 + Vec3::new(1.4, 4.0, 0.0);
-    let target = world.vehicle.pos + fwd * 2.5 + Vec3::Y * 0.35;
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Behind and a little to the left so the wind lean sits in frame, and low
+    // enough that the track behind the car is in the picture.
+    let eye = world.vehicle.pos - fwd * 8.4 - right * 3.6 + Vec3::Y * 2.6;
+    let target = world.vehicle.pos + fwd * 1.6 + Vec3::Y * 0.45;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+fn belly_chase(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Clear of the body. Low rear three-quarter along the shelf between the ruts.
+    let eye = world.vehicle.pos - fwd * 5.6 - right * 1.25 + Vec3::Y * 0.78;
+    let target = world.vehicle.pos + fwd * 0.2 - Vec3::Y * 0.28;
     CameraPose {
         eye,
         target,
@@ -600,7 +616,7 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
             saved_slurry = true;
             println!("slurry still at z {z:.1}");
         }
-        if !saved_still && z > 12.0 {
+        if !saved_still && z > 6.4 && z < 10.5 {
             write_png(&still, width, height, &rgba).expect("still");
             saved_still = true;
             println!("through still at z {z:.1}");
@@ -632,7 +648,7 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     let report = drive.finish();
     let sim_fps = (frame * steps_per_frame) as f32 / wall;
     println!(
-        "through-drive frames {frame} sim-steps/s {sim_fps:.2} z {:.1} speed {:.2} spray {:.4} rut {:.3} removed {:.4} stuck {:.4} shed {:.4} dust {:.4} settled {:.4} gap {:.5}",
+        "through-drive frames {frame} sim-steps/s {sim_fps:.2} z {:.1} speed {:.2} spray {:.4} rut {:.3} removed {:.4} stuck {:.4} shed {:.4} dust {:.5} air {:.5} settled {:.5} gap {:.5}",
         report.end_z,
         report.speed_peak,
         report.spray_m3,
@@ -641,6 +657,7 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
         report.stuck_m3,
         report.shed_m3,
         report.dust_injected_m3,
+        report.dust_air_m3,
         report.dust_settled_m3,
         report.ledger_gap
     );
@@ -667,6 +684,29 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
         panic!("ffmpeg failed: {status}");
     }
     println!("video {}", video.display());
+    capture_belly_shelf(renderer, width, height);
+}
+
+fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
+    let mut world = silt::World::flat(0.4);
+    let report = world.carve_belly_shelf();
+    println!(
+        "belly shelf drag {:.3} kN unload {:.3} kN shelf {:.3} m rut {:.3} m cut {:.4} placed {:.4} gap {:.5}",
+        report.drag_n / 1000.0,
+        report.unload_n / 1000.0,
+        report.shelf_y,
+        report.rut_y,
+        report.cut_m3,
+        report.placed_m3,
+        report.gap_m3
+    );
+    let pose = belly_chase(&world);
+    let rgba = renderer
+        .draw(&world, pose, None, true)
+        .expect("belly readback");
+    let path = PathBuf::from(MEDIA).join("slurry-belly-proof.png");
+    write_png(&path, width, height, &rgba).expect("belly still");
+    println!("belly {}", path.display());
 }
 
 fn capture(args: &[String]) {
@@ -696,6 +736,7 @@ fn capture(args: &[String]) {
     if args.iter().any(|s| s == "--through-drive") {
         renderer.show_bike = false;
         renderer.show_props = false;
+        renderer.show_hills = false;
         renderer.niva_picture = true;
         renderer.water_column = true;
         capture_through_drive(&mut renderer, parsed.width, parsed.height);
