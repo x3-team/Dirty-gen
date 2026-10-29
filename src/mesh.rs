@@ -1245,9 +1245,15 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
 }
 
-/// A short ribbon lying in a rut. Width stays put, so the plan is a strip.
-/// The edges lift in a wave that travels along the length.
-fn add_rut_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+/// One ribbon for a tire line. `p.pos` is the head at the tire, `p.size` is
+/// the length back down the rut, and `p.vel` points along that rut.
+/// The strip is a single surface: constant width, no breaks, a wave along
+/// its length. Both edges share a height, so the plan does not bow.
+fn add_rut_ribbon(
+    mesh: &mut CpuMesh,
+    p: &silt::particles::Particle,
+    ground: Option<&silt::soil::SoilField>,
+) {
     let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::new(0.0, 0.0, -1.0);
@@ -1258,29 +1264,33 @@ fn add_rut_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
         side = Vec3::X;
     }
     side = side.normalize();
-    // Short strip in the rut. The centerline stays straight and the width
-    // stays constant, so the plan is not a crescent or a wedge. The curl is
-    // a wave along the length: both edges rise and fall together.
-    let length = 0.80_f32;
-    let half_w = 0.044_f32;
-    let segs = 24usize;
+    let length = p.size.clamp(0.7, 12.0);
+    let half_w = 0.055_f32;
+    let lead = 0.20_f32;
+    let span = (length - lead).max(0.55);
+    let segs = ((span / 0.16).ceil() as usize).clamp(12, 80);
     let across = 5usize;
-    let waves = 3.0_f32;
     let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
-        let t = s as f32 / segs as f32;
-        let along = (t - 0.5) * length;
-        let phase = t * std::f32::consts::PI * 2.0 * waves;
-        let arch = phase.sin() * 0.040;
+        let dist = lead + span * (s as f32 / segs as f32);
+        let center = p.pos + dir * dist;
+        let mut h = ground
+            .map(|soil| soil.sample(center.x, center.z).height)
+            .unwrap_or(p.pos.y);
+        if h < 0.05 {
+            h = p.pos.y;
+        }
+        // Locked to the ground, so the curl stays in the rut as the car moves.
+        // The trough stays above the soil: a wave that sinks reads as dashes.
+        let phase = center.z * std::f32::consts::TAU / 1.15;
+        let arch = (phase.sin() * 0.5 + 0.5) * 0.08;
         let mut row = Vec::with_capacity(across);
         for a in 0..across {
             let u = a as f32 / (across - 1) as f32;
             let from_mid = (u - 0.5).abs() * 2.0;
             let x = (u - 0.5) * 2.0 * half_w;
-            // A shallow channel, the same at every station, so the
-            // cross-section is a curl and the outline still does not bow.
-            let channel = from_mid * from_mid * 0.016;
-            row.push(p.pos + dir * along + side * x + Vec3::Y * (0.058 + arch + channel));
+            let channel = from_mid * from_mid * 0.014;
+            row.push(Vec3::new(center.x, 0.0, center.z) + side * x + Vec3::Y * (h + 0.03 + arch + channel));
         }
         rows.push(row);
     }
@@ -1301,7 +1311,7 @@ fn add_rut_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 /// is a ribbon rather than a box, a tablet, or a cube.
 fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     if !p.ledger {
-        add_rut_ribbon(mesh, p);
+        add_rut_ribbon(mesh, p, None);
         return;
     }
     add_slurry_curl(mesh, p, false);
@@ -1652,18 +1662,25 @@ mod slurry_shapes {
 /// smaller lumps. Ledger soil is not in this mesh once it has landed: that
 /// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
+    mud_chunks_with_ground(items, None)
+}
+
+/// Same chunks, with picture ribbons laid on the heightfield instead of a flat y.
+pub fn mud_chunks_with_ground(
+    items: &[silt::particles::Particle],
+    ground: Option<&silt::soil::SoilField>,
+) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
-    // Picture sheets off the body. Ledger flecks are smaller and must not
-    // fill the mesh before these are drawn.
+    // One continuous ribbon per tire line. Drawn before ledger flecks.
     for p in items {
         if !p.alive || p.life <= 0.0 || p.kind != silt::particles::KIND_SLURRY_RIBBON || p.ledger {
             continue;
         }
-        if mesh.vertices.len() + 400 >= MAX_VERTS {
+        if mesh.vertices.len() + 6000 >= MAX_VERTS {
             break;
         }
-        add_slurry_ribbon(&mut mesh, p);
+        add_rut_ribbon(&mut mesh, p, ground);
     }
     // Draw the big clumps first so a full splash cannot crowd them out.
     // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
