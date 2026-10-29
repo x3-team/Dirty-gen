@@ -207,6 +207,12 @@ pub fn slurry_flow_conduct(kind: SurfaceKind, moisture: f32) -> f32 {
     (22.0 / visc).clamp(0.02, 3.0)
 }
 
+/// How fast a disturbed slurry free surface levels after a pass or a shed.
+/// Clay settles slowest, then silt, then sand.
+pub fn slurry_settle_pace(kind: SurfaceKind, moisture: f32) -> f32 {
+    slurry_flow_conduct(kind, moisture)
+}
+
 /// Metres per second of berm soil that can join a neighbouring slurry.
 /// The same viscosity that slows the pipe keeps the creep slow.
 pub fn berm_creep_rate(kind: SurfaceKind, moisture: f32) -> f32 {
@@ -2781,6 +2787,69 @@ impl SoilField {
         self.column_volume_in(x0, x1, z0, z1, &self.slurry)
     }
 
+    /// Slurry ahead of the treads (bow) and in the rut lane behind them, cubic metres.
+    pub fn slurry_bow_and_rut_volumes(
+        &self,
+        pool_x0: f32,
+        pool_x1: f32,
+        pool_z0: f32,
+        pool_z1: f32,
+        front_hub: (f32, f32),
+        rear_left: (f32, f32),
+        rear_right: (f32, f32),
+        track_half: f32,
+        forward: Vec3,
+    ) -> (f32, f32) {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let cell = self.cell;
+        let area = cell * cell;
+        let half = self.size * 0.5;
+        let lip = 0.52_f32;
+        let inner_margin = cell * 1.4;
+        let rear_z = rear_left.1.min(rear_right.1);
+        let front_z = front_hub.1;
+        let bow_near = front_z + 0.18;
+        let bow_far = (front_z + 0.95).min(pool_z1 - lip);
+        let wake_top = rear_z - 0.14;
+        let wake_floor = pool_z0 + inner_margin;
+        let on_rut = |cx: f32| {
+            (cx - rear_left.0).abs() <= track_half + cell * 0.2
+                || (cx - rear_right.0).abs() <= track_half + cell * 0.2
+        };
+        let mut bow = 0.0_f32;
+        let mut rut = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz >= pool_z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let depth = self.slurry[idx];
+                if depth <= 1.0e-5 {
+                    continue;
+                }
+                let rel_x = cx - front_hub.0;
+                let rel_z = cz - front_z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                if (bow_near..=bow_far).contains(&along)
+                    && lat.abs() <= track_half + cell * 0.65
+                {
+                    bow += depth * area;
+                } else if cz <= wake_top
+                    && cz >= wake_floor
+                    && on_rut(cx)
+                {
+                    rut += depth * area;
+                }
+            }
+        }
+        (bow, rut)
+    }
+
     /// Deepest bed cut, metres, among cells whose centers lie in the rectangle.
     pub fn max_bed_cut_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
         let half = self.size * 0.5;
@@ -2831,6 +2900,12 @@ impl SoilField {
         self.flow_slurry(dt);
     }
 
+    /// Let bow slurry and berm spoil run back into the rut after motion stops.
+    /// Same as [`step_slurry`](Self::step_slurry), split into short steps.
+    pub fn step_slurry_settle(&mut self, dt: f32) {
+        self.step_slurry(dt);
+    }
+
     /// Advance slurry in short bites so a long settle does not overshoot the head.
     pub fn advance_slurry(&mut self, seconds: f32) {
         if seconds <= 0.0 {
@@ -2841,6 +2916,11 @@ impl SoilField {
         for _ in 0..steps {
             self.step_slurry(dt);
         }
+    }
+
+    /// Level a bow wave and berm back into the bed and rut after a pass or shed.
+    pub fn advance_slurry_settle(&mut self, seconds: f32) {
+        self.advance_slurry(seconds);
     }
 
     /// A berm loses placed soil into a lower neighbour that already holds slurry.
@@ -2868,7 +2948,7 @@ impl SoilField {
                     continue;
                 }
                 let nidx = jj as usize * res + ii as usize;
-                if slurry0[nidx] < 0.004 {
+                if slurry0[nidx] < 0.004 && !self.in_rut_or_hole(nidx) {
                     continue;
                 }
                 let surf = self.bed[nidx] + placed0[nidx] + slurry0[nidx];
@@ -7327,6 +7407,18 @@ mod tests {
         assert_eq!(prior.slurry[idx], 0.0);
         assert!((prior.tread_amp[idx] - amp).abs() < 1.0e-6);
         assert!((loaded.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn slurry_settle_pace_orders_by_viscosity() {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let clay = slurry_settle_pace(SurfaceKind::WetMud, moisture);
+        let silt = slurry_settle_pace(SurfaceKind::Silt, moisture);
+        let sand = slurry_settle_pace(SurfaceKind::Sand, moisture);
+        assert!(
+            sand > silt && silt > clay,
+            "settle pace clay {clay:.3} silt {silt:.3} sand {sand:.3} m/s per m head"
+        );
     }
 
     #[test]
