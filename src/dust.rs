@@ -3,15 +3,18 @@
 //! Names match the fluid-core API: [`dust_may_lift`], [`DustInject`],
 //! [`inject_dust`], [`AIR_RES`], [`AIR_LAYERS`], [`SLOW_STRIDE`],
 //! [`DUST_WET_MOISTURE`], [`DUST_WET_WATER_M`], and [`Dust::set_wind`].
-//! `FluidCore::step` with `SheetDrive::Wind` is the horizontal transport.
-//! That module is not on this branch, so this file does not define
-//! `fluid_core` and does not keep a second sheet solver.
+//!
+//! `src/fluid_core.rs` is not on this branch, so density is advected here by
+//! the wind plus a kinematic wake, then settled. That step is not a pressure
+//! projection and not vorticity confinement. When `src/fluid_core.rs` is
+//! present, `build.rs` sets `has_fluid_core` and the same step calls
+//! `fluid_core::advect_dust_density` instead of this copy.
 //!
 //! The offer is `DUST_OFFER_K * slip * dryness` cubic metres per second.
 //! `inject_dust` returns the cubic metres that entered the air, or 0 when
-//! [`dust_may_lift`] is false. Every [`SLOW_STRIDE`] frames the bottom layer
-//! settles onto the ground. Settled dust is not lofted. Emitted volume =
-//! airborne + settled.
+//! [`dust_may_lift`] is false. Every [`SLOW_STRIDE`] frames the column falls
+//! and the bottom settles. Settled dust is not lofted. Emitted volume =
+//! airborne + settled, and dust that leaves the window is settled.
 
 use glam::Vec3;
 
@@ -28,8 +31,8 @@ pub const SLOW_STRIDE: u32 = 6;
 /// Cubic metres per second offered at 1 m/s slip and dryness 1.
 pub const DUST_OFFER_K: f32 = 1.4e-3;
 /// Fall speed applied on the slow stride, metres per second.
-pub const SETTLE_M_S: f32 = 0.42;
-/// Dust frame budget, milliseconds. Offer, settle, and texture publish.
+pub const SETTLE_M_S: f32 = 0.24;
+/// Dust frame budget, milliseconds. Offer, advection, settle, and texture publish.
 pub const FRAME_BUDGET_MS: f32 = 1.5;
 
 /// Vehicle-frame air window, metres. +X right, +Y up, +Z forward.
@@ -44,16 +47,18 @@ pub const AIR_DZ_M: f32 = (AIR_Z1_M - AIR_Z0_M) / AIR_RES as f32;
 pub const AIR_DY_M: f32 = (AIR_Y1_M - AIR_Y0_M) / AIR_LAYERS as f32;
 
 const CELL_VOL_M3: f32 = AIR_DX_M * AIR_DY_M * AIR_DZ_M;
+/// Cells thinner than this are settled. They are below the density texture's visible floor.
+const CELL_CULL_M3: f32 = 1.0e-8;
 
-const THROW_AFT_0: f32 = 0.10;
-const THROW_AFT_1: f32 = 1.55;
-const THROW_SIDE: f32 = 0.34;
-const THROW_UP_1: f32 = 1.15;
-const THROW_ALONG_C: f32 = 0.78;
-const THROW_UP_C: f32 = 0.48;
-const THROW_ALONG_R: f32 = 0.55;
-const THROW_SIDE_R: f32 = 0.34;
-const THROW_UP_R: f32 = 0.42;
+const THROW_AFT_0: f32 = 0.12;
+const THROW_AFT_1: f32 = 1.85;
+const THROW_SIDE: f32 = 0.36;
+const THROW_UP_1: f32 = 1.75;
+const THROW_ALONG_C: f32 = 0.90;
+const THROW_UP_C: f32 = 0.88;
+const THROW_ALONG_R: f32 = 0.62;
+const THROW_SIDE_R: f32 = 0.36;
+const THROW_UP_R: f32 = 0.78;
 
 /// Solver tire radius. Matches the Niva contact used by the rest of the engine.
 pub const WHEEL_RADIUS_M: f32 = 0.38;
@@ -231,12 +236,15 @@ pub struct DustLedger {
 /// Dust channel on the air window. Wind is stored for `FluidCore::set_wind`.
 pub struct Dust {
     vol: Vec<f32>,
+    /// Scratch for the donor-cell step. Same layout as `vol`.
+    next: Vec<f32>,
     emitted: f64,
     air: f64,
     settled: f64,
     per_tire: [f64; 4],
     wind_x: f32,
     wind_z: f32,
+    speed: f32,
     forward: Vec3,
     right: Vec3,
     chassis_z: f32,
@@ -246,6 +254,9 @@ pub struct Dust {
     x1: u32,
     z0: u32,
     z1: u32,
+    /// Inclusive x span that holds dust on each z row. Empty when lo > hi.
+    row_lo: Vec<u32>,
+    row_hi: Vec<u32>,
 }
 
 impl Dust {
@@ -253,12 +264,14 @@ impl Dust {
         let n = (AIR_RES * AIR_LAYERS * AIR_RES) as usize;
         Self {
             vol: vec![0.0; n],
+            next: vec![0.0; n],
             emitted: 0.0,
             air: 0.0,
             settled: 0.0,
             per_tire: [0.0; 4],
             wind_x: 0.0,
             wind_z: 0.0,
+            speed: 0.0,
             forward: Vec3::new(0.0, 0.0, 1.0),
             right: Vec3::new(1.0, 0.0, 0.0),
             chassis_z: 0.0,
@@ -268,6 +281,8 @@ impl Dust {
             x1: 0,
             z0: 1,
             z1: 0,
+            row_lo: vec![1; AIR_RES as usize],
+            row_hi: vec![0; AIR_RES as usize],
         }
     }
 
@@ -424,6 +439,38 @@ impl Dust {
         volume as f32
     }
 
+    /// `(metres behind the rear axle, metres to the right of the centerline)`.
+    pub fn plume_offset(&self) -> (f32, f32) {
+        if self.x0 > self.x1 || self.z0 > self.z1 {
+            return (0.0, 0.0);
+        }
+        let rear_z = self.chassis_z + (HUBS[2][2] + HUBS[3][2]) * 0.5;
+        let mut volume = 0.0f64;
+        let mut sx = 0.0f64;
+        let mut sz = 0.0f64;
+        for iz in self.z0..=self.z1 {
+            for iy in 0..AIR_LAYERS {
+                for ix in self.x0..=self.x1 {
+                    let v = self.vol[at(ix, iy, iz)];
+                    if v <= 0.0 {
+                        continue;
+                    }
+                    let p = cell_center(self.chassis_z, ix, iy, iz);
+                    let vd = v as f64;
+                    volume += vd;
+                    sx += p.x as f64 * vd;
+                    sz += p.z as f64 * vd;
+                }
+            }
+        }
+        if volume <= 1.0e-14 {
+            return (0.0, 0.0);
+        }
+        let x = (sx / volume) as f32;
+        let z = (sz / volume) as f32;
+        (rear_z - z, x)
+    }
+
     fn sync_frame(&mut self, tires: &[Tire]) {
         let Some(tire) = tires.first() else {
             return;
@@ -436,15 +483,115 @@ impl Dust {
             self.forward = tire.forward.normalize();
             self.right = tire.right.normalize();
         }
+        self.speed = tire.speed.max(0.0);
     }
 
     fn finish_frame(&mut self, dt: f32) {
+        self.transport_dust(dt);
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {
             let elapsed = self.settle_dt;
             self.settle_dt = 0.0;
             self.settle_bottom(elapsed);
+        }
+    }
+
+    /// Horizontal density step, then the caller settles.
+    ///
+    /// With `src/fluid_core.rs` on the crate path this calls
+    /// `fluid_core::advect_dust_density(vol, wind_x, wind_z, speed, forward, right, dt)`
+    /// and books the returned cubic metres as settled. Otherwise the private
+    /// wind-and-wake donor cell runs.
+    fn transport_dust(&mut self, dt: f32) {
+        if dt <= 0.0 || self.x0 > self.x1 {
+            return;
+        }
+        #[cfg(has_fluid_core)]
+        {
+            let outflow = crate::fluid_core::advect_dust_density(
+                &mut self.vol,
+                self.wind_x,
+                self.wind_z,
+                self.speed,
+                self.forward,
+                self.right,
+                dt,
+            );
+            if outflow > 0.0 {
+                self.air -= outflow;
+                self.settled += outflow;
+            }
+            self.rebuild_rows_from_volume();
+        }
+        #[cfg(not(has_fluid_core))]
+        {
+            self.advect_by_wind_and_wake(dt);
+        }
+    }
+
+    /// `fluid_core` writes `vol` directly. Recover the row spans settle scans.
+    #[cfg(has_fluid_core)]
+    fn rebuild_rows_from_volume(&mut self) {
+        self.x0 = 1;
+        self.x1 = 0;
+        self.z0 = 1;
+        self.z1 = 0;
+        for iz in 0..AIR_RES as usize {
+            self.row_lo[iz] = 1;
+            self.row_hi[iz] = 0;
+        }
+        for iz in 0..AIR_RES {
+            for ix in 0..AIR_RES {
+                if (0..AIR_LAYERS).any(|iy| self.vol[at(ix, iy, iz)] > 0.0) {
+                    self.touch(ix, iz);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(has_fluid_core))]
+    fn advect_by_wind_and_wake(&mut self, dt: f32) {
+        let rel = Vec3::new(self.wind_x, 0.0, self.wind_z) - self.forward * self.speed;
+        let span = rel.x.abs() + rel.z.abs();
+        if span < 1.0e-5 {
+            return;
+        }
+        let cfl = span * dt / AIR_DX_M.min(AIR_DZ_M);
+        let steps = (cfl / 0.70).ceil().clamp(1.0, 6.0) as u32;
+        let sub = dt / steps as f32;
+        for _ in 0..steps {
+            let (x0, x1, z0, z1, live, outflow) = advect_once(
+                &mut self.vol,
+                &mut self.next,
+                &mut self.row_lo,
+                &mut self.row_hi,
+                self.z0,
+                self.z1,
+                self.forward,
+                self.right,
+                rel,
+                sub,
+            );
+            if live {
+                self.x0 = x0;
+                self.x1 = x1;
+                self.z0 = z0;
+                self.z1 = z1;
+            } else {
+                self.x0 = 1;
+                self.x1 = 0;
+                self.z0 = 1;
+                self.z1 = 0;
+                for iz in 0..AIR_RES as usize {
+                    self.row_lo[iz] = 1;
+                    self.row_hi[iz] = 0;
+                }
+            }
+            if outflow > 0.0 {
+                self.air -= outflow;
+                self.settled += outflow;
+            }
         }
     }
 
@@ -463,7 +610,12 @@ impl Dust {
 
     fn shift_down(&mut self, f: f32) {
         for iz in self.z0..=self.z1 {
-            for ix in self.x0..=self.x1 {
+            let lo = self.row_lo[iz as usize];
+            let hi = self.row_hi[iz as usize];
+            if lo > hi {
+                continue;
+            }
+            for ix in lo..=hi {
                 if column_empty(self, ix, iz) {
                     continue;
                 }
@@ -500,6 +652,14 @@ impl Dust {
     }
 
     fn touch(&mut self, ix: u32, iz: u32) {
+        let row = iz as usize;
+        if self.row_lo[row] > self.row_hi[row] {
+            self.row_lo[row] = ix;
+            self.row_hi[row] = ix;
+        } else {
+            self.row_lo[row] = self.row_lo[row].min(ix);
+            self.row_hi[row] = self.row_hi[row].max(ix);
+        }
         if self.x0 > self.x1 {
             self.x0 = ix;
             self.x1 = ix;
@@ -697,6 +857,272 @@ fn weight_at(air: &Dust, x: f32, z: f32, ix: u32, iy: u32, iz: u32) -> f32 {
     throw_weight(along, side, rel.y)
 }
 
+/// One donor-cell substep. Mass that leaves the window is returned as cubic metres.
+#[cfg(not(has_fluid_core))]
+fn advect_once(
+    vol: &mut [f32],
+    next: &mut [f32],
+    row_lo: &mut [u32],
+    row_hi: &mut [u32],
+    z0: u32,
+    z1: u32,
+    forward: Vec3,
+    right: Vec3,
+    rel: Vec3,
+    dt: f32,
+) -> (u32, u32, u32, u32, bool, f64) {
+    let mut read_lo = [1u32; AIR_RES as usize];
+    let mut read_hi = [0u32; AIR_RES as usize];
+    if z0 <= z1 {
+        for iz in z0..=z1 {
+            read_lo[iz as usize] = row_lo[iz as usize];
+            read_hi[iz as usize] = row_hi[iz as usize];
+        }
+    }
+    let wz0 = z0.saturating_sub(1);
+    let wz1 = (z1 + 1).min(AIR_RES - 1);
+    let mut write_lo = [1u32; AIR_RES as usize];
+    let mut write_hi = [0u32; AIR_RES as usize];
+    for iz in wz0..=wz1 {
+        let mut lo = 1u32;
+        let mut hi = 0u32;
+        let mut any = false;
+        let src0 = iz.saturating_sub(1);
+        let src1 = (iz + 1).min(AIR_RES - 1);
+        for src in src0..=src1 {
+            if read_lo[src as usize] > read_hi[src as usize] {
+                continue;
+            }
+            let (a, b) = if src == iz {
+                (
+                    read_lo[src as usize].saturating_sub(1),
+                    (read_hi[src as usize] + 1).min(AIR_RES - 1),
+                )
+            } else {
+                (read_lo[src as usize], read_hi[src as usize])
+            };
+            if !any {
+                lo = a;
+                hi = b;
+                any = true;
+            } else {
+                lo = lo.min(a);
+                hi = hi.max(b);
+            }
+        }
+        if !any {
+            continue;
+        }
+        write_lo[iz as usize] = lo;
+        write_hi[iz as usize] = hi;
+        for iy in 0..AIR_LAYERS {
+            for ix in lo..=hi {
+                next[at(ix, iy, iz)] = 0.0;
+            }
+        }
+        row_lo[iz as usize] = 1;
+        row_hi[iz as usize] = 0;
+    }
+
+    let mut outflow = 0.0f64;
+    let res = AIR_RES as i32;
+    let stream = rel.dot(forward);
+
+    for iz in z0..=z1 {
+        if read_lo[iz as usize] > read_hi[iz as usize] {
+            continue;
+        }
+        let gz = AIR_Z0_M + (iz as f32 + 0.5) * AIR_DZ_M;
+        for ix in read_lo[iz as usize]..=read_hi[iz as usize] {
+            if (0..AIR_LAYERS).all(|iy| vol[at(ix, iy, iz)] == 0.0) {
+                continue;
+            }
+            let gx = AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M;
+            let (lx, lz) = vehicle_local(gx, gz, right, forward);
+            let deficit = wake_deficit(lx, lz);
+            let vel = rel - forward * (stream * deficit);
+            let mut fx = vel.x * dt / AIR_DX_M;
+            let mut fz = vel.z * dt / AIR_DZ_M;
+            let mag = fx.abs() + fz.abs();
+            if mag > 0.92 {
+                let s = 0.92 / mag;
+                fx *= s;
+                fz *= s;
+            }
+            let ax = fx.abs();
+            let az = fz.abs();
+            let nix = if fx > 0.0 {
+                ix as i32 + 1
+            } else if fx < 0.0 {
+                ix as i32 - 1
+            } else {
+                ix as i32
+            };
+            let niz = if fz > 0.0 {
+                iz as i32 + 1
+            } else if fz < 0.0 {
+                iz as i32 - 1
+            } else {
+                iz as i32
+            };
+            let x_moves = fx != 0.0;
+            let z_moves = fz != 0.0;
+            for iy in 0..AIR_LAYERS {
+                let v = vol[at(ix, iy, iz)];
+                if v == 0.0 {
+                    continue;
+                }
+                let leave_x = v * ax;
+                let mut leave_z = v * az;
+                let mut stay = v - leave_x;
+                if stay < leave_z {
+                    leave_z = stay;
+                    stay = 0.0;
+                } else {
+                    stay -= leave_z;
+                }
+                deposit(next, ix as i32, iy, iz as i32, stay, res, &mut outflow);
+                if x_moves {
+                    deposit(next, nix, iy, iz as i32, leave_x, res, &mut outflow);
+                }
+                if z_moves {
+                    deposit(next, ix as i32, iy, niz, leave_z, res, &mut outflow);
+                }
+            }
+        }
+    }
+
+    // Drop sub-visible specks back into the fullest surviving cell so the
+    // active rows stay on the plume. That mass is still airborne.
+    let mut bx0 = 0u32;
+    let mut bx1 = 0u32;
+    let mut bz0 = 0u32;
+    let mut bz1 = 0u32;
+    let mut live = false;
+    let mut speck = 0.0f64;
+    let mut sink = 0usize;
+    let mut sink_v = 0.0f32;
+    for iz in wz0..=wz1 {
+        row_lo[iz as usize] = 1;
+        row_hi[iz as usize] = 0;
+        if write_lo[iz as usize] > write_hi[iz as usize] {
+            continue;
+        }
+        for ix in write_lo[iz as usize]..=write_hi[iz as usize] {
+            let mut any = false;
+            for iy in 0..AIR_LAYERS {
+                let i = at(ix, iy, iz);
+                let v = next[i];
+                if v < CELL_CULL_M3 {
+                    if v > 0.0 {
+                        speck += v as f64;
+                    }
+                    vol[i] = 0.0;
+                } else {
+                    vol[i] = v;
+                    any = true;
+                    if v > sink_v {
+                        sink_v = v;
+                        sink = i;
+                    }
+                }
+            }
+            if !any {
+                continue;
+            }
+            let row = iz as usize;
+            if row_lo[row] > row_hi[row] {
+                row_lo[row] = ix;
+                row_hi[row] = ix;
+            } else {
+                row_lo[row] = row_lo[row].min(ix);
+                row_hi[row] = row_hi[row].max(ix);
+            }
+            if !live {
+                bx0 = ix;
+                bx1 = ix;
+                bz0 = iz;
+                bz1 = iz;
+                live = true;
+            } else {
+                bx0 = bx0.min(ix);
+                bx1 = bx1.max(ix);
+                bz0 = bz0.min(iz);
+                bz1 = bz1.max(iz);
+            }
+        }
+    }
+    if speck > 0.0 {
+        if live {
+            vol[sink] += speck as f32;
+        } else {
+            outflow += speck;
+        }
+    }
+    (bx0, bx1, bz0, bz1, live, outflow)
+}
+
+#[cfg(not(has_fluid_core))]
+fn deposit(next: &mut [f32], ix: i32, iy: u32, iz: i32, amount: f32, res: i32, outflow: &mut f64) {
+    if amount == 0.0 {
+        return;
+    }
+    if ix < 0 || iz < 0 || ix >= res || iz >= res {
+        *outflow += amount as f64;
+        return;
+    }
+    next[at(ix as u32, iy, iz as u32)] += amount;
+}
+
+/// Chassis-relative grid offset to vehicle right / forward.
+#[cfg(not(has_fluid_core))]
+fn vehicle_local(offset_x: f32, offset_z: f32, right: Vec3, forward: Vec3) -> (f32, f32) {
+    let lx = offset_x * right.x + offset_z * right.z;
+    let lz = offset_x * forward.x + offset_z * forward.z;
+    (lx, lz)
+}
+
+/// Fraction of the oncoming stream held with the car. No pressure solve.
+#[cfg(not(has_fluid_core))]
+fn wake_deficit(x: f32, z: f32) -> f32 {
+    let mut d = body_wake(x, z);
+    d = d.max(tire_wake(x, z, HUBS[0][0], HUBS[0][2]));
+    d = d.max(tire_wake(x, z, HUBS[1][0], HUBS[1][2]));
+    d = d.max(tire_wake(x, z, HUBS[2][0], HUBS[2][2]));
+    d = d.max(tire_wake(x, z, HUBS[3][0], HUBS[3][2]));
+    d.clamp(0.0, 0.70)
+}
+
+#[cfg(not(has_fluid_core))]
+fn body_wake(x: f32, z: f32) -> f32 {
+    let aft = -1.90 - z;
+    if aft <= 0.0 || aft >= 8.5 {
+        return 0.0;
+    }
+    let ax = x.abs();
+    if ax >= 1.15 {
+        return 0.0;
+    }
+    let along = 1.0 - aft / 8.5;
+    let side = 1.0 - (ax * ax) / (1.15 * 1.15);
+    0.62 * along * side
+}
+
+#[cfg(not(has_fluid_core))]
+fn tire_wake(x: f32, z: f32, hx: f32, hz: f32) -> f32 {
+    let aft = hz - z;
+    if aft <= 0.0 || aft >= 3.8 {
+        return 0.0;
+    }
+    let dx = x - hx;
+    if dx.abs() >= 0.55 {
+        return 0.0;
+    }
+    let along = 1.0 - aft / 3.8;
+    let side = 1.0 - (dx * dx) / (0.55 * 0.55);
+    0.36 * along * side
+}
+
 fn throw_weight(along: f32, side: f32, up: f32) -> f32 {
     if !(THROW_AFT_0..=THROW_AFT_1).contains(&along)
         || side.abs() > THROW_SIDE
@@ -708,11 +1134,16 @@ fn throw_weight(along: f32, side: f32, up: f32) -> f32 {
     let s = side / THROW_SIDE_R;
     let h = (up - THROW_UP_C) / THROW_UP_R;
     let q = 1.0 - (a * a + s * s + h * h);
-    if q <= 0.0 {
-        0.0
-    } else {
-        q * q
+    let mut w = if q <= 0.0 { 0.0 } else { q * q };
+    // A thin skirt on the bottom layer so dust that has fallen can leave the grid.
+    if up < AIR_DY_M {
+        let ha = 1.0 - a * a;
+        let hs = 1.0 - s * s;
+        if ha > 0.0 && hs > 0.0 {
+            w += 0.08 * ha * hs;
+        }
     }
+    w
 }
 
 #[cfg(test)]
@@ -827,6 +1258,45 @@ mod tests {
         }
         let ahead = dust.volume_ahead_of_front_m3();
         assert!(ahead <= dust.dust_air_m3() * 0.02 + 1.0e-8, "ahead {ahead}");
+    }
+
+    #[test]
+    fn plume_trails_behind_the_niva_and_leans_with_the_wind() {
+        let (wind, _) = drive(
+            PROOF_SPEED_M_S,
+            PROOF_SLIP_M_S,
+            PROOF_MOISTURE,
+            0.0,
+            proof_wind(),
+            2.0,
+            PROOF_DT_S,
+        );
+        let (calm, _) = drive(
+            PROOF_SPEED_M_S,
+            PROOF_SLIP_M_S,
+            PROOF_MOISTURE,
+            0.0,
+            Vec3::ZERO,
+            2.0,
+            PROOF_DT_S,
+        );
+        let (behind, lateral) = wind.plume_offset();
+        let (calm_behind, calm_lateral) = calm.plume_offset();
+        assert!(
+            behind > 2.5,
+            "wind plume is {behind:.2} m behind the rear axle"
+        );
+        assert!(
+            calm_behind > 2.5,
+            "calm plume is {calm_behind:.2} m behind the rear axle"
+        );
+        assert!(
+            lateral > calm_lateral + 0.45,
+            "wind lateral {lateral:.2} calm {calm_lateral:.2}"
+        );
+        assert_eq!(wind.wind(), (1.5, -0.9));
+        closes(&wind);
+        closes(&calm);
     }
 
     #[test]

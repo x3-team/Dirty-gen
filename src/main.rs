@@ -49,11 +49,11 @@ fn main() {
     }
     let tris = niva_mesh::load_chassis();
     let chassis = chassis_at(dust.chassis_z());
-    // Straight from the left. Nose to the right, cloud behind the tires.
+    // Outside the plume, left-rear. Nose to the right, trail behind the bumper, +X wind to the left.
     let cam = Camera {
-        eye: chassis + Vec3::new(-8.4, 1.42, -1.35),
-        target: chassis + Vec3::new(0.1, 0.58, -1.35),
-        fov_y: 0.58,
+        eye: chassis + Vec3::new(-7.6, 1.28, -6.4),
+        target: chassis + Vec3::new(0.25, 0.52, -1.6),
+        fov_y: 0.60,
     };
     let rgb = draw::render(&tris, chassis, &shown_tex, &cam, WIDTH, HEIGHT);
     write_png(&out, WIDTH, HEIGHT, &rgb).expect("write proof");
@@ -86,6 +86,38 @@ fn drive_proof() -> (Dust, DensityTexture, Vec<f64>) {
         z += PROOF_SPEED_M_S * PROOF_DT_S;
     }
     (dust, tex, times)
+}
+
+fn plume_height(tex: &DensityTexture) -> (f32, f32) {
+    let mut volume = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut above = 0.0f64;
+    if tex.nx == 0 {
+        return (0.0, 0.0);
+    }
+    for iz in 0..tex.nz {
+        for iy in 0..tex.ny {
+            for ix in 0..tex.nx {
+                let i = (ix + iy * tex.nx + iz * tex.nx * tex.ny) as usize;
+                let fraction = tex.samples[i];
+                if fraction <= 0.0 {
+                    continue;
+                }
+                let y = tex.origin.y + (iy as f32 + 0.5) * tex.cell.y;
+                let v = fraction as f64;
+                volume += v;
+                sy += y as f64 * v;
+                if y >= 0.45 {
+                    above += v;
+                }
+            }
+        }
+    }
+    if volume <= 0.0 {
+        (0.0, 0.0)
+    } else {
+        ((sy / volume) as f32, (above / volume) as f32)
+    }
 }
 
 fn upload_timed(tex: &DensityTexture) -> Result<(dust_trail::GpuDensity, f64), String> {
@@ -144,6 +176,15 @@ fn print_report(
         );
     }
     let _ = calm_z;
+    let (behind, lateral) = dust.plume_offset();
+    let (calm_behind, calm_lateral) = calm.plume_offset();
+    let (height, above) = plume_height(tex);
+    println!("plume_behind_rear_m {:.3}", behind);
+    println!("plume_lateral_m {:.3}", lateral);
+    println!("plume_height_m {:.3}", height);
+    println!("plume_mass_above_0.45 {:.3}", above);
+    println!("calm_plume_behind_rear_m {:.3}", calm_behind);
+    println!("calm_plume_lateral_m {:.3}", calm_lateral);
     for i in 2..4 {
         let aft = calm.aft_of_tire(i).unwrap_or(f32::NAN);
         println!("calm_tire{i}_aft_m {:.3}", aft);

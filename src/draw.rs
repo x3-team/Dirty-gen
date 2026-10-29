@@ -8,9 +8,9 @@ use dust_trail::DensityTexture;
 
 use crate::niva_mesh::{Tri, BODY, CHASSIS, GLASS, LAMP_F, LAMP_R, TRIM, WHEEL};
 
-const EXTINCTION: f32 = 640.0;
-const SPLAT_RADIUS_M: f32 = 0.38;
-const MIN_RHO: f32 = 2.0e-4;
+const EXTINCTION: f32 = 3600.0;
+const SPLAT_RADIUS_M: f32 = 0.34;
+const MIN_RHO: f32 = 4.0e-5;
 
 pub struct Camera {
     pub eye: Vec3,
