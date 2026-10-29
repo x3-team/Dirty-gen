@@ -9,9 +9,12 @@
 //! Deep slurry also drags. The viscosity is the mix — clay, silt, or sand —
 //! and it resists both the roll of the tread and the forward motion of the
 //! tire. Pulling the tire out holds a short suction, then the seal breaks and
-//! throws ribbons and drops taken from the slurry. Slurry that stays behind
-//! sits in the tread voids. Spinning the wheel, or shedding the coat, lets
-//! that hold leave as ribbons. What is in the grooves, what is thrown, and
+//! throws ribbons and drops taken from the slurry. An extreme exit tears the
+//! rut lip, breaks the seal on every wheel, and drives out. What leaves the
+//! column is the rut tear-out, the groove shed, and ribbons, sheets, and fine
+//! spray in the air. Slurry that stays behind sits in the tread voids.
+//! Spinning the wheel, or shedding the coat, lets that hold leave as ribbons.
+//! What is in the grooves, what is thrown, and
 //! what returns to the rut add up to the slurry that left the column. A roll
 //! or a sideways shove in that slurry splits the new cut into the berm, the
 //! throw, and the slurry that stays in the rut. Clay holds, so the shove is

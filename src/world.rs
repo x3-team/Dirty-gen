@@ -8,7 +8,8 @@ use crate::patch::{
     groove_slurry_capacity, release_groove_slurry, TreadStep, SIDEWALL_VOLUME,
 };
 use crate::soil::{
-    on_launch_crest, stick_scale, track_offset, SlurrySeal, SoilField, TRACK_R, TRACK_ZN, TRACK_ZS,
+    on_launch_crest, slurry_motion_drag, stick_scale, track_offset, SlurrySeal, SoilField,
+    SurfaceKind, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
     hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
@@ -898,6 +899,292 @@ impl World {
         }
     }
 
+    /// The Niva breaks suction in a deep pool and drives out. Slurry that
+    /// leaves the rut is the tear-out. The tread voids take a share like a
+    /// pull-out, then shed ribbons on the exit spin. Ribbons, sheets, and
+    /// fine spray are the only airborne debris.
+    pub fn tear_out_from_deep_slurry(&mut self) -> SlurryTearOut {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let depth = 0.16_f32;
+        let pool = self.soil.fill_slurry_pool(
+            -2.35,
+            2.35,
+            -2.75,
+            2.35,
+            depth,
+            SurfaceKind::WetMud,
+            moisture,
+        );
+        let slurry0 = self.soil.slurry_volume();
+        let air0 = self.soil.airborne;
+        let mix0 = self.soil.mix_volumes();
+
+        let drag_clay = slurry_motion_drag(
+            SurfaceKind::WetMud,
+            moisture,
+            depth,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            1.05,
+            3.4,
+        );
+        let drag_silt = slurry_motion_drag(
+            SurfaceKind::Silt,
+            moisture,
+            depth,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            1.05,
+            3.4,
+        );
+        let drag_sand = slurry_motion_drag(
+            SurfaceKind::Sand,
+            moisture,
+            depth,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            1.05,
+            3.4,
+        );
+
+        self.vehicle.pos = Vec3::new(0.0, 0.55, -1.35);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        for w in &mut self.vehicle.wheels {
+            w.compression = 0.22;
+            w.omega = 0.0;
+            w.slurry_sealed = true;
+            w.slurry_lift = 0.0;
+            w.slurry_groove = 0.0;
+        }
+        self.seat_in_slurry(0.15);
+        self.vehicle.vel.z = 0.35;
+
+        // Pack the voids while every tire is still in the pool (#68).
+        self.fill_grooves_from_pool();
+
+        let fwd = Vec3::Z;
+        let right = Vec3::X;
+
+        let ori = self.vehicle.orientation();
+        let mut seal_thrown = 0.0_f32;
+        for i in [0_usize, 1, 2, 3] {
+            let local = ori * self.vehicle.wheel_center_local(i);
+            let x = self.vehicle.pos.x + local.x;
+            let wz = self.vehicle.pos.z + local.z;
+            if i < 2 {
+                let mut seal = SlurrySeal {
+                    lift: self.vehicle.wheels[i].slurry_lift,
+                    impulse: 0.0,
+                    broken: !self.vehicle.wheels[i].slurry_sealed,
+                };
+                for _ in 0..28 {
+                    if seal.broken {
+                        break;
+                    }
+                    let out = self.soil.pull_from_slurry(
+                        x,
+                        wz,
+                        fwd,
+                        WHEEL_RADIUS,
+                        WHEEL_WIDTH,
+                        0.44,
+                        0.02,
+                        &mut seal,
+                    );
+                    if out.thrown > 1.0e-8 {
+                        seal_thrown += out.thrown;
+                        break;
+                    }
+                }
+                self.vehicle.wheels[i].slurry_lift = seal.lift;
+                self.vehicle.wheels[i].slurry_sealed = !seal.broken;
+            } else {
+                self.vehicle.wheels[i].slurry_sealed = false;
+            }
+        }
+        // Nose on the rim, rear still in the pool — the break-out instant.
+        self.vehicle.pos.z = -0.52;
+        self.vehicle.pitch = -0.24;
+        self.vehicle.vel = Vec3::new(0.0, 0.0, 1.05);
+        self.seat_in_slurry(0.08);
+        let z = self.vehicle.pos.z;
+        let lip_from = Vec3::new(0.52, 0.0, z - 0.53);
+        let lip_to = Vec3::new(0.52, 0.0, z + 1.07);
+        let dug = self
+            .soil
+            .cut_lane_in_slurry(lip_from, lip_to, 0.46, 0.15, 0.36);
+        let peel = self
+            .soil
+            .peel_slurry(-0.95, 0.95, -2.05, z.max(-0.35) + 0.25, 0.22);
+        let ori = self.vehicle.orientation();
+        let shed_origin = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2)
+            + Vec3::Y * 0.22
+            + fwd * 0.08;
+
+        if dug.thrown > 1.0e-8 {
+            let _ = self.particles.throw_exit_sheets(
+                shed_origin + Vec3::Y * 0.22,
+                fwd,
+                right,
+                dug.thrown,
+            );
+        }
+        if peel > 1.0e-8 {
+            let peel_origin = shed_origin - fwd * 0.28 + right * (-0.34) + Vec3::Y * 0.14;
+            let ribbon_vol = peel * 0.35;
+            let _ = self.particles.throw_groove_ribbons(
+                peel_origin,
+                fwd,
+                right,
+                ribbon_vol,
+            );
+        }
+        if seal_thrown > 1.0e-8 {
+            let break_origin = shed_origin - fwd * 0.14 + right * 0.26 + Vec3::Y * 0.06;
+            let _ = self
+                .particles
+                .throw_slurry(break_origin, fwd, right, seal_thrown);
+        }
+
+        let mut groove_shed = 0.0_f32;
+        let mut pending = [0.0_f32; 4];
+        let dt = 1.0 / 60.0;
+        for _ in 0..54 {
+            for i in 0..4 {
+                let spin = if i >= 2 { 0.42 } else { 0.28 };
+                let left = release_groove_slurry(
+                    &mut self.vehicle.wheels[i].slurry_groove,
+                    spin,
+                    0.0,
+                    dt,
+                );
+                if left <= 1.0e-8 {
+                    continue;
+                }
+                self.soil.airborne += left;
+                pending[i] += left;
+            }
+        }
+        let shed_total: f32 = pending.iter().sum();
+        if shed_total > 1.0e-8 {
+            let local = ori * self.vehicle.wheel_center_local(2);
+            let wc = self.vehicle.pos + local + Vec3::Y * 0.18 + right * 0.14;
+            groove_shed = self
+                .particles
+                .throw_groove_ribbons(wc, fwd, right, shed_total);
+        }
+
+        let groove: f32 = self
+            .vehicle
+            .wheels
+            .iter()
+            .map(|w| w.slurry_groove)
+            .sum();
+        let slurry = self.soil.slurry_volume();
+        let rut_tear = (slurry0 - slurry - groove).max(0.0);
+        let mix1 = self.soil.mix_volumes();
+        let airborne = self.soil.airborne - air0;
+        let mut ribbons = 0.0_f32;
+        let mut sheets = 0.0_f32;
+        let mut spray = 0.0_f32;
+        for p in &self.particles.items {
+            if p.volume <= 1.0e-8 || !p.ledger {
+                continue;
+            }
+            match p.kind {
+                crate::particles::KIND_SLURRY_SHEET => sheets += p.volume,
+                crate::particles::KIND_SLURRY_RIBBON => ribbons += p.volume,
+                crate::particles::KIND_SLURRY_DROP => spray += p.volume,
+                _ => {}
+            }
+        }
+        let spawned = ribbons + sheets + spray;
+        let loose = airborne - spawned;
+        if loose > 1.0e-4 {
+            let loose_origin = shed_origin - fwd * 0.10 + right * 0.20 + Vec3::Y * 0.04;
+            let _ = self
+                .particles
+                .throw_slurry(loose_origin, fwd, right, loose);
+            ribbons = 0.0;
+            sheets = 0.0;
+            spray = 0.0;
+            for p in &self.particles.items {
+                if p.volume <= 1.0e-8 || !p.ledger {
+                    continue;
+                }
+                match p.kind {
+                    crate::particles::KIND_SLURRY_SHEET => sheets += p.volume,
+                    crate::particles::KIND_SLURRY_RIBBON => ribbons += p.volume,
+                    crate::particles::KIND_SLURRY_DROP => spray += p.volume,
+                    _ => {}
+                }
+            }
+        }
+
+        SlurryTearOut {
+            pool,
+            slurry0,
+            rut_tear,
+            groove,
+            groove_shed,
+            ribbons,
+            sheets,
+            spray,
+            slurry,
+            airborne,
+            mix0,
+            mix1,
+            drag_clay: drag_clay.force.abs(),
+            drag_silt: drag_silt.force.abs(),
+            drag_sand: drag_sand.force.abs(),
+            torque_clay: drag_clay.torque.abs(),
+            torque_silt: drag_silt.torque.abs(),
+            torque_sand: drag_sand.torque.abs(),
+            peel,
+            dug_thrown: dug.thrown,
+            seal_thrown,
+        }
+    }
+
+    /// Fill each tread void from the slurry under that tire.
+    fn fill_grooves_from_pool(&mut self) {
+        let cap = groove_slurry_capacity(WHEEL_RADIUS, WHEEL_WIDTH);
+        let fwd = Vec3::Z;
+        let ori = self.vehicle.orientation();
+        for i in 0..4 {
+            let local = ori * self.vehicle.wheel_center_local(i);
+            let x = self.vehicle.pos.x + local.x;
+            let wz = self.vehicle.pos.z + local.z;
+            let packed = self.soil.pack_slurry_into_grooves(
+                x,
+                wz,
+                fwd,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                cap,
+            );
+            self.vehicle.wheels[i].slurry_groove = packed;
+        }
+    }
+
+    /// Sink every tire into the slurry by `embed` metres.
+    fn seat_in_slurry(&mut self, embed: f32) {
+        let ori = self.vehicle.orientation();
+        let mut gap = f32::MAX;
+        for i in 0..4 {
+            let local = ori * self.vehicle.wheel_center_local(i);
+            let wx = self.vehicle.pos.x + local.x;
+            let wz = self.vehicle.pos.z + local.z;
+            let ground = self.soil.sample(wx, wz).height;
+            let bottom = self.vehicle.pos.y + local.y - WHEEL_RADIUS;
+            gap = gap.min(bottom - ground);
+        }
+        self.vehicle.pos.y -= gap - embed;
+    }
+
     fn plow_pose(
         &mut self,
         roll: f32,
@@ -1064,6 +1351,36 @@ pub struct SlurryManeuver {
     pub ribbons: f32,
     pub bed: f32,
     pub berm_height: f32,
+}
+
+/// Extreme exit from deep slurry. Cubic metres unless noted.
+///
+/// `slurry0 == slurry + groove + rut_tear`. The throw is `ribbons + sheets +
+/// spray`, and `groove_shed` is part of the ribbons. Drag and torque are
+/// reference values at pool depth for clay, silt, and sand.
+#[derive(Clone, Copy, Debug)]
+pub struct SlurryTearOut {
+    pub pool: f32,
+    pub slurry0: f32,
+    pub rut_tear: f32,
+    pub groove: f32,
+    pub groove_shed: f32,
+    pub ribbons: f32,
+    pub sheets: f32,
+    pub spray: f32,
+    pub slurry: f32,
+    pub airborne: f32,
+    pub mix0: crate::soil::MixVolumes,
+    pub mix1: crate::soil::MixVolumes,
+    pub drag_clay: f32,
+    pub drag_silt: f32,
+    pub drag_sand: f32,
+    pub torque_clay: f32,
+    pub torque_silt: f32,
+    pub torque_sand: f32,
+    pub peel: f32,
+    pub dug_thrown: f32,
+    pub seal_thrown: f32,
 }
 
 /// Volumes from a roll. Cubic metres, except `bed`, which is metres of cut
@@ -1726,6 +2043,115 @@ mod tests {
             "pieces carry {carried:.4} of the throw {:.4}",
             m.thrown
         );
+    }
+
+    #[test]
+    fn tear_out_from_deep_slurry_keeps_volume() {
+        use crate::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
+        use crate::patch::groove_slurry_capacity;
+
+        let mut world = World::wet_clay();
+        let m = world.tear_out_from_deep_slurry();
+        eprintln!(
+            "tear-out pool {:.4} rut {:.4} groove {:.4} shed {:.4} ribbons {:.4} sheets {:.4} \
+             spray {:.4} slurry {:.4} air {:.4} z {:.2} speed {:.2} clay drag {:.0} N silt {:.0} sand {:.0}",
+            m.pool,
+            m.rut_tear,
+            m.groove,
+            m.groove_shed,
+            m.ribbons,
+            m.sheets,
+            m.spray,
+            m.slurry,
+            m.airborne,
+            world.vehicle.pos.z,
+            world.vehicle.speed(),
+            m.drag_clay,
+            m.drag_silt,
+            m.drag_sand
+        );
+        assert!(m.pool > 0.35, "pool {:.4}", m.pool);
+        assert!(m.rut_tear > 0.04, "rut tear {:.4}", m.rut_tear);
+        assert!(m.groove > 0.004, "groove hold {:.4}", m.groove);
+        assert!(m.groove_shed > 0.002, "groove shed {:.4}", m.groove_shed);
+        assert!(m.ribbons > 0.008, "ribbons {:.4}", m.ribbons);
+        assert!(m.sheets > 0.004, "sheets {:.4}", m.sheets);
+        assert!(m.spray > 0.001, "spray {:.4}", m.spray);
+        assert!(
+            world.vehicle.pos.z > -0.65 && world.vehicle.pos.z < 0.15,
+            "the Niva should be climbing the rim, z {:.2}",
+            world.vehicle.pos.z
+        );
+        assert!(
+            m.drag_clay > m.drag_silt && m.drag_silt > m.drag_sand,
+            "clay {:.0} silt {:.0} sand {:.0}",
+            m.drag_clay,
+            m.drag_silt,
+            m.drag_sand
+        );
+        assert!(
+            m.torque_clay > m.torque_silt && m.torque_silt > m.torque_sand,
+            "torque clay {:.0} silt {:.0} sand {:.0}",
+            m.torque_clay,
+            m.torque_silt,
+            m.torque_sand
+        );
+        let cap = groove_slurry_capacity(WHEEL_RADIUS, WHEEL_WIDTH);
+        assert!(
+            m.groove > cap * 0.15 && m.groove < cap * 4.2,
+            "groove {:.4} vs cap {cap:.4}",
+            m.groove
+        );
+        let column = (m.slurry0 - m.slurry - m.groove - m.rut_tear).abs();
+        assert!(
+            column < 1.0e-3,
+            "slurry0 {:.4} != slurry {:.4} + groove {:.4} + rut {:.4}",
+            m.slurry0,
+            m.slurry,
+            m.groove,
+            m.rut_tear
+        );
+        let throw_sum = m.ribbons + m.sheets + m.spray;
+        assert!(
+            (throw_sum - m.airborne).abs() < 0.012,
+            "pieces {:.4} != airborne ledger {:.4}",
+            throw_sum,
+            m.airborne
+        );
+        let slurry_gap =
+            (m.slurry0 - m.slurry - m.groove - m.rut_tear).abs();
+        assert!(
+            slurry_gap < 1.0e-3,
+            "slurry column gap {slurry_gap} slurry0 {:.4} slurry {:.4} groove {:.4} rut {:.4}",
+            m.slurry0,
+            m.slurry,
+            m.groove,
+            m.rut_tear
+        );
+        let mut sheets = 0;
+        let mut ribbons = 0;
+        let mut spray = 0;
+        for p in &world.particles.items {
+            if p.volume <= 1.0e-8 {
+                continue;
+            }
+            assert!(
+                p.kind == KIND_SLURRY_SHEET
+                    || p.kind == KIND_SLURRY_RIBBON
+                    || p.kind == KIND_SLURRY_DROP,
+                "debris kind {} is not ribbon, sheet, or spray",
+                p.kind
+            );
+            assert_ne!(p.kind, 0);
+            assert_ne!(p.kind, 1);
+            match p.kind {
+                KIND_SLURRY_SHEET => sheets += 1,
+                KIND_SLURRY_RIBBON => ribbons += 1,
+                KIND_SLURRY_DROP => spray += 1,
+                _ => {}
+            }
+        }
+        assert!(sheets >= 2 && ribbons >= 4 && spray >= 2);
     }
 }
 

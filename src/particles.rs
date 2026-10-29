@@ -309,6 +309,40 @@ impl Particles {
         carried
     }
 
+    /// Sheets leaving the rear tread on a pool exit. All stations sit behind
+    /// and outboard of the hub so nothing crosses the roof or reads as a crescent.
+    pub fn throw_exit_sheets(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        volume: f32,
+    ) -> f32 {
+        let forward = horizontal_axis(forward, Vec3::Z);
+        let right = horizontal_axis(right, Vec3::X);
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return 0.0;
+        }
+        let stations = [
+            (-0.78_f32, -0.32, 0.28),
+            (-0.62, -0.38, 0.36),
+            (-0.54, -0.24, 0.32),
+            (-0.70, -0.28, 0.24),
+        ];
+        let n = stations.len();
+        let mut carried = 0.0_f32;
+        for (i, (along, out, up)) in stations.into_iter().enumerate() {
+            let share = volume / n as f32;
+            let pos = origin + forward * along + right * out + Vec3::Y * up;
+            let t = i as f32;
+            let vel = -forward * (0.35 + t * 0.08)
+                - right * (2.5 + t * 0.18)
+                + Vec3::Y * (0.52 + t * 0.10);
+            carried += self.spawn_slurry(pos, vel, share, KIND_SLURRY_SHEET, false);
+        }
+        carried
+    }
+
     /// Slurry torn off by a sideways spin. Ribbons only. No drops.
     /// The volume is already in the thrown account. Landing returns it to the rut.
     pub fn throw_spin_ribbons(

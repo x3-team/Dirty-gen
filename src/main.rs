@@ -526,6 +526,8 @@ struct CaptureArgs {
     slurry_groove_proof: PathBuf,
     slurry_roll: bool,
     slurry_roll_proof: PathBuf,
+    slurry_tear_out: bool,
+    slurry_tear_out_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -614,6 +616,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_roll {
         capture_slurry_roll(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_tear_out {
+        capture_slurry_tear_out(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -802,6 +808,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_groove_proof = PathBuf::from(format!("{MEDIA}/slurry-groove-proof.png"));
     let mut slurry_roll = false;
     let mut slurry_roll_proof = PathBuf::from(format!("{MEDIA}/slurry-roll-proof.png"));
+    let mut slurry_tear_out = false;
+    let mut slurry_tear_out_proof =
+        PathBuf::from(format!("{MEDIA}/slurry-tear-out-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -878,6 +887,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_roll = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_roll_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-tear-out-proof" => {
+                slurry_tear_out = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_tear_out_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -969,6 +984,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_groove_proof,
         slurry_roll,
         slurry_roll_proof,
+        slurry_tear_out,
+        slurry_tear_out_proof,
     }
 }
 
@@ -1541,6 +1558,19 @@ fn silence_chunks(world: &mut World) {
     }
 }
 
+/// Drop solid clods from the still. Slurry ribbons, sheets, and spray stay.
+#[cfg(not(target_arch = "wasm32"))]
+fn silence_soil_clods(world: &mut World) {
+    use silt::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
+    for p in &mut world.particles.items {
+        if p.kind == KIND_SLURRY_RIBBON || p.kind == KIND_SLURRY_SHEET || p.kind == KIND_SLURRY_DROP
+        {
+            continue;
+        }
+        p.alive = false;
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn niva_tread_camera(world: &World, wheel: usize) -> CameraPose {
     let vehicle = &world.vehicle;
@@ -1776,6 +1806,137 @@ fn capture_slurry_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose.target.y,
         pose.target.z
     );
+}
+
+/// The Niva climbing out of a deep pool. Ribbons, sheets, and fine spray
+/// hang beside the rut. The numbers are the rut tear-out, the groove hold,
+/// and the debris split.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_tear_out(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.tear_out_from_deep_slurry();
+    silence_soil_clods(&mut world);
+    println!(
+        "slurry-tear-out pool {:.4} m3  rut {:.4} m3  groove {:.4} m3  shed {:.4} m3  \
+         ribbons {:.4} m3  sheets {:.4} m3  spray {:.4} m3  slurry {:.4} m3  airborne {:.4} m3  \
+         clay drag {:.0} N  silt {:.0} N  sand {:.0} N  clay torque {:.0} N·m  silt {:.0}  sand {:.0}",
+        out.pool,
+        out.rut_tear,
+        out.groove,
+        out.groove_shed,
+        out.ribbons,
+        out.sheets,
+        out.spray,
+        out.slurry,
+        out.airborne,
+        out.drag_clay,
+        out.drag_silt,
+        out.drag_sand,
+        out.torque_clay,
+        out.torque_silt,
+        out.torque_sand,
+    );
+    let lines = [
+        format!("rut {:.4}", out.rut_tear),
+        format!("groove {:.4}", out.groove),
+        format!("ribbons {:.4}", out.ribbons),
+        format!("sheets {:.4}", out.sheets),
+        format!("spray {:.4}", out.spray),
+        format!("slurry {:.4}", out.slurry),
+        format!("clay {:.0} N", out.drag_clay),
+        format!("silt {:.0} N", out.drag_silt),
+        format!("sand {:.0} N", out.drag_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = lift_camera(&world, slurry_tear_out_camera(&world));
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_tear_out_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_tear_out_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry tear-out still");
+    println!(
+        "cc0 slurry-tear-out {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_tear_out_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_tear_out_camera(world: &World) -> CameraPose {
+    use silt::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
+
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let ori = vehicle.orientation();
+    let rear_l = vehicle.pos + ori * vehicle.wheel_center_local(2);
+    let rear_r = vehicle.pos + ori * vehicle.wheel_center_local(3);
+    let rear = (rear_l + rear_r) * 0.5;
+
+    let (mut sx, mut sy, mut sz, mut sw) = (0.0_f32, 0.0, 0.0, 0.0);
+    for p in &world.particles.items {
+        if !p.alive || !p.ledger || p.volume <= 1.0e-8 {
+            continue;
+        }
+        if p.kind != KIND_SLURRY_RIBBON && p.kind != KIND_SLURRY_SHEET && p.kind != KIND_SLURRY_DROP {
+            continue;
+        }
+        let w = p.volume;
+        sx += p.pos.x * w;
+        sy += p.pos.y * w;
+        sz += p.pos.z * w;
+        sw += w;
+    }
+    let debris = if sw > 1.0e-6 {
+        Vec3::new(sx / sw, sy / sw, sz / sw)
+    } else {
+        rear - fwd * 0.42 - right * 0.30 + Vec3::Y * 0.75
+    };
+
+    let tread_lip = Vec3::new(
+        rear_l.x - fwd.x * 0.12,
+        world.soil.sample(rear_l.x, rear_l.z).height + 0.04,
+        rear_l.z - fwd.z * 0.12,
+    );
+    let pool_back = rear - fwd * 0.95;
+    let pool_back = Vec3::new(
+        pool_back.x,
+        world.soil.sample(pool_back.x, pool_back.z).height + 0.05,
+        pool_back.z,
+    );
+
+    // Beside the rear treads: debris, pool lip, left rear leaving the rut.
+    let look = debris * 0.36 + rear_l * 0.22 + tread_lip * 0.20 + pool_back * 0.22;
+    let look = Vec3::new(
+        look.x,
+        look.y.max(world.soil.sample(look.x, look.z).height + 0.12),
+        look.z,
+    );
+    // Same rear-quarter axis, pulled back for lip + tire + spray in one frame.
+    let eye = rear - right * 2.75 - fwd * 3.45 + Vec3::Y * 0.82;
+    let ortho = 4.85;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3106,14 +3267,14 @@ fn stamp_proof_lines(rgba: &mut [u8], width: u32, height: u32, lines: &[&str]) {
     let gap = scale;
     let cw = 5 * scale + gap;
     let ch = 7 * scale + gap * 2;
-    let x0 = 18u32;
+    let x0 = 24u32;
     let y0 = 16u32;
     let mut max_w = 0u32;
     for line in lines {
         max_w = max_w.max(line.chars().count() as u32 * cw);
     }
-    let plate_w = max_w + 20;
-    let plate_h = lines.len() as u32 * ch + 14;
+    let plate_w = max_w + 28;
+    let plate_h = lines.len() as u32 * ch + 18;
     for y in y0..y0.saturating_add(plate_h).min(height) {
         for x in x0..x0.saturating_add(plate_w).min(width) {
             let i = ((y * width + x) * 4) as usize;
@@ -3125,7 +3286,7 @@ fn stamp_proof_lines(rgba: &mut [u8], width: u32, height: u32, lines: &[&str]) {
     }
     for (li, line) in lines.iter().enumerate() {
         let y = y0 + 8 + li as u32 * ch;
-        let mut x = x0 + 10;
+        let mut x = x0 + 14;
         for ch in line.chars() {
             blit_glyph(rgba, width, height, x, y, ch, scale);
             x += cw;
@@ -3188,8 +3349,11 @@ fn glyph_rows(ch: char) -> Option<[u8; 7]> {
         'n' => [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
         'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
         'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000],
+        'g' => [0b00000, 0b00000, 0b01111, 0b10000, 0b10110, 0b10001, 0b01110],
+        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
         'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
         's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+        'v' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
         't' => [0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00100, 0b00011],
         'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
         'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
