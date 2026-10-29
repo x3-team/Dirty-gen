@@ -1670,9 +1670,18 @@ impl World {
             pass1_depth,
         );
         let driver = -right;
-        // Beside the rear tread, in the slurry spray line — not on the door.
-        let ribbon_base = rear_l + driver * 1.34 + Vec3::Y * 0.20 - fwd * 0.38;
-        let spray_base = rear_l + driver * 1.05 + Vec3::Y * 0.42 - fwd * 0.22;
+        let mud_h = self.soil.sample(rear_l.x, rear_l.z).height;
+        // Beside the rear tread at mud height — clear of the door panel.
+        let ribbon_base = Vec3::new(
+            rear_l.x + driver.x * 1.48,
+            mud_h + 0.32,
+            rear_l.z + driver.z * 1.48 - fwd.z * 0.44,
+        );
+        let spray_base = Vec3::new(
+            rear_l.x + driver.x * 1.18,
+            mud_h + 0.52,
+            rear_l.z + driver.z * 1.18 - fwd.z * 0.28,
+        );
         let mut ri = 0usize;
         let mut di = 0usize;
         for p in &mut self.particles.items {

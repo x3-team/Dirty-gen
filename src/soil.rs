@@ -3332,7 +3332,31 @@ impl SoilField {
                     continue;
                 }
                 spoil += removed * area;
+                self.slurry[idx] = (self.slurry[idx] - bite * 0.55).max(0.012);
                 self.loose[idx] = (self.loose[idx] + removed * 0.35).min(0.16);
+                self.sync(idx);
+            }
+        }
+        // Leave a higher slurry shelf on the first-pass lip beside each rut.
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz > wake_top + cell {
+                    continue;
+                }
+                if on_rut(cx) {
+                    continue;
+                }
+                let lip = (cx - rear_left.0).abs().min((cx - rear_right.0).abs());
+                if lip < track_half + cell * 0.4 || lip > track_half + cell * 1.6 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.slurry[idx] < 0.008 {
+                    continue;
+                }
+                self.slurry[idx] = (self.slurry[idx] + step * 0.35).min(0.42);
                 self.sync(idx);
             }
         }
