@@ -4,11 +4,13 @@ use std::f32::consts::PI;
 
 use glam::Vec3;
 
-use dust_trail::Parcel;
+use dust_trail::DensityTexture;
 
 use crate::niva_mesh::{Tri, BODY, CHASSIS, GLASS, LAMP_F, LAMP_R, TRIM, WHEEL};
 
-const EXTINCTION: f32 = 380.0;
+const EXTINCTION: f32 = 640.0;
+const SPLAT_RADIUS_M: f32 = 0.38;
+const MIN_RHO: f32 = 2.0e-4;
 
 pub struct Camera {
     pub eye: Vec3,
@@ -57,10 +59,11 @@ impl Basis {
     }
 }
 
+/// Raster the Niva and splat the 3D density texture. This is not a volume render.
 pub fn render(
     chassis_tris: &[Tri],
     chassis: Vec3,
-    parcels: &[Parcel],
+    density: &DensityTexture,
     cam: &Camera,
     width: u32,
     height: u32,
@@ -79,8 +82,8 @@ pub fn render(
         draw_tri(&mut color, &mut depth, &basis, p, tri.kind, light, w);
     }
     let mut tau = vec![0.0_f32; n];
-    for parcel in parcels {
-        splat(&mut tau, &depth, &basis, parcel, w);
+    for (pos, mass) in density.splats(MIN_RHO) {
+        splat(&mut tau, &depth, &basis, pos, mass, SPLAT_RADIUS_M, w);
     }
     composite(&mut color, &tau, w, h);
     encode(&color)
@@ -289,18 +292,26 @@ fn draw_tri_front(
     }
 }
 
-fn splat(tau: &mut [f32], depth: &[f32], cam: &Basis, parcel: &Parcel, w: usize) {
-    let Some((sx, sy, z)) = cam.project(parcel.pos) else {
+fn splat(
+    tau: &mut [f32],
+    depth: &[f32],
+    cam: &Basis,
+    pos: Vec3,
+    mass_kg: f32,
+    radius_m: f32,
+    w: usize,
+) {
+    let Some((sx, sy, z)) = cam.project(pos) else {
         return;
     };
-    let rad = parcel.radius_m / z * cam.f;
+    let rad = radius_m / z * cam.f;
     if rad < 0.8 {
         return;
     }
     let sigma = rad * 0.50;
     let inv = 1.0 / (2.0 * sigma * sigma);
-    let sigma_w = (parcel.radius_m * 0.50).max(0.05);
-    let column = EXTINCTION * parcel.mass_kg / (2.0 * PI * sigma_w * sigma_w);
+    let sigma_w = (radius_m * 0.50).max(0.05);
+    let column = EXTINCTION * mass_kg / (2.0 * PI * sigma_w * sigma_w);
     let r = (sigma * 2.4).ceil() as i32;
     let x0 = (sx as i32 - r).max(0);
     let y0 = (sy as i32 - r).max(0);

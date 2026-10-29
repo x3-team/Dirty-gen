@@ -1,8 +1,8 @@
 # Dirty-gen
 
-Dust trail solver for the Lada Niva.
+Dust caller for the Lada Niva. The air grid is `fluid_core` (slurry ledger): 128 by 8 layers, wind via `set_wind`, settle every 6 frames from the bottom layer.
 
-On dry ground each tire lofts fines. The mass rate is `k * dryness * max(speed - 0.5, 0) ^ 1.5` kilograms per second. The near-wake density is that rate mixed into the air the tire sweeps, so it rises with dryness and with speed. Wind drags the parcels. Moisture at or above 0.55, or standing water at or above 8 mm, lofts nothing.
+A tire offers `k * slip * dryness` cubic metres per second through `DustInject`. `dust_may_lift` is false at moisture 0.55 or at 8 mm of water, and `inject_dust` then returns 0. Settled dust stays down. Emitted volume equals airborne plus settled. The renderer receives a 3D density texture.
 
 ```
 cargo test

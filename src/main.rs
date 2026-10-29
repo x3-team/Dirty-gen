@@ -1,16 +1,18 @@
-//! Proof frame for the dust-trail solver. Niva only, no text plate.
+//! Proof frame for the dust channel. Niva only, no text plate.
 
 mod draw;
 mod niva_mesh;
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use glam::Vec3;
 
 use draw::{write_png, Camera};
 use dust_trail::{
-    chassis_at, drive, dryness, loft_rate_kg_s, proof_wind, reference_samples, wake_density_kg_m3,
-    DustTrail, PROOF_DT_S, PROOF_MOISTURE, PROOF_SECONDS, PROOF_SPEED_M_S, PROOF_WATER_M,
+    chassis_at, offer_m3_s, proof_wind, reference_samples, upload_density_texture, DensityTexture,
+    Dust, FRAME_BUDGET_MS, PROOF_DT_S, PROOF_MOISTURE, PROOF_SECONDS, PROOF_SLIP_M_S,
+    PROOF_SPEED_M_S, PROOF_WATER_M,
 };
 
 const WIDTH: u32 = 1280;
@@ -25,100 +27,168 @@ fn main() {
                 "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/dust-trail-proof.png",
             )
         });
-    let (dust, z) = drive(
+    let (dust, tex, times) = drive_proof();
+    let (calm, calm_z) = dust_trail::drive(
         PROOF_SPEED_M_S,
-        PROOF_MOISTURE,
-        PROOF_WATER_M,
-        proof_wind(),
-        PROOF_SECONDS,
-        PROOF_DT_S,
-    );
-    let (calm, zc) = drive(
-        PROOF_SPEED_M_S,
+        PROOF_SLIP_M_S,
         PROOF_MOISTURE,
         PROOF_WATER_M,
         Vec3::ZERO,
         PROOF_SECONDS,
         PROOF_DT_S,
     );
-    print_report(&dust, z, &calm, zc);
+    let gpu = upload_timed(&tex);
+    print_report(&dust, &tex, &times, &calm, calm_z, &gpu);
+    let shown = match &gpu {
+        Ok((g, _)) => g.read_density().unwrap_or_else(|_| tex.samples.clone()),
+        Err(_) => tex.samples.clone(),
+    };
+    let mut shown_tex = tex.clone();
+    if shown.len() == shown_tex.samples.len() {
+        shown_tex.samples = shown;
+    }
     let tris = niva_mesh::load_chassis();
-    let chassis = chassis_at(z);
-    // Left side, a little aft, so the plume is a cloud behind the tires
-    // rather than a column looked at end-on.
-    // Straight from the left so the ray crosses the plume instead of
-    // looking down its length. Nose to the right, cloud behind the tires.
+    let chassis = chassis_at(dust.chassis_z());
+    // Straight from the left. Nose to the right, cloud behind the tires.
     let cam = Camera {
         eye: chassis + Vec3::new(-8.4, 1.42, -1.35),
         target: chassis + Vec3::new(0.1, 0.58, -1.35),
         fov_y: 0.58,
     };
-    let rgb = draw::render(&tris, chassis, &dust.parcels, &cam, WIDTH, HEIGHT);
+    let rgb = draw::render(&tris, chassis, &shown_tex, &cam, WIDTH, HEIGHT);
     write_png(&out, WIDTH, HEIGHT, &rgb).expect("write proof");
     eprintln!(
-        "proof {}x{} tris {} parcels {} -> {}",
+        "proof {}x{} tris {} tex {}x{}x{} -> {}",
         WIDTH,
         HEIGHT,
         tris.len(),
-        dust.parcels.len(),
+        shown_tex.nx,
+        shown_tex.ny,
+        shown_tex.nz,
         out.display()
     );
 }
 
-fn print_report(dust: &DustTrail, z: f32, calm: &DustTrail, zc: f32) {
-    let dry = dryness(PROOF_MOISTURE, PROOF_WATER_M);
-    let rate = loft_rate_kg_s(PROOF_MOISTURE, PROOF_WATER_M, PROOF_SPEED_M_S);
-    let rho = wake_density_kg_m3(PROOF_MOISTURE, PROOF_WATER_M, PROOF_SPEED_M_S);
-    let (behind, lateral) = dust.rear_offset(z).unwrap();
-    let (behind_c, lateral_c) = calm.rear_offset(zc).unwrap();
+fn drive_proof() -> (Dust, DensityTexture, Vec<f64>) {
+    let mut dust = Dust::new();
     let wind = proof_wind();
-    let max_y = dust.parcels.iter().map(|p| p.pos.y).fold(0.0_f32, f32::max);
-    println!("dust trail");
+    dust.set_wind(wind.x, wind.z);
+    let mut tex = DensityTexture::empty();
+    let steps = ((PROOF_SECONDS / PROOF_DT_S).round() as i32).max(0);
+    let mut z = 0.0;
+    let mut times = Vec::with_capacity(steps as usize);
+    for _ in 0..steps {
+        let tires = dust_trail::tires_at(z, PROOF_SPEED_M_S, PROOF_SLIP_M_S);
+        let t = Instant::now();
+        dust.step(&tires, PROOF_MOISTURE, PROOF_WATER_M, PROOF_DT_S);
+        dust.publish(&mut tex);
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+        z += PROOF_SPEED_M_S * PROOF_DT_S;
+    }
+    (dust, tex, times)
+}
+
+fn upload_timed(tex: &DensityTexture) -> Result<(dust_trail::GpuDensity, f64), String> {
+    let t = Instant::now();
+    let gpu = upload_density_texture(tex)?;
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    Ok((gpu, ms))
+}
+
+fn print_report(
+    dust: &Dust,
+    tex: &DensityTexture,
+    times: &[f64],
+    calm: &Dust,
+    calm_z: f32,
+    gpu: &Result<(dust_trail::GpuDensity, f64), String>,
+) {
+    let dry = dust_trail::dryness(PROOF_MOISTURE, PROOF_WATER_M);
+    let rate = offer_m3_s(PROOF_SLIP_M_S, PROOF_MOISTURE, PROOF_WATER_M);
+    let wind = proof_wind();
+    let (wind_x, wind_z) = dust.wind();
+    let steady: Vec<f64> = times.iter().copied().skip(15).collect();
+    let mean = if steady.is_empty() {
+        0.0
+    } else {
+        steady.iter().sum::<f64>() / steady.len() as f64
+    };
+    let max = steady.iter().copied().fold(0.0f64, f64::max);
+    println!("dust channel");
     println!("speed_m_s {:.3}", PROOF_SPEED_M_S);
+    println!("slip_m_s {:.3}", PROOF_SLIP_M_S);
     println!("moisture {:.3}", PROOF_MOISTURE);
     println!("water_m {:.3}", PROOF_WATER_M);
     println!("dryness {:.4}", dry);
     println!("wind_m_s {:.3} {:.3} {:.3}", wind.x, wind.y, wind.z);
-    println!("loft_per_tire_kg_s {:.6}", rate);
-    println!("loft_total_kg_s {:.6}", rate * 4.0);
-    println!("wake_density_kg_m3 {:.6}", rho);
-    println!("emitted_kg {:.6}", dust.emitted_kg);
-    println!("airborne_kg {:.6}", dust.airborne_kg());
-    println!("settled_kg {:.6}", dust.settled_kg);
-    println!("near_wake_bulk_kg_m3 {:.6}", dust.near_wake_bulk_kg_m3(z));
-    println!("behind_rear_axle_m {:.3}", behind);
-    println!("lateral_m {:.3}", lateral);
-    println!("calm_behind_m {:.3}", behind_c);
-    println!("calm_lateral_m {:.3}", lateral_c);
-    println!("cloud_top_m {:.3}", max_y);
-    println!("parcels {}", dust.parcels.len());
-    println!("reference");
-    println!("moisture water_m speed dryness rate_kg_s density_kg_m3");
-    for s in reference_samples() {
+    println!("set_wind {:.3} {:.3}", wind_x, wind_z);
+    println!("offer_per_tire_m3_s {:.6}", rate);
+    println!("offer_total_m3_s {:.6}", rate * 4.0);
+    let books = dust.ledger();
+    println!("emitted_m3 {:.6}", books.emitted_m3);
+    println!("dust_air_m3 {:.6}", books.dust_air_m3);
+    println!("dust_settled_m3 {:.6}", books.dust_settled_m3);
+    println!(
+        "ledger_err_m3 {:.8}",
+        (books.emitted_m3 - books.dust_air_m3 - books.dust_settled_m3).abs()
+    );
+    println!("max_fraction {:.6}", dust.max_fraction());
+    println!("texture {}x{}x{}", tex.nx, tex.ny, tex.nz);
+    println!("texture_air_m3 {:.6}", tex.airborne_m3());
+    for i in 0..4 {
+        let aft = dust.aft_of_tire(i).unwrap_or(f32::NAN);
         println!(
-            "{:.2} {:.3} {:.1} {:.4} {:.6} {:.6}",
-            s.moisture, s.water_m, s.speed, s.dryness, s.rate_kg_s, s.density_kg_m3
+            "tire{i}_emitted_m3 {:.6} aft_m {:.3}",
+            dust.emitted_by_tire()[i],
+            aft
         );
     }
-    println!(
-        "simulated near-wake bulk, calm wind, {:.1} s",
-        PROOF_SECONDS
-    );
-    println!("case bulk_kg_m3 emitted_kg");
-    for (name, m, w, u) in [
-        ("dry_8", 0.0_f32, 0.0_f32, 8.0_f32),
-        ("proof_pad_8", PROOF_MOISTURE, 0.0, 8.0),
-        ("damp_8", 0.30, 0.0, 8.0),
-        ("slow_3", 0.0, 0.0, 3.0),
-        ("fast_12", 0.0, 0.0, 12.0),
-        ("wet_8", 0.90, 0.0, 8.0),
-        ("pond_8", 0.0, 0.02, 8.0),
-    ] {
-        let (d, zz) = drive(u, m, w, Vec3::ZERO, PROOF_SECONDS, PROOF_DT_S);
+    let _ = calm_z;
+    for i in 2..4 {
+        let aft = calm.aft_of_tire(i).unwrap_or(f32::NAN);
+        println!("calm_tire{i}_aft_m {:.3}", aft);
+    }
+    println!("frame_budget_ms {:.3}", FRAME_BUDGET_MS);
+    println!("frame_mean_ms {:.4}", mean);
+    println!("frame_max_ms {:.4}", max);
+    println!("frames_timed {}", steady.len());
+    match gpu {
+        Ok((g, ms)) => {
+            let size = g.extent();
+            println!("gpu_adapter {}", g.adapter_name);
+            println!(
+                "gpu_texture {}x{}x{} {:?}",
+                size.width, size.height, size.depth_or_array_layers, g.format
+            );
+            println!("gpu_upload_ms {:.3}", ms);
+        }
+        Err(err) => println!("gpu_texture_error {err}"),
+    }
+    println!("reference");
+    println!("moisture water_m slip dryness offer_m3_s");
+    for s in reference_samples() {
         println!(
-            "{name} {:.6} {:.6}",
-            d.near_wake_bulk_kg_m3(zz),
-            d.emitted_kg
+            "{:.2} {:.3} {:.1} {:.4} {:.6}",
+            s.moisture, s.water_m, s.slip, s.dryness, s.offer_m3_s
+        );
+    }
+    println!("simulated {:.1} s, calm wind, speed 8", PROOF_SECONDS);
+    println!("case emitted_m3 dust_air_m3 dust_settled_m3");
+    for (name, m, w, slip) in [
+        ("dry_slip_1.6", 0.0_f32, 0.0_f32, 1.6_f32),
+        ("proof_pad", PROOF_MOISTURE, 0.0, PROOF_SLIP_M_S),
+        ("damp_0.30", 0.30, 0.0, 1.6),
+        ("slip_0.4", 0.0, 0.0, 0.4),
+        ("slip_3", 0.0, 0.0, 3.0),
+        ("zero_slip", 0.0, 0.0, 0.0),
+        ("wet", 0.90, 0.0, 1.6),
+        ("pond", 0.0, 0.02, 1.6),
+    ] {
+        let (d, _) = dust_trail::drive(8.0, slip, m, w, Vec3::ZERO, PROOF_SECONDS, PROOF_DT_S);
+        let books = d.ledger();
+        println!(
+            "{name} {:.6} {:.6} {:.6}",
+            books.emitted_m3, books.dust_air_m3, books.dust_settled_m3
         );
     }
 }
