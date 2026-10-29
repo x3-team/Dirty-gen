@@ -506,11 +506,11 @@ impl Particles {
         side: f32,
         ground: f32,
     ) {
-        let pos = Vec3::new(origin.x, ground + 0.30, origin.z)
-            - forward * 0.14
-            + right * side * 0.04;
-        let vel = -forward * 0.85 - right * side * 0.40 + Vec3::Y * 0.22;
-        self.spawn(pos, vel, 0.48, 0.07, KIND_SLURRY_RIBBON);
+        // On the tire line, thrown straight back down the rut.
+        let _ = (right, side);
+        let pos = Vec3::new(origin.x, ground + 0.20, origin.z) - forward * 0.16;
+        let vel = -forward * 1.35 + Vec3::Y * 0.06;
+        self.spawn(pos, vel, 0.50, 0.07, KIND_SLURRY_RIBBON);
         if let Some(p) = self.items.last_mut() {
             p.volume = 0.0024;
             p.ledger = false;
@@ -630,7 +630,7 @@ impl Particles {
             // Belly in the crater, the wet cap still above the soil.
             let belly = if p.kind == KIND_SLURRY_RIBBON && !p.ledger {
                 // Sit the curl on the track. The ledger pieces stay low.
-                0.85
+                1.25
             } else {
                 match p.kind {
                     3 => 0.12,
@@ -675,7 +675,16 @@ impl Particles {
                     let sit = h + p.size * belly;
                     p.grounded = true;
                     p.pos.y = sit;
-                    p.vel = Vec3::ZERO;
+                    if p.kind == KIND_SLURRY_RIBBON && !p.ledger {
+                        let heading = Vec3::new(p.vel.x, 0.0, p.vel.z);
+                        p.vel = if heading.length_squared() > 1.0e-6 {
+                            heading.normalize() * 0.25
+                        } else {
+                            Vec3::new(0.0, 0.0, -0.25)
+                        };
+                    } else {
+                        p.vel = Vec3::ZERO;
+                    }
                     p.spin = Vec3::ZERO;
                 }
             }

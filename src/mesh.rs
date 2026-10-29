@@ -1163,7 +1163,7 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     let length = if roll_sheet {
         (0.44 + speed * 0.022).clamp(0.48, 0.68)
     } else if shed {
-        (0.30 + speed * 0.012).clamp(0.32, 0.48)
+        (0.48 + speed * 0.02).clamp(0.52, 0.68)
     } else {
         (0.44 + speed * 0.035).clamp(0.48, 0.72)
     };
@@ -1177,7 +1177,7 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     };
     let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.022);
     let length = if shed { length } else { length.min(width * 7.2) };
-    let segs = 8usize;
+    let segs = if shed { 12usize } else { 8usize };
     let panel = if roll_sheet { PANEL_CLOD } else { 49.0 };
     let side_sweep = if roll_sheet {
         0.10
@@ -1197,42 +1197,39 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
         let taper = if shed {
-            (0.78 + 0.22 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.7, 1.0)
+            (0.82 + 0.18 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.78, 1.0)
         } else {
             (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0)
         };
-        let arc = (t * std::f32::consts::PI).sin();
-        let twist = (t - 0.5) * twist_scale;
-        let arc_scale = 0.16;
-        // A shed piece is an arc in the ground plane, narrow across, so it
-        // reads as a curl. A straight centerline was a flat slab.
-        let (side_t, up_t, hook) = if shed {
-            // An open hook, not a closed crescent. Each strip wobbles a little
-            // so the trail is not a row of identical bananas.
-            let wobble = 0.82 + 0.28 * (p.pos.x * 2.7 + p.pos.z * 1.3).sin().abs();
-            let ang = t * (1.35 + 0.40 * (p.pos.z * 1.9).cos().abs());
-            let radius = length.max(0.34) * wobble;
-            let mut outward = dir * ang.sin() - side * ang.cos();
-            if outward.length_squared() < 1.0e-6 {
-                outward = side;
-            }
-            outward = outward.normalize();
-            let hook = dir * (ang.sin() * radius)
-                + side * ((1.0 - ang.cos()) * radius)
-                + up * (t * t * 0.20);
-            (outward, Vec3::Y, hook)
+        if shed {
+            // A short strip down the rut. It twists and lifts along its
+            // length. The centerline does not bend into a crescent.
+            let roll = (t - 0.5) * 1.15;
+            let lift = (t * std::f32::consts::PI).sin();
+            let half_w = 0.058 * taper;
+            let skin = 0.012;
+            let side_t = (side * roll.cos() + up * roll.sin()).normalize();
+            let up_t = dir.cross(side_t).normalize();
+            let c = p.pos
+                + dir * (length * (t - 0.5))
+                + up * lift * 0.055
+                + side_t * lift * 0.012;
+            let w = side_t * half_w;
+            let h = up_t * skin;
+            ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
         } else {
+            let arc = (t * std::f32::consts::PI).sin();
+            let twist = (t - 0.5) * twist_scale;
             let side_t = side * twist.cos() + up * twist.sin();
             let up_t = -side * twist.sin() + up * twist.cos();
-            let hook = dir * (length * (t - 0.5))
-                + up * (arc - 0.55) * length * arc_scale
+            let c = p.pos
+                + dir * (length * (t - 0.5))
+                + up * (arc - 0.55) * length * 0.16
                 + side * (t - 0.5) * width * side_sweep;
-            (side_t, up_t, hook)
-        };
-        let c = p.pos + hook;
-        let w = side_t * width * 0.5 * taper;
-        let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
-        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+            let w = side_t * width * 0.5 * taper;
+            let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
+            ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+        }
     }
     for s in 0..segs {
         let a = ring[s];
@@ -1248,9 +1245,65 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
 }
 
+/// A short ribbon lying in a rut. Width stays put, so the plan is a strip.
+/// The edges lift in a wave that travels along the length.
+fn add_rut_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::new(0.0, 0.0, -1.0);
+    }
+    dir = dir.normalize();
+    let mut side = Vec3::new(-dir.z, 0.0, dir.x);
+    if side.length_squared() < 1.0e-6 {
+        side = Vec3::X;
+    }
+    side = side.normalize();
+    // Short strip in the rut. The centerline stays straight and the width
+    // stays constant, so the plan is not a crescent or a wedge. The curl is
+    // a wave along the length: both edges rise and fall together.
+    let length = 0.80_f32;
+    let half_w = 0.044_f32;
+    let segs = 24usize;
+    let across = 5usize;
+    let waves = 3.0_f32;
+    let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let along = (t - 0.5) * length;
+        let phase = t * std::f32::consts::PI * 2.0 * waves;
+        let arch = phase.sin() * 0.040;
+        let mut row = Vec::with_capacity(across);
+        for a in 0..across {
+            let u = a as f32 / (across - 1) as f32;
+            let from_mid = (u - 0.5).abs() * 2.0;
+            let x = (u - 0.5) * 2.0 * half_w;
+            // A shallow channel, the same at every station, so the
+            // cross-section is a curl and the outline still does not bow.
+            let channel = from_mid * from_mid * 0.016;
+            row.push(p.pos + dir * along + side * x + Vec3::Y * (0.058 + arch + channel));
+        }
+        rows.push(row);
+    }
+    let panel = 49.0;
+    for s in 0..segs {
+        for a in 0..across - 1 {
+            let a00 = rows[s][a];
+            let a10 = rows[s][a + 1];
+            let a01 = rows[s + 1][a];
+            let a11 = rows[s + 1][a + 1];
+            add_quad(mesh, [a00, a10, a11, a01], panel);
+            add_quad(mesh, [a00, a01, a11, a10], panel);
+        }
+    }
+}
+
 /// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
 /// is a ribbon rather than a box, a tablet, or a cube.
 fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    if !p.ledger {
+        add_rut_ribbon(mesh, p);
+        return;
+    }
     add_slurry_curl(mesh, p, false);
 }
 
