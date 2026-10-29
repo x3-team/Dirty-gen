@@ -290,10 +290,10 @@ impl Particles {
         }
         // Spread through the air beside the rut. Stacked stations read as one lump.
         let stations = [
-            (-1.05_f32, -0.15, 1.15),
-            (0.45, 0.65, 0.72),
-            (1.20, -0.15, 0.32),
-            (-0.25, 0.55, 0.98),
+            (-0.85_f32, -0.25, 1.38),
+            (0.50, 0.70, 0.62),
+            (1.15, -0.20, 0.26),
+            (-0.10, 0.55, 0.98),
         ];
         let n = stations.len();
         let mut carried = 0.0_f32;
@@ -324,9 +324,9 @@ impl Particles {
             return 0.0;
         }
         let stations = [
-            (0.75_f32, 0.20, 0.52),
-            (-0.90, 0.95, 1.15),
-            (-1.10, -0.45, 0.48),
+            (0.70_f32, 0.80, 1.14),
+            (-1.25, -0.20, 0.80),
+            (-0.60, 0.90, 0.44),
         ];
         let n = stations.len();
         let mut carried = 0.0_f32;

@@ -1071,9 +1071,48 @@ fn add_soil_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
+/// A fast sideways spin throws a flat ribbon. The tread peel stays curled.
+fn spin_ribbon(vel: Vec3) -> bool {
+    vel.length() > 6.0
+}
+
+/// Straight band in the sheet frame. No bow, so the silhouette is not a crescent.
+fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32, width: f32, thick: f32) {
+    let (dir, side, up) = slurry_sheet_axes(p.vel);
+    let segs = 8usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        // Tips narrow a little. The run of the strip stays full width.
+        let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
+        let taper = edge.powf(0.18).clamp(0.7, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5;
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
 /// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
 /// is a ribbon rather than a box, a tablet, or a cube.
 fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    if spin_ribbon(p.vel) {
+        // Long, narrow, and flat. The roll still must not grow another crescent.
+        add_flat_strip(mesh, p, 0.90, 0.07, 0.004);
+        return;
+    }
     let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.35, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::Z;
@@ -1144,40 +1183,9 @@ fn slurry_sheet_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
     (dir, side, up.normalize())
 }
 
-/// A roll's slurry. Wider than the spin ribbon, still pinched and thin, so it
-/// reads as a sheet and not a tablet, a sphere, or a teardrop.
+/// A roll's slurry. A flat sheet, wider than the spin ribbon, with no bow.
 fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let (dir, side, up) = slurry_sheet_axes(p.vel);
-    let length = 1.15_f32;
-    let width = 0.16_f32;
-    let thick = 0.005_f32;
-    let segs = 8usize;
-    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
-    for s in 0..=segs {
-        let t = s as f32 / segs as f32;
-        let taper = (t * (1.0 - t) * 4.0).powf(0.35).clamp(0.22, 1.0);
-        let arc = (t * std::f32::consts::PI).sin();
-        // Bow in the face, so the silhouette is a curled sheet and not a lens.
-        let c = p.pos
-            + dir * (length * (t - 0.5))
-            + side * (arc - 0.62) * 0.10
-            + up * (arc - 0.55) * 0.02;
-        let w = side * width * 0.5 * taper;
-        let h = up * thick * 0.5 * (0.5 + 0.5 * taper);
-        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
-    }
-    for s in 0..segs {
-        let a = ring[s];
-        let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
-    }
-    let a = ring[0];
-    let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+    add_flat_strip(mesh, p, 0.90, 0.22, 0.004);
 }
 
 /// A small liquid drop torn off with the ribbons. A short pinched fleck.
@@ -1244,17 +1252,22 @@ mod slurry_shapes {
 
     /// Length, width, thickness in the same frame the ribbon mesh uses.
     fn ribbon_frame(mesh: &CpuMesh, vel: Vec3) -> [f32; 3] {
-        let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
-        if dir.length_squared() < 1.0e-6 {
-            dir = Vec3::Z;
-        }
-        dir = dir.normalize();
-        let mut side = dir.cross(Vec3::Y);
-        if side.length_squared() < 1.0e-6 {
-            side = dir.cross(Vec3::X);
-        }
-        side = side.normalize();
-        let up = side.cross(dir).normalize();
+        let (dir, side, up) = if spin_ribbon(vel) {
+            slurry_sheet_axes(vel)
+        } else {
+            let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
+            if dir.length_squared() < 1.0e-6 {
+                dir = Vec3::Z;
+            }
+            dir = dir.normalize();
+            let mut side = dir.cross(Vec3::Y);
+            if side.length_squared() < 1.0e-6 {
+                side = dir.cross(Vec3::X);
+            }
+            side = side.normalize();
+            let up = side.cross(dir).normalize();
+            (dir, side, up)
+        };
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(-f32::MAX);
         for v in &mesh.vertices {
