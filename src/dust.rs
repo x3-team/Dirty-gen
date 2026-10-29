@@ -14,7 +14,10 @@
 //! `inject_dust` returns the cubic metres that entered the air, or 0 when
 //! [`dust_may_lift`] is false. Every [`SLOW_STRIDE`] frames the column falls
 //! and the bottom settles. Settled dust is not lofted. Emitted volume =
-//! airborne + settled, and dust that leaves the window is settled.
+//! airborne + settled. Dust that settles or leaves the window is stored on
+//! 0.5 m ground cells so it can sit on the wet track in the same ledger.
+
+use std::collections::HashMap;
 
 use glam::Vec3;
 
@@ -47,8 +50,10 @@ pub const AIR_DZ_M: f32 = (AIR_Z1_M - AIR_Z0_M) / AIR_RES as f32;
 pub const AIR_DY_M: f32 = (AIR_Y1_M - AIR_Y0_M) / AIR_LAYERS as f32;
 
 const CELL_VOL_M3: f32 = AIR_DX_M * AIR_DY_M * AIR_DZ_M;
-/// Cells thinner than this are settled. They are below the density texture's visible floor.
+/// Cells thinner than this stay airborne: they fold into the fullest surviving cell.
 const CELL_CULL_M3: f32 = 1.0e-8;
+/// Ground cells for dust that has left the air window, metres.
+const SETTLED_CELL_M: f32 = 0.5;
 
 const THROW_AFT_0: f32 = 0.12;
 const THROW_AFT_1: f32 = 1.85;
@@ -257,6 +262,9 @@ pub struct Dust {
     /// Inclusive x span that holds dust on each z row. Empty when lo > hi.
     row_lo: Vec<u32>,
     row_hi: Vec<u32>,
+    /// Settled dust on the ground, 0.5 m cells, world metres. Not a second sheet.
+    settled_cells: HashMap<(i32, i32), f64>,
+    exits: Vec<(f32, f32, f64)>,
 }
 
 impl Dust {
@@ -283,6 +291,8 @@ impl Dust {
             z1: 0,
             row_lo: vec![1; AIR_RES as usize],
             row_hi: vec![0; AIR_RES as usize],
+            settled_cells: HashMap::new(),
+            exits: Vec::new(),
         }
     }
 
@@ -310,6 +320,59 @@ impl Dust {
 
     pub fn dust_settled_m3(&self) -> f32 {
         self.settled as f32
+    }
+
+    /// Settled dust whose 0.5 m cell center matches `pred` (world x, world z).
+    pub fn settled_m3_where(&self, mut pred: impl FnMut(f32, f32) -> bool) -> f32 {
+        let mut sum = 0.0f64;
+        for (&(ix, iz), &volume) in &self.settled_cells {
+            let x = (ix as f32 + 0.5) * SETTLED_CELL_M;
+            let z = (iz as f32 + 0.5) * SETTLED_CELL_M;
+            if pred(x, z) {
+                sum += volume;
+            }
+        }
+        sum as f32
+    }
+
+    #[cfg(test)]
+    fn settled_map_m3(&self) -> f64 {
+        self.settled_cells.values().sum()
+    }
+
+    #[cfg(test)]
+    fn settled_centroid(&self) -> Option<(f32, f32)> {
+        let mut mass = 0.0f64;
+        let mut sx = 0.0f64;
+        let mut sz = 0.0f64;
+        for (&(ix, iz), &volume) in &self.settled_cells {
+            mass += volume;
+            sx += (ix as f64 + 0.5) * (SETTLED_CELL_M as f64) * volume;
+            sz += (iz as f64 + 0.5) * (SETTLED_CELL_M as f64) * volume;
+        }
+        if mass <= 1.0e-14 {
+            None
+        } else {
+            Some(((sx / mass) as f32, (sz / mass) as f32))
+        }
+    }
+
+    fn note_settled(&mut self, world_x: f32, world_z: f32, volume: f64) {
+        if volume <= 0.0 {
+            return;
+        }
+        let ix = (world_x / SETTLED_CELL_M).floor() as i32;
+        let iz = (world_z / SETTLED_CELL_M).floor() as i32;
+        *self.settled_cells.entry((ix, iz)).or_insert(0.0) += volume;
+    }
+
+    fn book_exits(&mut self) {
+        let n = self.exits.len();
+        for i in 0..n {
+            let (x, z, volume) = self.exits[i];
+            self.note_settled(x, z, volume);
+        }
+        self.exits.clear();
     }
 
     pub fn ledger(&self) -> DustLedger {
@@ -560,17 +623,23 @@ impl Dust {
         let cfl = span * dt / AIR_DX_M.min(AIR_DZ_M);
         let steps = (cfl / 0.70).ceil().clamp(1.0, 6.0) as u32;
         let sub = dt / steps as f32;
+        let chassis_z = self.chassis_z;
+        let forward = self.forward;
+        let right = self.right;
+        self.exits.clear();
         for _ in 0..steps {
             let (x0, x1, z0, z1, live, outflow) = advect_once(
                 &mut self.vol,
                 &mut self.next,
                 &mut self.row_lo,
                 &mut self.row_hi,
+                &mut self.exits,
                 self.z0,
                 self.z1,
-                self.forward,
-                self.right,
+                forward,
+                right,
                 rel,
+                chassis_z,
                 sub,
             );
             if live {
@@ -593,6 +662,7 @@ impl Dust {
                 self.settled += outflow;
             }
         }
+        self.book_exits();
     }
 
     /// On the slow stride, dust falls and the bottom of each column settles.
@@ -644,6 +714,10 @@ impl Dust {
                 let settled = before - after;
                 self.settled += settled;
                 self.air -= settled;
+                if settled > 0.0 {
+                    let p = cell_center(self.chassis_z, ix, 0, iz);
+                    self.note_settled(p.x, p.z, settled);
+                }
                 for iy in 0..AIR_LAYERS {
                     self.vol[at(ix, iy, iz)] = col[iy as usize];
                 }
@@ -864,11 +938,13 @@ fn advect_once(
     next: &mut [f32],
     row_lo: &mut [u32],
     row_hi: &mut [u32],
+    exits: &mut Vec<(f32, f32, f64)>,
     z0: u32,
     z1: u32,
     forward: Vec3,
     right: Vec3,
     rel: Vec3,
+    chassis_z: f32,
     dt: f32,
 ) -> (u32, u32, u32, u32, bool, f64) {
     let mut read_lo = [1u32; AIR_RES as usize];
@@ -981,12 +1057,42 @@ fn advect_once(
                 } else {
                     stay -= leave_z;
                 }
-                deposit(next, ix as i32, iy, iz as i32, stay, res, &mut outflow);
+                deposit(
+                    next,
+                    ix as i32,
+                    iy,
+                    iz as i32,
+                    stay,
+                    res,
+                    &mut outflow,
+                    exits,
+                    chassis_z,
+                );
                 if x_moves {
-                    deposit(next, nix, iy, iz as i32, leave_x, res, &mut outflow);
+                    deposit(
+                        next,
+                        nix,
+                        iy,
+                        iz as i32,
+                        leave_x,
+                        res,
+                        &mut outflow,
+                        exits,
+                        chassis_z,
+                    );
                 }
                 if z_moves {
-                    deposit(next, ix as i32, iy, niz, leave_z, res, &mut outflow);
+                    deposit(
+                        next,
+                        ix as i32,
+                        iy,
+                        niz,
+                        leave_z,
+                        res,
+                        &mut outflow,
+                        exits,
+                        chassis_z,
+                    );
                 }
             }
         }
@@ -1056,22 +1162,72 @@ fn advect_once(
         if live {
             vol[sink] += speck as f32;
         } else {
+            // Nothing in the window survived the cell floor. The scalar books
+            // this remainder as settled; park each speck on the ground cell
+            // it occupied. A live plume never takes this path.
             outflow += speck;
+            for iz in wz0..=wz1 {
+                if write_lo[iz as usize] > write_hi[iz as usize] {
+                    continue;
+                }
+                for ix in write_lo[iz as usize]..=write_hi[iz as usize] {
+                    for iy in 0..AIR_LAYERS {
+                        let v = next[at(ix, iy, iz)];
+                        if v > 0.0 && v < CELL_CULL_M3 {
+                            let (x, z) = exit_world(ix as i32, iz as i32, chassis_z);
+                            exits.push((x, z, v as f64));
+                        }
+                    }
+                }
+            }
         }
     }
     (bx0, bx1, bz0, bz1, live, outflow)
 }
 
 #[cfg(not(has_fluid_core))]
-fn deposit(next: &mut [f32], ix: i32, iy: u32, iz: i32, amount: f32, res: i32, outflow: &mut f64) {
+fn deposit(
+    next: &mut [f32],
+    ix: i32,
+    iy: u32,
+    iz: i32,
+    amount: f32,
+    res: i32,
+    outflow: &mut f64,
+    exits: &mut Vec<(f32, f32, f64)>,
+    chassis_z: f32,
+) {
     if amount == 0.0 {
         return;
     }
     if ix < 0 || iz < 0 || ix >= res || iz >= res {
-        *outflow += amount as f64;
+        let left = amount as f64;
+        *outflow += left;
+        let (x, z) = exit_world(ix, iz, chassis_z);
+        exits.push((x, z, left));
         return;
     }
     next[at(ix as u32, iy, iz as u32)] += amount;
+}
+
+/// World position just outside the air window for mass that left the domain.
+#[cfg(not(has_fluid_core))]
+fn exit_world(ix: i32, iz: i32, chassis_z: f32) -> (f32, f32) {
+    let x = if ix < 0 {
+        AIR_X0_M - 0.5 * AIR_DX_M
+    } else if ix >= AIR_RES as i32 {
+        AIR_X1_M + 0.5 * AIR_DX_M
+    } else {
+        AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M
+    };
+    let gz = if iz < 0 {
+        AIR_Z0_M - 0.5 * AIR_DZ_M
+    } else if iz >= AIR_RES as i32 {
+        AIR_Z1_M + 0.5 * AIR_DZ_M
+    } else {
+        AIR_Z0_M + (iz as f32 + 0.5) * AIR_DZ_M
+    };
+    (x, chassis_z + gz)
 }
 
 /// Chassis-relative grid offset to vehicle right / forward.
@@ -1162,6 +1318,12 @@ mod tests {
             books.emitted_m3,
             books.dust_air_m3 + books.dust_settled_m3,
             1.0e-6,
+        );
+        let map_err = (dust.settled_map_m3() - dust.settled).abs();
+        assert!(
+            map_err < 1.0e-9,
+            "settled map {map_err} scalar {}",
+            dust.settled
         );
     }
 
@@ -1374,5 +1536,122 @@ mod tests {
         assert!(err < 1.0e-5, "texture volume err {err}");
         assert!(dust.max_fraction() > 0.0);
         assert!(!tex.splats(1.0e-6).is_empty());
+    }
+
+    /// Wet track, slurry, then dry ground. Dust uses the air grid already in this crate.
+    /// Water and slurry are static pours on the same books; they are not a second sheet solver.
+    #[test]
+    fn through_drive() {
+        // Puddle x −6..6, z −24..0, 20 mm. Slurry x −2..2, z −16..−8, 40 mm.
+        let water_m3 = 12.0_f64 * 24.0 * 0.02;
+        let slurry_m3 = 4.0_f64 * 8.0 * 0.04;
+        let soil0 = 0.25_f64;
+        let mut soil = soil0;
+        let opened = water_m3 + slurry_m3 + soil0;
+
+        let mut dust = Dust::new();
+        dust.set_wind(1.5, -0.9);
+        let dt = PROOF_DT_S;
+        let speed = PROOF_SPEED_M_S;
+        let slip = PROOF_SLIP_M_S;
+        let mut chassis_z = -20.0_f32;
+        let steps = (5.0_f32 / dt).round() as i32;
+        let mut saw_dry_air = false;
+        let mut max_lateral = f32::MIN;
+        let mut crossed_slurry = false;
+
+        for _ in 0..steps {
+            let tires = tires_at(chassis_z, speed, slip);
+            let mut moisture = [0.0_f32; 4];
+            let mut water = [0.0_f32; 4];
+            let mut any_dry = false;
+            let mut any_slurry = false;
+            for (i, tire) in tires.iter().enumerate() {
+                let z = tire.contact.z;
+                if z <= 0.0 {
+                    moisture[i] = 0.70;
+                    water[i] = 0.02;
+                } else {
+                    moisture[i] = PROOF_MOISTURE;
+                    water[i] = 0.0;
+                    any_dry = true;
+                }
+                if tire.contact.x.abs() <= 2.0 && (-16.0..=-8.0).contains(&z) {
+                    any_slurry = true;
+                }
+            }
+            let before = dust.emitted;
+            dust.step_pads(&tires, &moisture, &water, dt);
+            let entered = dust.emitted - before;
+            assert!(entered >= -1.0e-12, "dust returned to the soil");
+            if !any_dry {
+                assert_eq!(entered, 0.0, "wet track lofted at chassis {chassis_z}");
+            }
+            if any_slurry {
+                crossed_slurry = true;
+                assert_eq!(entered, 0.0, "slurry lofted at chassis {chassis_z}");
+            }
+            soil -= entered;
+            assert!(soil >= -1.0e-9, "soil stock went negative");
+            let total = water_m3 + slurry_m3 + soil + dust.air + dust.settled;
+            let gap = (total - opened).abs();
+            assert!(
+                gap < 1.0e-8,
+                "shared ledger gap {gap} at chassis {chassis_z}"
+            );
+            if any_dry && dust.air > 1.0e-6 {
+                saw_dry_air = true;
+                max_lateral = max_lateral.max(dust.plume_offset().1);
+            }
+            chassis_z += speed * dt;
+        }
+
+        assert!(crossed_slurry, "the Niva never met the slurry patch");
+        assert!(
+            saw_dry_air,
+            "dry ground did not lift dust into the air grid"
+        );
+        assert!(dust.emitted > 1.0e-3, "emitted {}", dust.emitted);
+        closes(&dust);
+
+        let on_wet = dust.settled_m3_where(|_x, z| z <= 0.0);
+        assert!(
+            on_wet > 1.0e-5,
+            "settled on the wet track {on_wet} air {} settled {}",
+            dust.dust_air_m3(),
+            dust.dust_settled_m3()
+        );
+        assert!(
+            max_lateral > 0.30,
+            "wind did not carry the plume, lateral {max_lateral}"
+        );
+        let (cx, cz) = dust.settled_centroid().expect("settled film");
+        assert!(
+            cx > 0.05,
+            "settled film did not lean with the wind ({cx}, {cz})"
+        );
+
+        let emitted = dust.emitted;
+        let air = dust.air;
+        let wet_before = on_wet;
+        let back = tires_at(-5.0, 0.0, 2.0);
+        for _ in 0..(SLOW_STRIDE * 4) {
+            dust.step_pads(&back, &[0.70; 4], &[0.02; 4], dt);
+            assert_eq!(dust.emitted, emitted, "wet ground lofted");
+            assert!(dust.air <= air + 1.0e-8, "air rose on the wet track");
+        }
+        let wet_after = dust.settled_m3_where(|_x, z| z <= 0.0);
+        assert!(
+            wet_after + 1.0e-6 >= wet_before,
+            "settled dust left the wet track {wet_before} -> {wet_after}"
+        );
+        let total = water_m3 + slurry_m3 + soil + dust.air + dust.settled;
+        assert!(
+            (total - opened).abs() < 1.0e-8,
+            "ledger after the wet return {}",
+            (total - opened).abs()
+        );
+        assert!((dust.emitted - (soil0 - soil)).abs() < 1.0e-9);
+        closes(&dust);
     }
 }
