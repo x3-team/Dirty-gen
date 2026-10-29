@@ -264,6 +264,39 @@ pub fn sinkage_at_normal(
     (sink, area, buoy)
 }
 
+/// Breakaway multiplier after rocking compacts the rut. Clay keeps most of its
+/// hold; sand gives way sooner once the loose spoil is packed firm.
+pub fn stuck_compact_breakaway(kind: SurfaceKind, compact: f32) -> f32 {
+    let compact = compact.clamp(0.0, 1.0);
+    let release = match kind {
+        SurfaceKind::WetMud => 0.14,
+        SurfaceKind::Silt => 0.26,
+        SurfaceKind::Sand => 0.42,
+        _ => 0.20,
+    };
+    1.0 - release * compact
+}
+
+/// Relative rate rocking compacts loose spoil back into the rut floor.
+pub fn stuck_rock_compact_pace(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::WetMud => 1.05,
+        SurfaceKind::Silt => 1.35,
+        SurfaceKind::Sand => 1.85,
+        _ => 1.2,
+    }
+}
+
+/// Reference hold at saturation: clay hardest, sand lets go soonest.
+pub fn stuck_saturation_hold(kind: SurfaceKind) -> f32 {
+    match kind {
+        SurfaceKind::WetMud => 1.0,
+        SurfaceKind::Silt => 0.78,
+        SurfaceKind::Sand => 0.55,
+        _ => 0.70,
+    }
+}
+
 /// Sink depth, contact patch, moisture, and seal suction for one soil band.
 pub fn moisture_sinkage_row(kind: SurfaceKind, state: SurfaceMoisture) -> MoistureSinkageRow {
     let (wetness, loose, water) = moisture_state_fields(kind, state);

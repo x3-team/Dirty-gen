@@ -542,6 +542,8 @@ struct CaptureArgs {
     moisture_traction_proof: PathBuf,
     moisture_sinkage: bool,
     moisture_sinkage_proof: PathBuf,
+    stuck_recovery: bool,
+    stuck_recovery_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -662,6 +664,10 @@ fn capture(args: &[String]) {
     }
     if parsed.moisture_sinkage {
         capture_moisture_sinkage(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.stuck_recovery {
+        capture_stuck_recovery(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -873,6 +879,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut moisture_sinkage = false;
     let mut moisture_sinkage_proof =
         PathBuf::from(format!("{MEDIA}/moisture-sinkage-proof.png"));
+    let mut stuck_recovery = false;
+    let mut stuck_recovery_proof =
+        PathBuf::from(format!("{MEDIA}/stuck-recovery-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -999,6 +1008,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     moisture_sinkage_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--stuck-recovery-proof" => {
+                stuck_recovery = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    stuck_recovery_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1104,6 +1119,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         moisture_traction_proof,
         moisture_sinkage,
         moisture_sinkage_proof,
+        stuck_recovery,
+        stuck_recovery_proof,
     }
 }
 
@@ -2292,6 +2309,112 @@ fn moisture_pad_camera(world: &World, ortho: f32) -> CameraPose {
 #[cfg(not(target_arch = "wasm32"))]
 fn moisture_sinkage_camera(world: &World) -> CameraPose {
     moisture_pad_camera(world, 6.8)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_stuck_recovery(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.stuck_recovery_in_saturated_clay();
+    silence_chunks(&mut world);
+
+    println!(
+        "stuck-recovery rut {:.4}->{:.4}->{:.4}->{:.4} m  belly {:.4}->{:.4} m  drag {:.0} n",
+        out.rut_before,
+        out.rut_after_spin,
+        out.rut_after_rock,
+        out.rut_after_exit,
+        out.belly_before,
+        out.belly_spin,
+        out.belly_drag_before
+    );
+    println!(
+        "stuck-recovery grip {:.0}->{:.0} n  spd {:.3}->{:.3}->{:.3} m/s  \
+         hold clay {:.2} silt {:.2} sand {:.2}",
+        out.grip_before,
+        out.grip_after_rock,
+        out.speed_before,
+        out.speed_after_rock,
+        out.speed_after_exit,
+        out.hold_clay,
+        out.hold_silt,
+        out.hold_sand
+    );
+    println!(
+        "stuck-recovery cut {:.4} plcd {:.4} air {:.4} loose {:.4} pack {:.4} void {:.4} sum {:.4} m3",
+        out.cut,
+        out.placed,
+        out.airborne,
+        out.loose_rut,
+        out.packed,
+        out.rut_void,
+        out.sum
+    );
+
+    let lines = [
+        format!(
+            "rut {:.4} {:.4} {:.4} m bef spin rock",
+            out.rut_before, out.rut_after_spin, out.rut_after_rock
+        ),
+        format!(
+            "belly {:.4} m drag {:.0} n stuck",
+            out.belly_before, out.belly_drag_before
+        ),
+        format!(
+            "grip {:.0} to {:.0} n bef rock",
+            out.grip_before, out.grip_after_rock
+        ),
+        format!(
+            "spd {:.3} to {:.3} to {:.3} m/s",
+            out.speed_before, out.speed_after_rock, out.speed_after_exit
+        ),
+        format!(
+            "hold clay {:.2} silt {:.2} sand {:.2}",
+            out.hold_clay, out.hold_silt, out.hold_sand
+        ),
+        format!(
+            "cut {:.4} plcd {:.4} air {:.4} loose {:.4}",
+            out.cut, out.placed, out.airborne, out.loose_rut
+        ),
+        format!(
+            "pack {:.4} void {:.4} sum {:.4} m3",
+            out.packed, out.rut_void, out.sum
+        ),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = stuck_recovery_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.stuck_recovery_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.stuck_recovery_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("stuck recovery still");
+    println!(
+        "cc0 stuck-recovery {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.stuck_recovery_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stuck_recovery_camera(world: &World) -> CameraPose {
+    moisture_pad_camera(world, 5.2)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4044,7 +4167,7 @@ fn capture_cc0(renderer: &mut Renderer, parsed: &CaptureArgs) {
 /// readable on the mud without a shader change.
 #[cfg(not(target_arch = "wasm32"))]
 fn stamp_proof_lines(rgba: &mut [u8], width: u32, height: u32, lines: &[&str]) {
-    let scale = 3u32;
+    let scale = 2u32;
     let gap = scale;
     let cw = 5 * scale + gap;
     let ch = 7 * scale + gap * 2;
@@ -4140,6 +4263,12 @@ fn glyph_rows(ch: char) -> Option<[u8; 7]> {
         'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
         'k' => [0b00000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10100, 0b10010],
         'y' => [0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        'f' => [0b00000, 0b00000, 0b01111, 0b10000, 0b11110, 0b10000, 0b10000],
+        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+        '>' => [0b00000, 0b10000, 0b01000, 0b00100, 0b01000, 0b10000, 0b00000],
+        '/' => [0b00000, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         _ => return None,
     };
     Some(rows)

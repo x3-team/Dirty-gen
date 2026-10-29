@@ -1321,6 +1321,17 @@ impl SoilField {
         self.height[idx] = self.bed[idx] + self.placed[idx] + self.slurry[idx];
     }
 
+    /// Put bed, placed, and loose back and rebuild height. For proof stills after
+    /// a later drive phase that should not change the frame geometry.
+    pub fn restore_bed_layers(&mut self, bed: Vec<f32>, placed: Vec<f32>, loose: Vec<f32>) {
+        self.bed = bed;
+        self.placed = placed;
+        self.loose = loose;
+        for idx in 0..self.bed.len() {
+            self.sync(idx);
+        }
+    }
+
     /// Remove `drop` metres. Placed spoil comes off before the bed is cut.
     /// The returned thickness is volume that has to be put down somewhere else.
     fn excavate(&mut self, idx: usize, drop: f32) -> f32 {
@@ -1846,6 +1857,157 @@ impl SoilField {
             self.roughness[idx] = lerp(self.roughness[idx], 0.86, 0.3);
         }
         self.sync(idx);
+    }
+
+    /// Rocking forward and back packs loose spoil into the rut floor. Volume
+    /// stays on the heightfield: loose drops and the bed rises in place.
+    pub fn compact_rut_under_patch(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        radius: f32,
+        width: f32,
+        pace: f32,
+        dt: f32,
+    ) {
+        if pace <= 0.0 || dt <= 0.0 {
+            return;
+        }
+        let half_l = radius.max(0.05) * 0.95;
+        let half_w = (width.max(0.02) * 0.5).max(self.cell * 0.45);
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let fwd = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let rgt = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+        if fwd.length_squared() < 1.0e-6 {
+            return;
+        }
+        let i0 = (((center.x - half_l - half) / self.cell).floor() as isize).clamp(0, self.res as isize - 1);
+        let i1 = (((center.x + half_l - half) / self.cell).ceil() as isize).clamp(0, self.res as isize - 1);
+        let j0 = (((center.z - half_l - half) / self.cell).floor() as isize).clamp(0, self.res as isize - 1);
+        let j1 = (((center.z + half_l - half) / self.cell).ceil() as isize).clamp(0, self.res as isize - 1);
+        let blend_cap = if pace > 2.0 { 0.58 } else { 0.35 };
+        let blend = (1.0 - (-pace * dt).exp()).min(blend_cap);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                let lx = (x - center.x) * rgt.x + (z - center.z) * rgt.z;
+                let lz = (x - center.x) * fwd.x + (z - center.z) * fwd.z;
+                if lx.abs() > half_w || lz.abs() > half_l {
+                    continue;
+                }
+                let along = (1.0 - (lz.abs() / half_l).powi(2)).max(0.0);
+                let across = (1.0 - (lx.abs() / half_w).powi(2)).max(0.0);
+                let w = along * across;
+                if w < 0.08 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let loose = self.loose[idx];
+                if loose < 1.0e-4 {
+                    continue;
+                }
+                let pack = loose * blend * w;
+                self.loose[idx] = (loose - pack).max(0.0);
+                self.bed[idx] += pack;
+                self.height[idx] += pack;
+                let wet = self.wetness[idx];
+                self.darken[idx] =
+                    (self.darken[idx] + 18.0 * w * dt * (0.40 + wet)).min(1.0);
+                self.roughness[idx] = lerp(self.roughness[idx], 0.22, 0.08 * w * blend);
+                let _ = area;
+                self.sync(idx);
+            }
+        }
+    }
+
+    /// Pack loose smear from the lane into the deepest rut floor (m³ budget).
+    pub fn pack_loose_in_region(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        mut budget_m3: f32,
+    ) -> f32 {
+        if budget_m3 <= 1.0e-8 {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let half = self.size * 0.5;
+        let mut loose_cells: Vec<(usize, f32)> = Vec::new();
+        let mut deep_cells: Vec<(usize, f32)> = Vec::new();
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                if depth >= 0.012 {
+                    deep_cells.push((idx, depth));
+                }
+                let loose = self.loose[idx];
+                if loose >= 1.0e-5 {
+                    loose_cells.push((idx, loose));
+                }
+            }
+        }
+        if loose_cells.is_empty() || deep_cells.is_empty() {
+            return 0.0;
+        }
+        deep_cells.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        loose_cells.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut loose_i = 0usize;
+        let mut packed = 0.0_f32;
+        for (floor_idx, _) in deep_cells {
+            if budget_m3 <= 1.0e-8 || loose_i >= loose_cells.len() {
+                break;
+            }
+            let mut lift = (budget_m3 / area).min(0.06);
+            if lift < 1.0e-6 {
+                break;
+            }
+            let mut gathered = 0.0_f32;
+            while gathered < lift && loose_i < loose_cells.len() {
+                let src = loose_cells[loose_i].0;
+                let avail = self.loose[src];
+                let need = lift - gathered;
+                let take = avail.min(need);
+                if take < 1.0e-6 {
+                    loose_i += 1;
+                    continue;
+                }
+                self.loose[src] = avail - take;
+                gathered += take;
+                if self.loose[src] < 1.0e-5 {
+                    loose_i += 1;
+                }
+            }
+            if gathered < 1.0e-6 {
+                continue;
+            }
+            self.bed[floor_idx] += gathered;
+            self.height[floor_idx] += gathered;
+            let wet = self.wetness[floor_idx];
+            self.darken[floor_idx] = (self.darken[floor_idx] + 0.14 * (0.40 + wet)).min(1.0);
+            self.roughness[floor_idx] = lerp(self.roughness[floor_idx], 0.22, 0.32);
+            self.sync(floor_idx);
+            let vol = gathered * area;
+            packed += vol;
+            budget_m3 -= vol;
+        }
+        packed
     }
 
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {
@@ -3032,6 +3194,11 @@ impl SoilField {
     /// Cubic metres of placed soil whose cell centers lie in the rectangle.
     pub fn placed_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
         self.column_volume_in(x0, x1, z0, z1, &self.placed)
+    }
+
+    /// Cubic metres of loose smear in the rectangle (depth × cell area).
+    pub fn loose_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        self.column_volume_in(x0, x1, z0, z1, &self.loose)
     }
 
     /// World XZ of the wet berm centroid in a rectangle, for parking load on it.

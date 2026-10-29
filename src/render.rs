@@ -122,6 +122,8 @@ pub struct Renderer {
     /// Midday sun and sky. The window keeps the low sun unless a still asks.
     pub daylight: bool,
     pub show_props: bool,
+    /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
+    pub show_environment: bool,
     pub show_bike: bool,
     /// Draw the fitted Lada Niva instead of the dune buggy mesh.
     pub niva_picture: bool,
@@ -983,6 +985,7 @@ impl Renderer {
             depth_format: formats.depth,
             daylight: false,
             show_props: true,
+            show_environment: true,
             show_bike: true,
             niva_picture: false,
             niva_body,
@@ -1187,7 +1190,9 @@ impl Renderer {
             draw_indexed(&mut pass, &self.terrain);
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
-            draw_indexed(&mut pass, &self.env);
+            if self.show_environment {
+                draw_indexed(&mut pass, &self.env);
+            }
             if self.show_props {
                 draw_indexed(&mut pass, &self.props);
             }
@@ -1196,7 +1201,9 @@ impl Renderer {
                 self.draw_bike(&mut pass, bike_susp_count);
             }
             pass.set_pipeline(&self.pipe_shadow_mesh);
-            self.draw_chunks(&mut pass, chunk_count);
+            if chunk_count > 0 {
+                self.draw_chunks(&mut pass, chunk_count);
+            }
         }
 
         {
@@ -1232,7 +1239,9 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
-            draw_indexed(&mut pass, &self.env);
+            if self.show_environment {
+                draw_indexed(&mut pass, &self.env);
+            }
             self.draw_vehicle(&mut pass);
             if self.show_bike {
                 self.draw_bike(&mut pass, bike_susp_count);
@@ -1250,7 +1259,9 @@ impl Renderer {
 
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
-            self.draw_chunks(&mut pass, chunk_count);
+            if chunk_count > 0 {
+                self.draw_chunks(&mut pass, chunk_count);
+            }
 
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
