@@ -18,6 +18,8 @@ const TEX: u32 = 4096;
 pub struct NivaScene {
     pub body: CpuMesh,
     pub glass: CpuMesh,
+    /// Exhaust. Kept off the ford-exit still: it reads as a pipe under the belly.
+    pub exhaust: CpuMesh,
     pub wheels: [CpuMesh; 4],
     pub base: Vec<RgbaTex>,
     pub nor: Vec<RgbaTex>,
@@ -30,6 +32,7 @@ pub fn load() -> NivaScene {
     let decoded = decompress(&doc, bin);
     let mut body = CpuMesh::new();
     let mut glass = CpuMesh::new();
+    let mut exhaust = CpuMesh::new();
     let mut raw_wheels: Vec<(Vec3, CpuMesh)> = Vec::new();
     let scene = doc
         .default_scene()
@@ -43,6 +46,7 @@ pub fn load() -> NivaScene {
             &decoded,
             &mut body,
             &mut glass,
+            &mut exhaust,
             &mut raw_wheels,
         );
     }
@@ -50,6 +54,7 @@ pub fn load() -> NivaScene {
         .vertices
         .iter()
         .chain(glass.vertices.iter())
+        .chain(exhaust.vertices.iter())
         .map(|v| Vec3::from(v.pos).abs().max_element())
         .fold(0.0_f32, f32::max);
     for (_, mesh) in &raw_wheels {
@@ -61,11 +66,12 @@ pub fn load() -> NivaScene {
     let unit = if cloud > 30.0 { 0.01 } else { 1.0 };
     scale_mesh(&mut body, unit);
     scale_mesh(&mut glass, unit);
+    scale_mesh(&mut exhaust, unit);
     for (hub, mesh) in &mut raw_wheels {
         *hub *= unit;
         scale_mesh(mesh, unit);
     }
-    let wheels = fit_to_hardpoints(&mut body, &mut glass, raw_wheels);
+    let wheels = fit_to_hardpoints(&mut body, &mut glass, &mut exhaust, raw_wheels);
     let (base, nor, mr) = textures(&doc, bin);
     let (bmin, bmax) = mesh_bounds(&body);
     let ext = bmax - bmin;
@@ -84,6 +90,7 @@ pub fn load() -> NivaScene {
     NivaScene {
         body,
         glass,
+        exhaust,
         wheels,
         base,
         nor,
@@ -98,6 +105,7 @@ fn walk(
     decoded: &[u8],
     body: &mut CpuMesh,
     glass: &mut CpuMesh,
+    exhaust: &mut CpuMesh,
     wheels: &mut Vec<(Vec3, CpuMesh)>,
 ) {
     let world = parent * local_matrix(node);
@@ -108,6 +116,24 @@ fn walk(
         if name.starts_with("wheel_low") {
             let hub = world.transform_point3(Vec3::ZERO);
             wheels.push((hub, cpu));
+        } else if name.contains("exhaust")
+            || name.contains("driveshaft")
+            || name.contains("framerail")
+            || name.contains("undercarriage")
+            || name.contains("skidplate")
+            || name.contains("fueltank")
+            || name.contains("axel")
+            || name.contains("transfercase")
+            || name.contains("transmission")
+            || name.contains("upperarm")
+            || name.contains("lowerarm")
+            || name.contains("knucle")
+            || name.contains("spring")
+            || name.contains("shock")
+            || name.contains("brace")
+        {
+            // Pipes, axles, and the belly tray. The ford still does not draw them.
+            exhaust.append(&mut cpu);
         } else {
             let glass_only = mesh
                 .primitives()
@@ -124,7 +150,7 @@ fn walk(
         }
     }
     for child in node.children() {
-        walk(&child, world, bin, decoded, body, glass, wheels);
+        walk(&child, world, bin, decoded, body, glass, exhaust, wheels);
     }
 }
 
@@ -155,6 +181,7 @@ fn split_glass(src: &mut CpuMesh, body: &mut CpuMesh, glass: &mut CpuMesh) {
 fn fit_to_hardpoints(
     body: &mut CpuMesh,
     glass: &mut CpuMesh,
+    exhaust: &mut CpuMesh,
     raw: Vec<(Vec3, CpuMesh)>,
 ) -> [CpuMesh; 4] {
     assert!(raw.len() >= 4, "niva wheels {}", raw.len());
@@ -205,6 +232,7 @@ fn fit_to_hardpoints(
     };
     apply(body, map_p, map_n);
     apply(glass, map_p, map_n);
+    apply(exhaust, map_p, map_n);
     let mut out: [Option<CpuMesh>; 4] = [None, None, None, None];
     for (i, (hub, mut mesh)) in raw.into_iter().enumerate() {
         let _ = &mut hubs;

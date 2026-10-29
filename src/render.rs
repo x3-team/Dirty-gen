@@ -129,8 +129,11 @@ pub struct Renderer {
     pub niva_picture: bool,
     /// Draw the solved water column, including a bow above the film range.
     pub water_column: bool,
+    /// The Niva exhaust. Off for the ford exit, where it hangs under the belly as a pipe.
+    pub show_niva_exhaust: bool,
     niva_body: GpuMesh,
     niva_glass: GpuMesh,
+    niva_exhaust: GpuMesh,
     niva_wheels: [GpuMesh; 4],
 }
 
@@ -887,6 +890,7 @@ impl Renderer {
         let props = upload_cpu(&device, &cc0.props, "props");
         let niva_body = upload_cpu(&device, &niva.body, "niva-body");
         let niva_glass = upload_cpu(&device, &niva.glass, "niva-glass");
+        let niva_exhaust = upload_cpu(&device, &niva.exhaust, "niva-exhaust");
         let niva_wheels = [
             upload_cpu(&device, &niva.wheels[0], "niva-fl"),
             upload_cpu(&device, &niva.wheels[1], "niva-fr"),
@@ -991,8 +995,10 @@ impl Renderer {
             show_bike: true,
             niva_picture: false,
             water_column: false,
+            show_niva_exhaust: true,
             niva_body,
             niva_glass,
+            niva_exhaust,
             niva_wheels,
         }
     }
@@ -1502,6 +1508,9 @@ impl Renderer {
         };
         pass.set_bind_group(2, &self.model_bg, &[0]);
         draw_indexed(pass, body);
+        if self.niva_picture && self.show_niva_exhaust && self.niva_exhaust.count > 0 {
+            draw_indexed(pass, &self.niva_exhaust);
+        }
         for i in 0..4 {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * (i as u32 + 1)]);
             draw_indexed(pass, &wheels[i]);

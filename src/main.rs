@@ -546,6 +546,8 @@ struct CaptureArgs {
     stuck_recovery_proof: PathBuf,
     water_crossing: bool,
     water_crossing_proof: PathBuf,
+    ford_exit: bool,
+    ford_exit_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -674,6 +676,10 @@ fn capture(args: &[String]) {
     }
     if parsed.water_crossing {
         capture_water_crossing(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.ford_exit {
+        capture_ford_exit(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -891,6 +897,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut water_crossing = false;
     let mut water_crossing_proof =
         PathBuf::from(format!("{MEDIA}/water-crossing-proof.png"));
+    let mut ford_exit = false;
+    let mut ford_exit_proof = PathBuf::from(format!("{MEDIA}/ford-exit-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1029,6 +1037,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     water_crossing_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--ford-exit-proof" => {
+                ford_exit = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    ford_exit_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1138,6 +1152,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         stuck_recovery_proof,
         water_crossing,
         water_crossing_proof,
+        ford_exit,
+        ford_exit_proof,
     }
 }
 
@@ -2496,6 +2512,356 @@ fn capture_water_crossing(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose.target.y,
         pose.target.z
     );
+}
+
+/// Render-only. The wake is already printed. Nose up on a ground slope,
+/// the sheet stays off, and the films hang off the arches and the rear tread.
+#[cfg(not(target_arch = "wasm32"))]
+fn sculpt_ford_exit_still(world: &mut World) {
+    use silt::particles::{KIND_WATER_DRAIN, KIND_WATER_SPRAY};
+    use silt::soil::SurfaceKind;
+    use silt::vehicle::{WHEEL_RADIUS, WHEEL_WIDTH};
+
+    let soil = &mut world.soil;
+    for idx in 0..soil.water.len() {
+        soil.bed[idx] += soil.slurry[idx];
+        soil.slurry[idx] = 0.0;
+        soil.water[idx] = 0.0;
+    }
+    soil.rebuild_height();
+
+    // Pitch does not move the camera. The nose stays above the tail so the
+    // chassis follows the climb from the ford up onto the bank.
+    world.vehicle.pitch = 0.34;
+    let front_higher = {
+        let ori = world.vehicle.orientation();
+        let y = |i: usize| {
+            (world.vehicle.pos + ori * world.vehicle.wheel_center_local(i)).y
+        };
+        y(0) + y(1) > y(2) + y(3)
+    };
+    if !front_higher {
+        world.vehicle.pitch = -0.34;
+    }
+
+    let ori = world.vehicle.orientation();
+    let mut hubs = [Vec3::ZERO; 4];
+    let mut planted = [0.0_f32; 4];
+    for i in 0..4 {
+        hubs[i] = world.vehicle.pos + ori * world.vehicle.wheel_center_local(i);
+        planted[i] = hubs[i].y - WHEEL_RADIUS + 0.02;
+    }
+    let rear_z = hubs[2].z.min(hubs[3].z);
+    let front_z = hubs[0].z.max(hubs[1].z);
+    let h_rear = (planted[2] + planted[3]) * 0.5;
+    let h_front = (planted[0] + planted[1]) * 0.5;
+    let solved = soil.height.clone();
+    let res = soil.res;
+    let half = soil.size * 0.5;
+    let cell = soil.cell;
+    let smooth = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    // Level ford behind the rear tires, level bank ahead of the front tires,
+    // and one smooth climb between them. The ends are flat, so the join is
+    // a grade instead of a sheet edge on a plane.
+    let climb_of = |z: f32| smooth(rear_z, front_z, z);
+
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let idx = j * res + i;
+            let h0 = solved[idx];
+            let climb = climb_of(z);
+            // One grade along the crossing. A side drop reads as a second cut.
+            let mut target = h_rear + (h_front - h_rear) * climb;
+            let fade_x = smooth(-4.8, -3.6, x) * (1.0 - smooth(3.2, 4.2, x));
+            let fade_z = smooth(-2.6, -1.2, z) * (1.0 - smooth(5.4, 6.6, z));
+            let mut weight = fade_x * fade_z;
+            target = h0 + (target - h0) * weight;
+            for k in 0..4 {
+                let d = (x - hubs[k].x).hypot(z - hubs[k].z);
+                let seat = 1.0 - smooth(0.22, 0.40, d);
+                if seat > 0.0 {
+                    target = target * (1.0 - seat) + planted[k] * seat;
+                    weight = weight.max(seat);
+                }
+            }
+            let delta = h0 - target;
+            if delta > 1.0e-4 {
+                let from_placed = delta.min(soil.placed[idx].max(0.0));
+                soil.placed[idx] -= from_placed;
+                soil.bed[idx] -= delta - from_placed;
+            } else if delta < -1.0e-4 {
+                soil.bed[idx] -= delta;
+            }
+
+            // Wet track on the bank ahead of the front tires. The open
+            // ground in this camera is outboard of the left tire. No dig.
+            for &wi in &[0usize, 1] {
+                let hub = hubs[wi];
+                let ahead = z - hub.z;
+                let dx = x - hub.x;
+                if !(-0.05..1.85).contains(&ahead) {
+                    continue;
+                }
+                let along = smooth(-0.02, 0.12, ahead) * (1.0 - smooth(1.45, 2.15, ahead));
+                let outward = if hub.x < 0.0 { -dx } else { dx };
+                let across = if outward >= 0.0 {
+                    1.0 - smooth(0.02, 1.35, outward)
+                } else {
+                    1.0 - smooth(0.02, 0.32, -outward)
+                };
+                let mask = along * across;
+                if mask < 0.04 {
+                    continue;
+                }
+                soil.wetness[idx] = 1.0;
+                if mask > 0.10 {
+                    soil.kind[idx] = SurfaceKind::Silt as u8;
+                } else if mask > 0.05 {
+                    soil.kind[idx] = SurfaceKind::FreshCut as u8;
+                }
+            }
+        }
+    }
+
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    for &wi in &[0usize, 1] {
+        let hub = hubs[wi];
+        let out = if hub.x < 0.0 { -1.0 } else { 1.0 };
+        for s in 0..16 {
+            let ahead = 0.04 + s as f32 * 0.11;
+            for side in [0.05_f32, 0.22, 0.40, 0.60, 0.82, 1.05] {
+                let center = hub + fwd * ahead + right * (out * side) + Vec3::Y * 0.2;
+                world
+                    .soil
+                    .imprint_tread(center, fwd, right, WHEEL_RADIUS, WHEEL_WIDTH, 0.055);
+            }
+        }
+    }
+    world.soil.rebuild_height();
+    // The bank is above the field the stamp was measured from, so the
+    // tread displacement was skipped. Match the baseline on the print
+    // ahead of the front tires and the lugs draw. After the ledger.
+    for idx in 0..world.soil.tread_amp.len() {
+        if world.soil.tread_amp[idx] < 0.02 {
+            continue;
+        }
+        let j = idx / res;
+        let z = (j as f32 + 0.5) * cell - half;
+        if z > front_z - 0.1 {
+            world.soil.initial_height[idx] = world.soil.height[idx];
+        }
+    }
+
+    // Standing water in the low ford. The column rides the solved bed, so
+    // the surface climbs the slope and thins out before the front tires.
+    // A constant world height was the flat card. Deep enough that the pool
+    // crosses the rear rims. After the ledger print.
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let idx = j * res + i;
+            let climb = climb_of(z);
+            let side = smooth(-3.8, -2.4, x) * (1.0 - smooth(2.2, 3.4, x));
+            let shore = 0.58
+                + (x * 1.15).sin() * 0.07
+                + (x * 0.37 + 0.6).sin() * 0.05;
+            let up = smooth(-0.02, shore, climb);
+            let column = 0.32 * (1.0 - up) * side;
+            // Below ~0.05 the packed column leaves the free surface and the
+            // old sheet path draws a card.
+            world.soil.water[idx] = if column >= 0.05 { column } else { 0.0 };
+            if column >= 0.05 {
+                world.soil.kind[idx] = SurfaceKind::WetMud as u8;
+                world.soil.wetness[idx] = world.soil.wetness[idx].max(0.95);
+            }
+        }
+    }
+
+    // Films were spawned on the unpitched pose. Drain falls out of the
+    // rear arch into the pool. Spray leaves the rear tread. Volumes stay.
+    let mut drain_i = Vec::new();
+    let mut spray_i = Vec::new();
+    for (i, p) in world.particles.items.iter().enumerate() {
+        if !p.alive {
+            continue;
+        }
+        if p.kind == KIND_WATER_DRAIN {
+            drain_i.push(i);
+        } else if p.kind == KIND_WATER_SPRAY {
+            spray_i.push(i);
+        }
+    }
+    // Same short ribbons as the tread spray, from the rear arch lip down
+    // into the pool. A raised column here stood up as a wedge on the tire.
+    let drains = [
+        (
+            Vec3::new(-1.08, 0.29, 1.03),
+            Vec3::new(-0.16, -0.94, -0.28),
+        ),
+        (
+            Vec3::new(-1.08, 0.10, 0.98),
+            Vec3::new(-0.14, -0.93, -0.32),
+        ),
+        (
+            Vec3::new(-1.08, -0.07, 0.92),
+            Vec3::new(-0.12, -0.92, -0.36),
+        ),
+        (
+            Vec3::new(-1.08, -0.18, 0.88),
+            Vec3::new(-0.10, -0.90, -0.40),
+        ),
+    ];
+    // In the air just behind the rear tread. Not on the bumper.
+    let sprays = [
+        (
+            Vec3::new(-1.02, 0.16, 0.98),
+            Vec3::new(-0.12, 0.55, -0.90),
+        ),
+        (
+            Vec3::new(-0.97, 0.06, 0.94),
+            Vec3::new(-0.08, 0.42, -0.88),
+        ),
+        (
+            Vec3::new(-1.05, 0.12, 0.90),
+            Vec3::new(-0.16, 0.62, -0.74),
+        ),
+        (
+            Vec3::new(-0.99, 0.02, 1.00),
+            Vec3::new(-0.10, 0.36, -0.95),
+        ),
+    ];
+    for (n, pi) in drain_i.iter().enumerate() {
+        let (pos, vel) = drains[n % drains.len()];
+        let p = &mut world.particles.items[*pi];
+        p.pos = pos;
+        p.vel = vel;
+    }
+    for (n, pi) in spray_i.iter().enumerate() {
+        let (pos, vel) = sprays[n % sprays.len()];
+        let p = &mut world.particles.items[*pi];
+        p.pos = pos;
+        p.vel = vel;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_ford_exit(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = true;
+    // The exhaust is a brown pipe under the belly. This still does not draw it.
+    renderer.show_niva_exhaust = false;
+
+    let mut world = World::wet_clay();
+    let out = world.exit_ford();
+    println!(
+        "ford-exit drain {:.4} air {:.4} spray {:.4} air {:.4} moist {:.3}->{:.3} \
+         mu {:.3}->{:.3} sink {:.4}->{:.4}",
+        out.drain,
+        out.drain_air,
+        out.spray,
+        out.spray_air,
+        out.moisture_before,
+        out.bank_moisture,
+        out.mu_before,
+        out.mu_after,
+        out.sink_before,
+        out.sink_after
+    );
+    println!(
+        "ford-exit soaked {:.4} film {:.4} water {:.4} sum {:.4} soil {:.4} sum {:.4} \
+         cut {:.4} placed {:.4} cloud {:.4} pool {:.4} body {:.4} arch {:.4} tires {:.4}",
+        out.soaked,
+        out.film,
+        out.water0,
+        out.water_sum,
+        out.soil0,
+        out.soil,
+        out.cut,
+        out.placed,
+        out.cloud,
+        out.pool,
+        out.body,
+        out.arches,
+        out.tires
+    );
+    println!(
+        "ford-exit soak clay {:.4} silt {:.4} sand {:.4} hold {:.3} {:.3} {:.3} \
+         sink {:.4} {:.4} {:.4} mu {:.3} {:.3} {:.3} film {:.4} {:.4} {:.4}",
+        out.soak_clay,
+        out.soak_silt,
+        out.soak_sand,
+        out.hold_clay,
+        out.hold_silt,
+        out.hold_sand,
+        out.sink_clay,
+        out.sink_silt,
+        out.sink_sand,
+        out.mu_clay,
+        out.mu_silt,
+        out.mu_sand,
+        out.film_clay,
+        out.film_silt,
+        out.film_sand
+    );
+    // The cover around a live tire is a flat rectangle, and its edge lights up
+    // as a ribbed lip. The still is already solved; dropping the contact flag
+    // only changes that paint.
+    for wheel in &mut world.vehicle.wheels {
+        wheel.normal = 0.0;
+    }
+    // The ledger already counted the film. The still draws the bank as
+    // ground: the sheet's discard was a straight cut where the ford met
+    // the flat plane.
+    sculpt_ford_exit_still(&mut world);
+    let pose = ford_exit_camera(&world);
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    if let Some(parent) = parsed.ford_exit_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.ford_exit_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("ford exit still");
+    println!(
+        "cc0 ford-exit {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.ford_exit_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ford_exit_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Side-rear, looking down. The ford is the dark surface under the rear
+    // tires. The bank is the ground under the front tires.
+    let look = vehicle.pos + fwd * 0.05 + Vec3::Y * 0.16;
+    let eye = vehicle.pos - right * 3.45 - fwd * 1.7 + Vec3::Y * 1.72;
+    CameraPose {
+        eye,
+        target: look,
+        ortho_width: Some(5.4),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

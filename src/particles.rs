@@ -13,6 +13,10 @@ pub const KIND_SLURRY_RIBBON: u8 = 5;
 pub const KIND_SLURRY_DROP: u8 = 6;
 /// A wider sheet from a roll in slurry. Still a ribbon, not a tablet.
 pub const KIND_SLURRY_SHEET: u8 = 7;
+/// Water leaving the body or a wheel arch. A flat film, not a drip.
+pub const KIND_WATER_DRAIN: u8 = 8;
+/// Water thrown off a wet tread. A flat sheet, not a spray of drops.
+pub const KIND_WATER_SPRAY: u8 = 9;
 
 /// Volume accepted into ribbon pieces and drop pieces.
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,6 +55,8 @@ pub struct Particle {
     pub ledger: bool,
     /// Landing puts the volume back into the slurry rut, not on the shoulder.
     pub returns_to_rut: bool,
+    /// The volume is water. Landing returns it to the free film, not the bed.
+    pub water: bool,
 }
 
 impl Default for Particle {
@@ -71,6 +77,7 @@ impl Default for Particle {
             volume: 0.0,
             ledger: false,
             returns_to_rut: false,
+            water: false,
         }
     }
 }
@@ -136,6 +143,7 @@ impl Particles {
             volume: 0.0,
             ledger: false,
             returns_to_rut: false,
+            water: false,
         };
         let _ = self.insert(piece);
     }
@@ -177,6 +185,7 @@ impl Particles {
             volume,
             ledger: true,
             returns_to_rut: false,
+            water: false,
         };
         if self.insert(piece) {
             volume
@@ -419,6 +428,40 @@ impl Particles {
             volume,
             ledger: true,
             returns_to_rut,
+            water: false,
+        };
+        if self.insert(piece) {
+            volume
+        } else {
+            0.0
+        }
+    }
+
+    /// One flat water film. `kind` is drain or tread spray. The volume stays
+    /// on the piece until it lands back in the free film.
+    pub fn spawn_water_sheet(&mut self, pos: Vec3, vel: Vec3, volume: f32, kind: u8) -> f32 {
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return 0.0;
+        }
+        let seed = self.rng;
+        let _ = self.rnd();
+        let piece = Particle {
+            pos,
+            vel,
+            life: 4.0,
+            max_life: 4.0,
+            size: 0.08,
+            kind,
+            alive: true,
+            seed,
+            spin: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            grounded: false,
+            deposited: false,
+            volume,
+            ledger: true,
+            returns_to_rut: false,
+            water: true,
         };
         if self.insert(piece) {
             volume
@@ -544,7 +587,14 @@ impl Particles {
             p.life -= dt;
             if p.life <= 0.0 {
                 if p.ledger && p.volume > 1.0e-8 {
-                    if let Some(rest) = deposit_ledger(soil, p) {
+                    if p.water {
+                        let left = soil.pour_film_at(p.pos.x, p.pos.z, p.volume, 0.10);
+                        p.volume = left;
+                        if left > 1.0e-8 {
+                            p.life = 0.05;
+                            continue;
+                        }
+                    } else if let Some(rest) = deposit_ledger(soil, p) {
                         p.pos = rest + Vec3::Y * p.size * 0.22;
                         p.volume = 0.0;
                     }
@@ -579,7 +629,14 @@ impl Particles {
             let sit = h + p.size * belly;
             if p.pos.y <= sit {
                 if !p.deposited {
-                    if p.ledger {
+                    if p.water && p.ledger {
+                        let left = soil.pour_film_at(p.pos.x, p.pos.z, p.volume, 0.10);
+                        p.volume = left;
+                        if left <= 1.0e-8 {
+                            p.volume = 0.0;
+                            p.deposited = true;
+                        }
+                    } else if p.ledger {
                         if let Some(rest) = deposit_ledger(soil, p) {
                             p.pos.x = rest.x;
                             p.pos.z = rest.z;

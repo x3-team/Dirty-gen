@@ -902,6 +902,7 @@ fn add_lump(
     stacks: usize,
     slices: usize,
     slump: bool,
+    panel: f32,
 ) {
     let axis = Vec3::new(
         0.88 + chunk_hash(seed, 1) * 0.22,
@@ -964,7 +965,7 @@ fn add_lump(
             nrm[a],
             pts[b],
             nrm[b],
-            PANEL_CLOD,
+            panel,
             center,
         );
     }
@@ -982,7 +983,7 @@ fn add_lump(
                 nrm[c],
                 pts[b],
                 nrm[b],
-                PANEL_CLOD,
+                panel,
                 center,
             );
             add_tri_smooth(
@@ -993,7 +994,7 @@ fn add_lump(
                 nrm[c],
                 pts[d],
                 nrm[d],
-                PANEL_CLOD,
+                panel,
                 center,
             );
         }
@@ -1011,7 +1012,7 @@ fn add_lump(
             nrm[a],
             pts[b],
             nrm[b],
-            PANEL_CLOD,
+            panel,
             center,
         );
     }
@@ -1027,6 +1028,7 @@ fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, s
         stacks,
         slices,
         p.grounded,
+        PANEL_CLOD,
     );
 }
 
@@ -1076,28 +1078,86 @@ fn spin_ribbon(vel: Vec3) -> bool {
     vel.length() > 6.0
 }
 
-/// Straight band in the sheet frame. No bow, so the silhouette is not a crescent.
-fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32, width: f32, thick: f32) {
-    let (dir, side, up) = slurry_sheet_axes(p.vel);
-    let segs = 8usize;
+/// Existing glass tint. Spray ribbons use it so they read as water, not mud.
+const PANEL_WATER_DROP: f32 = 65.0;
+
+/// A short ribbon thrown off the tread. Pinched at the ends, a few centimetres
+/// long. Not a sphere, a teardrop, or a board.
+fn add_spray_ribbon(mesh: &mut CpuMesh, origin: Vec3, dir: Vec3, slot: u32) {
+    let dir = if dir.length_squared() < 1.0e-8 {
+        Vec3::new(-0.1, 0.4, -0.9)
+    } else {
+        dir
+    }
+    .normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = 0.11 + (slot % 3) as f32 * 0.012;
+    let width = 0.016;
+    let thick = 0.006;
+    let segs = 5usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
-        // Tips narrow a little. The run of the strip stays full width.
-        let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
-        let taper = edge.powf(0.18).clamp(0.7, 1.0);
-        let c = p.pos + dir * (length * (t - 0.5));
+        let taper = (t * (1.0 - t) * 4.0).powf(0.65).clamp(0.18, 1.0);
+        let bow = (t * std::f32::consts::PI).sin();
+        let c = origin + dir * (length * t) + up * (bow * 0.008);
         let w = side * width * 0.5 * taper;
-        let h = up * thick * 0.5;
+        let h = up * thick * 0.5 * (0.5 + 0.5 * taper);
         ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
     }
     for s in 0..segs {
         let a = ring[s];
         let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_WATER_DROP);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_WATER_DROP);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_WATER_DROP);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_WATER_DROP);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_WATER_DROP);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_WATER_DROP);
+}
+
+/// Ford exit. Drain and spray are the same short ribbons. Spray leaves the
+/// tread. Drain is a few of them falling off the arch. Not a card or a column.
+fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let drain = p.kind == silt::particles::KIND_WATER_DRAIN;
+    if !drain && p.kind != silt::particles::KIND_WATER_SPRAY {
+        return;
+    }
+    let mut dir = p.vel;
+    if dir.length_squared() < 1.0e-6 {
+        dir = if drain {
+            Vec3::new(-0.08, -0.95, -0.28)
+        } else {
+            Vec3::new(-0.12, 0.5, -0.85)
+        };
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    // The tread throws a wider fan. The arch drip stays tighter so it reads
+    // as a few streaks, not a sheet standing over the tire.
+    let (spread, side_step, up_step) = if drain {
+        (0.22_f32, 0.020, 0.008)
+    } else {
+        (0.42, 0.034, 0.016)
+    };
+    for k in 0..3u32 {
+        let ang = (k as f32 - 1.0) * spread;
+        let d = (dir * ang.cos() + side * ang.sin()).normalize();
+        let origin = p.pos + side * (k as f32 - 1.0) * side_step + up * (k as f32 - 1.0) * up_step;
+        add_spray_ribbon(mesh, origin, d, p.seed.wrapping_add(k));
     }
 }
 
@@ -1206,9 +1266,44 @@ fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 /// The ledger volume stays on the particle; this mark does not swell into a
 /// teardrop blob, a sphere, or a tablet.
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let mut q = *p;
-    q.size = p.size.clamp(0.02, 0.05);
-    add_slurry_curl(mesh, &q, false);
+    // The ribbon curl floors length near half a metre. That mark is a teardrop
+    // blob. A drop is a short pinched fleck; the ledger volume stays on the particle.
+    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::X;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = 0.062_f32;
+    let width = 0.024_f32;
+    let thick = 0.010_f32;
+    let segs = 6usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.12, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * (0.45 + 0.55 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 #[cfg(test)]
@@ -1389,6 +1484,73 @@ mod slurry_shapes {
     }
 
     #[test]
+    fn ford_exit_spray_is_particles_and_drain_is_not_a_card() {
+        use silt::particles::{Particle, KIND_WATER_DRAIN, KIND_WATER_SPRAY};
+        fn assert_ribbons(mesh: &CpuMesh, name: &str) {
+            assert!(
+                mesh.vertices.len() > 250,
+                "{name} is not many ribbons, verts {}",
+                mesh.vertices.len()
+            );
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(-f32::MAX);
+            for v in &mesh.vertices {
+                let q = Vec3::from_array(v.pos);
+                min = min.min(q);
+                max = max.max(q);
+                assert!(
+                    (v.panel - 47.0).abs() > 0.5,
+                    "{name} uses the brown film panel"
+                );
+                assert!((v.panel - 65.0).abs() < 0.5, "{name} is not the water tint");
+            }
+            let ext = max - min;
+            let mut axes = [ext.x, ext.y, ext.z];
+            axes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert!(axes[0] > 0.004, "{name} is a flat card {axes:?}");
+            assert!(
+                axes[2] > axes[0] * 1.7,
+                "{name} is a sphere or a cube {axes:?}"
+            );
+            assert!(axes[2] < 0.40, "{name} is a long board {axes:?}");
+        }
+        let drain = Particle {
+            pos: Vec3::new(0.2, 0.4, 0.1),
+            vel: Vec3::new(0.05, -0.35, -1.6),
+            life: 2.0,
+            max_life: 2.0,
+            size: 0.08,
+            kind: KIND_WATER_DRAIN,
+            alive: true,
+            volume: 0.0012,
+            ledger: true,
+            water: true,
+            ..Particle::default()
+        };
+        let mut drain_mesh = CpuMesh::new();
+        add_water_film(&mut drain_mesh, &drain);
+        assert_ribbons(&drain_mesh, "drain");
+
+        let mut mesh = CpuMesh::new();
+        let spray = Particle {
+            pos: Vec3::new(0.2, 0.4, 0.1),
+            vel: Vec3::new(-0.2, 0.7, -0.6),
+            life: 2.0,
+            max_life: 2.0,
+            size: 0.08,
+            kind: KIND_WATER_SPRAY,
+            alive: true,
+            seed: 7,
+            volume: 0.0012,
+            ledger: true,
+            water: true,
+            ..Particle::default()
+        };
+        add_water_film(&mut mesh, &spray);
+        assert_ribbons(&mesh, "spray");
+    }
+
+    #[test]
     fn mud_chunks_includes_the_breakaway() {
         use silt::particles::Particles;
         let mut particles = Particles::new();
@@ -1410,15 +1572,20 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
-    for kind in [7u8, 5, 6, 3, 1, 4, 0, 2] {
+    // 8 and 9 are ford-exit water films. 7 is a roll sheet. 5 and 6 are the
+    // slurry breakaway: ribbons, then drops.
+    for kind in [8u8, 9, 7, 5, 6, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
             if p.ledger {
                 if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
-                    if p.kind == silt::particles::KIND_SLURRY_DROP {
+                    if p.kind == silt::particles::KIND_WATER_DRAIN
+                        || p.kind == silt::particles::KIND_WATER_SPRAY
+                    {
+                        add_water_film(&mut mesh, p);
+                    } else if p.kind == silt::particles::KIND_SLURRY_DROP {
                         add_mud_drop(&mut mesh, p);
                     } else if p.kind == silt::particles::KIND_SLURRY_SHEET {
                         add_slurry_sheet(&mut mesh, p);
