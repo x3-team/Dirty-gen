@@ -5,9 +5,9 @@ use glam::Vec3;
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
 use crate::patch::{
-    contact_patch, groove_slurry_capacity, moisture_traction_row, release_groove_slurry,
-    TreadCoat, TreadStep, MOISTURE_TRACTION_NORMAL, MOISTURE_TRACTION_SINK,
-    MOISTURE_TRACTION_SLIP, SIDEWALL_VOLUME,
+    contact_patch, groove_slurry_capacity, moisture_sinkage_row, moisture_traction_row,
+    release_groove_slurry, sinkage_at_normal, TreadCoat, TreadStep, MOISTURE_SINKAGE_NORMAL,
+    MOISTURE_TRACTION_NORMAL, MOISTURE_TRACTION_SINK, MOISTURE_TRACTION_SLIP, SIDEWALL_VOLUME,
 };
 use crate::soil::{
     moisture_state_fields, on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale,
@@ -1308,6 +1308,106 @@ impl World {
             clay_slip_after: crate::soil::moisture_peak_slip(SurfaceKind::WetMud, after_state),
             clay_wet_before: dry_w,
             clay_wet_after: s.wetness,
+            cut,
+            placed,
+        }
+    }
+
+    /// Clay, silt, and sand sink depth and contact area across dry, damp,
+    /// saturated, and pooled moisture. One clay pass wets a dry band; cut and
+    /// placed volumes stay closed.
+    pub fn moisture_sinkage_compare(&mut self) -> MoistureSinkageWake {
+        self.soil = SoilField::moisture_traction_pad();
+        self.bike.pos = Vec3::new(14.0, 0.5, 14.0);
+        self.bike.vel = Vec3::ZERO;
+        self.vehicle.pos = Vec3::new(-1.35, 0.72, -0.35);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        let h = self
+            .soil
+            .sample(self.vehicle.pos.x, self.vehicle.pos.z)
+            .height;
+        self.vehicle.pos.y = h + 0.62;
+
+        let clay = sinkage_grid(SurfaceKind::WetMud);
+        let silt = sinkage_grid(SurfaceKind::Silt);
+        let sand = sinkage_grid(SurfaceKind::Sand);
+
+        let (dry_w, dry_loose, dry_water) =
+            moisture_state_fields(SurfaceKind::WetMud, SurfaceMoisture::Dry);
+        let (sink_before, area_before, buoy_before) = sinkage_at_normal(
+            MOISTURE_SINKAGE_NORMAL,
+            SurfaceKind::WetMud,
+            dry_w,
+            dry_loose,
+            dry_water,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+        );
+        let cut0 = self.soil.cut_volume();
+        let placed0 = self.soil.placed_volume();
+        let mut z = -1.85_f32;
+        while z <= -1.05 {
+            self.soil.stamp_wheel(
+                Vec3::new(-1.35, 0.30, z),
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                Vec3::Z,
+                Vec3::X,
+                0.07,
+                0.32,
+                0.10,
+                true,
+                0.0,
+                0.0,
+            );
+            z += 0.11;
+        }
+        let res = self.soil.res;
+        let cell = self.soil.cell;
+        let half = self.soil.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let zc = (j as f32 + 0.5) * cell - half;
+                if (x + 1.35).abs() > 0.38 || zc > -1.0 || zc < -2.0 {
+                    continue;
+                }
+                let idx = j * res + i;
+                let dug = (self.soil.initial_height[idx] - self.soil.bed[idx]).max(0.0);
+                if dug > 0.012 {
+                    self.soil.water[idx] = self.soil.water[idx].max(0.055);
+                    self.soil.wetness[idx] = self.soil.wetness[idx].max(0.93);
+                }
+            }
+        }
+        let s = self.soil.sample(-1.35, -1.55);
+        let (sink_after, area_after, buoy_after) = sinkage_at_normal(
+            MOISTURE_SINKAGE_NORMAL,
+            s.kind(),
+            s.wetness,
+            s.loose,
+            s.water,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+        );
+        let cut = self.soil.cut_volume() - cut0;
+        let placed = self.soil.placed_volume() - placed0;
+
+        MoistureSinkageWake {
+            clay,
+            silt,
+            sand,
+            clay_sink_before: sink_before,
+            clay_sink_after: sink_after,
+            clay_area_before: area_before,
+            clay_area_after: area_after,
+            clay_wet_before: dry_w,
+            clay_wet_after: s.wetness,
+            clay_buoy_before: buoy_before,
+            clay_buoy_after: buoy_after,
             cut,
             placed,
         }
@@ -2707,6 +2807,21 @@ fn traction_grid(kind: SurfaceKind) -> [MoistureTractionCell; 4] {
     })
 }
 
+fn sinkage_grid(kind: SurfaceKind) -> [MoistureSinkageCell; 4] {
+    std::array::from_fn(|i| {
+        let state = SurfaceMoisture::ALL[i];
+        let row = moisture_sinkage_row(kind, state);
+        MoistureSinkageCell {
+            sink_m: row.sink_m,
+            contact_m2: row.contact_m2,
+            wetness: row.wetness,
+            water_m: row.water_m,
+            buoy_n: row.buoy_n,
+            suction_n: row.suction_n,
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MoistureTractionCell {
     pub mu: f32,
@@ -2729,6 +2844,34 @@ pub struct MoistureTractionWake {
     pub clay_slip_after: f32,
     pub clay_wet_before: f32,
     pub clay_wet_after: f32,
+    pub cut: f32,
+    pub placed: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MoistureSinkageCell {
+    pub sink_m: f32,
+    pub contact_m2: f32,
+    pub wetness: f32,
+    pub water_m: f32,
+    pub buoy_n: f32,
+    pub suction_n: f32,
+}
+
+/// Sink and contact table per soil and moisture, plus clay dry-band pass.
+#[derive(Clone, Copy, Debug)]
+pub struct MoistureSinkageWake {
+    pub clay: [MoistureSinkageCell; 4],
+    pub silt: [MoistureSinkageCell; 4],
+    pub sand: [MoistureSinkageCell; 4],
+    pub clay_sink_before: f32,
+    pub clay_sink_after: f32,
+    pub clay_area_before: f32,
+    pub clay_area_after: f32,
+    pub clay_wet_before: f32,
+    pub clay_wet_after: f32,
+    pub clay_buoy_before: f32,
+    pub clay_buoy_after: f32,
     pub cut: f32,
     pub placed: f32,
 }
@@ -3841,6 +3984,100 @@ mod tests {
         assert!(
             m.clay_slip_after > m.clay_slip_before + 0.04,
             "wetted rut peak slip should rise"
+        );
+    }
+
+    #[test]
+    fn moisture_sinkage_rises_with_wetness_floats_in_pool_and_pass_conserves_volume() {
+        use crate::patch::MOISTURE_SINKAGE_NORMAL;
+        let mut world = World::flat(0.18);
+        let m = world.moisture_sinkage_compare();
+        eprintln!(
+            "clay dry sink {:.4} m area {:.4} m2  pool sink {:.4} m buoy {:.0} N",
+            m.clay[0].sink_m,
+            m.clay[0].contact_m2,
+            m.clay[3].sink_m,
+            m.clay[3].buoy_n
+        );
+        eprintln!(
+            "clay pass sink {:.4}->{:.4} m area {:.4}->{:.4} m2 wet {:.2}->{:.2} cut {:.4} placed {:.4}",
+            m.clay_sink_before,
+            m.clay_sink_after,
+            m.clay_area_before,
+            m.clay_area_after,
+            m.clay_wet_before,
+            m.clay_wet_after,
+            m.cut,
+            m.placed
+        );
+        assert!(
+            m.clay[0].sink_m < m.clay[2].sink_m,
+            "dry clay should hold the tire, dry {:.4} sat {:.4} m",
+            m.clay[0].sink_m,
+            m.clay[2].sink_m
+        );
+        assert!(
+            m.clay[2].sink_m > m.silt[2].sink_m,
+            "wet clay should sit deeper than silt, clay {:.4} silt {:.4} m",
+            m.clay[2].sink_m,
+            m.silt[2].sink_m
+        );
+        assert!(
+            m.silt[2].sink_m > m.sand[2].sink_m,
+            "silt sits between clay and sand at saturation, silt {:.4} sand {:.4} m",
+            m.silt[2].sink_m,
+            m.sand[2].sink_m
+        );
+        assert!(
+            m.sand[2].sink_m > m.sand[0].sink_m * 1.12,
+            "sand should sink more once saturated, dry {:.4} sat {:.4} m",
+            m.sand[0].sink_m,
+            m.sand[2].sink_m
+        );
+        assert!(
+            m.clay[3].buoy_n > m.clay[0].buoy_n + 80.0,
+            "pool should float the tire, dry buoy {:.0} pool {:.0} N",
+            m.clay[0].buoy_n,
+            m.clay[3].buoy_n
+        );
+        assert!(
+            m.clay[3].buoy_n > m.clay[2].buoy_n + 60.0,
+            "standing water should lift more than pore saturation alone, sat {:.0} pool {:.0} N",
+            m.clay[2].buoy_n,
+            m.clay[3].buoy_n
+        );
+        let soil_load_sat = MOISTURE_SINKAGE_NORMAL - m.clay[2].buoy_n;
+        let soil_load_pool = MOISTURE_SINKAGE_NORMAL - m.clay[3].buoy_n;
+        assert!(
+            soil_load_pool < soil_load_sat - 120.0,
+            "flotation should unload the patch, sat load {:.0} pool {:.0} N",
+            soil_load_sat,
+            soil_load_pool
+        );
+        assert!(
+            m.clay[3].suction_n > m.sand[3].suction_n * 1.4,
+            "clay should seal with more suction, clay {:.0} sand {:.0} N",
+            m.clay[3].suction_n,
+            m.sand[3].suction_n
+        );
+        assert!(m.cut > 1.0e-4, "pass did not cut");
+        assert!(
+            (m.cut - m.placed).abs() < m.cut * 0.025 + 1.0e-5,
+            "volume drift cut {} placed {}",
+            m.cut,
+            m.placed
+        );
+        assert!(
+            m.clay_sink_after > m.clay_sink_before * 1.08,
+            "wetted rut should sink deeper {} -> {} m",
+            m.clay_sink_before,
+            m.clay_sink_after
+        );
+        assert!(
+            m.clay_area_after > m.clay_area_before * 1.05,
+            "deeper sink should widen contact {} -> {} m2",
+            m.clay_area_before,
+            m.clay_area_after
         );
     }
 

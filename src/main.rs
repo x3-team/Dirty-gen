@@ -540,6 +540,8 @@ struct CaptureArgs {
     wet_berm_creep_proof: PathBuf,
     moisture_traction: bool,
     moisture_traction_proof: PathBuf,
+    moisture_sinkage: bool,
+    moisture_sinkage_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -656,6 +658,10 @@ fn capture(args: &[String]) {
     }
     if parsed.moisture_traction {
         capture_moisture_traction(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.moisture_sinkage {
+        capture_moisture_sinkage(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -864,6 +870,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut moisture_traction = false;
     let mut moisture_traction_proof =
         PathBuf::from(format!("{MEDIA}/moisture-traction-proof.png"));
+    let mut moisture_sinkage = false;
+    let mut moisture_sinkage_proof =
+        PathBuf::from(format!("{MEDIA}/moisture-sinkage-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -984,6 +993,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     moisture_traction_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--moisture-sinkage-proof" => {
+                moisture_sinkage = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    moisture_sinkage_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1087,6 +1102,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         wet_berm_creep_proof,
         moisture_traction,
         moisture_traction_proof,
+        moisture_sinkage,
+        moisture_sinkage_proof,
     }
 }
 
@@ -2043,7 +2060,6 @@ fn capture_wet_berm_creep(renderer: &mut Renderer, parsed: &CaptureArgs) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(not(target_arch = "wasm32"))]
 fn capture_moisture_traction(renderer: &mut Renderer, parsed: &CaptureArgs) {
     use silt::soil::{SurfaceKind, SurfaceMoisture};
 
@@ -2148,6 +2164,117 @@ fn capture_moisture_traction(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn moisture_traction_camera(world: &World) -> CameraPose {
+    moisture_pad_camera(world, 6.8)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_moisture_sinkage(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{SurfaceKind, SurfaceMoisture};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::flat(0.18);
+    let out = world.moisture_sinkage_compare();
+    silence_soil_clods(&mut world);
+
+    for (name, kind) in [
+        ("clay", SurfaceKind::WetMud),
+        ("silt", SurfaceKind::Silt),
+        ("sand", SurfaceKind::Sand),
+    ] {
+        let grid = match name {
+            "clay" => out.clay,
+            "silt" => out.silt,
+            _ => out.sand,
+        };
+        for (state, cell) in SurfaceMoisture::ALL.iter().zip(grid.iter()) {
+            println!(
+                "moisture-sinkage {name} {}  wet {:.2}  sink {:.4} m  area {:.4} m2  \
+                 buoy {:.0} N  suction {:.0} N",
+                state.label(),
+                cell.wetness,
+                cell.sink_m,
+                cell.contact_m2,
+                cell.buoy_n,
+                cell.suction_n
+            );
+        }
+    }
+    println!(
+        "clay pass  wet {:.2}->{:.2}  sink {:.4}->{:.4} m  area {:.4}->{:.4} m2  \
+         buoy {:.0}->{:.0} N  cut {:.4} m3  placed {:.4} m3",
+        out.clay_wet_before,
+        out.clay_wet_after,
+        out.clay_sink_before,
+        out.clay_sink_after,
+        out.clay_area_before,
+        out.clay_area_after,
+        out.clay_buoy_before,
+        out.clay_buoy_after,
+        out.cut,
+        out.placed
+    );
+
+    let lines = [
+        format!(
+            "clay dry sink {:.4} m area {:.4} m2 wet {:.2}",
+            out.clay[0].sink_m, out.clay[0].contact_m2, out.clay[0].wetness
+        ),
+        format!(
+            "clay pool sink {:.4} m buoy {:.0}N wet {:.2}",
+            out.clay[3].sink_m, out.clay[3].buoy_n, out.clay[3].wetness
+        ),
+        format!(
+            "silt dry->{:.4} sat->{:.4} m sand {:.4}->{:.4} m",
+            out.silt[0].sink_m, out.silt[2].sink_m, out.sand[0].sink_m, out.sand[2].sink_m
+        ),
+        format!(
+            "clay pass sink {:.4}->{:.4} m area {:.4}->{:.4} m2",
+            out.clay_sink_before,
+            out.clay_sink_after,
+            out.clay_area_before,
+            out.clay_area_after
+        ),
+        format!(
+            "clay pass wet {:.2}->{:.2} buoy {:.0}->{:.0}N",
+            out.clay_wet_before,
+            out.clay_wet_after,
+            out.clay_buoy_before,
+            out.clay_buoy_after
+        ),
+        format!("cut {:.4} m3  placed {:.4} m3", out.cut, out.placed),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = moisture_sinkage_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.moisture_sinkage_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.moisture_sinkage_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("moisture sinkage still");
+    println!(
+        "cc0 moisture-sinkage {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.moisture_sinkage_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn moisture_pad_camera(world: &World, ortho: f32) -> CameraPose {
     let vehicle = &world.vehicle;
     let fwd = vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
@@ -2156,10 +2283,15 @@ fn moisture_traction_camera(world: &World) -> CameraPose {
     let look = Vec3::new(center.x, ground + 0.05, center.z);
     let eye = look + right * 2.85 + fwd * (-4.2) + Vec3::Y * 2.45;
     CameraPose {
-        eye: clear_ortho_eye(world, eye, look, 6.8),
+        eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
-        ortho_width: Some(6.8),
+        ortho_width: Some(ortho),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn moisture_sinkage_camera(world: &World) -> CameraPose {
+    moisture_pad_camera(world, 6.8)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
