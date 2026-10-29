@@ -11,7 +11,8 @@
 //! wheel spins or the coat sheds, and then it leaves as ribbons.
 
 use crate::soil::{
-    contact_length, softness_of, stick_scale, terramech_for, SurfaceKind,
+    contact_length, moisture_mu_scale, moisture_peak_slip, softness_of, stick_scale,
+    surface_moisture, terramech_for, SurfaceKind,
 };
 
 /// Share of the patch that is lug. The rest is void the tread can pack.
@@ -148,11 +149,16 @@ pub fn integrated_shear(slip: f32, length: f32, shear_k: f32) -> f32 {
 /// Residual after the peak. A clean spin still holds a share of the peak.
 /// Mud on the lug face drops the slide further.
 pub fn spin_residual(slip: f32, smear: f32) -> f32 {
+    spin_residual_at(slip, smear, PEAK_SLIP)
+}
+
+pub fn spin_residual_at(slip: f32, smear: f32, peak_slip: f32) -> f32 {
+    let peak = peak_slip.max(0.08);
     let x = slip.abs();
-    if x <= PEAK_SLIP {
+    if x <= peak {
         return 1.0;
     }
-    let t = ((x - PEAK_SLIP) / 0.70).clamp(0.0, 1.0);
+    let t = ((x - peak) / 0.70).clamp(0.0, 1.0);
     let s = t * t * (3.0 - 2.0 * t);
     let floor = lerp(0.64, 0.30, smear.clamp(0.0, 1.0));
     lerp(1.0, floor, s)
@@ -161,10 +167,15 @@ pub fn spin_residual(slip: f32, smear: f32) -> f32 {
 /// Rises to 1 at the peak slip, then falls with the residual. This is the
 /// shape of the patch force, separate from the soil's own friction.
 pub fn traction_factor(slip: f32, smear: f32) -> f32 {
+    traction_factor_at(slip, smear, PEAK_SLIP)
+}
+
+pub fn traction_factor_at(slip: f32, smear: f32, peak_slip: f32) -> f32 {
+    let peak = peak_slip.max(0.08);
     let x = slip.abs();
-    let rise = 1.0 - (-(x / PEAK_SLIP).min(8.0) * 2.4).exp();
-    let peak = 1.0 - (-2.4_f32).exp();
-    (rise / peak) * spin_residual(x, smear)
+    let rise = 1.0 - (-(x / peak).min(8.0) * 2.4).exp();
+    let peak_h = 1.0 - (-2.4_f32).exp();
+    (rise / peak_h) * spin_residual_at(x, smear, peak)
 }
 
 /// Bare soil uses `phi`. A smeared lug shears mud against mud.
@@ -172,6 +183,48 @@ pub fn face_mu(phi: f32, smear: f32) -> f32 {
     let clean = phi.tan().max(0.02);
     let coated = (clean * 0.58).max(0.05);
     lerp(clean, coated, smear.clamp(0.0, 1.0))
+}
+
+/// Reference load and slip for moisture traction readouts.
+pub const MOISTURE_TRACTION_NORMAL: f32 = 3_000.0;
+pub const MOISTURE_TRACTION_SLIP: f32 = 0.15;
+pub const MOISTURE_TRACTION_SINK: f32 = 0.05;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MoistureTractionRow {
+    pub mu: f32,
+    pub peak_slip: f32,
+    pub grip: f32,
+    pub wetness: f32,
+    pub water: f32,
+}
+
+/// Grip, friction, and peak slip for one soil kind and moisture band.
+pub fn moisture_traction_row(
+    kind: SurfaceKind,
+    state: crate::soil::SurfaceMoisture,
+) -> MoistureTractionRow {
+    use crate::soil::moisture_state_fields;
+    let (wetness, loose, water) = moisture_state_fields(kind, state);
+    let patch = contact_patch(
+        0.38,
+        0.28,
+        MOISTURE_TRACTION_SINK,
+        MOISTURE_TRACTION_SLIP,
+        MOISTURE_TRACTION_NORMAL,
+        kind,
+        wetness,
+        loose,
+        water,
+        TreadCoat::clean(),
+    );
+    MoistureTractionRow {
+        mu: patch.mu,
+        peak_slip: moisture_peak_slip(kind, state),
+        grip: patch.grip,
+        wetness,
+        water,
+    }
 }
 
 pub fn contact_patch(
@@ -207,17 +260,20 @@ pub fn contact_patch(
     }
     let soft = softness_of(wetness, loose, water);
     let tm = terramech_for(kind, soft, water);
+    let moisture = surface_moisture(wetness, water, kind);
+    let peak_slip = moisture_peak_slip(kind, moisture);
+    let m_scale = moisture_mu_scale(kind, moisture);
     let sigma = (normal / full).clamp(0.0, 80_000.0);
     let shear = integrated_shear(slip, length, tm.shear_k);
-    let clean_mu = tm.phi.tan().max(0.02);
-    let mu = face_mu(tm.phi, coat.smear);
-    let mu_ratio = (mu / clean_mu).clamp(0.2, 1.25);
+    let clean_mu = (tm.phi.tan().max(0.02)) * m_scale;
+    let mu = face_mu((clean_mu.max(0.02)).atan(), coat.smear);
+    let mu_ratio = (mu / clean_mu.max(1.0e-4)).clamp(0.2, 1.25);
     // One on a clean tread at or below the peak. The Janosi term already
     // builds with slip, so this only cuts the force once the tire is spinning
     // or the lugs are coated.
-    let scale = (spin_residual(slip, coat.smear) * mu_ratio).clamp(0.20, 1.15);
+    let scale = (spin_residual_at(slip, coat.smear, peak_slip) * mu_ratio).clamp(0.20, 1.15);
     let tau = tm.cohesion + sigma * clean_mu;
-    let grip = tau * lug_area * traction_factor(slip, coat.smear) * mu_ratio;
+    let grip = tau * lug_area * traction_factor_at(slip, coat.smear, peak_slip) * mu_ratio;
 
     let stick = stick_scale(kind, wetness);
     let loose_n = (loose / 0.06).clamp(0.0, 1.0);

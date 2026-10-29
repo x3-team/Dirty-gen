@@ -124,6 +124,131 @@ pub fn liquid_regime(kind: SurfaceKind, water: f32) -> LiquidRegime {
     }
 }
 
+/// Pore moisture plus standing water, for tire grip and peak slip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceMoisture {
+    Dry = 0,
+    Damp = 1,
+    Saturated = 2,
+    Pooled = 3,
+}
+
+impl SurfaceMoisture {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dry => "dry",
+            Self::Damp => "damp",
+            Self::Saturated => "sat",
+            Self::Pooled => "pool",
+        }
+    }
+
+    pub const ALL: [SurfaceMoisture; 4] = [
+        SurfaceMoisture::Dry,
+        SurfaceMoisture::Damp,
+        SurfaceMoisture::Saturated,
+        SurfaceMoisture::Pooled,
+    ];
+}
+
+/// Classify the contact surface from pore wetness and standing water.
+pub fn surface_moisture(wetness: f32, water: f32, kind: SurfaceKind) -> SurfaceMoisture {
+    let w = wetness.clamp(0.0, 1.0);
+    let regime = liquid_regime(kind, water);
+    if regime == LiquidRegime::Slurry {
+        return SurfaceMoisture::Pooled;
+    }
+    if matches!(kind, SurfaceKind::Sand | SurfaceKind::Gravel) && water >= 0.018 {
+        return SurfaceMoisture::Pooled;
+    }
+    if regime == LiquidRegime::Film {
+        return SurfaceMoisture::Damp;
+    }
+    if w >= 0.72 {
+        SurfaceMoisture::Saturated
+    } else if w >= 0.28 {
+        SurfaceMoisture::Damp
+    } else {
+        SurfaceMoisture::Dry
+    }
+}
+
+/// Wetness, loose smear, and standing water for one moisture band.
+pub fn moisture_state_fields(kind: SurfaceKind, state: SurfaceMoisture) -> (f32, f32, f32) {
+    let loose = 0.01;
+    match state {
+        SurfaceMoisture::Dry => (0.08, 0.0, 0.0),
+        SurfaceMoisture::Damp => {
+            let w = match kind {
+                SurfaceKind::Sand => 0.36,
+                SurfaceKind::Silt => 0.46,
+                _ => 0.40,
+            };
+            (w, loose, 0.012)
+        }
+        SurfaceMoisture::Saturated => {
+            let w = match kind {
+                SurfaceKind::Sand => 0.82,
+                SurfaceKind::Silt => 0.90,
+                _ => 0.88,
+            };
+            (w, loose + 0.004, 0.0)
+        }
+        SurfaceMoisture::Pooled => {
+            let water = match kind {
+                SurfaceKind::Sand | SurfaceKind::Gravel => 0.022,
+                _ => 0.11,
+            };
+            (0.92, loose + 0.008, water)
+        }
+    }
+}
+
+/// Slip where the patch peaks, metres per metre. Wetter ground peaks earlier.
+pub fn moisture_peak_slip(kind: SurfaceKind, state: SurfaceMoisture) -> f32 {
+    let base = match kind {
+        SurfaceKind::Sand => 0.20_f32,
+        SurfaceKind::Silt => 0.16_f32,
+        SurfaceKind::WetMud | SurfaceKind::DryCrust | SurfaceKind::FreshCut => 0.18_f32,
+        _ => 0.18_f32,
+    };
+    let widen = match state {
+        SurfaceMoisture::Dry => 0.0_f32,
+        SurfaceMoisture::Damp => 0.03_f32,
+        SurfaceMoisture::Saturated => 0.085_f32,
+        SurfaceMoisture::Pooled => 0.145_f32,
+    };
+    (base + widen).clamp(0.12, 0.38)
+}
+
+/// Extra scale on `tan φ` from moisture, on top of the terramech curve.
+pub fn moisture_mu_scale(kind: SurfaceKind, state: SurfaceMoisture) -> f32 {
+    use SurfaceMoisture::*;
+    let k = match kind {
+        SurfaceKind::Sand => kind,
+        SurfaceKind::Silt => kind,
+        SurfaceKind::WetMud | SurfaceKind::DryCrust | SurfaceKind::FreshCut | SurfaceKind::PackedClay => {
+            SurfaceKind::WetMud
+        }
+        _ => SurfaceKind::WetMud,
+    };
+    match (k, state) {
+        (SurfaceKind::WetMud, Dry) => 1.10,
+        (SurfaceKind::WetMud, Damp) => 0.96,
+        (SurfaceKind::WetMud, Saturated) => 0.76,
+        (SurfaceKind::WetMud, Pooled) => 0.50,
+        (SurfaceKind::Sand, Dry) => 1.04,
+        (SurfaceKind::Sand, Damp) => 1.10,
+        (SurfaceKind::Sand, Saturated) => 0.70,
+        (SurfaceKind::Sand, Pooled) => 0.55,
+        (SurfaceKind::Silt, Dry) => 0.94,
+        (SurfaceKind::Silt, Damp) => 0.80,
+        (SurfaceKind::Silt, Saturated) => 0.56,
+        (SurfaceKind::Silt, Pooled) => 0.40,
+        _ => 1.0,
+    }
+}
+
 /// Metres of water that stay in the pores and do not enter the pipe.
 pub fn water_hold(kind: SurfaceKind) -> f32 {
     match kind {
@@ -6033,6 +6158,61 @@ impl SoilField {
                 if dug > 0.02 && x.abs() < 0.28 {
                     field.water[idx] = field.water[idx].max(0.03);
                     field.wetness[idx] = field.wetness[idx].max(0.92);
+                }
+            }
+        }
+        field
+    }
+
+    /// Flat pad with clay, silt, and sand strips. Each strip holds four moisture
+    /// bands along Z so the Niva can sit on damp clay while the readout compares
+    /// dry, damp, saturated, and pooled traction on all three soils.
+    pub fn moisture_traction_pad() -> Self {
+        let mut field = Self::flat(0.18);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        let strips = [
+            (-1.35_f32, SurfaceKind::WetMud),
+            (0.0, SurfaceKind::Silt),
+            (1.35, SurfaceKind::Sand),
+        ];
+        let bands: [(f32, f32); 4] = [(-2.05, -1.05), (-0.85, 0.15), (0.35, 1.35), (1.55, 2.55)];
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let mut best = f32::MAX;
+                let mut pick = (
+                    SurfaceKind::WetMud,
+                    moisture_state_fields(SurfaceKind::WetMud, SurfaceMoisture::Dry),
+                );
+                for (cx, kind) in strips {
+                    if (x - cx).abs() > 0.52 {
+                        continue;
+                    }
+                    for (state, (z0, z1)) in SurfaceMoisture::ALL.iter().zip(bands.iter()) {
+                        let z_mid = (z0 + z1) * 0.5;
+                        let d = (z - z_mid).abs();
+                        if d < best {
+                            best = d;
+                            pick = (kind, moisture_state_fields(kind, *state));
+                        }
+                    }
+                }
+                let (kind, (wetness, loose, water)) = pick;
+                if best < 0.55 {
+                    field.kind[idx] = kind as u8;
+                    field.wetness[idx] = wetness;
+                    field.base_wetness[idx] = wetness.min(0.75);
+                    field.water[idx] = water;
+                    field.loose[idx] = loose;
+                    field.roughness[idx] = match kind {
+                        SurfaceKind::Sand => 0.90,
+                        SurfaceKind::Silt => 0.46,
+                        _ => 0.38,
+                    };
                 }
             }
         }

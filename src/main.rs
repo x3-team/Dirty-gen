@@ -538,6 +538,8 @@ struct CaptureArgs {
     slurry_settle_proof: PathBuf,
     wet_berm_creep: bool,
     wet_berm_creep_proof: PathBuf,
+    moisture_traction: bool,
+    moisture_traction_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -650,6 +652,10 @@ fn capture(args: &[String]) {
     }
     if parsed.wet_berm_creep {
         capture_wet_berm_creep(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.moisture_traction {
+        capture_moisture_traction(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -855,6 +861,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut wet_berm_creep = false;
     let mut wet_berm_creep_proof =
         PathBuf::from(format!("{MEDIA}/wet-berm-creep-proof.png"));
+    let mut moisture_traction = false;
+    let mut moisture_traction_proof =
+        PathBuf::from(format!("{MEDIA}/moisture-traction-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -969,6 +978,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     wet_berm_creep_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--moisture-traction-proof" => {
+                moisture_traction = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    moisture_traction_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1070,6 +1085,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_settle_proof,
         wet_berm_creep,
         wet_berm_creep_proof,
+        moisture_traction,
+        moisture_traction_proof,
     }
 }
 
@@ -2023,6 +2040,126 @@ fn capture_wet_berm_creep(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose.target.y,
         pose.target.z
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_moisture_traction(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::soil::{SurfaceKind, SurfaceMoisture};
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::flat(0.18);
+    let out = world.moisture_traction_compare();
+    silence_soil_clods(&mut world);
+
+    for (name, kind) in [
+        ("clay", SurfaceKind::WetMud),
+        ("silt", SurfaceKind::Silt),
+        ("sand", SurfaceKind::Sand),
+    ] {
+        let grid = match name {
+            "clay" => out.clay,
+            "silt" => out.silt,
+            _ => out.sand,
+        };
+        for (state, cell) in SurfaceMoisture::ALL.iter().zip(grid.iter()) {
+            println!(
+                "moisture-traction {name} {}  wet {:.2}  mu {:.3}  slip {:.3}  grip {:.0} N",
+                state.label(),
+                cell.wetness,
+                cell.mu,
+                cell.peak_slip,
+                cell.grip
+            );
+        }
+    }
+    println!(
+        "clay pass  wet {:.2}->{:.2}  mu {:.3}->{:.3}  slip {:.3}->{:.3}  grip {:.0}->{:.0} N  \
+         cut {:.4} m3  placed {:.4} m3",
+        out.clay_wet_before,
+        out.clay_wet_after,
+        out.clay_mu_before,
+        out.clay_mu_after,
+        out.clay_slip_before,
+        out.clay_slip_after,
+        out.clay_grip_before,
+        out.clay_grip_after,
+        out.cut,
+        out.placed
+    );
+
+    let lines = [
+        format!(
+            "clay dry mu {:.3} slip {:.3} grip {:.0}N",
+            out.clay[0].mu, out.clay[0].peak_slip, out.clay[0].grip
+        ),
+        format!(
+            "clay pool mu {:.3} slip {:.3} grip {:.0}N",
+            out.clay[3].mu, out.clay[3].peak_slip, out.clay[3].grip
+        ),
+        format!(
+            "silt dry mu {:.3}  sat mu {:.3}  grip {:.0}->{:.0}N",
+            out.silt[0].mu, out.silt[2].mu, out.silt[0].grip, out.silt[2].grip
+        ),
+        format!(
+            "sand dry mu {:.3}  pool mu {:.3}  slip {:.3}->{:.3}",
+            out.sand[0].mu, out.sand[3].mu, out.sand[0].peak_slip, out.sand[3].peak_slip
+        ),
+        format!(
+            "clay pass wet {:.2}->{:.2} mu {:.3}->{:.3} grip {:.0}->{:.0}N",
+            out.clay_wet_before,
+            out.clay_wet_after,
+            out.clay_mu_before,
+            out.clay_mu_after,
+            out.clay_grip_before,
+            out.clay_grip_after
+        ),
+        format!("cut {:.4} m3  placed {:.4} m3", out.cut, out.placed),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = moisture_traction_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.moisture_traction_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.moisture_traction_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("moisture traction still");
+    println!(
+        "cc0 moisture-traction {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.moisture_traction_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn moisture_traction_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let center = vehicle.pos + fwd * 0.4;
+    let ground = world.soil.sample(center.x, center.z).height;
+    let look = Vec3::new(center.x, ground + 0.05, center.z);
+    let eye = look + right * 2.85 + fwd * (-4.2) + Vec3::Y * 2.45;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, 6.8),
+        target: look,
+        ortho_width: Some(6.8),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

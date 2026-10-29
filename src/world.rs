@@ -5,12 +5,14 @@ use glam::Vec3;
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
 use crate::patch::{
-    groove_slurry_capacity, release_groove_slurry, TreadStep, SIDEWALL_VOLUME,
+    contact_patch, groove_slurry_capacity, moisture_traction_row, release_groove_slurry,
+    TreadCoat, TreadStep, MOISTURE_TRACTION_NORMAL, MOISTURE_TRACTION_SINK,
+    MOISTURE_TRACTION_SLIP, SIDEWALL_VOLUME,
 };
 use crate::soil::{
-    on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale, track_offset,
-    wet_berm_creep_under_load_rate,
-    SlurrySeal, SoilField, SurfaceKind, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
+    moisture_state_fields, on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale,
+    surface_moisture, track_offset, wet_berm_creep_under_load_rate, SlurrySeal, SoilField,
+    SurfaceKind, SurfaceMoisture, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
     hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
@@ -1201,6 +1203,113 @@ impl World {
             torque_clay: drag.clay.torque.abs(),
             torque_silt: drag.silt.torque.abs(),
             torque_sand: drag.sand.torque.abs(),
+        }
+    }
+
+    /// Clay, silt, and sand traction across dry, damp, saturated, and pooled
+    /// moisture. One clay pass wets a dry band; cut and placed volumes stay closed.
+    pub fn moisture_traction_compare(&mut self) -> MoistureTractionWake {
+        self.soil = SoilField::moisture_traction_pad();
+        self.bike.pos = Vec3::new(14.0, 0.5, 14.0);
+        self.bike.vel = Vec3::ZERO;
+        self.vehicle.pos = Vec3::new(-1.35, 0.72, -0.35);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        let h = self
+            .soil
+            .sample(self.vehicle.pos.x, self.vehicle.pos.z)
+            .height;
+        self.vehicle.pos.y = h + 0.62;
+
+        let clay = traction_grid(SurfaceKind::WetMud);
+        let silt = traction_grid(SurfaceKind::Silt);
+        let sand = traction_grid(SurfaceKind::Sand);
+
+        let (dry_w, dry_loose, dry_water) =
+            moisture_state_fields(SurfaceKind::WetMud, SurfaceMoisture::Dry);
+        let before = contact_patch(
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            MOISTURE_TRACTION_SINK,
+            MOISTURE_TRACTION_SLIP,
+            MOISTURE_TRACTION_NORMAL,
+            SurfaceKind::WetMud,
+            dry_w,
+            dry_loose,
+            dry_water,
+            TreadCoat::clean(),
+        );
+        let dry_state = surface_moisture(dry_w, dry_water, SurfaceKind::WetMud);
+        let cut0 = self.soil.cut_volume();
+        let placed0 = self.soil.placed_volume();
+        let mut z = -1.85_f32;
+        while z <= -1.05 {
+            self.soil.stamp_wheel(
+                Vec3::new(-1.35, 0.30, z),
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                Vec3::Z,
+                Vec3::X,
+                0.07,
+                0.32,
+                0.10,
+                true,
+                0.0,
+                0.0,
+            );
+            z += 0.11;
+        }
+        let res = self.soil.res;
+        let cell = self.soil.cell;
+        let half = self.soil.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let zc = (j as f32 + 0.5) * cell - half;
+                if (x + 1.35).abs() > 0.38 || zc > -1.0 || zc < -2.0 {
+                    continue;
+                }
+                let idx = j * res + i;
+                let dug = (self.soil.initial_height[idx] - self.soil.bed[idx]).max(0.0);
+                if dug > 0.012 {
+                    self.soil.water[idx] = self.soil.water[idx].max(0.055);
+                    self.soil.wetness[idx] = self.soil.wetness[idx].max(0.93);
+                }
+            }
+        }
+        let s = self.soil.sample(-1.35, -1.55);
+        let after = contact_patch(
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            MOISTURE_TRACTION_SINK,
+            MOISTURE_TRACTION_SLIP,
+            MOISTURE_TRACTION_NORMAL,
+            s.kind(),
+            s.wetness,
+            s.loose,
+            s.water,
+            TreadCoat::clean(),
+        );
+        let after_state = surface_moisture(s.wetness, s.water, s.kind());
+        let cut = self.soil.cut_volume() - cut0;
+        let placed = self.soil.placed_volume() - placed0;
+
+        MoistureTractionWake {
+            clay,
+            silt,
+            sand,
+            clay_mu_before: before.mu,
+            clay_mu_after: after.mu,
+            clay_grip_before: before.grip,
+            clay_grip_after: after.grip,
+            clay_slip_before: crate::soil::moisture_peak_slip(SurfaceKind::WetMud, dry_state),
+            clay_slip_after: crate::soil::moisture_peak_slip(SurfaceKind::WetMud, after_state),
+            clay_wet_before: dry_w,
+            clay_wet_after: s.wetness,
+            cut,
+            placed,
         }
     }
 
@@ -2585,6 +2694,45 @@ pub struct SlurrySecondPassWake {
     pub torque_sand: f32,
 }
 
+fn traction_grid(kind: SurfaceKind) -> [MoistureTractionCell; 4] {
+    std::array::from_fn(|i| {
+        let state = SurfaceMoisture::ALL[i];
+        let row = moisture_traction_row(kind, state);
+        MoistureTractionCell {
+            mu: row.mu,
+            peak_slip: row.peak_slip,
+            grip: row.grip,
+            wetness: row.wetness,
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MoistureTractionCell {
+    pub mu: f32,
+    pub peak_slip: f32,
+    pub grip: f32,
+    pub wetness: f32,
+}
+
+/// Traction table per soil and moisture, plus clay dry-band pass before/after.
+#[derive(Clone, Copy, Debug)]
+pub struct MoistureTractionWake {
+    pub clay: [MoistureTractionCell; 4],
+    pub silt: [MoistureTractionCell; 4],
+    pub sand: [MoistureTractionCell; 4],
+    pub clay_mu_before: f32,
+    pub clay_mu_after: f32,
+    pub clay_grip_before: f32,
+    pub clay_grip_after: f32,
+    pub clay_slip_before: f32,
+    pub clay_slip_after: f32,
+    pub clay_wet_before: f32,
+    pub clay_wet_after: f32,
+    pub cut: f32,
+    pub placed: f32,
+}
+
 /// Bow wave and berm after a pass, then after slurry settle. Cubic metres unless noted.
 ///
 /// Wet berm under Niva load. `sum_* == berm_* + rut_* + pool_slurry_*` (m³).
@@ -3626,6 +3774,74 @@ mod tests {
             assert_ne!(p.kind, 0);
             assert_ne!(p.kind, 1);
         }
+    }
+
+    #[test]
+    fn moisture_traction_falls_with_wetness_and_pass_conserves_volume() {
+        let mut world = World::flat(0.18);
+        let m = world.moisture_traction_compare();
+        eprintln!(
+            "clay dry mu {:.3} grip {:.0}  pool mu {:.3} grip {:.0}",
+            m.clay[0].mu, m.clay[0].grip, m.clay[3].mu, m.clay[3].grip
+        );
+        eprintln!(
+            "clay pass mu {:.3}->{:.3} grip {:.0}->{:.0} wet {:.2}->{:.2} cut {:.4} placed {:.4}",
+            m.clay_mu_before,
+            m.clay_mu_after,
+            m.clay_grip_before,
+            m.clay_grip_after,
+            m.clay_wet_before,
+            m.clay_wet_after,
+            m.cut,
+            m.placed
+        );
+        assert!(
+            m.clay[0].grip > m.clay[3].grip * 1.35,
+            "pooled clay should grip less, dry {} pool {}",
+            m.clay[0].grip,
+            m.clay[3].grip
+        );
+        assert!(
+            m.silt[0].mu > m.silt[2].mu,
+            "saturated silt should mu-drop {} -> {}",
+            m.silt[0].mu,
+            m.silt[2].mu
+        );
+        assert!(
+            m.sand[0].grip > m.sand[3].grip * 1.2,
+            "pooled sand should grip less {} pool {}",
+            m.sand[0].grip,
+            m.sand[3].grip
+        );
+        assert!(
+            m.sand[1].grip > m.sand[2].grip,
+            "damp sand should grip more than saturated {} sat {}",
+            m.sand[1].grip,
+            m.sand[2].grip
+        );
+        assert!(
+            m.clay[3].peak_slip > m.clay[0].peak_slip + 0.08,
+            "pooled peak slip {:.3} dry {:.3}",
+            m.clay[3].peak_slip,
+            m.clay[0].peak_slip
+        );
+        assert!(m.cut > 1.0e-4, "pass did not cut");
+        assert!(
+            (m.cut - m.placed).abs() < m.cut * 0.025 + 1.0e-5,
+            "volume drift cut {} placed {}",
+            m.cut,
+            m.placed
+        );
+        assert!(
+            m.clay_grip_after < m.clay_grip_before * 0.92,
+            "wetted rut should grip less {} -> {}",
+            m.clay_grip_before,
+            m.clay_grip_after
+        );
+        assert!(
+            m.clay_slip_after > m.clay_slip_before + 0.04,
+            "wetted rut peak slip should rise"
+        );
     }
 
     #[test]
