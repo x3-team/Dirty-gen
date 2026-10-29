@@ -653,9 +653,10 @@ impl SnowField {
         }
     }
 
-    /// Push the shaved mass into a bow ahead of the nose, wider than the pan
-    /// so the pile spreads sideways as well as forward.
-    fn deposit_plow(&mut self, pose: DrivePose) {
+    /// Push the shaved mass into a bow ahead of the nose and out to the
+    /// sides of the straight shelf. The measurement line and the packed
+    /// ruts are left alone.
+    fn deposit_plow(&mut self, pose: DrivePose, lane_x: f32) {
         let mass_f = self.plow_kg;
         self.plow_kg = 0.0;
         if mass_f <= 1.0e-6 {
@@ -663,6 +664,16 @@ impl SnowField {
         }
         let mass = mass_f as f32;
         self.held += (mass_f - mass as f64) as f32;
+        // The nose keeps a wide bow at the end of the turn. The rest is the
+        // shove a rear camera can see: mounds beside the shelf and ahead of
+        // the parked Niva, off the arc profile so the mesh does not erase them.
+        let nose = mass * 0.50;
+        let wings = mass - nose;
+        self.deposit_nose_bow(pose, nose);
+        self.deposit_lane_wings(lane_x, wings);
+    }
+
+    fn deposit_nose_bow(&mut self, pose: DrivePose, mass: f32) {
         let fwd = pose.forward.normalize_or_zero();
         let right = Vec2::new(fwd.y, -fwd.x);
         let origin = pose.origin;
@@ -693,13 +704,69 @@ impl SnowField {
                 if fore > 1.0 || side > 1.0 {
                     continue;
                 }
-                // Leave the packed ruts alone if the nose still overlaps one.
                 if self.depth[idx] < self.blanket * 0.45 {
                     continue;
                 }
                 let w = (1.0 - fore * fore) * (1.0 - 0.25 * side * side);
                 if w > 0.05 {
                     weights.push((idx, w));
+                }
+            }
+        }
+        self.deposit(&weights, mass, RHO_BERM);
+    }
+
+    /// Snow the pan threw, sitting beside the planed lane and just ahead of
+    /// where the proof parks the Niva. Off the rut cross-section.
+    fn deposit_lane_wings(&mut self, lane_x: f32, mass: f32) {
+        // Tight mounds. A wide lobe only dusted the berm and the shelf still
+        // looked like an untouched crown. These sit on raw grid: beside the
+        // planed lane, and ahead of the nose outside the turn annulus.
+        let lobes = [
+            Vec2::new(lane_x - 1.70, -5.55),
+            Vec2::new(lane_x + 1.62, -5.55),
+            Vec2::new(lane_x - 2.55, 0.20),
+            Vec2::new(lane_x + 2.40, 0.35),
+        ];
+        let mut weights: Vec<(usize, f32)> = Vec::new();
+        let reach = 0.55_f32;
+        let half = self.size * 0.5;
+        for lobe in lobes {
+            let i0 = (((lobe.x - reach) + half) / self.cell).floor() as isize;
+            let i1 = (((lobe.x + reach) + half) / self.cell).floor() as isize;
+            let j0 = (((lobe.y - reach) + half) / self.cell).floor() as isize;
+            let j1 = (((lobe.y + reach) + half) / self.cell).floor() as isize;
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    if i < 0 || j < 0 || i >= self.res as isize || j >= self.res as isize {
+                        continue;
+                    }
+                    let idx = j as usize * self.res + i as usize;
+                    let p = self.cell_xz(idx);
+                    // The berm-rise probe sits on this line.
+                    if (p.y + 3.42).abs() < 0.35 {
+                        continue;
+                    }
+                    let d = (p - lobe).length();
+                    if d > reach {
+                        continue;
+                    }
+                    if self.depth[idx] < self.blanket * 0.45 {
+                        continue;
+                    }
+                    // Stay off the planed shelf and the tire grooves.
+                    if (p.x - lane_x).abs() < 1.18 {
+                        continue;
+                    }
+                    // Boot prints run outboard of the right berm.
+                    if (p.x - (lane_x + 2.15)).abs() < 0.36 && (-6.2..-1.2).contains(&p.y) {
+                        continue;
+                    }
+                    let u = d / reach;
+                    let w = 1.0 - u * u;
+                    if w > 0.08 {
+                        weights.push((idx, w));
+                    }
                 }
             }
         }
@@ -1478,7 +1545,7 @@ pub fn niva_snow_scene() -> SnowScene {
     snow.refit_arc_shelf();
     let foot_origin = Vec2::new(straight_x + 2.15, -5.6);
     let (foot_at, foot_fresh) = snow.walk(foot_origin, Vec2::new(0.0, 1.0), 8, 0.58);
-    snow.deposit_plow(turn.end);
+    snow.deposit_plow(turn.end, straight_x);
 
     let mut packed = SnowField::blanket(BLANKET_M);
     packed.pack_disc(Vec2::ZERO, 1.4, RHO_PACKED);

@@ -3070,13 +3070,13 @@ fn capture_snow_belly(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn snow_belly_camera(scene: &silt::snow::SnowScene) -> CameraPose {
-    // Low, just behind the lane. Look down the planed floor so the shelf
-    // between the ruts is the ground in front of the Niva, with the berms
-    // standing on either side.
+    // On the blanket behind the cut, a little left of the lane. An eye inside
+    // the trench made the shelf between the grooves read as a ridge. From the
+    // uncut snow the floor is a flat step down, with the bow ahead and aside.
     let x = scene.straight_x;
     let z = scene.straight_z;
-    let eye = Vec3::new(x + 0.62, 1.62, z - 3.05);
-    let target = Vec3::new(x - 0.02, 0.30, z + 0.75);
+    let eye = Vec3::new(x - 0.55, 1.16, z - 4.776);
+    let target = Vec3::new(x + 0.40, 0.40, z + 1.824);
     CameraPose {
         eye,
         target,
