@@ -8,8 +8,8 @@ use crate::patch::{
     groove_slurry_capacity, release_groove_slurry, TreadStep, SIDEWALL_VOLUME,
 };
 use crate::soil::{
-    on_launch_crest, slurry_motion_drag, stick_scale, track_offset, SlurrySeal, SoilField,
-    SurfaceKind, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
+    on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale, track_offset,
+    SlurrySeal, SoilField, SurfaceKind, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
     hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
@@ -1203,6 +1203,72 @@ impl World {
         }
     }
 
+    /// After a second pass through the pool, let the bow wave and berm creep
+    /// back into the rut. Clay settles slower than silt and sand.
+    pub fn settle_slurry_after_second_pass(
+        &mut self,
+        drive_seconds: f32,
+        settle_seconds: f32,
+    ) -> SlurrySettleWake {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let pool_x = SLURRY_POOL_X;
+        let pool_z = SLURRY_POOL_Z;
+        let pass = self.second_pass_through_deep_slurry(drive_seconds);
+        let (bow_before, rut_before) = self.slurry_bow_rut_volumes(pool_x, pool_z);
+        let berm_before = pass.berm;
+        let mix0 = self.soil.mix_volumes();
+
+        self.soil.advance_slurry_settle(settle_seconds);
+
+        let (bow_after, rut_after) = self.slurry_bow_rut_volumes(pool_x, pool_z);
+        let berm_after = self.slurry_berm_volume(pool_x, pool_z);
+        let slurry = (pass.sum - berm_after - bow_after - pass.groove - pass.wake_m3
+            - pass.ribbons
+            - pass.spray)
+            .max(0.0);
+        let mix1 = self.soil.mix_volumes();
+        SlurrySettleWake {
+            pool: pass.pool,
+            berm_before,
+            berm_after,
+            bow_before,
+            bow_after,
+            rut_before,
+            rut_after,
+            slurry,
+            groove: pass.groove,
+            wake_m3: pass.wake_m3,
+            ribbons: pass.ribbons,
+            spray: pass.spray,
+            sum: pass.sum,
+            mix0,
+            mix1,
+            pace_clay: slurry_settle_pace(SurfaceKind::WetMud, moisture),
+            pace_silt: slurry_settle_pace(SurfaceKind::Silt, moisture),
+            pace_sand: slurry_settle_pace(SurfaceKind::Sand, moisture),
+        }
+    }
+
+    fn slurry_bow_rut_volumes(&self, pool_x: (f32, f32), pool_z: (f32, f32)) -> (f32, f32) {
+        let fwd = self.vehicle.forward();
+        let ori = self.vehicle.orientation();
+        let front = self.vehicle.pos + ori * self.vehicle.wheel_center_local(0);
+        let rear_l = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
+        let rear_r = self.vehicle.pos + ori * self.vehicle.wheel_center_local(3);
+        let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
+        self.soil.slurry_bow_and_rut_volumes(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        )
+    }
+
     /// Lean and roll the Niva in a deep slurry pool. Body and tire contact
     /// split volume across the berm, a bow wave, and a throw of sheets and
     /// ribbons. The pool total is conserved. Clay holds harder than silt and
@@ -2384,6 +2450,33 @@ pub struct SlurrySecondPassWake {
     pub torque_sand: f32,
 }
 
+/// Bow wave and berm after a pass, then after slurry settle. Cubic metres unless noted.
+///
+/// `pool == berm_after + slurry + bow_after + groove + wake + ribbons + spray`
+/// (`sum`). `bow_*` and `rut_*` are slurry in the bow crest band and rut lane.
+/// `pace_*` is the settle conduct (m/s per m head) for clay, silt, and sand.
+#[derive(Clone, Copy, Debug)]
+pub struct SlurrySettleWake {
+    pub pool: f32,
+    pub berm_before: f32,
+    pub berm_after: f32,
+    pub bow_before: f32,
+    pub bow_after: f32,
+    pub rut_before: f32,
+    pub rut_after: f32,
+    pub slurry: f32,
+    pub groove: f32,
+    pub wake_m3: f32,
+    pub ribbons: f32,
+    pub spray: f32,
+    pub sum: f32,
+    pub mix0: crate::soil::MixVolumes,
+    pub mix1: crate::soil::MixVolumes,
+    pub pace_clay: f32,
+    pub pace_silt: f32,
+    pub pace_sand: f32,
+}
+
 /// Roll the Niva onto its side in a deep slurry pool. Cubic metres unless noted.
 ///
 /// `pool == berm + slurry + bow + shed` (`sum`), where `shed == ribbons +
@@ -3377,6 +3470,66 @@ mod tests {
             assert_ne!(p.kind, 0);
             assert_ne!(p.kind, 1);
         }
+    }
+
+    #[test]
+    fn slurry_settle_after_second_pass_levels_bow_and_berm() {
+        let mut world = World::wet_clay();
+        let m = world.settle_slurry_after_second_pass(3.6, 8.0);
+        eprintln!(
+            "settle pool {:.4} berm {:.4}->{:.4} bow {:.4}->{:.4} rut {:.4}->{:.4} sum {:.4} \
+             clay {:.3} silt {:.3} sand {:.3}",
+            m.pool,
+            m.berm_before,
+            m.berm_after,
+            m.bow_before,
+            m.bow_after,
+            m.rut_before,
+            m.rut_after,
+            m.sum,
+            m.pace_clay,
+            m.pace_silt,
+            m.pace_sand
+        );
+        assert!(m.pool > 0.35, "pool {:.4}", m.pool);
+        assert!(m.bow_before > 0.008, "bow before {:.4}", m.bow_before);
+        assert!(
+            m.bow_after < m.bow_before - 0.002,
+            "bow did not settle {:.4} -> {:.4}",
+            m.bow_before,
+            m.bow_after
+        );
+        assert!(
+            m.rut_after > m.rut_before + 0.002,
+            "rut did not fill {:.4} -> {:.4}",
+            m.rut_before,
+            m.rut_after
+        );
+        assert!(
+            m.berm_after < m.berm_before - 0.0005,
+            "berm did not creep {:.4} -> {:.4}",
+            m.berm_before,
+            m.berm_after
+        );
+        assert!(
+            m.pace_sand > m.pace_silt && m.pace_silt > m.pace_clay,
+            "pace clay {:.3} silt {:.3} sand {:.3}",
+            m.pace_clay,
+            m.pace_silt,
+            m.pace_sand
+        );
+        assert!(
+            (m.mix1.total() - m.mix0.total()).abs() < 1.0e-3,
+            "mix drift {:.6} -> {:.6}",
+            m.mix0.total(),
+            m.mix1.total()
+        );
+        assert!(
+            (m.pool - m.sum).abs() < 1.0e-3,
+            "pool {:.4} != sum {:.4}",
+            m.pool,
+            m.sum
+        );
     }
 
     #[test]

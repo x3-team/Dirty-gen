@@ -534,6 +534,8 @@ struct CaptureArgs {
     slurry_second_pass_proof: PathBuf,
     slurry_rollover: bool,
     slurry_rollover_proof: PathBuf,
+    slurry_settle: bool,
+    slurry_settle_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -638,6 +640,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_rollover {
         capture_slurry_rollover(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_settle {
+        capture_slurry_settle(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -837,6 +843,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_rollover = false;
     let mut slurry_rollover_proof =
         PathBuf::from(format!("{MEDIA}/slurry-rollover-proof.png"));
+    let mut slurry_settle = false;
+    let mut slurry_settle_proof =
+        PathBuf::from(format!("{MEDIA}/slurry-settle-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -939,6 +948,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     slurry_rollover_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--slurry-settle-proof" => {
+                slurry_settle = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_settle_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1036,6 +1051,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_second_pass_proof,
         slurry_rollover,
         slurry_rollover_proof,
+        slurry_settle,
+        slurry_settle_proof,
     }
 }
 
@@ -1917,6 +1934,74 @@ fn capture_slurry_rollover(renderer: &mut Renderer, parsed: &CaptureArgs) {
     println!(
         "cc0 slurry-rollover {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
         parsed.slurry_rollover_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Second pass through the pool, then slurry settle. Bow and berm numbers are
+/// just-after versus settled; sum is the conserved pool total.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_settle(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.settle_slurry_after_second_pass(3.6, 8.0);
+    silence_soil_clods(&mut world);
+    println!(
+        "slurry-settle pool {:.4} berm {:.4}->{:.4} bow {:.4}->{:.4} rut {:.4}->{:.4} \
+         sum {:.4} groove {:.4} wake {:.4} clay {:.3} silt {:.3} sand {:.3}",
+        out.pool,
+        out.berm_before,
+        out.berm_after,
+        out.bow_before,
+        out.bow_after,
+        out.rut_before,
+        out.rut_after,
+        out.sum,
+        out.groove,
+        out.wake_m3,
+        out.pace_clay,
+        out.pace_silt,
+        out.pace_sand,
+    );
+    let lines = [
+        format!("pool {:.4} m3", out.pool),
+        format!("berm {:.4}->{:.4} m3", out.berm_before, out.berm_after),
+        format!("bow {:.4}->{:.4} m3", out.bow_before, out.bow_after),
+        format!("rut {:.4}->{:.4} m3", out.rut_before, out.rut_after),
+        format!("sum {:.4} m3", out.sum),
+        format!("groove {:.4} m3", out.groove),
+        format!("wake {:.4} m3", out.wake_m3),
+        format!("clay {:.3} m/s", out.pace_clay),
+        format!("silt {:.3} m/s", out.pace_silt),
+        format!("sand {:.3} m/s", out.pace_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = slurry_plow_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_settle_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_settle_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry settle still");
+    println!(
+        "cc0 slurry-settle {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_settle_proof.display(),
         pose.eye.x,
         pose.eye.y,
         pose.eye.z,
