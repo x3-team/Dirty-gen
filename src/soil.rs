@@ -3005,11 +3005,11 @@ impl SoilField {
         let j1 = (((z + reach) + half) / self.cell).floor() as isize;
         let track_back = -radius * 0.55;
         let track_front = radius * 0.12;
-        let wake_far = -radius * 2.35;
-        let wake_near = -radius * 0.58;
+        let wake_far = -radius * 2.55;
+        let wake_near = -radius * 0.52;
         // Ahead of the rubber, so the wave is in front of the tread and not under it.
-        let bow_near = radius * 0.95;
-        let bow_far = radius * 2.2;
+        let bow_near = radius * 0.72;
+        let bow_far = radius * 2.55;
 
         let area = self.cell * self.cell;
         let mut taken: Vec<(usize, f32)> = Vec::new();
@@ -3025,12 +3025,12 @@ impl SoilField {
                 let along = rel_x * forward.x + rel_z * forward.z;
                 let idx = j as usize * self.res + i as usize;
                 if (track_back..=track_front).contains(&along) && lat.abs() <= half_track {
-                    let take = self.slurry[idx] * 0.64;
+                    let take = self.slurry[idx] * 0.86;
                     if take > 1.0e-6 {
                         taken.push((idx, take));
                     }
                 } else if (wake_far..=wake_near).contains(&along) && lat.abs() <= half_track {
-                    let take = self.slurry[idx] * 0.40;
+                    let take = self.slurry[idx] * 0.52;
                     if take > 1.0e-6 {
                         taken.push((idx, take));
                         wake_m3 += take * area;

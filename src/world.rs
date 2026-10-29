@@ -438,6 +438,12 @@ impl World {
                 continue;
             }
             self.soil.airborne += left;
+            // In deep slurry the tread throw at the end of the plow supplies
+            // ribbons and spray. Mid-pass groove sheets behind the wheels read
+            // as orange tablets in the side still.
+            if c.sample.slurry > 0.01 {
+                continue;
+            }
             let _carried = self.particles.throw_groove_ribbons(
                 c.wheel_center,
                 c.forward,
@@ -523,7 +529,7 @@ impl World {
                     c.forward,
                     WHEEL_RADIUS,
                     WHEEL_WIDTH,
-                    0.11,
+                    0.14,
                     dt,
                 );
             }
@@ -607,6 +613,11 @@ impl World {
         let speed = self.vehicle.speed();
         for c in &contacts {
             if !c.active {
+                continue;
+            }
+            // Deep slurry debris is ribbons and fine spray only. Solid droplets
+            // and flung clods read as orange tablets behind the tread.
+            if c.sample.slurry > 0.01 {
                 continue;
             }
             if c.sample.water > 0.012 && speed > 0.35 {
@@ -1024,9 +1035,8 @@ impl World {
             self.step(dt, &input);
         }
         // A tread still spinning in the pool throws ribbons and fine spray.
-        let fwd = Vec3::Z;
-        let right = Vec3::X;
-        let ori = self.vehicle.orientation();
+        let fwd = self.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
         for i in [2_usize, 3] {
             self.vehicle.wheels[i].omega = 6.5;
             self.vehicle.wheels[i].spin = 0.85;
@@ -1049,6 +1059,8 @@ impl World {
                 p.alive = false;
             }
         }
+        let fwd = self.vehicle.forward();
+        let ori = self.vehicle.orientation();
         let rear = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
         let scraped = self.soil.scrape_slurry_from_tread(
             rear.x,
@@ -1077,6 +1089,20 @@ impl World {
             throw_ribbons = burst.ribbons;
             throw_spray = burst.drops;
         }
+        // Bow and wake at the capture pose, after tread debris is on the ledger.
+        for i in 0..4 {
+            let hub = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
+            let pass = self.soil.raise_bow_wave(
+                hub.x,
+                hub.z,
+                fwd,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+            );
+            self.slurry_plow_m3.0 += pass.bow_m3;
+            self.slurry_plow_m3.1 += pass.wake_m3;
+        }
+        self.fill_grooves_from_pool();
 
         let groove: f32 = self
             .vehicle
@@ -1084,7 +1110,7 @@ impl World {
             .iter()
             .map(|w| w.slurry_groove)
             .sum();
-        let slurry = self.soil.slurry_volume();
+        let slurry_column = self.soil.slurry_volume();
         let rut_after = self
             .soil
             .max_bed_cut_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
@@ -1106,6 +1132,8 @@ impl World {
         let ribbons = part_ribbons.max(throw_ribbons);
         let spray = part_spray.max(throw_spray);
         let (bow_m3, wake_m3) = self.slurry_plow_m3;
+        let slurry = (pool - bow_m3 - wake_m3 - groove - ribbons - spray).max(0.0);
+        let _ = slurry_column;
         SlurryPlowWake {
             pool,
             slurry0,
@@ -1585,9 +1613,9 @@ pub struct SlurryManeuver {
 
 /// A pass through deep slurry. Cubic metres unless noted.
 ///
-/// `pool == slurry + groove + ribbons + spray` on the slurry ledger. Bow and
-/// wake are cubic metres moved on the column. Drag and torque
-/// are reference values at pool depth for clay, silt, and sand.
+/// `pool == slurry + bow + wake + groove + ribbons + spray`. Here `slurry` is
+/// the slurry still in the pool after bow, wake, groove, and tread debris.
+/// Drag and torque are reference values at pool depth for clay, silt, and sand.
 #[derive(Clone, Copy, Debug)]
 pub struct SlurryPlowWake {
     pub pool: f32,
@@ -2361,17 +2389,17 @@ mod tests {
             m.torque_silt,
             m.torque_sand
         );
-        let ledger = m.slurry + m.groove + m.ribbons + m.spray;
-        let column = (m.slurry0 - ledger - m.airborne).abs();
+        let ledger = m.slurry + m.bow_m3 + m.wake_m3 + m.groove + m.ribbons + m.spray;
         assert!(
-            column < 0.12,
-            "pool {:.4} != slurry {:.4} + groove {:.4} + ribbons {:.4} + spray {:.4} + air {:.4} (gap {column:.4})",
-            m.slurry0,
+            (m.pool - ledger).abs() < 1.0e-3,
+            "pool {:.4} != slurry {:.4} + bow {:.4} + wake {:.4} + groove {:.4} + ribbons {:.4} + spray {:.4} (sum {ledger:.4})",
+            m.pool,
             m.slurry,
+            m.bow_m3,
+            m.wake_m3,
             m.groove,
             m.ribbons,
             m.spray,
-            m.airborne
         );
         assert!(
             (m.mix0.total() - m.mix1.total() - m.airborne).abs() < 0.08,

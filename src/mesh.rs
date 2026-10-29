@@ -1099,10 +1099,6 @@ fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32
         add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
         add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
     }
-    let a = ring[0];
-    let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
@@ -1233,10 +1229,6 @@ fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
         add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
         add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
     }
-    let a = ring[0];
-    let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 #[cfg(test)]
