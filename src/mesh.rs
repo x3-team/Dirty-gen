@@ -21,6 +21,8 @@ pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
 /// Wet mud clod. Not body paint, and not a camera-facing card.
 pub const PANEL_CLOD: f32 = 46.0;
+/// Dry dust lofted off the track. A pale film, not wet mud.
+pub const PANEL_DUST: f32 = 47.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1245,6 +1247,48 @@ fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
+/// A wisp of the air-grid dust. The volume stays on the grid. This mark is
+/// a short fleck along the wind, not a sphere and not a bar.
+fn add_dust_wisp(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-4 {
+        let a = p.pos.x * 12.7 + p.pos.z * 4.1;
+        dir = Vec3::new(a.cos(), 0.0, a.sin());
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = Vec3::Z;
+    }
+    side = side.normalize();
+    let scale = (p.size / 0.05).clamp(1.2, 9.0);
+    let length = 0.046_f32 * scale;
+    let width = 0.012_f32 * scale;
+    let thick = 0.006_f32 * scale;
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (0.22 + 0.78 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.22, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = Vec3::Y * width * 0.5 * taper;
+        let h = side * thick * 0.5 * taper;
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_DUST);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_DUST);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_DUST);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_DUST);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_DUST);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_DUST);
+}
+
 #[cfg(test)]
 mod slurry_shapes {
     use super::*;
@@ -1445,22 +1489,38 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
     // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
-    for kind in [7u8, 5, 6, 3, 1, 4, 0, 2] {
+    for kind in [8u8, 7, 5, 6, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
+            if p.kind == 8 {
+                if mesh.vertices.len() + 200 < MAX_VERTS {
+                    add_dust_wisp(&mut mesh, p);
+                }
+                continue;
+            }
+            if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 {
+                if mesh.vertices.len() + 200 < MAX_VERTS {
+                    add_mud_drop(&mut mesh, p);
+                }
+                continue;
+            }
+            if p.kind == silt::particles::KIND_SLURRY_SHEET {
+                if mesh.vertices.len() + 400 < MAX_VERTS {
+                    add_slurry_sheet(&mut mesh, p);
+                }
+                continue;
+            }
+            if p.kind == silt::particles::KIND_SLURRY_RIBBON {
+                if mesh.vertices.len() + 400 < MAX_VERTS {
+                    add_slurry_ribbon(&mut mesh, p);
+                }
+                continue;
+            }
             if p.ledger {
                 if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
-                    if p.kind == silt::particles::KIND_SLURRY_DROP {
-                        add_mud_drop(&mut mesh, p);
-                    } else if p.kind == silt::particles::KIND_SLURRY_SHEET {
-                        add_slurry_sheet(&mut mesh, p);
-                    } else if p.kind == silt::particles::KIND_SLURRY_RIBBON {
-                        add_slurry_ribbon(&mut mesh, p);
-                    } else {
-                        add_soil_ribbon(&mut mesh, p);
-                    }
+                    add_soil_ribbon(&mut mesh, p);
                 }
                 continue;
             }

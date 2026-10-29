@@ -6,6 +6,8 @@
 
 pub mod adhesion;
 pub mod bike;
+pub mod dust;
+pub mod fluid_core;
 pub mod lod;
 pub mod particles;
 pub mod patch;
@@ -14,4 +16,7 @@ pub mod soil;
 pub mod vehicle;
 pub mod world;
 
-pub use world::{demo_camera, demo_drive, demo_drive_bike, dig_input, CameraPose, Input, World};
+pub use world::{
+    demo_camera, demo_drive, demo_drive_bike, dig_input, CameraPose, Input, ThroughDrive,
+    ThroughReport, World,
+};

@@ -1343,6 +1343,10 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        let g = noise(world.xz * 2.2 + vec2<f32>(world.y * 1.4, 0.3));
+        let col = mix(vec3<f32>(0.46, 0.38, 0.26), vec3<f32>(0.68, 0.58, 0.40), g);
+        return vec4<f32>(col, 0.72);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
