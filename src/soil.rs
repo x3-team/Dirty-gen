@@ -3236,16 +3236,17 @@ impl SoilField {
         let mut crests: Vec<(usize, f32)> = Vec::new();
         let rear_z = rear_left.1.min(rear_right.1);
         let front_z = front_hub.1;
-        let wake_back = pool_z0 + margin;
-        let wake_front = rear_z - self.cell * 0.8;
-        let bow_near = front_z + self.cell * 0.55;
-        let bow_far = (front_z + 1.25).min(pool_z1 - margin);
+        let wake_front = rear_z - self.cell * 0.35;
+        let wake_back = rear_z - 1.45;
+        let bow_near = front_z + self.cell * 0.45;
+        let bow_far = (front_z + 1.05).min(pool_z1 - margin);
         if bow_far <= bow_near + 0.05 || wake_front <= wake_back + 0.05 {
             return;
         }
         let on_rut = |cx: f32| {
             (cx - rear_left.0).abs() <= track_half || (cx - rear_right.0).abs() <= track_half
         };
+        let min_film = 0.058_f32;
         for j in 0..self.res {
             for i in 0..self.res {
                 let cx = (i as f32 + 0.5) * self.cell - half;
@@ -3257,14 +3258,17 @@ impl SoilField {
                 {
                     continue;
                 }
-                if cz < wake_back || cz > wake_front || !on_rut(cx) {
-                    continue;
-                }
                 let idx = j * self.res + i;
-                if self.slurry[idx] <= 0.01 {
+                if self.slurry[idx] <= min_film + 0.01 {
                     continue;
                 }
-                let take = self.slurry[idx] * 0.48;
+                let mut take = 0.0_f32;
+                if cz >= wake_back && cz <= wake_front && on_rut(cx) {
+                    let u = ((wake_front - cz) / (wake_front - wake_back).max(0.05)).clamp(0.0, 1.0);
+                    take = (self.slurry[idx] - min_film) * (0.22 + 0.42 * u);
+                } else if cz >= rear_z + 0.05 && cz <= front_z - 0.05 && on_rut(cx) {
+                    take = self.slurry[idx] * 0.16;
+                }
                 if take > 1.0e-6 {
                     donors.push((idx, take));
                     moved += take * area;

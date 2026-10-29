@@ -1080,7 +1080,7 @@ impl World {
             self.soil.airborne += scraped;
         }
         if throw_vol > 1.0e-6 {
-            let origin = rear + Vec3::Y * 0.38 + right * 0.42 - fwd * 0.12;
+            let origin = rear + Vec3::Y * 0.62 + right * 0.78 - fwd * 0.28;
             let burst = self.particles.throw_slurry(origin, fwd, right, throw_vol);
             throw_ribbons = burst.ribbons;
             throw_spray = burst.drops;
@@ -1145,6 +1145,8 @@ impl World {
             half_track,
             fwd,
         );
+        let air_base = rear + right * 1.05 + Vec3::Y * 0.72 - fwd * 0.45;
+        let mut n = 0usize;
         for p in &mut self.particles.items {
             if !p.alive {
                 continue;
@@ -1154,9 +1156,16 @@ impl World {
             {
                 continue;
             }
-            p.life = p.life.max(3.6);
-            p.max_life = p.max_life.max(3.6);
-            p.vel.y = p.vel.y.max(0.35);
+            if p.pos.y < rear.y + 0.35 {
+                p.alive = false;
+                continue;
+            }
+            p.grounded = false;
+            p.deposited = false;
+            p.life = p.life.max(3.8);
+            p.vel = right * 1.6 + Vec3::Y * 0.55 - fwd * 0.35;
+            p.pos = air_base + Vec3::Y * (n as f32 * 0.07) + right * (n as f32 * 0.04);
+            n += 1;
         }
         SlurryPlowWake {
             pool,
