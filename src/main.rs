@@ -1880,26 +1880,54 @@ fn capture_slurry_tear_out(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn slurry_tear_out_camera(world: &World) -> CameraPose {
-    let p = world.vehicle.pos;
-    let fwd = world.vehicle.forward();
+    use silt::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
+
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    let pool = Vec3::new(
-        0.0,
-        world.soil.sample(0.0, -1.55).height + 0.04,
-        -1.55,
+    let ori = vehicle.orientation();
+    let rear_l = vehicle.pos + ori * vehicle.wheel_center_local(2);
+    let rear_r = vehicle.pos + ori * vehicle.wheel_center_local(3);
+    let rear = (rear_l + rear_r) * 0.5;
+
+    let (mut sx, mut sy, mut sz, mut sw) = (0.0_f32, 0.0, 0.0, 0.0);
+    for p in &world.particles.items {
+        if !p.alive || !p.ledger || p.volume <= 1.0e-8 {
+            continue;
+        }
+        if p.kind != KIND_SLURRY_RIBBON && p.kind != KIND_SLURRY_SHEET && p.kind != KIND_SLURRY_DROP {
+            continue;
+        }
+        let w = p.volume;
+        sx += p.pos.x * w;
+        sy += p.pos.y * w;
+        sz += p.pos.z * w;
+        sw += w;
+    }
+    let debris = if sw > 1.0e-6 {
+        Vec3::new(sx / sw, sy / sw, sz / sw)
+    } else {
+        rear - fwd * 0.42 - right * 0.30 + Vec3::Y * 0.75
+    };
+
+    let pool_back = rear - fwd * 0.72;
+    let pool_back = Vec3::new(
+        pool_back.x,
+        world.soil.sample(pool_back.x, pool_back.z).height + 0.05,
+        pool_back.z,
     );
-    let lip = Vec3::new(
-        p.x * 0.65,
-        world.soil.sample(p.x, p.z).height + 0.05,
-        p.z * 0.55 + pool.z * 0.45,
-    );
+    let nose = vehicle.pos + fwd * 0.95 + Vec3::Y * 0.18;
+
+    // Beside the rear treads: debris, pool behind, nose-up exit still in frame.
+    let look = debris * 0.52 + rear * 0.24 + pool_back * 0.14 + nose * 0.10;
     let look = Vec3::new(
-        lip.x * 0.42 + pool.x * 0.58,
-        lip.y * 0.45 + pool.y * 0.55 + 0.08,
-        lip.z * 0.35 + pool.z * 0.65,
+        look.x,
+        look.y.max(world.soil.sample(look.x, look.z).height + 0.14),
+        look.z,
     );
-    let eye = look + right * 5.05 - fwd * 1.15 + Vec3::Y * 1.35;
-    let ortho = 7.6;
+    // Driver-side rear quarter — groove ribbons and roll sheets face this way.
+    let eye = rear - right * 2.05 - fwd * 2.25 + Vec3::Y * 0.62;
+    let ortho = 3.55;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
