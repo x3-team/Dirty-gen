@@ -2474,32 +2474,8 @@ fn capture_water_crossing(renderer: &mut Renderer, parsed: &CaptureArgs) {
         out.stick_sand
     );
 
-    let lines = [
-        format!(
-            "wave {:.3} m spd {:.2} depth {:.3}",
-            out.bow, out.speed, out.depth
-        ),
-        format!("drag {:.0} n buoy {:.0} n", out.drag, out.buoy),
-        format!("stall {:.3} m intake {:.3}", out.stall, out.intake),
-        format!("scour {:.4} m3 turbid {:.4}", out.scour, out.turbid),
-        format!("water {:.3} m3 closed", out.water),
-        format!(
-            "cut {:.3} placed {:.3} cloud {:.4}",
-            out.cut, out.placed, out.cloud
-        ),
-        format!(
-            "clay {:.3} silt {:.3} sand {:.3}",
-            out.cloud_clay, out.cloud_silt, out.cloud_sand
-        ),
-        format!(
-            "stick {:.2} {:.2} {:.2}",
-            out.stick_clay, out.stick_silt, out.stick_sand
-        ),
-    ];
-    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
     let pose = water_crossing_camera(&world);
-    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
-    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
     if let Some(parent) = parsed.water_crossing_proof.parent() {
         std::fs::create_dir_all(parent).ok();
     }
