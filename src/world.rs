@@ -1136,6 +1136,8 @@ impl World {
         let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
         self.soil
             .clear_placed_in_pool(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
         self.soil.accentuate_plow_bow_wake(
             pool_x.0,
             pool_x.1,
@@ -1147,8 +1149,10 @@ impl World {
             half_track,
             fwd,
         );
-        let ribbon_base = rear_r + right * 0.58 + Vec3::Y * 0.52 - fwd * 0.08;
-        let spray_base = rear_r + right * 0.44 + Vec3::Y * 0.62 - fwd * 0.05;
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
+        let ribbon_base = rear_r + right * 0.62 + Vec3::Y * 0.50 - fwd * 0.06;
+        let spray_base = rear_r + right * 0.48 + Vec3::Y * 0.68 - fwd * 0.04;
         let mut ri = 0usize;
         let mut di = 0usize;
         for p in &mut self.particles.items {
@@ -1160,20 +1164,19 @@ impl World {
             p.life = p.life.max(4.2);
             p.max_life = p.max_life.max(4.2);
             if p.kind == crate::particles::KIND_SLURRY_RIBBON {
-                p.pos = ribbon_base
-                    + Vec3::Y * (ri as f32 * 0.09)
-                    + right * (ri as f32 * 0.05)
-                    + fwd * (ri as f32 * -0.03);
-                p.vel = right * 0.35 + Vec3::Y * 0.08;
-                p.size = (p.volume * 55.0).cbrt().clamp(0.085, 0.14);
-                p.spin = Vec3::new(0.4, 0.2, 0.5);
+                p.pos = ribbon_base + right * (ri as f32 * 0.14) + fwd * (ri as f32 * -0.05);
+                p.vel = right * 2.4 + fwd * (-0.65);
+                p.size = (p.volume * 55.0).cbrt().clamp(0.09, 0.15);
+                p.spin = Vec3::new(0.15, 0.35, 0.1);
                 ri += 1;
             } else if p.kind == crate::particles::KIND_SLURRY_DROP {
-                p.pos = spray_base
-                    + Vec3::Y * (di as f32 * 0.05)
-                    + right * ((di as f32 * 0.03) - 0.04);
-                p.vel = right * 0.25 + Vec3::Y * 0.12;
-                p.size = (p.volume * 90.0).cbrt().clamp(0.035, 0.06);
+                if p.pos.y < rear_r.y + 0.42 {
+                    p.alive = false;
+                    continue;
+                }
+                p.pos = spray_base + right * (di as f32 * 0.06) + Vec3::Y * (di as f32 * 0.04);
+                p.vel = right * 1.8 + Vec3::Y * 0.25;
+                p.size = (p.volume * 90.0).cbrt().clamp(0.028, 0.045);
                 di += 1;
             } else if p.kind != crate::particles::KIND_SLURRY_SHEET {
                 p.alive = false;

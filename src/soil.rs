@@ -3213,6 +3213,45 @@ impl SoilField {
 
     /// Clear placed spoil inside the pool. Sidewall smear and crest clods
     /// read as orange tablets in a slurry still.
+    /// Slurry piled on the rim or on the berm reads as blocks in a still.
+    pub fn trim_slurry_pool_rim(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        rim: f32,
+    ) {
+        let half = self.size * 0.5;
+        let rim = rim.max(self.cell);
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                let idx = j * self.res + i;
+                if self.slurry[idx] <= 1.0e-6 {
+                    continue;
+                }
+                let inside = x >= x0 && x < x1 && z >= z0 && z < z1;
+                let near_edge = inside
+                    && (x >= x1 - rim
+                        || z >= z1 - rim
+                        || x <= x0 + rim
+                        || z <= z0 + rim);
+                let outside_spill = !inside
+                    && x >= x0 - rim
+                    && x < x1 + rim
+                    && z >= z0 - rim
+                    && z < z1 + rim;
+                if !near_edge && !outside_spill {
+                    continue;
+                }
+                self.slurry[idx] = 0.0;
+                self.sync(idx);
+            }
+        }
+    }
+
     pub fn clear_placed_in_pool(&mut self, x0: f32, x1: f32, z0: f32, z1: f32) {
         let half = self.size * 0.5;
         for j in 0..self.res {
