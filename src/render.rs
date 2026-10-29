@@ -140,6 +140,14 @@ pub struct Renderer {
     niva_body: GpuMesh,
     niva_glass: GpuMesh,
     niva_wheels: [GpuMesh; 4],
+    /// Versioned physics maps. The picture shaders do not read these.
+    contract: Option<silt::render_contract::ContractGpu>,
+    contract_cpu: silt::render_contract::ContractFrame,
+    pipe_debug: Option<wgpu::RenderPipeline>,
+    /// Top-down debug view of the render contract. Off for the Niva picture.
+    pub debug_contract: bool,
+    /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
+    pub debug_mode: u32,
 }
 
 pub struct GpuFormats {
@@ -704,6 +712,8 @@ impl Renderer {
         let terrain_layout_ref = &terrain_layout;
         let mesh_layout_ref = &mesh_layout;
 
+        let contract = silt::render_contract::ContractGpu::try_new(&device);
+
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipe_terrain = pipeline(
             &device,
@@ -881,6 +891,48 @@ impl Renderer {
             false,
             None,
         );
+        // Debug view. It reads only the render contract. Compiling it here
+        // keeps a contract edit from landing with a shader that does not match.
+        let debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("render-contract-debug"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("render_contract.wgsl").into()),
+        });
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipe_debug_try = contract.as_ref().map(|contract_gpu| {
+            let debug_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("contract-debug"),
+                bind_group_layouts: &[&contract_gpu.layout],
+                push_constant_ranges: &[],
+            });
+            pipeline(
+                &device,
+                &debug_shader,
+                &debug_layout,
+                "vs_debug",
+                Some("fs_debug"),
+                &[],
+                color_format,
+                None,
+                false,
+                None,
+            )
+        });
+        // A device that cannot sample the contract maps keeps the picture.
+        // The shader module above still has to compile.
+        #[cfg(not(target_arch = "wasm32"))]
+        let pipe_debug = if pollster::block_on(device.pop_error_scope()).is_some() {
+            None
+        } else {
+            pipe_debug_try
+        };
+        #[cfg(target_arch = "wasm32")]
+        let pipe_debug = {
+            let fut = device.pop_error_scope();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = fut.await;
+            });
+            pipe_debug_try
+        };
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(err) = pollster::block_on(device.pop_error_scope()) {
             panic!("wgpu pipeline validation: {err}");
@@ -1036,6 +1088,11 @@ impl Renderer {
             niva_body,
             niva_glass,
             niva_wheels,
+            contract,
+            contract_cpu: silt::render_contract::ContractFrame::new(),
+            pipe_debug,
+            debug_contract: false,
+            debug_mode: 0,
         }
     }
 
@@ -1113,6 +1170,33 @@ impl Renderer {
         present: Option<(&wgpu::TextureView, bool)>,
         readback: bool,
     ) -> Option<Vec<u8>> {
+        self.draw_with_sheet(world, cam, present, readback, None, None)
+    }
+
+    /// Draw the Niva picture. `fluid` and `dust`, when present, are the sheet
+    /// the contract publishes. The picture shaders do not read that sheet.
+    pub fn draw_with_sheet(
+        &mut self,
+        world: &World,
+        cam: CameraPose,
+        present: Option<(&wgpu::TextureView, bool)>,
+        readback: bool,
+        fluid: Option<&silt::fluid_core::FluidCore>,
+        dust: Option<&silt::dust::Dust>,
+    ) -> Option<Vec<u8>> {
+        silt::render_contract::publish(
+            &mut self.contract_cpu,
+            &world.soil,
+            &world.particles.items,
+            [world.vehicle.pos.x, world.vehicle.pos.z],
+            world.time,
+            self.debug_mode,
+            fluid,
+            dust,
+        );
+        if let Some(gpu) = &self.contract {
+            gpu.upload(&self.queue, &self.contract_cpu);
+        }
         self.upload_soil(&world.soil);
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
@@ -1338,6 +1422,36 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+        }
+
+        if self.debug_contract {
+            if let (Some(pipe), Some(gpu)) = (&self.pipe_debug, &self.contract) {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("contract-debug"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.05,
+                                b: 0.05,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &gpu.bind_group, &[]);
+                let n = silt::render_contract::WINDOW_CELLS
+                    * silt::render_contract::WINDOW_CELLS
+                    * 6;
+                pass.draw(0..n, 0..1);
+            }
         }
 
         if let Some((view, srgb)) = present {
@@ -2363,3 +2477,139 @@ fn fs_blit_tosrgb(in: V) -> @location(0) vec4<f32> {
     return vec4<f32>(pow(c.rgb, vec3<f32>(2.2)), c.a);
 }
 "#;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn debug_contract_view_reads_the_published_maps() {
+    prepare_software_vulkan();
+    let (_instance, _adapter, device, queue) = open_adapter(true, None);
+    let gpu = silt::render_contract::ContractGpu::try_new(&device).expect("contract maps");
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("render-contract-debug"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("render_contract.wgsl").into()),
+    });
+    let debug_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("contract-debug-test"),
+        bind_group_layouts: &[&gpu.layout],
+        push_constant_ranges: &[],
+    });
+    let pipe = pipeline(
+        &device,
+        &shader,
+        &debug_layout,
+        "vs_debug",
+        Some("fs_debug"),
+        &[],
+        wgpu::TextureFormat::Rgba8Unorm,
+        None,
+        false,
+        None,
+    );
+    let _ = device.poll(wgpu::Maintain::Wait);
+    if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+        panic!("debug contract shader: {err}");
+    }
+
+    let soil = silt::soil::SoilField::flat(0.35);
+    let mut frame = silt::render_contract::ContractFrame::new();
+    silt::render_contract::publish(
+        &mut frame,
+        &soil,
+        &[],
+        [0.0, 0.0],
+        1.0,
+        0,
+        None,
+        None,
+    );
+    gpu.upload(&queue, &frame);
+
+    let width = 64u32;
+    let height = 64u32;
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("contract-debug-color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = color.create_view(&Default::default());
+    let padded = width * 4;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("contract-debug-readback"),
+        size: (padded * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("contract-debug-test"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &gpu.bind_group, &[]);
+        let n = silt::render_contract::WINDOW_CELLS * silt::render_contract::WINDOW_CELLS * 6;
+        pass.draw(0..n, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &color,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &readback,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    queue.submit(Some(encoder.finish()));
+    let _ = device.poll(wgpu::Maintain::Wait);
+    if let Some(err) = pollster::block_on(device.pop_error_scope()) {
+        panic!("debug contract draw: {err}");
+    }
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    let _ = device.poll(wgpu::Maintain::Wait);
+    rx.recv().expect("map").expect("map buffer");
+    let bytes = slice.get_mapped_range();
+    let mid = ((height / 2) * padded + (width / 2) * 4) as usize;
+    let px = [bytes[mid], bytes[mid + 1], bytes[mid + 2], bytes[mid + 3]];
+    drop(bytes);
+    readback.unmap();
+    assert_ne!(px, [255, 0, 255, 255], "version mismatch magenta");
+    assert!(px[3] == 255, "debug view did not cover the centre {px:?}");
+    assert!(px[0] > 0, "ground ramp was empty {px:?}");
+}

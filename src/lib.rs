@@ -9,6 +9,7 @@ pub mod dust;
 pub mod fluid_core;
 pub mod particles;
 pub mod patch;
+pub mod render_contract;
 pub mod soil;
 pub mod vehicle;
 pub mod world;

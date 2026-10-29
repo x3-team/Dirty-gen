@@ -596,7 +596,14 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     while frame < 51 && drive.world.vehicle.pos.z < 19.6 {
         let pose = through_chase(&drive.world);
         let rgba = renderer
-            .draw(&drive.world, pose, None, true)
+            .draw_with_sheet(
+                &drive.world,
+                pose,
+                None,
+                true,
+                Some(&drive.fluid),
+                Some(drive.dust()),
+            )
             .expect("readback");
         let path = dir.join(format!("frame_{frame:04}.png"));
         write_png(&path, width, height, &rgba).expect("png");
@@ -625,7 +632,14 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     if !saved_still || !saved_slurry {
         let pose = through_chase(&drive.world);
         let rgba = renderer
-            .draw(&drive.world, pose, None, true)
+            .draw_with_sheet(
+                &drive.world,
+                pose,
+                None,
+                true,
+                Some(&drive.fluid),
+                Some(drive.dust()),
+            )
             .expect("readback");
         if !saved_slurry {
             write_png(&slurry_still, width, height, &rgba).expect("slurry still");
