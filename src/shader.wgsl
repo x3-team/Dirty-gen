@@ -1605,9 +1605,11 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         return vec4<f32>(mapped_spray.rgb, 0.92);
     }
     if (in.panel > 48.5 && in.panel < 49.5) {
-        let g = noise(in.world.xz * 4.0 + vec2<f32>(in.world.y * 2.0, 0.2));
-        let clay = mix(vec3<f32>(0.22, 0.13, 0.06), vec3<f32>(0.38, 0.24, 0.11), g);
-        let lit_rib = shade(in.world, in.nrm, clay, 0.42, vec3<f32>(0.02, 0.008, 0.003));
+        let g = noise(in.world.xz * 7.5 + vec2<f32>(in.world.y * 2.0, 0.2));
+        let blot = noise(in.world.xz * 1.6 + vec2<f32>(2.0, 0.4));
+        let clay0 = mix(vec3<f32>(0.15, 0.08, 0.035), vec3<f32>(0.30, 0.17, 0.07), g);
+        let clay = mix(clay0, clay0 * 0.62, blot * blot);
+        let lit_rib = shade(in.world, in.nrm, clay, 0.78, vec3<f32>(0.012, 0.005, 0.002));
         return vec4<f32>(present(lit_rib).rgb, 1.0);
     }
     let mapped = present(lit);

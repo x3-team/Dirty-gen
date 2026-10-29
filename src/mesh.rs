@@ -1245,10 +1245,31 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
 }
 
-/// One ribbon for a tire line. `p.pos` is the head at the tire, `p.size` is
-/// the length back down the rut, and `p.vel` points along that rut.
-/// The strip is a single surface: constant width, no breaks, a wave along
-/// its length. Both edges share a height, so the plan does not bow.
+/// Jagged offset for a torn slurry edge. Corners stay sharp. About −1..1.
+fn torn_edge(z: f32, salt: f32) -> f32 {
+    let u = z * 2.15 + salt;
+    let i = u.floor();
+    let f = u - i;
+    let cell = |n: f32| -> f32 {
+        let h = (n * 12.9898 + salt * 78.233).sin() * 43758.5453;
+        let r = h - h.floor();
+        if r > 0.74 {
+            -1.0
+        } else if r > 0.58 {
+            0.95
+        } else if r < 0.16 {
+            -0.62
+        } else {
+            (r - 0.40) * 0.55
+        }
+    };
+    cell(i) + (cell(i + 1.0) - cell(i)) * f
+}
+
+/// One flat sheet for a tire line. `p.pos` is the head at the tire, `p.size`
+/// is the length back down the rut, and `p.vel` points along that rut.
+/// The sheet lies on the soil and spreads. The edges are torn. It is not a
+/// hose, a pipe, a crescent, or a board.
 fn add_rut_ribbon(
     mesh: &mut CpuMesh,
     p: &silt::particles::Particle,
@@ -1265,14 +1286,14 @@ fn add_rut_ribbon(
     }
     side = side.normalize();
     let length = p.size.clamp(0.7, 12.0);
-    let half_w = 0.055_f32;
-    let lead = 0.20_f32;
+    let lead = 0.18_f32;
     let span = (length - lead).max(0.55);
-    let segs = ((span / 0.16).ceil() as usize).clamp(12, 80);
+    let segs = ((span / 0.12).ceil() as usize).clamp(12, 90);
     let across = 5usize;
     let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
-        let dist = lead + span * (s as f32 / segs as f32);
+        let t = s as f32 / segs as f32;
+        let dist = lead + span * t;
         let center = p.pos + dir * dist;
         let mut h = ground
             .map(|soil| soil.sample(center.x, center.z).height)
@@ -1280,17 +1301,22 @@ fn add_rut_ribbon(
         if h < 0.05 {
             h = p.pos.y;
         }
-        // Locked to the ground, so the curl stays in the rut as the car moves.
-        // The trough stays above the soil: a wave that sinks reads as dashes.
-        let phase = center.z * std::f32::consts::TAU / 1.15;
-        let arch = (phase.sin() * 0.5 + 0.5) * 0.08;
+        // Wider as it leaves the tire. Tears of about 20 cm, not a smooth hose edge.
+        let spread = 0.16 + 0.10 * t.sqrt();
+        let left = (spread + torn_edge(center.z, 1.7) * 0.22).clamp(0.06, 0.46);
+        let right = (spread + torn_edge(center.z, 8.9) * 0.22).clamp(0.06, 0.46);
         let mut row = Vec::with_capacity(across);
         for a in 0..across {
             let u = a as f32 / (across - 1) as f32;
-            let from_mid = (u - 0.5).abs() * 2.0;
-            let x = (u - 0.5) * 2.0 * half_w;
-            let channel = from_mid * from_mid * 0.014;
-            row.push(Vec3::new(center.x, 0.0, center.z) + side * x + Vec3::Y * (h + 0.03 + arch + channel));
+            let x = -left + (left + right) * u;
+            // A couple of millimetres, so the sheet is not a floating card
+            // and not a round tube.
+            let wrinkle = (center.z * 5.5 + x * 3.0).sin() * 0.006;
+            row.push(
+                Vec3::new(center.x, 0.0, center.z)
+                    + side * x
+                    + Vec3::Y * (h + 0.012 + wrinkle),
+            );
         }
         rows.push(row);
     }
