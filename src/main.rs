@@ -532,6 +532,8 @@ struct CaptureArgs {
     slurry_plow_proof: PathBuf,
     slurry_second_pass: bool,
     slurry_second_pass_proof: PathBuf,
+    slurry_rollover: bool,
+    slurry_rollover_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -632,6 +634,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_second_pass {
         capture_slurry_second_pass(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_rollover {
+        capture_slurry_rollover(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -828,6 +834,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_second_pass = false;
     let mut slurry_second_pass_proof =
         PathBuf::from(format!("{MEDIA}/slurry-second-pass-proof.png"));
+    let mut slurry_rollover = false;
+    let mut slurry_rollover_proof =
+        PathBuf::from(format!("{MEDIA}/slurry-rollover-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -922,6 +931,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_second_pass = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_second_pass_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-rollover-proof" => {
+                slurry_rollover = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_rollover_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -1019,6 +1034,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_plow_proof,
         slurry_second_pass,
         slurry_second_pass_proof,
+        slurry_rollover,
+        slurry_rollover_proof,
     }
 }
 
@@ -1839,6 +1856,105 @@ fn capture_slurry_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose.target.y,
         pose.target.z
     );
+}
+
+/// The Niva leaned onto its side in a deep slurry pool. The dent, bow, berm,
+/// and throw are visible. Overlay numbers match the PR body.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_rollover(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.rollover_in_deep_slurry();
+    silence_soil_clods(&mut world);
+    println!(
+        "slurry-rollover pool {:.4} berm {:.4} slurry {:.4} bow {:.4} shed {:.4} sum {:.4} \
+         ribbons {:.4} sheets {:.4} dent {:.4} clay {:.0} silt {:.0} sand {:.0}",
+        out.pool,
+        out.berm,
+        out.slurry,
+        out.bow_m3,
+        out.shed,
+        out.sum,
+        out.ribbons,
+        out.sheets,
+        out.dent,
+        out.drag_clay,
+        out.drag_silt,
+        out.drag_sand,
+    );
+    let lines = [
+        format!("pool {:.4} m3", out.pool),
+        format!("berm {:.4} m3", out.berm),
+        format!("slurry {:.4} m3", out.slurry),
+        format!("bow {:.4} m3", out.bow_m3),
+        format!("shed {:.4} m3", out.shed),
+        format!("sum {:.4} m3", out.sum),
+        format!("ribbons {:.4} m3", out.ribbons),
+        format!("sheets {:.4} m3", out.sheets),
+        format!("dent {:.4} m", out.dent),
+        format!("clay {:.0} N", out.drag_clay),
+        format!("silt {:.0} N", out.drag_silt),
+        format!("sand {:.0} N", out.drag_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = slurry_rollover_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_rollover_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_rollover_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry rollover still");
+    println!(
+        "cc0 slurry-rollover {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_rollover_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_rollover_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let driver = -right;
+    let ori = vehicle.orientation();
+    let rear = vehicle.pos + ori * vehicle.wheel_center_local(2);
+    let front = vehicle.pos + ori * vehicle.wheel_center_local(0);
+    let bow_x = front.x + fwd.x * 0.48;
+    let bow_z = front.z + fwd.z * 0.48;
+    let mud_h = world.soil.sample(rear.x, rear.z).height;
+    let bow_h = world.soil.sample(bow_x, bow_z).height;
+    let look = Vec3::new(
+        rear.x * 0.35 + front.x * 0.25 + bow_x * 0.40,
+        mud_h + 0.04,
+        rear.z * 0.35 + front.z * 0.25 + bow_z * 0.40,
+    );
+    let eye = Vec3::new(
+        rear.x + driver.x * 3.55 + fwd.x * (-1.05),
+        (mud_h + bow_h) * 0.5 + 0.22,
+        rear.z + driver.z * 3.55 + fwd.z * (-1.05),
+    );
+    let ortho = 7.2;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 /// The Niva on its second pass through the same slurry pool. The rut is deeper

@@ -4786,6 +4786,86 @@ impl SoilField {
         }
     }
 
+    /// Spread tall placed lumps inside a circle so the berm reads as a ridge,
+    /// not orange tablets or spikes. Total placed volume in the circle is
+    /// unchanged.
+    pub fn spread_placed_lumps(&mut self, cx: f32, cz: f32, radius: f32, cap: f32) {
+        let cap = cap.max(0.02);
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let res = self.res as isize;
+        let r0 = radius + self.cell;
+        let i0 = (((cx - r0) + half) / self.cell).floor() as isize;
+        let i1 = (((cx + r0) + half) / self.cell).floor() as isize;
+        let j0 = (((cz - r0) + half) / self.cell).floor() as isize;
+        let j1 = (((cz + r0) + half) / self.cell).floor() as isize;
+        let mut spill = 0.0_f32;
+        let mut donors: Vec<usize> = Vec::new();
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if (x - cx).hypot(z - cz) > radius {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if self.placed[idx] <= cap + 1.0e-6 {
+                    continue;
+                }
+                spill += (self.placed[idx] - cap) * area;
+                self.placed[idx] = cap;
+                donors.push(idx);
+                self.sync(idx);
+            }
+        }
+        if spill <= 1.0e-8 {
+            return;
+        }
+        let mut receivers: Vec<usize> = Vec::new();
+        for j in j0.max(1)..=j1.min(res - 2) {
+            for i in i0.max(1)..=i1.min(res - 2) {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if (x - cx).hypot(z - cz) > radius + self.cell * 1.2 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if donors.contains(&idx) {
+                    continue;
+                }
+                receivers.push(idx);
+            }
+        }
+        if receivers.is_empty() {
+            return;
+        }
+        let add = spill / (receivers.len() as f32 * area);
+        for idx in receivers {
+            self.placed[idx] += add;
+            self.kind[idx] = SurfaceKind::PlacedClod as u8;
+            self.sync(idx);
+        }
+    }
+
+    /// Clear tread negatives inside a rectangle. The bed and placed soil are
+    /// unchanged; only the tread height record is removed.
+    pub fn clear_tread_in(&mut self, x0: f32, x1: f32, z0: f32, z1: f32) {
+        let half = self.size * 0.5;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+            }
+        }
+    }
+
     /// Metres the persisted tread record sits below the rut surface.
     /// Negative inside a print, zero where no contact was stored.
     /// This is the height record. It does not move the bed or the pile.
