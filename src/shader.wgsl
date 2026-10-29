@@ -847,6 +847,34 @@ fn covered_depth(xz: vec2<f32>) -> f32 {
     return max(here, across);
 }
 
+// Metres above the bed. The solved column can be most of a metre; drawing
+// that is a mound. The pool stays a film. Only the tallest part of the bow
+// stands up, so the crest is a wave in the surface.
+fn shallow_water(column: f32) -> f32 {
+    // A film on the ground. The bow adds a low crest, not a mound.
+    // The solved column is left in the simulation; only a fraction is drawn.
+    let film = min(column, 0.11) * 0.10;
+    let extra = max(column - 0.11, 0.0);
+    let t = clamp(extra / 0.58, 0.0, 1.0);
+    let wave = t * 0.045;
+    return 0.003 + film + wave;
+}
+
+// Long swells on the free surface. A few centimetres, so the sheet stays
+// on the ground. A tight lattice would read as a checker.
+fn free_swell(xz: vec2<f32>, t: f32) -> f32 {
+    return 0.11 * sin(xz.x * 0.72 + xz.y * 1.05 + t * 0.7)
+        + 0.07 * sin(xz.y * 1.45 - xz.x * 0.28 - t * 0.45);
+}
+
+fn free_swell_grad(xz: vec2<f32>, t: f32) -> vec2<f32> {
+    let a = cos(xz.x * 0.72 + xz.y * 1.05 + t * 0.7);
+    let b = cos(xz.y * 1.45 - xz.x * 0.28 - t * 0.45);
+    let dx = 0.11 * a * 0.72 - 0.07 * b * 0.28;
+    let dz = 0.11 * a * 1.05 + 0.07 * b * 1.45;
+    return vec2<f32>(dx, dz);
+}
+
 fn water_bed(xz: vec2<f32>) -> f32 {
     // Blur a single-cell rut out of the sheet so the pool stays one surface.
     let e = 0.55;
@@ -878,7 +906,10 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let fill = smoothstep(0.04, 0.12, depth) * min(dug * 0.5, 0.032);
     let in_rut = local + 0.01 + rip + fill;
     let y_sheet = select(pond, in_rut, dug > 0.018 && depth > 0.004);
-    let surface = water_bed(in.xz) + column;
+    // The column is the solved water. Drawing it at full height is a mound.
+    // The sheet sits on the ground. The bow is a crest in that sheet, plus a swell.
+    let swell = select(0.0, free_swell(in.xz, frame.misc.x), free);
+    let surface = water_bed(in.xz) + shallow_water(column) + rip * 0.45 + swell;
     let y = select(y_sheet, surface, free);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
@@ -922,15 +953,20 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         discard;
     }
     let n = ripple_normal(xz, frame.misc.x);
-    // Keep the pond facing up. A bowed normal is what made the gray metal disc.
-    // The crossing crest uses the solved slope so the ridge is a face, not a tint.
     let flat = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
-    let de = 0.22;
-    let h0 = water_bed(xz) + water_column(xz);
-    let hx = water_bed(xz + vec2<f32>(de, 0.0)) + water_column(xz + vec2<f32>(de, 0.0));
-    let hz = water_bed(xz + vec2<f32>(0.0, de)) + water_column(xz + vec2<f32>(0.0, de));
-    let slope = normalize(vec3<f32>(-(hx - h0) / de, 1.0, -(hz - h0) / de));
-    let nrm = select(flat, normalize(mix(vec3<f32>(0.0, 1.0, 0.0), slope, 0.7)), free);
+    // Slope of the low sheet, not of the full column. A full-column normal
+    // is a wall.
+    let de = 0.28;
+    let y0 = shallow_water(water_column(xz));
+    let yx = shallow_water(water_column(xz + vec2<f32>(de, 0.0)));
+    let yz = shallow_water(water_column(xz + vec2<f32>(0.0, de)));
+    let g = free_swell_grad(xz, frame.misc.x);
+    // The crest is only a few centimetres. Stretch its normal so the face
+    // of the wave reads, without standing the water up into a mound.
+    let dx = (yx - y0) / de;
+    let dz = (yz - y0) / de;
+    let slope = normalize(vec3<f32>(-(dx * 2.6 + g.x * 2.4), 1.0, -(dz * 2.6 + g.y * 2.4)));
+    let nrm = select(flat, slope, free);
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
@@ -962,20 +998,21 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // A bowl is a cut, and the groove path opens that cut. The ford sheet is
     // the free surface, so the crest stays a surface instead of a tint.
     let shore_fade = smoothstep(0.003, 0.07, in.depth);
-    let alpha = select(solved, shore_fade, free);
+    var alpha = select(solved, shore_fade, free);
     if (free) {
-        // Dark water, soft at the rim. The bow face is the lighter slope.
-        // A bed-colored fill read as a flat tan disc.
-        let slope_amt = clamp((1.0 - nrm.y) * 4.0, 0.0, 1.0);
-        let deep = vec3<f32>(0.015, 0.034, 0.038);
-        let thin = vec3<f32>(0.032, 0.052, 0.048);
-        let depth_mix = smoothstep(0.02, 0.10, in.depth);
-        col = mix(thin, deep, depth_mix);
-        // The tilted face is the same water, lighter where it rises.
-        // A white lip on top of the pool was a crescent.
-        let face = vec3<f32>(0.10, 0.15, 0.13);
-        col = mix(col, face, smoothstep(0.08, 0.42, slope_amt));
-        col += vec3<f32>(0.035, 0.032, 0.022) * spec;
+        // Turbid water. The bed shows through the troughs. Crests catch the
+        // sun so the swell reads as a wave, not a flat stain.
+        let soil = bed;
+        let column_here = water_column(xz);
+        let deep = smoothstep(0.02, 0.10, column_here);
+        let murk = soil * vec3<f32>(0.26, 0.17, 0.08);
+        let body = mix(murk, vec3<f32>(0.07, 0.045, 0.018), deep * 0.5);
+        let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
+        col = body * (0.10 + 2.8 * ndl);
+        let halfv = normalize(sun + view);
+        let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), 3.0);
+        col += vec3<f32>(0.62, 0.46, 0.24) * sheen * 1.5;
+        alpha = shore_fade * mix(0.46, 0.72, deep);
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
@@ -1455,9 +1492,11 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     if (in.panel > 48.5 && in.panel < 49.5) {
         let g = noise(in.world.xz * 7.5 + vec2<f32>(in.world.y * 2.0, 0.2));
         let blot = noise(in.world.xz * 1.6 + vec2<f32>(2.0, 0.4));
-        let clay0 = mix(vec3<f32>(0.15, 0.08, 0.035), vec3<f32>(0.30, 0.17, 0.07), g);
-        let clay = mix(clay0, clay0 * 0.62, blot * blot);
-        let lit_rib = shade(in.world, in.nrm, clay, 0.78, vec3<f32>(0.012, 0.005, 0.002));
+        let clay0 = mix(vec3<f32>(0.09, 0.045, 0.02), vec3<f32>(0.18, 0.09, 0.035), g);
+        let clay = mix(clay0, clay0 * 0.5, blot * blot);
+        let face = smoothstep(0.25, 0.9, abs(in.nrm.y));
+        let clay_s = mix(clay * 0.42, clay, face);
+        let lit_rib = shade(in.world, in.nrm, clay_s, 0.88, vec3<f32>(0.0));
         return vec4<f32>(present(lit_rib).rgb, 1.0);
     }
     let mapped = present(lit);

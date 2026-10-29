@@ -1266,10 +1266,70 @@ fn torn_edge(z: f32, salt: f32) -> f32 {
     cell(i) + (cell(i + 1.0) - cell(i)) * f
 }
 
-/// One flat sheet for a tire line. `p.pos` is the head at the tire, `p.size`
-/// is the length back down the rut, and `p.vel` points along that rut.
-/// The sheet lies on the soil and spreads. The edges are torn. It is not a
-/// hose, a pipe, a crescent, or a board.
+fn slurry_hash(n: f32, salt: f32) -> f32 {
+    let h = (n * 12.9898 + salt * 78.233).sin() * 43758.5453;
+    h - h.floor()
+}
+
+fn ground_at(ground: Option<&silt::soil::SoilField>, x: f32, z: f32, fallback: f32) -> f32 {
+    let h = ground.map(|soil| soil.sample(x, z).height).unwrap_or(fallback);
+    if h < 0.05 { fallback } else { h }
+}
+
+/// A torn patch lying on the soil. Each station picks its own width, so the
+/// piece is not a rectangle or a band of one width.
+fn add_torn_patch(
+    mesh: &mut CpuMesh,
+    origin: Vec3,
+    dir: Vec3,
+    side: Vec3,
+    piece_len: f32,
+    half_w: f32,
+    thick: f32,
+    ground: Option<&silt::soil::SoilField>,
+    salt: f32,
+) {
+    let segs = 6usize;
+    let across = 4usize;
+    let panel = 49.0;
+    let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let center = origin + dir * (t * piece_len);
+        let h = ground_at(ground, center.x, center.z, origin.y);
+        let along = slurry_hash(center.z * 0.37 + t * 0.55, salt);
+        let tear = torn_edge(center.z * 0.45, salt);
+        let left = half_w * (0.28 + along * 1.25 + tear * 0.5);
+        let right = half_w
+            * (0.28 + slurry_hash(center.z * 0.37 + t * 0.55, salt + 2.7) * 1.25 + torn_edge(center.z * 0.45, salt + 4.0) * 0.5);
+        let left = left.clamp(0.02, 0.70);
+        let right = right.clamp(0.02, 0.70);
+        let along_thick = (t * std::f32::consts::PI).sin();
+        let station = 0.25 + slurry_hash(center.z, salt + 5.0) * 0.9;
+        let mut row = Vec::with_capacity(across);
+        for a in 0..across {
+            let u = a as f32 / (across - 1) as f32;
+            let x = -left + (left + right) * u;
+            let from_mid = (u - 0.5).abs() * 2.0;
+            let lift = thick * along_thick * station * (1.0 - from_mid * from_mid);
+            row.push(Vec3::new(center.x, 0.0, center.z) + side * x + Vec3::Y * (h + 0.004 + lift));
+        }
+        rows.push(row);
+    }
+    for s in 0..segs {
+        for a in 0..across - 1 {
+            let a00 = rows[s][a];
+            let a10 = rows[s][a + 1];
+            let a01 = rows[s + 1][a];
+            let a11 = rows[s + 1][a + 1];
+            add_quad(mesh, [a00, a10, a11, a01], panel);
+            add_quad(mesh, [a00, a01, a11, a10], panel);
+        }
+    }
+}
+
+/// One tire line of slurry. Separate torn sheets, thin smears, and clods,
+/// with gaps. Not one band of constant width.
 fn add_rut_ribbon(
     mesh: &mut CpuMesh,
     p: &silt::particles::Particle,
@@ -1286,50 +1346,81 @@ fn add_rut_ribbon(
     }
     side = side.normalize();
     let length = p.size.clamp(0.7, 12.0);
-    let lead = 0.18_f32;
-    let span = (length - lead).max(0.55);
-    let segs = ((span / 0.12).ceil() as usize).clamp(12, 90);
-    let across = 5usize;
-    let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
-    for s in 0..=segs {
-        let t = s as f32 / segs as f32;
-        let dist = lead + span * t;
-        let center = p.pos + dir * dist;
-        let mut h = ground
-            .map(|soil| soil.sample(center.x, center.z).height)
-            .unwrap_or(p.pos.y);
-        if h < 0.05 {
-            h = p.pos.y;
+    let lead = 0.16_f32;
+    let end = lead + (length - lead).max(0.5);
+    let mut dist = lead;
+    let mut i = 0i32;
+    while dist < end && i < 24 {
+        let origin = p.pos + dir * dist;
+        let hz = origin.z;
+        let gap_roll = slurry_hash(hz, 9.1);
+        // A break. The next piece does not continue the last edge.
+        if gap_roll < 0.22 {
+            dist += 0.55 + slurry_hash(hz, 1.2) * 1.05;
+            i += 1;
+            continue;
         }
-        // Wider as it leaves the tire. Tears of about 20 cm, not a smooth hose edge.
-        let spread = 0.16 + 0.10 * t.sqrt();
-        let left = (spread + torn_edge(center.z, 1.7) * 0.22).clamp(0.06, 0.46);
-        let right = (spread + torn_edge(center.z, 8.9) * 0.22).clamp(0.06, 0.46);
-        let mut row = Vec::with_capacity(across);
-        for a in 0..across {
-            let u = a as f32 / (across - 1) as f32;
-            let x = -left + (left + right) * u;
-            // A couple of millimetres, so the sheet is not a floating card
-            // and not a round tube.
-            let wrinkle = (center.z * 5.5 + x * 3.0).sin() * 0.006;
-            row.push(
-                Vec3::new(center.x, 0.0, center.z)
-                    + side * x
-                    + Vec3::Y * (h + 0.012 + wrinkle),
+        let yaw = (slurry_hash(hz, 11.0) - 0.5) * 0.55;
+        let (c, s) = (yaw.cos(), yaw.sin());
+        let dir_p = dir * c + side * s;
+        let side_p = side * c - dir * s;
+        let off = (slurry_hash(hz, 8.0) - 0.5) * 0.46;
+        let roll = slurry_hash(hz, 6.6);
+        let (piece_len, half_w, thick, advance) = if roll > 0.72 {
+            // A thin smear dragged along the rut. Wide, almost no height.
+            let len = 0.70 + slurry_hash(hz, 3.1) * 0.90;
+            (
+                len,
+                0.22 + slurry_hash(hz, 4.4) * 0.28,
+                0.0012 + slurry_hash(hz, 5.5) * 0.003,
+                len + 0.12 + slurry_hash(hz, 1.4) * 0.35,
+            )
+        } else if roll < 0.34 {
+            // A clod. Thicker than the sheet, still lying down in the rut.
+            let len = 0.16 + slurry_hash(hz, 3.1) * 0.18;
+            (
+                len,
+                0.07 + slurry_hash(hz, 4.4) * 0.08,
+                0.09 + slurry_hash(hz, 5.5) * 0.07,
+                len + 0.08 + slurry_hash(hz, 1.4) * 0.20,
+            )
+        } else {
+            let len = 0.16 + slurry_hash(hz, 3.1) * 0.48;
+            (
+                len,
+                0.045 + slurry_hash(hz, 4.4) * 0.16,
+                0.008 + slurry_hash(hz, 5.5) * 0.020,
+                len + 0.08 + slurry_hash(hz, 1.4) * 0.40,
+            )
+        };
+        add_torn_patch(
+            mesh,
+            origin + side * off,
+            dir_p,
+            side_p,
+            piece_len,
+            half_w,
+            thick,
+            ground,
+            1.7 + i as f32 * 3.1,
+        );
+        if slurry_hash(hz, 7.7) > 0.64 {
+            let side_off = if slurry_hash(hz, 8.8) > 0.5 { 1.0 } else { -1.0 }
+                * (0.12 + slurry_hash(hz, 0.4) * 0.24);
+            add_torn_patch(
+                mesh,
+                origin + side * (off + side_off) + dir * (piece_len * 0.3),
+                dir_p,
+                side_p,
+                0.10 + slurry_hash(hz, 1.9) * 0.12,
+                0.05 + slurry_hash(hz, 2.8) * 0.05,
+                0.07 + slurry_hash(hz, 3.7) * 0.06,
+                ground,
+                6.0 + i as f32,
             );
         }
-        rows.push(row);
-    }
-    let panel = 49.0;
-    for s in 0..segs {
-        for a in 0..across - 1 {
-            let a00 = rows[s][a];
-            let a10 = rows[s][a + 1];
-            let a01 = rows[s + 1][a];
-            let a11 = rows[s + 1][a + 1];
-            add_quad(mesh, [a00, a10, a11, a01], panel);
-            add_quad(mesh, [a00, a01, a11, a10], panel);
-        }
+        dist += advance;
+        i += 1;
     }
 }
 
