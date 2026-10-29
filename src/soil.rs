@@ -221,6 +221,15 @@ pub fn berm_creep_rate(kind: SurfaceKind, moisture: f32) -> f32 {
     (1.35 / visc).clamp(0.0018, 0.012)
 }
 
+/// Metres per second of wet berm spoil that slumps under tire or body load.
+/// Clay is slowest, then silt, then sand, at the same load and moisture.
+pub fn wet_berm_creep_under_load_rate(kind: SurfaceKind, moisture: f32, load_n: f32) -> f32 {
+    let kind = paste_kind(kind);
+    let visc = slurry_viscosity(kind, moisture).max(0.05);
+    let load = (load_n / 3000.0).clamp(0.0, 2.6);
+    (1.35 / visc).clamp(0.0025, 0.058) * (1.0 + 5.2 * load)
+}
+
 fn paste_kind(kind: SurfaceKind) -> SurfaceKind {
     match kind {
         SurfaceKind::Berm | SurfaceKind::PlacedClod | SurfaceKind::CutLip => SurfaceKind::WetMud,
@@ -1977,6 +1986,19 @@ impl SoilField {
             }
         }
 
+        if loaded && normal + push > 350.0 {
+            self.creep_wet_berm_under_patch(
+                center,
+                forward,
+                right,
+                radius,
+                width,
+                lane,
+                normal + push,
+                dt,
+            );
+        }
+
         if vol <= 1.0e-8 {
             return;
         }
@@ -2873,6 +2895,39 @@ impl SoilField {
         self.column_volume_in(x0, x1, z0, z1, &self.placed)
     }
 
+    /// World XZ of the wet berm centroid in a rectangle, for parking load on it.
+    pub fn berm_centroid_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> (f32, f32) {
+        let half = self.size * 0.5;
+        let mut sx = 0.0_f32;
+        let mut sz = 0.0_f32;
+        let mut w = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let p = self.placed[idx];
+                if p < 0.012 {
+                    continue;
+                }
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                if !matches!(kind, SurfaceKind::Berm | SurfaceKind::PlacedClod) {
+                    continue;
+                }
+                sx += x * p;
+                sz += z * p;
+                w += p;
+            }
+        }
+        if w <= 1.0e-6 {
+            return (x1 - 0.35, (z0 + z1) * 0.5);
+        }
+        (sx / w, sz / w)
+    }
+
     fn column_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32, column: &[f32]) -> f32 {
         let half = self.size * 0.5;
         let area = self.cell * self.cell;
@@ -2921,6 +2976,278 @@ impl SoilField {
     /// Level a bow wave and berm back into the bed and rut after a pass or shed.
     pub fn advance_slurry_settle(&mut self, seconds: f32) {
         self.advance_slurry(seconds);
+    }
+
+    /// Wet berm under a loaded tire or body panel. Spoil slumps into the rut
+    /// or the pool beside it. The berm column loses `placed`; the rut and
+    /// pool gain slurry. Nothing is minted or deleted.
+    pub fn creep_wet_berm_under_patch(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        radius: f32,
+        width: f32,
+        lane: bool,
+        load_n: f32,
+        dt: f32,
+    ) {
+        if dt <= 0.0 || load_n < 350.0 {
+            return;
+        }
+        let fwd = horizontal(forward);
+        let mut rt = horizontal(right);
+        if rt.length_squared() < 1.0e-8 {
+            rt = Vec3::new(fwd.z, 0.0, -fwd.x);
+        }
+        let sigma = (width * 0.42).max(self.cell * 0.34);
+        let half_w = if lane {
+            self.cell * 1.15
+        } else {
+            sigma * 1.65
+        };
+        let lip_band = if lane { self.cell * 1.05 } else { 0.0 };
+        let berm_band = self.cell * 1.05;
+        let half_l = if lane {
+            (contact_length(radius, 0.05) * 0.5 + self.cell * 0.35).max(self.cell * 1.05)
+        } else {
+            radius * 0.95
+        };
+        let along_reach = half_l + self.cell * 0.35;
+        let lateral_reach = half_w + lip_band + berm_band + self.cell * 0.55;
+        let reach = along_reach + lateral_reach;
+        let half = self.size * 0.5;
+        let i0 = (((center.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((center.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((center.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((center.z + reach) + half) / self.cell).floor() as isize;
+        let res = self.res as isize;
+        let placed0 = self.placed.clone();
+        let slurry0 = self.slurry.clone();
+        let mut take = vec![0.0_f32; placed0.len()];
+        let mut give = vec![0.0_f32; placed0.len()];
+
+        for j in j0.max(1)..j1.min(res - 1) {
+            for i in i0.max(1)..i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - center.x;
+                let rel_z = cz - center.z;
+                let lx = rel_x * rt.x + rel_z * rt.z;
+                let lz = rel_x * fwd.x + rel_z * fwd.z;
+                let along = if lane {
+                    1.0 - (lz.abs() / along_reach.max(0.05)).clamp(0.0, 1.0)
+                } else {
+                    (-0.5 * (lz / half_l.max(0.05)).powi(2)).exp()
+                };
+                if along <= 0.05 {
+                    continue;
+                }
+                let ax = lx.abs();
+                let idx = j as usize * self.res + i as usize;
+                if placed0[idx] < 0.008 {
+                    continue;
+                }
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                if kind != SurfaceKind::Berm {
+                    continue;
+                }
+                let moisture = self.wetness[idx];
+                if moisture < 0.32 {
+                    continue;
+                }
+                let under = if lane {
+                    ax <= half_w + lip_band + berm_band
+                } else {
+                    (-0.5 * (lx / sigma.max(0.02)).powi(2)).exp() > 0.12
+                };
+                if !under {
+                    continue;
+                }
+                let top = self.bed[idx] + placed0[idx] + slurry0[idx];
+                let mut dest: Option<usize> = None;
+                let mut dest_h = top;
+                for (di, dj) in [(1_isize, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let ii = i + di;
+                    let jj = j + dj;
+                    if ii < 1 || jj < 1 || ii >= res - 1 || jj >= res - 1 {
+                        continue;
+                    }
+                    let nidx = jj as usize * self.res + ii as usize;
+                    let wet_dest = slurry0[nidx] > 0.004 || self.water[nidx] > 0.004;
+                    if !wet_dest {
+                        continue;
+                    }
+                    let surf = self.bed[nidx] + placed0[nidx] + slurry0[nidx];
+                    if surf < dest_h - 0.003 || (slurry0[nidx] > 0.004 && surf <= top + 0.012) {
+                        dest_h = surf;
+                        dest = Some(nidx);
+                    }
+                }
+                let Some(nidx) = dest else {
+                    continue;
+                };
+                let depth = (wet_berm_creep_under_load_rate(kind, moisture, load_n) * dt * along)
+                    .min(placed0[idx] * 0.18)
+                    .min(placed0[idx]);
+                if depth <= 1.0e-6 {
+                    continue;
+                }
+                take[idx] += depth;
+                give[nidx] += depth;
+            }
+        }
+
+        for idx in 0..placed0.len() {
+            let lost = take[idx];
+            let gained = give[idx];
+            if lost <= 0.0 && gained <= 0.0 {
+                continue;
+            }
+            if lost > 0.0 {
+                self.placed[idx] = (placed0[idx] - lost).max(0.0);
+                if self.placed[idx] <= 0.002 {
+                    self.placed[idx] = 0.0;
+                }
+            }
+            if gained > 0.0 {
+                let before = slurry0[idx];
+                self.slurry[idx] = before + gained;
+                let m = self.wetness[idx].clamp(0.08, 0.92);
+                self.wetness[idx] = (m * before / self.slurry[idx].max(1.0e-4)).clamp(0.08, 0.92);
+            }
+            self.sync(idx);
+        }
+    }
+
+    /// Slump every wet berm cell in a rectangle while load sits on the shoulder.
+    /// Spoil joins slurry in the rut or the pool beside it.
+    pub fn slump_wet_berms_in(
+        &mut self,
+        dt: f32,
+        load_n: f32,
+        src_x0: f32,
+        src_x1: f32,
+        src_z0: f32,
+        src_z1: f32,
+        dest_x0: f32,
+        dest_x1: f32,
+        dest_z0: f32,
+        dest_z1: f32,
+        rut_lane_x: f32,
+        rut_z0: f32,
+        rut_z1: f32,
+    ) {
+        if dt <= 0.0 || load_n < 350.0 {
+            return;
+        }
+        let half = self.size * 0.5;
+        let in_rect =
+            |x: f32, z: f32, x0: f32, x1: f32, z0: f32, z1: f32| {
+                x >= x0 && x < x1 && z >= z0 && z < z1
+            };
+        let in_rut_lane = |x: f32, z: f32| {
+            x.abs() <= rut_lane_x && z >= rut_z0 && z < rut_z1
+        };
+        let placed0 = self.placed.clone();
+        let slurry0 = self.slurry.clone();
+        let mut take = vec![0.0_f32; placed0.len()];
+        let mut give = vec![0.0_f32; placed0.len()];
+        let res = self.res as isize;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if !in_rect(x, z, src_x0, src_x1, src_z0, src_z1) {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if placed0[idx] < 0.008 {
+                    continue;
+                }
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                if !matches!(kind, SurfaceKind::Berm | SurfaceKind::PlacedClod | SurfaceKind::CutLip)
+                {
+                    continue;
+                }
+                let moisture = self.wetness[idx];
+                if moisture < 0.32 {
+                    continue;
+                }
+                let top = self.bed[idx] + placed0[idx] + slurry0[idx];
+                let mut dest_rut: Option<usize> = None;
+                let mut dest_pool: Option<usize> = None;
+                let mut rut_h = top;
+                let mut pool_h = top;
+                let ii = i as isize;
+                let jj = j as isize;
+                for radius in 1isize..=3 {
+                    for dj in -radius..=radius {
+                        for di in -radius..=radius {
+                            if di.abs() != radius && dj.abs() != radius {
+                                continue;
+                            }
+                            let ni = ii + di;
+                            let nj = jj + dj;
+                            if ni < 0 || nj < 0 || ni >= res || nj >= res {
+                                continue;
+                            }
+                            let nx = (ni as f32 + 0.5) * self.cell - half;
+                            let nz = (nj as f32 + 0.5) * self.cell - half;
+                            if !in_rect(nx, nz, dest_x0, dest_x1, dest_z0, dest_z1) {
+                                continue;
+                            }
+                            let nidx = nj as usize * self.res + ni as usize;
+                            if slurry0[nidx] <= 0.004 && self.water[nidx] <= 0.004 {
+                                continue;
+                            }
+                            let surf = self.bed[nidx] + placed0[nidx] + slurry0[nidx];
+                            if in_rut_lane(nx, nz) {
+                                if surf <= top + 0.02 && surf < rut_h {
+                                    rut_h = surf;
+                                    dest_rut = Some(nidx);
+                                }
+                            } else if surf <= top + 0.02 && surf < pool_h {
+                                pool_h = surf;
+                                dest_pool = Some(nidx);
+                            }
+                        }
+                    }
+                }
+                let nidx = dest_rut.or(dest_pool);
+                let Some(nidx) = nidx else {
+                    continue;
+                };
+                let depth = (wet_berm_creep_under_load_rate(kind, moisture, load_n) * dt)
+                    .min(placed0[idx] * 0.22)
+                    .min(placed0[idx]);
+                if depth <= 1.0e-6 {
+                    continue;
+                }
+                take[idx] += depth;
+                give[nidx] += depth;
+            }
+        }
+        for idx in 0..placed0.len() {
+            let lost = take[idx];
+            let gained = give[idx];
+            if lost <= 0.0 && gained <= 0.0 {
+                continue;
+            }
+            if lost > 0.0 {
+                self.placed[idx] = (placed0[idx] - lost).max(0.0);
+                if self.placed[idx] <= 0.002 {
+                    self.placed[idx] = 0.0;
+                }
+            }
+            if gained > 0.0 {
+                let before = slurry0[idx];
+                self.slurry[idx] = before + gained;
+                let m = self.wetness[idx].clamp(0.08, 0.92);
+                self.wetness[idx] = (m * before / self.slurry[idx].max(1.0e-4)).clamp(0.08, 0.92);
+            }
+            self.sync(idx);
+        }
     }
 
     /// A berm loses placed soil into a lower neighbour that already holds slurry.
@@ -7418,6 +7745,88 @@ mod tests {
         assert!(
             sand > silt && silt > clay,
             "settle pace clay {clay:.3} silt {silt:.3} sand {sand:.3} m/s per m head"
+        );
+    }
+
+    #[test]
+    fn wet_berm_creep_under_load_orders_by_mix() {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let load = 5200.0;
+        let clay = wet_berm_creep_under_load_rate(SurfaceKind::WetMud, moisture, load);
+        let silt = wet_berm_creep_under_load_rate(SurfaceKind::Silt, moisture, load);
+        let sand = wet_berm_creep_under_load_rate(SurfaceKind::Sand, moisture, load);
+        assert!(
+            sand > silt && silt > clay,
+            "load creep clay {clay:.4} silt {silt:.4} sand {sand:.4} m/s"
+        );
+    }
+
+    #[test]
+    fn wet_berm_slumps_into_rut_under_load_and_conserves_volume() {
+        let mut soil = SoilField::mud_pad();
+        let bed = soil.paint_slurry_flow();
+        soil.advance_slurry(0.35);
+        let berm_before = soil.placed_volume_in(bed.x1, bed.x1 + 0.6, bed.high_z0, bed.high_z1);
+        let rut_before = soil.slurry_volume_in(bed.x0, bed.x1, bed.high_z0, bed.high_z1);
+        let pool_before = soil.slurry_volume_in(bed.x0, bed.x1, bed.low_z0, bed.low_z1);
+        let mix0 = soil.mix_volumes();
+        let half = soil.size * 0.5;
+        let mut bx = 0.0_f32;
+        let mut bz = 0.0_f32;
+        let mut n = 0.0_f32;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if x < bed.x1 || x >= bed.x1 + 0.55 || z < bed.high_z0 || z >= bed.high_z1 {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                if soil.placed[idx] < 0.02 {
+                    continue;
+                }
+                bx += x;
+                bz += z;
+                n += 1.0;
+            }
+        }
+        assert!(n > 0.5, "no berm cell for load creep");
+        bx /= n;
+        bz /= n;
+        let hub = Vec3::new(bx, soil.sample(bx, bz).height + 0.38, bz);
+        for _ in 0..240 {
+            soil.creep_wet_berm_under_patch(
+                hub,
+                Vec3::Z,
+                Vec3::X,
+                0.38,
+                0.30,
+                true,
+                5400.0,
+                1.0 / 60.0,
+            );
+        }
+        let berm_after = soil.placed_volume_in(bed.x1, bed.x1 + 0.6, bed.high_z0, bed.high_z1);
+        let rut_after = soil.slurry_volume_in(bed.x0, bed.x1, bed.high_z0, bed.high_z1);
+        let pool_after = soil.slurry_volume_in(bed.x0, bed.x1, bed.low_z0, bed.low_z1);
+        let mix1 = soil.mix_volumes();
+        eprintln!(
+            "wet berm load berm {berm_before:.4}->{berm_after:.4} rut {rut_before:.4}->{rut_after:.4} \
+             pool {pool_before:.4}->{pool_after:.4}"
+        );
+        assert!(
+            berm_after < berm_before - 0.001,
+            "berm did not slump, {berm_before:.4} -> {berm_after:.4}"
+        );
+        assert!(
+            rut_after + pool_after > rut_before + pool_before + 0.001,
+            "rut and pool did not gain slurry"
+        );
+        assert!(
+            (mix1.total() - mix0.total()).abs() < 1.0e-3,
+            "mix drift {:.6} -> {:.6}",
+            mix0.total(),
+            mix1.total()
         );
     }
 

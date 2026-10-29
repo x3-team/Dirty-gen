@@ -9,6 +9,7 @@ use crate::patch::{
 };
 use crate::soil::{
     on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale, track_offset,
+    wet_berm_creep_under_load_rate,
     SlurrySeal, SoilField, SurfaceKind, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
 };
 use crate::vehicle::{
@@ -1205,6 +1206,140 @@ impl World {
 
     /// After a second pass through the pool, let the bow wave and berm creep
     /// back into the rut. Clay settles slower than silt and sand.
+    /// One pass through the pool, then hold the Niva on the wet berm while
+    /// loaded tires slump spoil into the rut and the pool. Clay creeps slower
+    /// than silt and sand at the reference load.
+    pub fn wet_berm_creep_under_load(
+        &mut self,
+        pass_seconds: f32,
+        creep_seconds: f32,
+    ) -> WetBermCreepWake {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let pool_x = SLURRY_POOL_X;
+        let pool_z = SLURRY_POOL_Z;
+        let depth = SLURRY_POOL_DEPTH;
+        let pool = self.soil.fill_slurry_pool(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            depth,
+            SurfaceKind::WetMud,
+            moisture,
+        );
+        let mix0 = self.soil.mix_volumes();
+        let air0 = self.soil.airborne;
+        self.slurry_rut_pace = 0.14;
+        self.reset_niva_at_slurry_entry(0.72);
+        let pass = self.slurry_plow_drive_pass(pass_seconds, pool_x, pool_z, air0);
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
+
+        let fwd = self.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let (berm_x, berm_z) = self.soil.berm_centroid_in(
+            pool_x.0 - 0.35,
+            pool_x.1 + 0.85,
+            pool_z.0 - 0.35,
+            pool_z.1 + 0.55,
+        );
+        self.vehicle.pos = Vec3::new(berm_x - right.x * 0.42, self.vehicle.pos.y, berm_z);
+        self.vehicle.yaw = 0.04;
+        self.seat_in_slurry(0.12);
+
+        let (berm_before, rut_before, pool_slurry_before, sum_before) =
+            self.wet_berm_creep_ledger(pool_x, pool_z);
+        let dt = 1.0 / 60.0;
+        let steps = (creep_seconds / dt).round().max(1.0) as u32;
+        for _ in 0..steps {
+            self.press_niva_on_wet_berm(dt);
+        }
+
+        let (berm_after, rut_after, pool_slurry_after, sum_after) =
+            self.wet_berm_creep_ledger(pool_x, pool_z);
+        let mix1 = self.soil.mix_volumes();
+        WetBermCreepWake {
+            pool,
+            berm_before,
+            berm_after,
+            rut_before,
+            rut_after,
+            pool_slurry_before,
+            pool_slurry_after,
+            sum_before,
+            sum_after,
+            mix0,
+            mix1,
+            pace_clay: wet_berm_creep_under_load_rate(SurfaceKind::WetMud, moisture, 5200.0),
+            pace_silt: wet_berm_creep_under_load_rate(SurfaceKind::Silt, moisture, 5200.0),
+            pace_sand: wet_berm_creep_under_load_rate(SurfaceKind::Sand, moisture, 5200.0),
+        }
+    }
+
+    fn slurry_rut_lane_volume(&self, _pool_x: (f32, f32), pool_z: (f32, f32)) -> f32 {
+        let lane_x = 0.48_f32;
+        self.soil.slurry_volume_in(
+            -lane_x,
+            lane_x,
+            pool_z.0 + 0.18,
+            pool_z.1 - 0.12,
+        )
+    }
+
+    /// Berm placed spoil, slurry in the driven lane, and slurry in the open
+    /// pool. The three bands do not overlap; their sum is the conserved total.
+    fn wet_berm_creep_ledger(&self, pool_x: (f32, f32), pool_z: (f32, f32)) -> (f32, f32, f32, f32) {
+        let berm = self.slurry_berm_volume(pool_x, pool_z);
+        let rut = self.slurry_rut_lane_volume(pool_x, pool_z);
+        let total_slurry = self
+            .soil
+            .slurry_volume_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        let pool_slurry = (total_slurry - rut).max(0.0);
+        let sum = berm + rut + pool_slurry;
+        (berm, rut, pool_slurry, sum)
+    }
+
+    fn press_niva_on_wet_berm(&mut self, dt: f32) {
+        let pool_x = SLURRY_POOL_X;
+        let pool_z = SLURRY_POOL_Z;
+        let ori = self.vehicle.orientation();
+        let fwd = self.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let load_n = 5200.0;
+        let push = 980.0;
+        for i in 0..4 {
+            let center = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
+            let ground = self.soil.sample(center.x, center.z).height;
+            let sink = (ground - (center.y - WHEEL_RADIUS)).max(0.012);
+            let hub_y = ground + WHEEL_RADIUS - sink;
+            self.soil.creep_wet_berm_under_patch(
+                Vec3::new(center.x, hub_y, center.z),
+                fwd,
+                right,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                true,
+                load_n + push,
+                dt,
+            );
+        }
+        self.soil.slump_wet_berms_in(
+            dt,
+            load_n,
+            pool_x.0 - 0.35,
+            pool_x.1 + 0.85,
+            pool_z.0 - 0.35,
+            pool_z.1 + 0.55,
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            0.48,
+            pool_z.0 + 0.18,
+            pool_z.1 - 0.12,
+        );
+    }
+
     pub fn settle_slurry_after_second_pass(
         &mut self,
         drive_seconds: f32,
@@ -2452,6 +2587,27 @@ pub struct SlurrySecondPassWake {
 
 /// Bow wave and berm after a pass, then after slurry settle. Cubic metres unless noted.
 ///
+/// Wet berm under Niva load. `sum_* == berm_* + rut_* + pool_slurry_*` (m³).
+/// Rut and pool slurry are disjoint; berm is placed spoil beside the lane.
+/// `pace_*` is loaded creep speed (m/s) for clay, silt, and sand.
+#[derive(Clone, Copy, Debug)]
+pub struct WetBermCreepWake {
+    pub pool: f32,
+    pub berm_before: f32,
+    pub berm_after: f32,
+    pub rut_before: f32,
+    pub rut_after: f32,
+    pub pool_slurry_before: f32,
+    pub pool_slurry_after: f32,
+    pub sum_before: f32,
+    pub sum_after: f32,
+    pub mix0: crate::soil::MixVolumes,
+    pub mix1: crate::soil::MixVolumes,
+    pub pace_clay: f32,
+    pub pace_silt: f32,
+    pub pace_sand: f32,
+}
+
 /// `pool == berm_after + slurry + bow_after + groove + wake + ribbons + spray`
 /// (`sum`). `bow_*` and `rut_*` are slurry in the bow crest band and rut lane.
 /// `pace_*` is the settle conduct (m/s per m head) for clay, silt, and sand.
@@ -3470,6 +3626,63 @@ mod tests {
             assert_ne!(p.kind, 0);
             assert_ne!(p.kind, 1);
         }
+    }
+
+    #[test]
+    fn wet_berm_creeps_under_niva_load_and_conserves_pool() {
+        let mut world = World::wet_clay();
+        let m = world.wet_berm_creep_under_load(2.8, 6.5);
+        eprintln!(
+            "wet berm berm {:.4}->{:.4} rut {:.4}->{:.4} pool {:.4}->{:.4} sum {:.4}->{:.4} \
+             clay {:.4} silt {:.4} sand {:.4}",
+            m.berm_before,
+            m.berm_after,
+            m.rut_before,
+            m.rut_after,
+            m.pool_slurry_before,
+            m.pool_slurry_after,
+            m.sum_before,
+            m.sum_after,
+            m.pace_clay,
+            m.pace_silt,
+            m.pace_sand
+        );
+        assert!(
+            m.berm_after < m.berm_before - 0.0008,
+            "berm did not creep {:.4} -> {:.4}",
+            m.berm_before,
+            m.berm_after
+        );
+        let berm_lost = m.berm_before - m.berm_after;
+        let rut_gain = m.rut_after - m.rut_before;
+        let pool_gain = m.pool_slurry_after - m.pool_slurry_before;
+        assert!(
+            rut_gain + pool_gain > berm_lost * 0.85,
+            "berm lost {berm_lost:.4} but rut+pool gained {rut_gain:.4}+{pool_gain:.4}"
+        );
+        assert!(
+            m.pace_sand > m.pace_silt && m.pace_silt > m.pace_clay,
+            "pace clay {:.4} silt {:.4} sand {:.4}",
+            m.pace_clay,
+            m.pace_silt,
+            m.pace_sand
+        );
+        assert!(
+            (m.sum_before - (m.berm_before + m.rut_before + m.pool_slurry_before)).abs() < 1.0e-4,
+            "sum before {:.4} != parts",
+            m.sum_before
+        );
+        assert!(
+            (m.sum_after - (m.berm_after + m.rut_after + m.pool_slurry_after)).abs() < 1.0e-4,
+            "sum after {:.4} != parts",
+            m.sum_after
+        );
+        assert!(
+            (m.sum_after - m.sum_before).abs() < 1.0e-3,
+            "sum drift {:.4} -> {:.4}",
+            m.sum_before,
+            m.sum_after
+        );
     }
 
     #[test]

@@ -536,6 +536,8 @@ struct CaptureArgs {
     slurry_rollover_proof: PathBuf,
     slurry_settle: bool,
     slurry_settle_proof: PathBuf,
+    wet_berm_creep: bool,
+    wet_berm_creep_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -644,6 +646,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_settle {
         capture_slurry_settle(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.wet_berm_creep {
+        capture_wet_berm_creep(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -846,6 +852,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_settle = false;
     let mut slurry_settle_proof =
         PathBuf::from(format!("{MEDIA}/slurry-settle-proof.png"));
+    let mut wet_berm_creep = false;
+    let mut wet_berm_creep_proof =
+        PathBuf::from(format!("{MEDIA}/wet-berm-creep-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -954,6 +963,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     slurry_settle_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--wet-berm-creep-proof" => {
+                wet_berm_creep = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    wet_berm_creep_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1053,6 +1068,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_rollover_proof,
         slurry_settle,
         slurry_settle_proof,
+        wet_berm_creep,
+        wet_berm_creep_proof,
     }
 }
 
@@ -1946,6 +1963,92 @@ fn capture_slurry_rollover(renderer: &mut Renderer, parsed: &CaptureArgs) {
 #[cfg(not(target_arch = "wasm32"))]
 /// Second pass through the pool, then slurry settle. Bow and berm numbers are
 /// just-after versus settled; sum is the conserved pool total.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_wet_berm_creep(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.wet_berm_creep_under_load(2.8, 6.5);
+    silence_soil_clods(&mut world);
+    println!(
+        "wet-berm-creep berm {:.4}->{:.4} rut {:.4}->{:.4} pool {:.4}->{:.4} sum {:.4} \
+         clay {:.4} silt {:.4} sand {:.4}",
+        out.berm_before,
+        out.berm_after,
+        out.rut_before,
+        out.rut_after,
+        out.pool_slurry_before,
+        out.pool_slurry_after,
+        out.sum_after,
+        out.pace_clay,
+        out.pace_silt,
+        out.pace_sand,
+    );
+    let lines = [
+        format!("berm {:.4}->{:.4} m3", out.berm_before, out.berm_after),
+        format!("rut {:.4}->{:.4} m3", out.rut_before, out.rut_after),
+        format!(
+            "pool {:.4}->{:.4} m3",
+            out.pool_slurry_before, out.pool_slurry_after
+        ),
+        format!("sum {:.4}->{:.4} m3", out.sum_before, out.sum_after),
+        format!("clay {:.4} m/s", out.pace_clay),
+        format!("silt {:.4} m/s", out.pace_silt),
+        format!("sand {:.4} m/s", out.pace_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = wet_berm_creep_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.wet_berm_creep_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.wet_berm_creep_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("wet berm creep still");
+    println!(
+        "cc0 wet-berm-creep {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.wet_berm_creep_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wet_berm_creep_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let driver = -right;
+    let ori = vehicle.orientation();
+    let rear = vehicle.pos + ori * vehicle.wheel_center_local(2);
+    let berm_x = rear.x + right.x * 0.55;
+    let berm_z = rear.z + right.z * 0.55;
+    let berm_h = world.soil.sample(berm_x, berm_z).height;
+    let target = Vec3::new(berm_x, berm_h + 0.04, berm_z);
+    let eye = Vec3::new(
+        rear.x + driver.x * 3.2 + fwd.x * (-0.95),
+        berm_h + 0.22,
+        rear.z + driver.z * 3.2 + fwd.z * (-0.95),
+    );
+    CameraPose {
+        eye,
+        target,
+        ortho_width: Some(7.2),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn capture_slurry_settle(renderer: &mut Renderer, parsed: &CaptureArgs) {
     renderer.daylight = true;
