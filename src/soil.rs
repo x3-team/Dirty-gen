@@ -12,8 +12,12 @@
 //! throws ribbons and drops taken from the slurry. Slurry that stays behind
 //! sits in the tread voids. Spinning the wheel, or shedding the coat, lets
 //! that hold leave as ribbons. What is in the grooves, what is thrown, and
-//! what returns to the rut add up to the slurry that left the column. The
-//! visible height is bed + placed + the slurry that is still on the ground.
+//! what returns to the rut add up to the slurry that left the column. A roll
+//! or a sideways shove in that slurry splits the new cut into the berm, the
+//! throw, and the slurry that stays in the rut. Clay holds, so the shove is
+//! short. Silt is thinner and travels farther. A dry crust does not become
+//! slurry. The visible height is bed + placed + the slurry that is still on
+//! the ground.
 //!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
@@ -212,6 +216,42 @@ fn paste_kind(kind: SurfaceKind) -> SurfaceKind {
         SurfaceKind::Berm | SurfaceKind::PlacedClod | SurfaceKind::CutLip => SurfaceKind::WetMud,
         other => other,
     }
+}
+
+/// Metres a sideways shove carries slurry. Clay stays next to the rut.
+/// Silt runs farther at the same moisture, because it is the thinner mix.
+/// A dry crust does not slurry, so the reach is zero.
+pub fn slurry_slide_reach(kind: SurfaceKind, moisture: f32) -> f32 {
+    if !mixes_as_slurry(kind) {
+        return 0.0;
+    }
+    let visc = slurry_viscosity(paste_kind(kind), moisture).max(0.05);
+    (36.0 / visc).clamp(0.18, 2.4)
+}
+
+/// Share of the slurry in one cell that a sideways shove moves.
+/// Clay keeps almost all of it. Silt gives up more of the column.
+pub fn slurry_leave_fraction(kind: SurfaceKind, moisture: f32) -> f32 {
+    if !mixes_as_slurry(kind) {
+        return 0.0;
+    }
+    let visc = slurry_viscosity(paste_kind(kind), moisture).max(0.05);
+    let clay = slurry_viscosity(SurfaceKind::WetMud, moisture).max(0.05);
+    let thin = (1.0 - visc / clay).clamp(0.0, 1.0);
+    0.08 + thin * 0.70
+}
+
+/// Share of a fresh cut that stays in the rut as slurry instead of leaving
+/// as berm or throw. Clay holds a larger share. Silt keeps less. A dry crust
+/// returns zero: the cut is spoil, and the cell does not become slurry.
+pub fn slurry_hold_fraction(kind: SurfaceKind, moisture: f32) -> f32 {
+    if !mixes_as_slurry(kind) {
+        return 0.0;
+    }
+    let visc = slurry_viscosity(paste_kind(kind), moisture).max(0.05);
+    let clay = slurry_viscosity(SurfaceKind::WetMud, moisture).max(0.05);
+    let thick = (visc / clay).clamp(0.0, 1.0);
+    0.18 + thick * 0.28
 }
 
 /// Metres of upward travel that snap a slurry seal. The suction lives inside
@@ -3037,6 +3077,425 @@ impl SoilField {
         vol
     }
 
+    /// Cubic metres of slurry on the field.
+    pub fn slurry_volume(&self) -> f32 {
+        let area = self.cell * self.cell;
+        self.slurry.iter().sum::<f32>() * area
+    }
+
+    /// Cut a lane and split that volume into a berm, a throw, and slurry that
+    /// stays in the rut. The three add up to the bed that was removed.
+    ///
+    /// The solid share is the berm plus the throw. That is the #61 identity:
+    /// cut minus the slurry left in the rut equals placed spoil plus the
+    /// airborne account. With no slurry, and once the throw has landed, the
+    /// cut equals the placed volume.
+    ///
+    /// A dry crust keeps its kind. None of its cut is turned into slurry.
+    pub fn cut_lane_in_slurry(
+        &mut self,
+        from: Vec3,
+        to: Vec3,
+        half_width: f32,
+        depth: f32,
+        throw_frac: f32,
+    ) -> SlurryCut {
+        let from = Vec3::new(from.x, 0.0, from.z);
+        let to = Vec3::new(to.x, 0.0, to.z);
+        let delta = to - from;
+        let len = delta.length();
+        if len < 1.0e-3 || depth <= 1.0e-4 || half_width < 0.05 {
+            return SlurryCut::default();
+        }
+        let fwd = delta / len;
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let half = self.size * 0.5;
+        let res = self.res;
+        let area = self.cell * self.cell;
+        let depth = depth.min(0.26);
+        let throw_frac = throw_frac.clamp(0.0, 0.72);
+        let mid = from.lerp(to, 0.5);
+        let sample = self.sample(mid.x, mid.z);
+        let kind = sample.kind();
+        let moisture = sample.wetness.clamp(0.08, 0.92);
+        let mixes = mixes_as_slurry(kind);
+        let hold = slurry_hold_fraction(kind, moisture);
+
+        let reach = len * 0.5 + half_width + 1.1;
+        let res_i = res as isize;
+        let i0 = (((mid.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((mid.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((mid.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((mid.z + reach) + half) / self.cell).floor() as isize;
+
+        let mut cuts: Vec<(usize, f32)> = Vec::new();
+        for j in j0.max(1)..j1.min(res_i - 1) {
+            for i in i0.max(1)..i1.min(res_i - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - from.x;
+                let rel_z = cz - from.z;
+                let along = rel_x * fwd.x + rel_z * fwd.z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                if along < -self.cell * 0.2 || along > len + self.cell * 0.2 || lat.abs() > half_width
+                {
+                    continue;
+                }
+                let u = (lat.abs() / half_width).clamp(0.0, 1.0);
+                // Flat floor, then a short wall. A linear ramp across the
+                // whole width was a saucer, and the still could not see it.
+                let profile = if u < 0.70 {
+                    1.0
+                } else {
+                    ((1.0 - u) / 0.30).clamp(0.22, 1.0)
+                };
+                let drop = depth * profile;
+                let idx = j as usize * res + i as usize;
+                let before_bed = self.bed[idx];
+                let before_placed = self.placed[idx];
+                let removed = self.excavate(idx, drop);
+                if removed <= 1.0e-6 {
+                    continue;
+                }
+                let bed_drop = (before_bed - self.bed[idx]).max(0.0);
+                let placed_taken = (before_placed - self.placed[idx]).max(0.0);
+                if placed_taken > 1.0e-8 {
+                    // Spoil that was already down is not a new cut.
+                    self.placed[idx] += placed_taken;
+                }
+                if bed_drop <= 1.0e-6 {
+                    self.sync(idx);
+                    continue;
+                }
+                if mixes && !firm_cover(SurfaceKind::from_u8(self.kind[idx])) {
+                    self.kind[idx] = SurfaceKind::FreshCut as u8;
+                    self.darken[idx] = (self.darken[idx] + 0.35).min(1.0);
+                    self.wetness[idx] = self.wetness[idx].max(moisture);
+                }
+                self.sync(idx);
+                cuts.push((idx, bed_drop));
+            }
+        }
+
+        let depth_sum: f32 = cuts.iter().map(|(_, d)| *d).sum();
+        let cut = depth_sum * area;
+        if cut <= 1.0e-8 || depth_sum <= 1.0e-8 {
+            return SlurryCut::default();
+        }
+        let slurry = if mixes { cut * hold } else { 0.0 };
+        let leaving = cut - slurry;
+        let thrown = leaving * throw_frac;
+        let berm = leaving - thrown;
+
+        if slurry > 1.0e-8 {
+            for (idx, d) in &cuts {
+                self.slurry[*idx] += (slurry / area) * (*d / depth_sum);
+                self.sync(*idx);
+            }
+        }
+        self.lay_lane_berm(&cuts, from, fwd, right, half_width, len, berm);
+        if thrown > 1.0e-8 {
+            self.airborne += thrown;
+        }
+        SlurryCut {
+            cut,
+            berm,
+            thrown,
+            slurry,
+        }
+    }
+
+    /// Ridge on the right flank of a lane. The volume is `berm` exactly.
+    /// The floor of the cut is left clear so the trench stays open.
+    fn lay_lane_berm(
+        &mut self,
+        cuts: &[(usize, f32)],
+        from: Vec3,
+        fwd: Vec3,
+        right: Vec3,
+        half_width: f32,
+        len: f32,
+        berm: f32,
+    ) {
+        if berm <= 1.0e-8 {
+            return;
+        }
+        let half = self.size * 0.5;
+        let res = self.res;
+        let area = self.cell * self.cell;
+        let mut cut_at = vec![false; res * res];
+        for (idx, _) in cuts {
+            cut_at[*idx] = true;
+        }
+        let mut weight = vec![0.0_f32; res * res];
+        let res_i = res as isize;
+        let reach = len * 0.5 + half_width + 1.2;
+        let mid = from + fwd * (len * 0.5);
+        let i0 = (((mid.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((mid.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((mid.z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((mid.z + reach) + half) / self.cell).floor() as isize;
+        for j in j0.max(1)..j1.min(res_i - 1) {
+            for i in i0.max(1)..i1.min(res_i - 1) {
+                let idx = j as usize * res + i as usize;
+                if cut_at[idx] {
+                    continue;
+                }
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - from.x;
+                let rel_z = cz - from.z;
+                let along = rel_x * fwd.x + rel_z * fwd.z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                if along < -0.05 || along > len + 0.05 {
+                    continue;
+                }
+                let flank = lat - half_width;
+                if !(0.02..=0.72).contains(&flank) {
+                    continue;
+                }
+                let w = (-0.5 * ((flank - 0.18) / 0.11).powi(2)).exp();
+                if w > 0.08 {
+                    weight[idx] = w;
+                }
+            }
+        }
+        for _ in 0..5 {
+            let wsum: f32 = weight.iter().copied().sum();
+            if wsum <= 1.0e-6 {
+                break;
+            }
+            let max_h = weight.iter().copied().fold(0.0_f32, f32::max) * berm / (wsum * area);
+            if (0.16..=0.24).contains(&max_h) {
+                break;
+            }
+            if max_h > 0.24 {
+                let src = weight.clone();
+                for idx in 0..weight.len() {
+                    if src[idx] <= 0.0 || cut_at[idx] {
+                        weight[idx] = 0.0;
+                        continue;
+                    }
+                    let i = (idx % res) as isize;
+                    let j = (idx / res) as isize;
+                    let mut acc = src[idx] * 0.45;
+                    let mut wacc = 0.45_f32;
+                    for (di, dj) in [(1isize, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let ii = i + di;
+                        let jj = j + dj;
+                        if ii < 1 || jj < 1 || ii >= res_i - 1 || jj >= res_i - 1 {
+                            continue;
+                        }
+                        let nidx = jj as usize * res + ii as usize;
+                        if cut_at[nidx] {
+                            continue;
+                        }
+                        acc += src[nidx] * 0.14;
+                        wacc += 0.14;
+                    }
+                    weight[idx] = acc / wacc;
+                }
+            } else {
+                for w in &mut weight {
+                    if *w > 0.0 {
+                        *w = w.powf(1.55);
+                    }
+                }
+            }
+        }
+        let wsum: f32 = weight.iter().copied().sum();
+        if wsum <= 1.0e-6 {
+            // No flank on the field. Keep the mass on the lip cells that
+            // were cut rather than dropping it.
+            let add = berm / (cuts.len().max(1) as f32 * area);
+            for (idx, _) in cuts {
+                self.placed[*idx] += add;
+                self.sync(*idx);
+            }
+            return;
+        }
+        let scale = berm / (wsum * area);
+        for idx in 0..weight.len() {
+            if weight[idx] <= 0.0 {
+                continue;
+            }
+            self.placed[idx] += weight[idx] * scale;
+            self.loose[idx] = (self.loose[idx] + self.placed[idx] * 0.15).min(0.18);
+            self.sync(idx);
+        }
+    }
+
+    /// Push slurry sideways. The column is conserved. Clay's reach is about
+    /// one cell, so the rut keeps it. Silt moves several cells. A dry crust
+    /// is not a destination and is not turned into slurry.
+    pub fn slide_slurry(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        axis: Vec3,
+    ) -> SlurrySlide {
+        let axis = horizontal(axis);
+        let before = self.slurry_volume();
+        let (c0, vol0) = self.slurry_centroid_along(axis);
+        let src = self.slurry.clone();
+        let mut next = src.clone();
+        let half = self.size * 0.5;
+        let res = self.res;
+        let mut moved = 0.0_f32;
+        let area = self.cell * self.cell;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * res + i;
+                if src[idx] <= 1.0e-5 {
+                    continue;
+                }
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                if !mixes_as_slurry(kind) {
+                    continue;
+                }
+                let moisture = self.wetness[idx].clamp(0.08, 0.92);
+                let reach = slurry_slide_reach(kind, moisture);
+                let leave = slurry_leave_fraction(kind, moisture);
+                let take = src[idx] * leave;
+                if take <= 1.0e-6 || reach < self.cell * 0.5 {
+                    continue;
+                }
+                let steps = ((reach / self.cell).round() as i32).clamp(1, 12);
+                let mut dest = idx;
+                let mut di = i as isize;
+                let mut dj = j as isize;
+                let step_x = axis.x.signum() as isize;
+                let step_z = axis.z.signum() as isize;
+                // Axis is not always grid-aligned. Step along the dominant
+                // component, and along the other when the axis is diagonal.
+                let ax = axis.x.abs();
+                let az = axis.z.abs();
+                let mut walked = 0i32;
+                while walked < steps {
+                    let mut ni = di;
+                    let mut nj = dj;
+                    if ax >= az * 0.55 {
+                        ni += if axis.x >= 0.0 { 1 } else { -1 };
+                    }
+                    if az > ax * 0.55 {
+                        nj += if axis.z >= 0.0 { 1 } else { -1 };
+                    }
+                    if ni < 1 || nj < 1 || ni >= res as isize - 1 || nj >= res as isize - 1 {
+                        break;
+                    }
+                    let nidx = nj as usize * res + ni as usize;
+                    if !self.accepts_slurry(nidx) {
+                        break;
+                    }
+                    di = ni;
+                    dj = nj;
+                    dest = nidx;
+                    walked += 1;
+                    let _ = (step_x, step_z);
+                }
+                if dest == idx {
+                    continue;
+                }
+                next[idx] -= take;
+                next[dest] += take;
+                moved += take * area;
+            }
+        }
+        // A crust that started dry stays dry. Sliding onto it is refused above.
+        for idx in 0..next.len() {
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            if !mixes_as_slurry(kind) && src[idx] <= 1.0e-6 {
+                next[idx] = 0.0;
+            }
+        }
+        for idx in 0..next.len() {
+            if (next[idx] - self.slurry[idx]).abs() > 0.0 {
+                self.slurry[idx] = next[idx].max(0.0);
+                self.sync(idx);
+            }
+        }
+        let after = self.slurry_volume();
+        let (c1, _) = self.slurry_centroid_along(axis);
+        let _ = vol0;
+        SlurrySlide {
+            moved,
+            travel: if before > 1.0e-6 { c1 - c0 } else { 0.0 },
+            minted: after - before,
+        }
+    }
+
+    /// Take a share of the slurry in a rectangle and move it to the thrown
+    /// account. The bed is not cut. Returns the cubic metres removed.
+    pub fn peel_slurry(&mut self, x0: f32, x1: f32, z0: f32, z1: f32, fraction: f32) -> f32 {
+        let fraction = fraction.clamp(0.0, 0.85);
+        if fraction <= 1.0e-6 {
+            return 0.0;
+        }
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let mut vol = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                if !mixes_as_slurry(kind) || self.slurry[idx] <= 1.0e-6 {
+                    continue;
+                }
+                let take = self.slurry[idx] * fraction;
+                self.slurry[idx] -= take;
+                vol += take * area;
+                self.sync(idx);
+            }
+        }
+        if vol > 0.0 {
+            self.airborne += vol;
+        }
+        vol
+    }
+
+    fn accepts_slurry(&self, idx: usize) -> bool {
+        let kind = SurfaceKind::from_u8(self.kind[idx]);
+        mixes_as_slurry(kind)
+    }
+
+    fn slurry_centroid_along(&self, axis: Vec3) -> (f32, f32) {
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let mut acc = 0.0_f32;
+        let mut vol = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let idx = j * self.res + i;
+                let h = self.slurry[idx];
+                if h <= 1.0e-6 {
+                    continue;
+                }
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                let v = h * area;
+                acc += (x * axis.x + z * axis.z) * v;
+                vol += v;
+            }
+        }
+        if vol <= 1.0e-8 {
+            (0.0, 0.0)
+        } else {
+            (acc / vol, vol)
+        }
+    }
+
     /// Lift a tire through slurry. While the seal holds, the step adds a
     /// downward suction impulse. At [`SLURRY_BREAK_LIFT`] the seal snaps and
     /// a share of the slurry under the tread is thrown. That volume leaves
@@ -4639,6 +5098,27 @@ pub struct PlowCut {
     pub moved: f32,
     pub berm: f32,
     pub thrown: f32,
+}
+
+/// A lane cut in slurry. Cubic metres. `cut == berm + thrown + slurry`.
+/// `slurry` is the share that stayed in the rut. The throw is on `airborne`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlurryCut {
+    pub cut: f32,
+    pub berm: f32,
+    pub thrown: f32,
+    pub slurry: f32,
+}
+
+/// A sideways shove of slurry that was already on the field.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlurrySlide {
+    /// Cubic metres that left the cell they started in.
+    pub moved: f32,
+    /// Signed metres the slurry centroid traveled along the shove.
+    pub travel: f32,
+    /// Slurry volume after, minus before. Zero when nothing was minted.
+    pub minted: f32,
 }
 
 /// High slurry, the low rut in front of it, and the shared plan extents.
@@ -6804,5 +7284,122 @@ mod tests {
             before.total(),
             landed.total()
         );
+    }
+
+    /// Clay keeps its slurry in the rut. Silt, at the same moisture, slides
+    /// farther. A dry crust is not turned into slurry, and its cut still
+    /// equals the placed spoil plus the throw.
+    #[test]
+    fn clay_slurry_holds_silt_slides_and_crust_stays_dry() {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let clay_hold = slurry_hold_fraction(SurfaceKind::WetMud, moisture);
+        let silt_hold = slurry_hold_fraction(SurfaceKind::Silt, moisture);
+        let crust_hold = slurry_hold_fraction(SurfaceKind::DryCrust, moisture);
+        assert!(
+            clay_hold > silt_hold + 0.08,
+            "clay should keep more of the cut, clay {clay_hold:.3} silt {silt_hold:.3}"
+        );
+        assert!(
+            crust_hold < 1.0e-6,
+            "a dry crust must not hold a slurry share, {crust_hold}"
+        );
+        assert!(
+            slurry_slide_reach(SurfaceKind::Silt, moisture)
+                > slurry_slide_reach(SurfaceKind::WetMud, moisture) * 2.0,
+            "silt should be allowed to travel farther than clay"
+        );
+        assert!(slurry_slide_reach(SurfaceKind::DryCrust, moisture) < 1.0e-6);
+        assert!(slurry_leave_fraction(SurfaceKind::DryCrust, moisture) < 1.0e-6);
+
+        let clay = shove_slurry_pad(SurfaceKind::WetMud, moisture);
+        let silt = shove_slurry_pad(SurfaceKind::Silt, moisture);
+        eprintln!(
+            "slide clay travel {:.4} m  moved {:.4} m3  minted {:.6}    silt travel {:.4} m  moved {:.4} m3  minted {:.6}",
+            clay.travel, clay.moved, clay.minted, silt.travel, silt.moved, silt.minted
+        );
+        assert!(
+            clay.travel.abs() < 0.12,
+            "clay slurry should hold, travel {:.4} m",
+            clay.travel
+        );
+        assert!(
+            silt.travel > clay.travel + 0.20,
+            "silt should slide farther, clay {:.4} silt {:.4}",
+            clay.travel,
+            silt.travel
+        );
+        assert!(
+            silt.travel > clay.travel * 2.5,
+            "silt travel {:.4} is not several times the clay {:.4}",
+            silt.travel,
+            clay.travel
+        );
+        assert!(clay.minted.abs() < 1.0e-3 && silt.minted.abs() < 1.0e-3);
+        assert!(clay.moved > 1.0e-4, "the clay shove moved nothing");
+        assert!(silt.moved > clay.moved * 2.0, "silt did not give up more slurry");
+
+        let mut crust = SoilField::flat(0.12);
+        assert_eq!(
+            crust.sample(0.0, 0.0).kind(),
+            SurfaceKind::DryCrust,
+            "the dry pad should be a crust"
+        );
+        let before = crust.volumes();
+        let cut = crust.cut_lane_in_slurry(
+            Vec3::new(0.0, 0.0, -1.2),
+            Vec3::new(0.0, 0.0, 1.2),
+            0.42,
+            0.12,
+            0.40,
+        );
+        let after = crust.volumes();
+        eprintln!(
+            "crust cut {:.4} berm {:.4} thrown {:.4} slurry {:.4} placed {:.4} air {:.4}",
+            cut.cut,
+            cut.berm,
+            cut.thrown,
+            cut.slurry,
+            after.placed - before.placed,
+            crust.airborne
+        );
+        assert!(cut.cut > 0.02, "the crust was not cut, {:.4}", cut.cut);
+        assert!(cut.slurry < 1.0e-5, "crust became slurry, {:.4}", cut.slurry);
+        assert!(
+            crust.slurry.iter().all(|s| *s < 1.0e-5),
+            "a crust cell holds slurry"
+        );
+        assert_eq!(crust.sample(0.0, 0.0).kind(), SurfaceKind::DryCrust);
+        let gap = (cut.cut - cut.berm - cut.thrown - cut.slurry).abs();
+        assert!(gap < 1.0e-3, "crust cut split drifted {gap}");
+        let solid = (cut.cut - (after.placed - before.placed) - crust.airborne).abs();
+        assert!(
+            solid < 1.0e-3,
+            "crust broke cut = placed + airborne, gap {solid}"
+        );
+        let slide = crust.slide_slurry(-2.0, 2.0, -2.0, 2.0, Vec3::X);
+        assert!(slide.moved < 1.0e-6 && slide.minted.abs() < 1.0e-6);
+    }
+
+    fn shove_slurry_pad(kind: SurfaceKind, moisture: f32) -> SlurrySlide {
+        let mut soil = SoilField::mud_pad();
+        let _ = soil.fill_slurry_pool(-0.7, 0.7, -1.3, 1.3, 0.12, kind, moisture);
+        let bed0: Vec<f32> = soil.bed.clone();
+        let placed0: Vec<f32> = soil.placed.clone();
+        let slide = soil.slide_slurry(-0.7, 0.7, -1.3, 1.3, Vec3::X);
+        assert!(
+            soil.bed
+                .iter()
+                .zip(bed0.iter())
+                .all(|(a, b)| (a - b).abs() < 1.0e-6),
+            "the shove cut the bed"
+        );
+        assert!(
+            soil.placed
+                .iter()
+                .zip(placed0.iter())
+                .all(|(a, b)| (a - b).abs() < 1.0e-6),
+            "the shove moved the berm"
+        );
+        slide
     }
 }

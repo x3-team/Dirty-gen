@@ -1071,9 +1071,48 @@ fn add_soil_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
+/// A fast sideways spin throws a flat ribbon. The tread peel stays curled.
+fn spin_ribbon(vel: Vec3) -> bool {
+    vel.length() > 6.0
+}
+
+/// Straight band in the sheet frame. No bow, so the silhouette is not a crescent.
+fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32, width: f32, thick: f32) {
+    let (dir, side, up) = slurry_sheet_axes(p.vel);
+    let segs = 8usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        // Tips narrow a little. The run of the strip stays full width.
+        let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
+        let taper = edge.powf(0.18).clamp(0.7, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5;
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
 /// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
 /// is a ribbon rather than a box, a tablet, or a cube.
 fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    if spin_ribbon(p.vel) {
+        // Long, narrow, and flat. The roll still must not grow another crescent.
+        add_flat_strip(mesh, p, 0.90, 0.07, 0.004);
+        return;
+    }
     let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.35, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::Z;
@@ -1119,6 +1158,34 @@ fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
     let b = ring[segs];
     add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
     add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+}
+
+/// Length, width, and thickness for a roll sheet. The width stands up, so a
+/// camera looking along the lane sees the face and not the thin edge.
+fn slurry_sheet_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
+    let mut dir = Vec3::new(vel.x, vel.y * 0.22, vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::X;
+    }
+    dir = dir.normalize();
+    let mut side = Vec3::Y - dir * dir.y;
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::Z);
+    }
+    if side.length_squared() < 1.0e-6 {
+        side = Vec3::Z;
+    }
+    side = side.normalize();
+    let mut up = side.cross(dir);
+    if up.length_squared() < 1.0e-6 {
+        up = Vec3::Z;
+    }
+    (dir, side, up.normalize())
+}
+
+/// A roll's slurry. A flat sheet, wider than the spin ribbon, with no bow.
+fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    add_flat_strip(mesh, p, 0.90, 0.22, 0.004);
 }
 
 /// A small liquid drop torn off with the ribbons. A short pinched fleck.
@@ -1185,17 +1252,37 @@ mod slurry_shapes {
 
     /// Length, width, thickness in the same frame the ribbon mesh uses.
     fn ribbon_frame(mesh: &CpuMesh, vel: Vec3) -> [f32; 3] {
-        let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
-        if dir.length_squared() < 1.0e-6 {
-            dir = Vec3::Z;
+        let (dir, side, up) = if spin_ribbon(vel) {
+            slurry_sheet_axes(vel)
+        } else {
+            let mut dir = Vec3::new(vel.x, vel.y * 0.35, vel.z);
+            if dir.length_squared() < 1.0e-6 {
+                dir = Vec3::Z;
+            }
+            dir = dir.normalize();
+            let mut side = dir.cross(Vec3::Y);
+            if side.length_squared() < 1.0e-6 {
+                side = dir.cross(Vec3::X);
+            }
+            side = side.normalize();
+            let up = side.cross(dir).normalize();
+            (dir, side, up)
+        };
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(-f32::MAX);
+        for v in &mesh.vertices {
+            let p = Vec3::from_array(v.pos);
+            let q = Vec3::new(p.dot(dir), p.dot(side), p.dot(up));
+            min = min.min(q);
+            max = max.max(q);
         }
-        dir = dir.normalize();
-        let mut side = dir.cross(Vec3::Y);
-        if side.length_squared() < 1.0e-6 {
-            side = dir.cross(Vec3::X);
-        }
-        side = side.normalize();
-        let up = side.cross(dir).normalize();
+        let span = max - min;
+        [span.x, span.y, span.z]
+    }
+
+    /// Length, width, thickness in the frame `add_slurry_sheet` builds.
+    fn sheet_frame(mesh: &CpuMesh, vel: Vec3) -> [f32; 3] {
+        let (dir, side, up) = slurry_sheet_axes(vel);
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(-f32::MAX);
         for v in &mesh.vertices {
@@ -1285,6 +1372,46 @@ mod slurry_shapes {
     }
 
     #[test]
+    fn roll_sheet_is_a_sheet_and_not_a_chunk() {
+        use silt::particles::{Particles, KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
+        let mut particles = Particles::new();
+        let sheets = particles.throw_roll_sheets(Vec3::new(0.0, 0.5, 0.0), Vec3::Z, Vec3::X, 0.016);
+        let ribbons = particles.throw_spin_ribbons(Vec3::new(0.2, 0.4, 0.1), Vec3::Z, Vec3::X, 0.0045);
+        assert!((sheets - 0.016).abs() < 1.0e-5);
+        assert!((ribbons - 0.0045).abs() < 1.0e-5);
+        for p in &particles.items {
+            if p.volume <= 1.0e-8 {
+                continue;
+            }
+            assert_ne!(p.kind, KIND_SLURRY_DROP);
+            assert_ne!(p.kind, 1);
+            let mut mesh = CpuMesh::new();
+            let mut e = if p.kind == KIND_SLURRY_SHEET {
+                add_slurry_sheet(&mut mesh, p);
+                sheet_frame(&mesh, p.vel)
+            } else {
+                assert_eq!(p.kind, KIND_SLURRY_RIBBON);
+                add_slurry_ribbon(&mut mesh, p);
+                ribbon_frame(&mesh, p.vel)
+            };
+            e.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            assert!(
+                e[0] > e[1] * 2.4 && e[0] > e[2] * 3.0,
+                "shed is not a long thin sheet {e:?} kind {}",
+                p.kind
+            );
+            assert!(e[1] / e[0] < 0.42, "shed reads as a tablet {e:?}");
+            assert!(e[0] / e[2] > 4.0, "shed is a sphere or a chunk {e:?}");
+            if p.kind == KIND_SLURRY_SHEET {
+                assert!(
+                    e[1] > 0.14 && e[1] > e[2] * 3.0,
+                    "roll sheet is a hair or a tablet {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mud_chunks_includes_the_breakaway() {
         use silt::particles::Particles;
         let mut particles = Particles::new();
@@ -1306,8 +1433,8 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    // 5 and 6 are the slurry breakaway: ribbons, then drops.
-    for kind in [5u8, 6, 3, 1, 4, 0, 2] {
+    // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
+    for kind in [7u8, 5, 6, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
@@ -1316,6 +1443,8 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
                 if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
                     if p.kind == silt::particles::KIND_SLURRY_DROP {
                         add_mud_drop(&mut mesh, p);
+                    } else if p.kind == silt::particles::KIND_SLURRY_SHEET {
+                        add_slurry_sheet(&mut mesh, p);
                     } else if p.kind == silt::particles::KIND_SLURRY_RIBBON {
                         add_slurry_ribbon(&mut mesh, p);
                     } else {
