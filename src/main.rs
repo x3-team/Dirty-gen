@@ -3,6 +3,7 @@
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
 mod cc0;
+mod env;
 mod mesh;
 mod niva;
 mod render;
@@ -546,6 +547,8 @@ struct CaptureArgs {
     stuck_recovery_proof: PathBuf,
     water_crossing: bool,
     water_crossing_proof: PathBuf,
+    /// Directory for the beauty proof stills, when asked.
+    beauty: Option<PathBuf>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -690,6 +693,140 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     println!("video {}", video.display());
 }
 
+/// The through-drive for the beauty pass: puddle, bow wave, slurry rut,
+/// spray off the arches, out onto dry ground in its own dust. The solver and
+/// the contract are the through-drive's; only cameras are chosen here.
+/// Three stills at fixed points of the run, and with `--beauty-video` every
+/// step as a 30 fps clip on the chase camera.
+fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &Path, video: bool) {
+    std::fs::create_dir_all(dir).expect("beauty dir");
+    let frames = dir.join("frames");
+    if video {
+        let _ = std::fs::remove_dir_all(&frames);
+        std::fs::create_dir_all(&frames).expect("frame dir");
+    }
+    let mut drive = silt::ThroughDrive::new();
+    let dt = 1.0 / 30.0;
+    let stills: [(f32, &str, fn(&World) -> CameraPose); 3] = [
+        (-17.5, "puddle-wave", beauty_puddle_camera),
+        (-6.5, "slurry-spray", beauty_spray_camera),
+        (9.0, "dust-exit", beauty_dust_camera),
+    ];
+    let mut saved = [false; 3];
+    // SILT_BEAUTY_STILLS=puddle-wave,... renders only those stills and stops.
+    let only = std::env::var("SILT_BEAUTY_STILLS").ok();
+    if let Some(list) = &only {
+        for (k, (_, name, _)) in stills.iter().enumerate() {
+            saved[k] = !list.split(',').any(|n| n == *name);
+        }
+    }
+    let mut frame = 0u32;
+    let t0 = Instant::now();
+    while drive.world.vehicle.pos.z < 19.6 {
+        if !video && only.is_some() && saved.iter().all(|s| *s) {
+            break;
+        }
+        let z = drive.world.vehicle.pos.z;
+        for (k, (at, name, cam)) in stills.iter().enumerate() {
+            if !saved[k] && z >= *at {
+                let rgba = renderer
+                    .draw_with_sheet(
+                        &drive.world,
+                        cam(&drive.world),
+                        None,
+                        true,
+                        Some(&drive.fluid),
+                        Some(drive.dust()),
+                    )
+                    .expect("readback");
+                let path = dir.join(format!("{name}.png"));
+                write_png(&path, width, height, &rgba).expect("still");
+                println!("beauty still {} at z {z:.1}", path.display());
+                saved[k] = true;
+            }
+        }
+        if video {
+            let rgba = renderer
+                .draw_with_sheet(
+                    &drive.world,
+                    beauty_chase(&drive.world),
+                    None,
+                    true,
+                    Some(&drive.fluid),
+                    Some(drive.dust()),
+                )
+                .expect("readback");
+            write_png(&frames.join(format!("frame_{frame:04}.png")), width, height, &rgba)
+                .expect("frame");
+            frame += 1;
+            if frame % 15 == 0 {
+                println!("frame {frame} z {z:.1} wall {:.0}s", t0.elapsed().as_secs_f32());
+            }
+        }
+        drive.step(dt);
+    }
+    if video {
+        let out = dir.join("through-drive-beauty.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-y", "-framerate", "30", "-i"])
+            .arg(frames.join("frame_%04d.png"))
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart"])
+            .arg(&out)
+            .status()
+            .expect("ffmpeg");
+        assert!(status.success(), "ffmpeg failed: {status}");
+        println!("video {}", out.display());
+    }
+}
+
+fn vehicle_axes(world: &World) -> (Vec3, Vec3, Vec3) {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    (world.vehicle.pos, fwd, right)
+}
+
+/// Low on the puddle's bank, ahead of the nose, so the bow wave and its foam
+/// face the lens.
+fn beauty_puddle_camera(world: &World) -> CameraPose {
+    let (p, fwd, right) = vehicle_axes(world);
+    CameraPose {
+        eye: p + fwd * 4.8 + right * 3.2 + Vec3::Y * 1.25,
+        target: p + fwd * 0.4 - Vec3::Y * 0.05,
+        ortho_width: None,
+    }
+}
+
+/// Behind the rear arch, low, so ribbons torn off the tread fly at the lens.
+fn beauty_spray_camera(world: &World) -> CameraPose {
+    let (p, fwd, right) = vehicle_axes(world);
+    CameraPose {
+        eye: p - fwd * 4.2 + right * 2.1 + Vec3::Y * 0.75,
+        target: p - fwd * 0.6 + Vec3::Y * 0.35,
+        ortho_width: None,
+    }
+}
+
+/// Ahead of the car on dry ground, looking back into its headlights and the
+/// dust it drags off the track.
+fn beauty_dust_camera(world: &World) -> CameraPose {
+    let (p, fwd, right) = vehicle_axes(world);
+    CameraPose {
+        eye: p + fwd * 7.5 - right * 2.6 + Vec3::Y * 1.25,
+        target: p - fwd * 2.5 + Vec3::Y * 0.6,
+        ortho_width: None,
+    }
+}
+
+/// Rear three-quarter chase, lower and closer than the proof camera.
+fn beauty_chase(world: &World) -> CameraPose {
+    let (p, fwd, right) = vehicle_axes(world);
+    CameraPose {
+        eye: p - fwd * 6.8 - right * 2.4 + Vec3::Y * 2.0,
+        target: p + fwd * 0.4 + Vec3::Y * 0.35,
+        ortho_width: None,
+    }
+}
+
 fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     let mut world = silt::World::flat(0.4);
     let report = world.carve_belly_shelf();
@@ -730,6 +867,17 @@ fn capture(args: &[String]) {
         formats,
         scene,
     );
+    if let Some(at) = args.iter().position(|s| s == "--beauty-drive") {
+        let dir = PathBuf::from(args.get(at + 1).expect("--beauty-drive <dir>"));
+        let video = args.iter().any(|s| s == "--beauty-video");
+        renderer.show_bike = false;
+        renderer.show_props = false;
+        renderer.show_hills = false;
+        renderer.niva_picture = true;
+        renderer.water_column = true;
+        capture_beauty_drive(&mut renderer, parsed.width, parsed.height, &dir, video);
+        return;
+    }
     if args.iter().any(|s| s == "--through-drive") {
         renderer.show_bike = false;
         renderer.show_props = false;
@@ -846,6 +994,10 @@ fn capture(args: &[String]) {
     }
     if parsed.water_crossing {
         capture_water_crossing(&mut renderer, &parsed);
+        return;
+    }
+    if let Some(dir) = &parsed.beauty {
+        capture_beauty(&mut renderer, &parsed, dir);
         return;
     }
     let mut world = World::demo();
@@ -1063,6 +1215,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut water_crossing = false;
     let mut water_crossing_proof =
         PathBuf::from(format!("{MEDIA}/water-crossing-proof.png"));
+    let mut beauty = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1075,6 +1228,10 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         match flag {
             "--software" => software = true,
             "--through-drive" => {}
+            "--beauty-drive" => {
+                i += 1;
+            }
+            "--beauty-video" => {}
             "--width" => width = val(&mut i).parse().expect("width"),
             "--height" => height = val(&mut i).parse().expect("height"),
             "--fps" => fps = val(&mut i).parse().expect("fps"),
@@ -1202,6 +1359,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     water_crossing_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--beauty" => beauty = Some(PathBuf::from(val(&mut i))),
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1311,7 +1469,157 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         stuck_recovery_proof,
         water_crossing,
         water_crossing_proof,
+        beauty,
     }
+}
+
+/// Proof stills for the look: the Niva in a watered rut, wet gloss against a
+/// low sun, sand beside clay. Every soil and mud value comes from the solver;
+/// the camera and the sun are the only things staged here.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_beauty(renderer: &mut Renderer, parsed: &CaptureArgs, dir: &Path) {
+    use silt::soil::{
+        rut_depth_from_force, SoilField, SurfaceKind, HARD_PASS_NORMAL, HARD_PASS_PUSH,
+    };
+    std::fs::create_dir_all(dir).expect("beauty dir");
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    let dt = 1.0 / 60.0;
+
+    // Load the body the way the tread capture does: roll through the bog,
+    // then spin so the tires fling clay onto the arches and sills.
+    let mut bog = World::flat(0.72);
+    bog.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+    bog.bike.vel = Vec3::ZERO;
+    for loose in &mut bog.soil.loose {
+        *loose = loose.max(0.06);
+    }
+    for _ in 0..140 {
+        prescribe_roll(&mut bog, 1.15);
+        bog.step(dt, &Input::default());
+    }
+    let spin = Input {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+    };
+    for _ in 0..260 {
+        bog.step(dt, &spin);
+        hold_chassis(&mut bog);
+    }
+    let mass: f32 = bog.vehicle.panels.iter().map(|p| p.mass).sum();
+    println!("beauty body mud {mass:.3} kg-equivalent over {} panels", bog.vehicle.panels.len());
+
+    // The heavy pass from the force proof: both tracks cut at the depth the
+    // hard-pass load gives. Water is poured into the grooves to 7 cm under
+    // the old surface, then the solver's own flow settles it.
+    let mut world = World::wet_clay();
+    let hard = rut_depth_from_force(
+        HARD_PASS_NORMAL,
+        HARD_PASS_PUSH,
+        0.38,
+        0.28,
+        SurfaceKind::WetMud,
+        0.82,
+        0.02,
+        0.0,
+    )
+    .max(0.012);
+    for side in [-0.74_f32, 0.74] {
+        world.soil.roll_with_force(
+            Vec3::new(side, 0.0, -2.6),
+            Vec3::new(side, 0.0, 1.8),
+            hard,
+            0.0,
+            HARD_PASS_NORMAL,
+            HARD_PASS_PUSH,
+        );
+    }
+    for idx in 0..world.soil.water.len() {
+        let dug = world.soil.initial_height[idx] - world.soil.bed[idx];
+        world.soil.water[idx] = (dug - 0.07).max(0.0);
+    }
+    for _ in 0..120 {
+        world.soil.step_water(1.0 / 60.0);
+    }
+    world.vehicle.pos = Vec3::new(0.0, 0.8, 0.15);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    let ori = world.vehicle.orientation();
+    let mut seated = 0.0_f32;
+    for i in 0..4 {
+        let local = ori * world.vehicle.wheel_center_local(i);
+        let ground = world
+            .soil
+            .sample(world.vehicle.pos.x + local.x, world.vehicle.pos.z + local.z)
+            .height;
+        seated += ground + 0.38 - local.y;
+    }
+    world.vehicle.pos.y = seated / 4.0;
+    let v = world.soil.volumes();
+    println!(
+        "beauty rut depth {:.4} m  water {:.4} m3  placed {:.4} m3",
+        world.soil.max_rut_depth(),
+        world.soil.water.iter().sum::<f32>() * world.soil.cell * world.soil.cell,
+        v.placed
+    );
+    world.vehicle.panels = bog.vehicle.panels;
+    for (w, b) in world.vehicle.wheels.iter_mut().zip(bog.vehicle.wheels.iter()) {
+        w.mud = b.mud;
+        w.groove = b.groove;
+        w.smear = b.smear;
+        w.sidewall = b.sidewall;
+    }
+    silence_chunks(&mut world);
+
+    renderer.daylight = true;
+    let hero = CameraPose {
+        eye: Vec3::new(2.6, 1.15, 3.7),
+        target: Vec3::new(0.45, 0.2, 0.0),
+        ortho_width: None,
+    };
+    write_cc0_still(renderer, &world, "beauty-niva-rut", &dir.join("niva-rut-water.png"), parsed, hero);
+    let low = CameraPose {
+        eye: Vec3::new(1.75, 0.55, -4.4),
+        target: Vec3::new(0.74, -0.05, -1.5),
+        ortho_width: None,
+    };
+    write_cc0_still(renderer, &world, "beauty-water", &dir.join("rut-water-close.png"), parsed, low);
+    let side = CameraPose {
+        eye: Vec3::new(3.3, 0.8, 1.2),
+        target: Vec3::new(0.2, 0.4, -0.2),
+        ortho_width: None,
+    };
+    write_cc0_still(renderer, &world, "beauty-body", &dir.join("niva-body-mud.png"), parsed, side);
+    renderer.daylight = false;
+    let against = CameraPose {
+        eye: Vec3::new(-2.7, 1.05, 3.6),
+        target: Vec3::new(0.9, 0.15, -1.2),
+        ortho_width: None,
+    };
+    write_cc0_still(renderer, &world, "beauty-low-sun", &dir.join("niva-low-sun.png"), parsed, against);
+
+    // Wet gloss: the clay lane looking into a low sun, where a film shines.
+    let mut field = World::flat(0.2);
+    field.bike.pos = Vec3::new(14.0, 0.4, -14.0);
+    park_off(&mut field);
+    field.soil = SoilField::moisture_scene();
+    let into_sun = CameraPose {
+        eye: Vec3::new(-2.4, 0.8, -0.9),
+        target: Vec3::new(0.9, 0.0, 0.4),
+        ortho_width: None,
+    };
+    write_cc0_still(renderer, &field, "beauty-wet-gloss", &dir.join("wet-gloss.png"), parsed, into_sun);
+    renderer.daylight = true;
+    let border = CameraPose {
+        eye: Vec3::new(0.15, 0.8, 1.7),
+        target: Vec3::new(1.35, 0.0, -0.6),
+        ortho_width: None,
+    };
+    write_cc0_still(renderer, &field, "beauty-sand-clay-wet", &dir.join("sand-clay-wet.png"), parsed, border);
+    field.soil.advance_weather(150.0, 0.0);
+    write_cc0_still(renderer, &field, "beauty-sand-clay-dry", &dir.join("sand-clay-dry.png"), parsed, border);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

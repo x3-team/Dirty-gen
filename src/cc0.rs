@@ -92,6 +92,25 @@ const GROUND: &[MapSpec] = &[
         disp: Some("ground/rocky_gravel/rocky_gravel_disp_2k.jpg"),
         arm: Some("ground/rocky_gravel/rocky_gravel_arm_2k.jpg"),
     },
+    // Beauty pack. Wet mud: ambientCG Ground048 (dark churned soil). Its
+    // Ground037 sibling is a mossy lawn, so it is not used for mud.
+    MapSpec {
+        diff: "beauty/wet_mud-opt/Ground048/Ground048_4K-JPG_Color.webp",
+        nor: "beauty/wet_mud-opt/Ground048/Ground048_4K-JPG_NormalGL.webp",
+        rough: Some("beauty/wet_mud-opt/Ground048/Ground048_4K-JPG_Roughness.webp"),
+        ao: None,
+        disp: Some("beauty/wet_mud-opt/Ground048/Ground048_4K-JPG_Displacement.webp"),
+        arm: None,
+    },
+    // Sand: ambientCG Ground033, a fine dry grain.
+    MapSpec {
+        diff: "beauty/sand-opt/Ground033/Ground033_4K-JPG_Color.webp",
+        nor: "beauty/sand-opt/Ground033/Ground033_4K-JPG_NormalGL.webp",
+        rough: Some("beauty/sand-opt/Ground033/Ground033_4K-JPG_Roughness.webp"),
+        ao: None,
+        disp: Some("beauty/sand-opt/Ground033/Ground033_4K-JPG_Displacement.webp"),
+        arm: None,
+    },
 ];
 
 #[derive(Debug)]
@@ -106,10 +125,11 @@ pub struct Cc0Scene {
     pub glass: CpuMesh,
     pub wheels: [CpuMesh; 4],
     pub props: CpuMesh,
-    /// Five CC0 grounds, unmixed: mud_forest, brown_mud_dry, clay, grass, gravel.
-    pub ground_diff: [RgbaTex; 5],
-    pub ground_nor: [RgbaTex; 5],
-    pub ground_pack: [RgbaTex; 5],
+    /// CC0 grounds, unmixed: mud_forest, brown_mud_dry, clay, grass, gravel,
+    /// then the beauty pack's wet mud and sand.
+    pub ground_diff: Vec<RgbaTex>,
+    pub ground_nor: Vec<RgbaTex>,
+    pub ground_pack: Vec<RgbaTex>,
     pub buggy_base: RgbaTex,
     pub buggy_nor: RgbaTex,
     pub buggy_mr: RgbaTex,
@@ -149,7 +169,10 @@ pub fn load() -> Cc0Scene {
                 diff: tex_from_bytes(&read_file(spec.diff), SRC_DIM, true),
                 nor: tex_from_bytes(&read_file(spec.nor), SRC_DIM, false),
                 rough: tex_from_bytes(&read_file(spec.rough.expect("rough")), SRC_DIM, false),
-                ao: tex_from_bytes(&read_file(spec.ao.expect("ao")), SRC_DIM, false),
+                ao: match spec.ao {
+                    Some(p) => tex_from_bytes(&read_file(p), SRC_DIM, false),
+                    None => white_like(&tex_from_bytes(&read_file(spec.nor), SRC_DIM, false)),
+                },
                 disp: spec.disp.map(|p| tex_from_bytes(&read_file(p), SRC_DIM, false)),
                 arm: spec.arm.map(|p| tex_from_bytes(&read_file(p), SRC_DIM, false)),
             }
@@ -167,7 +190,10 @@ pub async fn load() -> Cc0Scene {
             diff: tex_from_bytes(&fetch_file(spec.diff).await, SRC_DIM, true),
             nor: tex_from_bytes(&fetch_file(spec.nor).await, SRC_DIM, false),
             rough: tex_from_bytes(&fetch_file(spec.rough.expect("rough")).await, SRC_DIM, false),
-            ao: tex_from_bytes(&fetch_file(spec.ao.expect("ao")).await, SRC_DIM, false),
+            ao: match spec.ao {
+                Some(p) => tex_from_bytes(&fetch_file(p).await, SRC_DIM, false),
+                None => white_like(&tex_from_bytes(&fetch_file(spec.nor).await, SRC_DIM, false)),
+            },
             disp: match spec.disp {
                 Some(p) => Some(tex_from_bytes(&fetch_file(p).await, SRC_DIM, false)),
                 None => None,
@@ -203,6 +229,15 @@ async fn fetch_file(rel: &str) -> Vec<u8> {
         .await
         .expect("array buffer body");
     js_sys::Uint8Array::new(&buf).to_vec()
+}
+
+/// Full-white map of the same size, for a set that ships no AO.
+fn white_like(t: &Tex) -> Tex {
+    Tex {
+        w: t.w,
+        h: t.h,
+        rgba: vec![255; t.rgba.len()],
+    }
 }
 
 fn tex_from_bytes(bytes: &[u8], max_dim: u32, srgb: bool) -> Tex {
@@ -319,11 +354,10 @@ fn u8f(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-fn pack_layers(maps: &[GroundMaps]) -> ([RgbaTex; 5], [RgbaTex; 5], [RgbaTex; 5]) {
-    assert_eq!(maps.len(), 5, "five CC0 grounds");
-    let mut diff = Vec::with_capacity(5);
-    let mut nor = Vec::with_capacity(5);
-    let mut pack = Vec::with_capacity(5);
+fn pack_layers(maps: &[GroundMaps]) -> (Vec<RgbaTex>, Vec<RgbaTex>, Vec<RgbaTex>) {
+    let mut diff = Vec::with_capacity(maps.len());
+    let mut nor = Vec::with_capacity(maps.len());
+    let mut pack = Vec::with_capacity(maps.len());
     for map in maps {
         assert_eq!(map.diff.w, map.nor.w);
         assert_eq!(map.diff.h, map.nor.h);
@@ -359,11 +393,7 @@ fn pack_layers(maps: &[GroundMaps]) -> ([RgbaTex; 5], [RgbaTex; 5], [RgbaTex; 5]
         }
         pack.push(rgba_tex(map.rough.w, map.rough.h, bytes));
     }
-    (
-        diff.try_into().unwrap(),
-        nor.try_into().unwrap(),
-        pack.try_into().unwrap(),
-    )
+    (diff, nor, pack)
 }
 
 fn load_buggy() -> (CpuMesh, CpuMesh, [CpuMesh; 4]) {

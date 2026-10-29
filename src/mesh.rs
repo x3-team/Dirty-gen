@@ -1787,11 +1787,37 @@ pub fn mud_chunks_with_ground(
     items: &[silt::particles::Particle],
     ground: Option<&silt::soil::SoilField>,
 ) -> CpuMesh {
+    mud_chunks_split(items, ground, false)
+}
+
+/// Heavier slurry pieces in the spray slots are the rut ribbon on the ground.
+pub const RUT_RIBBON_KG: f32 = 1.5;
+
+/// Liquid faster than this is in flight. `spray_from_contract` draws it.
+pub const SPRAY_FLIGHT_SPEED: f32 = 0.5;
+
+/// As `mud_chunks_with_ground`. With `spray_from_contract` set, liquid in
+/// flight is left to the contract spray strips; clods and everything lying
+/// on the ground stay here.
+pub fn mud_chunks_split(
+    items: &[silt::particles::Particle],
+    ground: Option<&silt::soil::SoilField>,
+    spray_from_contract: bool,
+) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
+    let in_flight = |p: &silt::particles::Particle| {
+        spray_from_contract
+            && spray_is_liquid(p.kind as u32)
+            && !(p.kind == silt::particles::KIND_SLURRY_RIBBON && !p.ledger)
+            && p.vel.length() > SPRAY_FLIGHT_SPEED
+    };
     // One continuous ribbon per tire line. Drawn before ledger flecks.
     for p in items {
         if !p.alive || p.life <= 0.0 || p.kind != silt::particles::KIND_SLURRY_RIBBON || p.ledger {
+            continue;
+        }
+        if in_flight(p) {
             continue;
         }
         if mesh.vertices.len() + 6000 >= MAX_VERTS {
@@ -1803,7 +1829,7 @@ pub fn mud_chunks_with_ground(
     // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
     for kind in [7u8, 5, 6, 9, 3, 1, 4, 0, 2] {
         for p in items {
-            if !p.alive || p.life <= 0.0 || p.kind != kind {
+            if !p.alive || p.life <= 0.0 || p.kind != kind || in_flight(p) {
                 continue;
             }
             if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 || p.kind == 9 {
@@ -1872,6 +1898,148 @@ pub fn mud_chunks_with_ground(
                 };
                 add_piece(&mut mesh, &q, 4, 7);
             }
+        }
+    }
+    mesh
+}
+
+/// Slurry ribbon from the contract spray buffer. The fraction of the panel
+/// id is the distance along the ribbon, tail 0 to head 1.
+pub const PANEL_SPRAY_RIBBON: f32 = 50.0;
+/// Water drop from the contract spray buffer. Fraction as above.
+pub const PANEL_SPRAY_DROP: f32 = 51.0;
+/// Mud drip or slurry drop from the contract spray buffer.
+pub const PANEL_SPRAY_MUD_DROP: f32 = 52.0;
+
+/// Material ids of the contract spray buffer the picture draws as liquid in
+/// flight. Clods (1, 3) stay solid pieces in `mud_chunks_with_ground`.
+pub fn spray_is_liquid(material: u32) -> bool {
+    matches!(material, 0 | 2 | 4 | 5 | 6 | 7 | 9)
+}
+
+/// Spray in flight, read only from the render contract's spray slots.
+///
+/// Slurry pieces (5, 7) become torn ribbons: a strip along the piece's
+/// ballistic path over the last few hundredths of a second, its width set by
+/// the mass and wobbling along the length. Everything else liquid becomes a
+/// short drop streaked along its velocity. Strips face the camera about their
+/// own axis, so a ribbon never turns edge-on into a line. The shader tears
+/// the edges; there are no stamps or spheres here.
+pub fn spray_from_contract(
+    spray: &[silt::render_contract::SprayGpu],
+    count: usize,
+    eye: Vec3,
+) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    const MAX_VERTS: usize = 24000;
+    let g = Vec3::new(0.0, -9.81, 0.0);
+    for s in spray.iter().take(count) {
+        if s.alive == 0 || !spray_is_liquid(s.material) {
+            continue;
+        }
+        let pos = Vec3::new(s.pos_mass[0], s.pos_mass[1], s.pos_mass[2]);
+        let vel = Vec3::new(s.vel_age[0], s.vel_age[1], s.vel_age[2]);
+        let speed = vel.length();
+        if speed <= SPRAY_FLIGHT_SPEED {
+            continue;
+        }
+        let mass = s.pos_mass[3].max(0.0);
+        // A slurry piece of kilograms is the rut ribbon laid along the tire
+        // line (the chunk mesh draws it on the ground), not a piece in flight.
+        if matches!(s.material, 5 | 7) && mass > RUT_RIBBON_KG {
+            continue;
+        }
+        let age = s.vel_age[3].max(0.0);
+        // A launch point estimate. It drifts slowly with drag, so the tear
+        // pattern stays on the piece from frame to frame instead of flickering.
+        let launch = pos - vel * age + g * (0.5 * age * age);
+        let seed = launch.x * 1.37 + launch.z * 0.91 + launch.y * 2.11;
+        let key = (seed * 6.0).floor() as i32 as u32;
+        let h = |n: u32| chunk_hash(key, n);
+        let ribbon = matches!(s.material, 5 | 7);
+        let (length, width, segs, panel) = if ribbon {
+            // Slurry: 1450 kg/m³. A sheet a few millimetres thick.
+            let vol = mass / 1450.0;
+            let sheet = if s.material == 7 { 0.006 } else { 0.004 };
+            let len = (speed * 0.03 * (0.7 + 0.6 * h(1))).clamp(0.06, 0.32);
+            let w = (vol / (sheet * len)).sqrt().clamp(0.02, 0.12) * (0.6 + 0.8 * h(2));
+            (len, w, 8usize, PANEL_SPRAY_RIBBON)
+        } else {
+            let density = silt::render_contract::spray_density_kg_m3(s.material as u8).max(1.0);
+            let r = (3.0 * (mass / density) / (4.0 * std::f32::consts::PI))
+                .cbrt()
+                .clamp(0.002, 0.018);
+            let w = r * 2.0 * (0.8 + 0.4 * h(2));
+            // A camera at 30 fps smears a drop over its last frame of travel.
+            let len = (speed / 30.0).clamp(w * 1.6, 0.30);
+            let panel = if matches!(s.material, 2 | 6) {
+                PANEL_SPRAY_MUD_DROP
+            } else {
+                PANEL_SPRAY_DROP
+            };
+            (len, w, 2usize, panel)
+        };
+        if mesh.vertices.len() + (segs + 1) * 2 >= MAX_VERTS {
+            break;
+        }
+        // Points back along the path, head first.
+        let span = length / speed;
+        let mut pts = Vec::with_capacity(segs + 1);
+        for k in 0..=segs {
+            let t = k as f32 / segs as f32;
+            let back = span * (1.0 - t);
+            pts.push(pos - vel * back + g * (0.5 * back * back));
+        }
+        let base = mesh.vertices.len() as u32;
+        let twist = h(3) * 6.283;
+        for k in 0..=segs {
+            let t = k as f32 / segs as f32;
+            let p = pts[k];
+            let tan = if k < segs {
+                pts[k + 1] - pts[k]
+            } else {
+                pts[k] - pts[k - 1]
+            }
+            .normalize_or_zero();
+            let to_eye = (eye - p).normalize_or_zero();
+            let mut side = tan.cross(to_eye);
+            if side.length_squared() < 1.0e-6 {
+                side = tan.cross(Vec3::Y);
+            }
+            side = side.normalize_or_zero();
+            let face = side.cross(tan).normalize_or_zero();
+            // A slow twist about the path, so a ribbon is a curl and not a card.
+            let (sn, cs) = (twist + t * 2.4).sin_cos();
+            let side_t = if ribbon {
+                (side * (0.75 + 0.25 * cs) + face * (0.35 * sn)).normalize_or_zero()
+            } else {
+                side
+            };
+            let nrm = side_t.cross(tan).normalize_or_zero();
+            // Width wobbles along the strip and pinches toward both ends.
+            let wob = if ribbon {
+                0.65 + 0.35 * (t * 9.0 + h(4) * 6.0).sin() * (0.5 + h(5))
+            } else {
+                1.0
+            };
+            let pinch = (t * (1.0 - t) * 4.0).sqrt().max(if ribbon { 0.18 } else { 0.35 });
+            let hw = width * 0.5 * wob.max(0.25) * pinch;
+            let frac = (t * 0.98).min(0.98);
+            for (side_sign, v) in [(-1.0f32, 0.0f32), (1.0, 1.0)] {
+                mesh.vertices.push(MeshVertex {
+                    pos: (p + side_t * hw * side_sign).to_array(),
+                    nrm: nrm.to_array(),
+                    // u: metres along the piece from its launch estimate, so
+                    // the tears ride with it. v: across, 0..1.
+                    uv: [seed.rem_euclid(97.0) + t * length, v],
+                    panel: panel + frac,
+                });
+            }
+        }
+        for k in 0..segs as u32 {
+            let a = base + k * 2;
+            mesh.indices
+                .extend_from_slice(&[a, a + 1, a + 3, a, a + 3, a + 2]);
         }
     }
     mesh

@@ -13,8 +13,8 @@ use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
 use crate::mesh::{
-    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_with_ground,
-    terrain_mesh,
+    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_split,
+    spray_from_contract, terrain_mesh,
     wheel_mesh, CpuMesh,
     MeshVertex, ParticleVertex, TerrainVertex,
 };
@@ -38,6 +38,13 @@ struct FrameData {
     misc: [f32; 4],
     /// Four tires, two vec4s each: center.xyz + radius, then forward.xz, sink, active.
     tires: [[f32; 4]; 8],
+    /// Irradiance / pi of the environment map, nine RGB SH terms.
+    sh: [[f32; 4]; 9],
+    /// x: env mip count, y: IBL gain, z: 1 when the sky is an HDRI, w: exposure.
+    env: [f32; 4],
+    /// Niva headlights: left lamp xyz + intensity, right lamp xyz, beam
+    /// direction xyz + cosine of the outer cone. Intensity 0 is off.
+    lamps: [[f32; 4]; 3],
 }
 
 #[repr(C)]
@@ -64,6 +71,12 @@ pub struct Renderer {
     model_stride: u32,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
+    env_tex: wgpu::Texture,
+    env_sh: [[f32; 4]; 9],
+    env_from_file: bool,
+    /// Which sky the env map was baked for. None until the first frame.
+    env_baked: Option<bool>,
+    hdri: Option<Vec<u8>>,
     model_buf: wgpu::Buffer,
     model_bg: wgpu::BindGroup,
     tex_bg: wgpu::BindGroup,
@@ -103,6 +116,8 @@ pub struct Renderer {
     chunk_i: wgpu::Buffer,
     dust_v: wgpu::Buffer,
     dust_i: wgpu::Buffer,
+    spray_v: wgpu::Buffer,
+    spray_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
@@ -144,6 +159,9 @@ pub struct Renderer {
     contract: Option<silt::render_contract::ContractGpu>,
     contract_cpu: silt::render_contract::ContractFrame,
     pipe_debug: Option<wgpu::RenderPipeline>,
+    pipe_fog: Option<wgpu::RenderPipeline>,
+    fog_bgl: wgpu::BindGroupLayout,
+    fog_bg: wgpu::BindGroup,
     /// Top-down debug view of the render contract. Off for the Niva picture.
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
@@ -257,9 +275,20 @@ impl Renderer {
         formats: GpuFormats,
         cc0: crate::cc0::Cc0Scene,
     ) -> Self {
+        // The picture reads the render contract at group 4 of the terrain and
+        // water pipelines. A device without storage buffers or a fifth bind
+        // group (WebGL2) gets the stand-in readers and keeps its soil cache.
+        let contract = silt::render_contract::ContractGpu::try_new(&device)
+            .filter(|_| device.limits().max_bind_groups >= 5);
+        let readers = if contract.is_some() {
+            include_str!("beauty_contract.wgsl")
+        } else {
+            include_str!("beauty_nocontract.wgsl")
+        };
+        let source = format!("{}\n{}", include_str!("shader.wgsl"), readers);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -268,11 +297,11 @@ impl Renderer {
 
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[uniform_entry(
-                0,
-                false,
-                std::mem::size_of::<FrameData>() as u64,
-            )],
+            entries: &[
+                uniform_entry(0, false, std::mem::size_of::<FrameData>() as u64),
+                filter_tex(1, wgpu::ShaderStages::FRAGMENT),
+                filter_samp(2, wgpu::ShaderStages::FRAGMENT),
+            ],
         });
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-tex"),
@@ -402,13 +431,50 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let env_levels = crate::env::ENV_W.max(crate::env::ENV_H).ilog2() + 1;
+        let env_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("env"),
+            size: wgpu::Extent3d {
+                width: crate::env::ENV_W,
+                height: crate::env::ENV_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: env_levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let env_view = env_tex.create_view(&Default::default());
+        // Wraps around the horizon, clamps at the poles. Trilinear so a rough
+        // reflection blends between the box-filtered levels.
+        let env_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("env"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame-bg"),
             layout: &frame_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&env_samp),
+                },
+            ],
         });
         let model_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model-bg"),
@@ -682,9 +748,13 @@ impl Renderer {
             ],
         });
 
+        let terrain_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
+            Some(gpu) => vec![&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl, &gpu.layout],
+            None => vec![&frame_bgl, &tex_bgl],
+        };
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain-layout"),
-            bind_group_layouts: &[&frame_bgl, &tex_bgl],
+            bind_group_layouts: &terrain_groups,
             push_constant_ranges: &[],
         });
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -712,7 +782,6 @@ impl Renderer {
         let terrain_layout_ref = &terrain_layout;
         let mesh_layout_ref = &mesh_layout;
 
-        let contract = silt::render_contract::ContractGpu::try_new(&device);
 
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipe_terrain = pipeline(
@@ -891,6 +960,41 @@ impl Renderer {
             false,
             None,
         );
+        // Dust volume. Only with the contract: it marches the dust_fog grid.
+        let fog_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fog-depth"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let pipe_fog = contract.as_ref().map(|contract_gpu| {
+            let fog_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fog-layout"),
+                bind_group_layouts: &[&frame_bgl, &tex_bgl, &fog_bgl, &paint_bgl, &contract_gpu.layout],
+                push_constant_ranges: &[],
+            });
+            pipeline(
+                &device,
+                &shader,
+                &fog_layout,
+                "vs_fog",
+                Some("fs_fog"),
+                &[],
+                color_format,
+                None,
+                true,
+                None,
+            )
+        });
+        let fog_bg = make_fog_bg(&device, &fog_bgl, &depth_view);
+
         // Debug view. It reads only the render contract. Compiling it here
         // keeps a contract edit from landing with a shader that does not match.
         let debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1012,6 +1116,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let spray_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spray-v"),
+            size: (24000 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let spray_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spray-i"),
+            size: (72000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -1022,6 +1138,11 @@ impl Renderer {
             model_stride,
             frame_buf,
             frame_bg,
+            env_tex,
+            env_sh: [[0.0; 4]; 9],
+            env_from_file: false,
+            env_baked: None,
+            hdri: crate::env::find_hdri(),
             model_buf,
             model_bg,
             tex_bg,
@@ -1057,6 +1178,8 @@ impl Renderer {
             chunk_i,
             dust_v,
             dust_i,
+            spray_v,
+            spray_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
@@ -1091,6 +1214,9 @@ impl Renderer {
             contract,
             contract_cpu: silt::render_contract::ContractFrame::new(),
             pipe_debug,
+            pipe_fog,
+            fog_bgl,
+            fog_bg,
             debug_contract: false,
             debug_mode: 0,
         }
@@ -1145,6 +1271,7 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        self.fog_bg = make_fog_bg(&self.device, &self.fog_bgl, &self.depth_view);
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
         self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1161,6 +1288,57 @@ impl Renderer {
                 },
             ],
         });
+    }
+
+    /// Fill the env map for this sky: the HDRI when one was found, else the
+    /// analytic sky. Every mip is written; the shader picks one by roughness.
+    fn bake_env(&mut self, sky: &crate::env::SkyLight) {
+        let map = self
+            .hdri
+            .as_deref()
+            .and_then(|bytes| crate::env::from_hdr(bytes, sky))
+            .unwrap_or_else(|| crate::env::procedural(sky));
+        for (level, (w, h, px)) in map.levels.iter().enumerate() {
+            if level as u32 >= self.env_tex.mip_level_count() {
+                break;
+            }
+            let stride = w * 8;
+            let padded = stride.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let mut bytes = vec![0u8; (padded * h) as usize];
+            for y in 0..*h {
+                for x in 0..*w {
+                    let c = px[(y * w + x) as usize];
+                    let at = (y * padded + x * 8) as usize;
+                    for k in 0..4 {
+                        let b = crate::env::f16_bits(c[k]).to_le_bytes();
+                        bytes[at + k * 2] = b[0];
+                        bytes[at + k * 2 + 1] = b[1];
+                    }
+                }
+            }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.env_tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(*h),
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.env_sh = map.sh;
+        self.env_from_file = map.from_file;
     }
 
     pub fn draw(
@@ -1245,6 +1423,15 @@ impl Renderer {
                 [0.10, 0.062, 0.038, 1.0],
             )
         };
+        if self.env_baked != Some(self.daylight) {
+            self.bake_env(&crate::env::SkyLight {
+                sun,
+                sun_color: Vec3::from_slice(&sun_color[..3]),
+                zenith: Vec3::from_slice(&sky_zenith[..3]),
+                horizon: Vec3::from_slice(&sky_horizon[..3]),
+            });
+            self.env_baked = Some(self.daylight);
+        }
         let frame = FrameData {
             view_proj: view_proj.to_cols_array_2d(),
             light_vp: light_vp.to_cols_array_2d(),
@@ -1268,13 +1455,41 @@ impl Renderer {
                 if self.water_column { 1.0 } else { 0.0 },
             ],
             tires: tire_frame(&world.vehicle),
+            sh: self.env_sh,
+            env: [
+                self.env_tex.mip_level_count() as f32,
+                if self.daylight { 0.42 } else { 0.55 },
+                if self.env_from_file { 1.0 } else { 0.0 },
+                if self.daylight { 0.86 } else { 1.0 },
+            ],
+            lamps: headlamps(&world.vehicle, if self.daylight || !self.niva_picture { 0.0 } else { 1.0 }),
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
-        let chunks = mud_chunks_with_ground(&world.particles.items, Some(&world.soil));
+        // Liquid in flight comes from the contract's spray slots; the chunk
+        // mesh keeps clods and what lies on the ground.
+        let spray_valid = self.contract_cpu.header.version == 1
+            && self.contract_cpu.header.valid & silt::render_contract::VALID_SPRAY != 0;
+        let chunks = mud_chunks_split(&world.particles.items, Some(&world.soil), spray_valid);
+        let spray = if spray_valid {
+            spray_from_contract(
+                &self.contract_cpu.spray,
+                self.contract_cpu.header.spray_count as usize,
+                cam.eye,
+            )
+        } else {
+            CpuMesh::new()
+        };
+        let spray_count = spray.indices.len() as u32;
+        if spray_count > 0 {
+            self.queue
+                .write_buffer(&self.spray_v, 0, bytemuck::cast_slice(&spray.vertices));
+            self.queue
+                .write_buffer(&self.spray_i, 0, bytemuck::cast_slice(&spray.indices));
+        }
         let chunk_count = chunks.indices.len() as u32;
         if chunk_count > 0 {
             self.queue
@@ -1282,7 +1497,15 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
-        let dust = dust_cloud(&world.particles.items);
+        // With the volume pass the airborne dust is the published grid; the
+        // picture cards would draw the same dust twice.
+        let fog_volume = self.pipe_fog.is_some()
+            && self.contract_cpu.header.valid & silt::render_contract::VALID_DUST_FOG != 0;
+        let dust = if fog_volume {
+            CpuMesh::new()
+        } else {
+            dust_cloud(&world.particles.items)
+        };
         let dust_count = dust.indices.len() as u32;
         if dust_count > 0 {
             self.queue
@@ -1382,6 +1605,11 @@ impl Renderer {
             }
 
             pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            if let Some(gpu) = &self.contract {
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+            }
             pass.set_pipeline(&self.pipe_terrain);
             draw_indexed(&mut pass, &self.terrain);
 
@@ -1403,6 +1631,11 @@ impl Renderer {
                 draw_indexed(&mut pass, &self.props);
             }
 
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            if let Some(gpu) = &self.contract {
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+            }
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
 
@@ -1418,10 +1651,40 @@ impl Renderer {
             if dust_count > 0 {
                 self.draw_dust(&mut pass, dust_count);
             }
+            if spray_count > 0 {
+                pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+                pass.set_vertex_buffer(0, self.spray_v.slice(..));
+                pass.set_index_buffer(self.spray_i.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..spray_count, 0, 0..1);
+            }
 
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+        }
+
+        if let (true, Some(pipe), Some(gpu)) = (fog_volume, &self.pipe_fog, &self.contract) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("dust-volume"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.fog_bg, &[]);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            pass.set_bind_group(4, &gpu.bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         if self.debug_contract {
@@ -1926,7 +2189,7 @@ fn upload_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &str,
-    layers: &[crate::cc0::RgbaTex; 5],
+    layers: &[crate::cc0::RgbaTex],
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let width = layers[0].width;
     let height = layers[0].height;
@@ -1939,7 +2202,7 @@ fn upload_array(
         size: wgpu::Extent3d {
             width,
             height,
-            depth_or_array_layers: 5,
+            depth_or_array_layers: layers.len() as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -2244,7 +2507,8 @@ fn make_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // The dust volume pass reads scene depth to stop its march.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&Default::default());
@@ -2612,4 +2876,35 @@ fn debug_contract_view_reads_the_published_maps() {
     assert_ne!(px, [255, 0, 255, 255], "version mismatch magenta");
     assert!(px[3] == 255, "debug view did not cover the centre {px:?}");
     assert!(px[0] > 0, "ground ramp was empty {px:?}");
+}
+
+/// Niva headlamps in world space. The body is fitted with the hubs at
+/// y -0.20 and the front axle at z 1.08 (niva.rs); the lamps sit 0.40 m above
+/// the hubs and 0.74 m ahead of the axle, 0.56 m either side.
+fn headlamps(vehicle: &Vehicle, on: f32) -> [[f32; 4]; 3] {
+    let ori = vehicle.orientation();
+    let left = vehicle.pos + ori * Vec3::new(-0.56, 0.20, 1.82);
+    let right = vehicle.pos + ori * Vec3::new(0.56, 0.20, 1.82);
+    // Dipped beam: a few degrees down the road.
+    let dir = (ori * Vec3::new(0.0, -0.05, 1.0)).normalize_or_zero();
+    [
+        [left.x, left.y, left.z, on],
+        [right.x, right.y, right.z, 0.0],
+        [dir.x, dir.y, dir.z, 0.86],
+    ]
+}
+
+fn make_fog_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    depth_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fog-depth"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(depth_view),
+        }],
+    })
 }
