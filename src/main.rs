@@ -2414,7 +2414,7 @@ fn capture_stuck_recovery(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn stuck_recovery_camera(world: &World) -> CameraPose {
-    moisture_pad_camera(world, 6.4)
+    moisture_pad_camera(world, 5.2)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
