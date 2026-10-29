@@ -11,8 +11,9 @@
 //! wheel spins or the coat sheds, and then it leaves as ribbons.
 
 use crate::soil::{
-    contact_length, moisture_mu_scale, moisture_peak_slip, softness_of, stick_scale,
-    surface_moisture, terramech_for, SurfaceKind,
+    contact_length, moisture_mu_scale, moisture_peak_slip, moisture_state_fields,
+    sinkage_on, softness_of, stick_scale, surface_moisture, terramech_for, wheel_buoyancy,
+    SurfaceKind, SurfaceMoisture,
 };
 
 /// Share of the patch that is lug. The rest is void the tread can pack.
@@ -202,9 +203,8 @@ pub struct MoistureTractionRow {
 /// Grip, friction, and peak slip for one soil kind and moisture band.
 pub fn moisture_traction_row(
     kind: SurfaceKind,
-    state: crate::soil::SurfaceMoisture,
+    state: SurfaceMoisture,
 ) -> MoistureTractionRow {
-    use crate::soil::moisture_state_fields;
     let (wetness, loose, water) = moisture_state_fields(kind, state);
     let patch = contact_patch(
         0.38,
@@ -224,6 +224,79 @@ pub fn moisture_traction_row(
         grip: patch.grip,
         wetness,
         water,
+    }
+}
+
+/// Reference normal per tire for sink and contact readouts (Niva static pose).
+pub const MOISTURE_SINKAGE_NORMAL: f32 = MOISTURE_TRACTION_NORMAL;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MoistureSinkageRow {
+    pub sink_m: f32,
+    pub contact_m2: f32,
+    pub wetness: f32,
+    pub water_m: f32,
+    pub buoy_n: f32,
+    pub suction_n: f32,
+}
+
+/// Equilibrium Bekker sink under `normal`, minus buoyancy from standing water.
+pub fn sinkage_at_normal(
+    normal: f32,
+    kind: SurfaceKind,
+    wetness: f32,
+    loose: f32,
+    water: f32,
+    radius: f32,
+    width: f32,
+) -> (f32, f32, f32) {
+    let radius = radius.max(0.05);
+    let width = width.max(0.02);
+    let buoy = wheel_buoyancy(water, radius, width);
+    let soil_load = (normal - buoy).max(0.0);
+    let sink = if soil_load < 1.0 {
+        0.0
+    } else {
+        sinkage_on(soil_load, kind, wetness, loose, water, radius, width)
+    };
+    let length = contact_length(radius, sink.max(1.0e-4));
+    let area = (length * width).max(0.0);
+    (sink, area, buoy)
+}
+
+/// Sink depth, contact patch, moisture, and seal suction for one soil band.
+pub fn moisture_sinkage_row(kind: SurfaceKind, state: SurfaceMoisture) -> MoistureSinkageRow {
+    let (wetness, loose, water) = moisture_state_fields(kind, state);
+    let (sink_m, contact_m2, buoy_n) = sinkage_at_normal(
+        MOISTURE_SINKAGE_NORMAL,
+        kind,
+        wetness,
+        loose,
+        water,
+        0.38,
+        0.28,
+    );
+    let moisture = surface_moisture(wetness, water, kind);
+    let suction_n = if matches!(moisture, SurfaceMoisture::Pooled | SurfaceMoisture::Saturated) {
+        crate::soil::slurry_suction_force(
+            kind,
+            wetness.clamp(0.08, 0.92),
+            sink_m.max(0.02),
+            0.38,
+            0.28,
+            0.04,
+            0.0,
+        )
+    } else {
+        0.0
+    };
+    MoistureSinkageRow {
+        sink_m,
+        contact_m2,
+        wetness,
+        water_m: water,
+        buoy_n,
+        suction_n,
     }
 }
 

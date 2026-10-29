@@ -190,13 +190,20 @@ pub fn moisture_state_fields(kind: SurfaceKind, state: SurfaceMoisture) -> (f32,
             let w = match kind {
                 SurfaceKind::Sand => 0.82,
                 SurfaceKind::Silt => 0.90,
+                SurfaceKind::WetMud => 0.96,
                 _ => 0.88,
             };
-            (w, loose + 0.004, 0.0)
+            let film = if matches!(kind, SurfaceKind::WetMud) {
+                0.048
+            } else {
+                0.0
+            };
+            (w, loose + 0.004, film)
         }
         SurfaceMoisture::Pooled => {
             let water = match kind {
                 SurfaceKind::Sand | SurfaceKind::Gravel => 0.022,
+                SurfaceKind::WetMud => 0.14,
                 _ => 0.11,
             };
             (0.92, loose + 0.008, water)
@@ -622,7 +629,14 @@ pub fn terramech_for(kind: SurfaceKind, softness: f32, water: f32) -> Terramech 
     // and collapses under a light tire.
     let base = terramech(softness);
     let mut tm = match kind {
-        SurfaceKind::WetMud => base,
+        SurfaceKind::WetMud => {
+            // Wet clay sticks and sits deeper once the pore is saturated.
+            let mut tm = base;
+            let bog = ((softness - 0.45) / 0.48).clamp(0.0, 1.0);
+            tm.k_eq *= lerp(1.0, 0.34, bog.powf(1.04));
+            tm.cohesion *= lerp(1.0, 1.14, bog);
+            tm
+        }
         SurfaceKind::Undisturbed => scale_mech(base, 1.12, 1.05, 0.52, 0.040, 0.9, 0.85),
         SurfaceKind::Grass => scale_mech(base, 1.28, 1.65, 0.46, 0.055, 1.05, 0.7),
         // Loose stone. High friction, almost no cohesion, and a modulus that
