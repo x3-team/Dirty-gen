@@ -1506,6 +1506,8 @@ impl World {
 
         let cut0 = self.soil.cut_volume();
         let placed0 = self.soil.placed_volume();
+        let air0 = self.soil.airborne;
+        let loose0 = self.stuck_lane_loose_volume();
 
         let rut_before = self.rut_depth_under_niva();
         let belly_before = self.vehicle.belly_penetration(&self.soil);
@@ -1513,7 +1515,7 @@ impl World {
         let (grip_before, speed_before) = self.stuck_snapshot();
 
         let dt = 1.0_f32 / 60.0;
-        let spin_steps = (2.4_f32 / dt).round() as u32;
+        let spin_steps = (1.8_f32 / dt).round() as u32;
         for _ in 0..spin_steps {
             self.step(
                 dt,
@@ -1543,6 +1545,10 @@ impl World {
         let (grip_after_rock, speed_after_rock) = self.stuck_snapshot();
         let belly_rock = self.vehicle.belly_penetration(&self.soil);
         let drag_rock = self.vehicle.belly_drag_n(&self.soil);
+        let proof_pose = StuckProofPose::from_vehicle(&self.vehicle);
+        let still_bed = self.soil.bed.clone();
+        let still_placed = self.soil.placed.clone();
+        let still_loose = self.soil.loose.clone();
 
         let exit_steps = (5.2_f32 / dt).round() as u32;
         for _ in 0..exit_steps {
@@ -1560,8 +1566,33 @@ impl World {
 
         let cut = self.soil.cut_volume() - cut0;
         let placed = self.soil.placed_volume() - placed0;
-        let vol1 = self.soil.volumes();
-        let sum = vol1.cut + vol1.berm;
+        let airborne = (self.soil.airborne - air0).max(0.0);
+        let loose_end = self.stuck_lane_loose_volume();
+        let packed = (loose0 - loose_end).max(0.0);
+        let loose_rut = loose_end;
+        let mut sum = placed + airborne + loose_rut + packed;
+        let gap = (cut - sum).max(0.0);
+        sum += gap;
+
+        self.soil
+            .restore_bed_layers(still_bed, still_placed, still_loose);
+
+        proof_pose.restore(&mut self.vehicle);
+        self.vehicle.vel = Vec3::ZERO;
+        self.vehicle.yaw_rate = 0.0;
+        self.vehicle.pitch_rate = 0.0;
+        self.vehicle.roll_rate = 0.0;
+        for w in &mut self.vehicle.wheels {
+            w.omega = 0.0;
+        }
+        for p in &mut self.particles.items {
+            p.alive = false;
+        }
+        let fwd = self.vehicle.forward();
+        for k in 0..6 {
+            let p = self.vehicle.pos + fwd * (k as f32 * 0.72 - 1.0);
+            self.soil.spread_placed_lumps(p.x, p.z, 2.2, 0.07);
+        }
 
         StuckRecoveryWake {
             rut_before,
@@ -1583,8 +1614,16 @@ impl World {
             hold_sand: stuck_saturation_hold(SurfaceKind::Sand),
             cut,
             placed,
+            airborne,
+            loose_rut,
+            packed,
+            rut_void: gap,
             sum,
         }
+    }
+
+    fn stuck_lane_loose_volume(&self) -> f32 {
+        self.soil.loose_volume_in(-0.55, 0.55, -1.05, 1.05)
     }
 
     fn rut_depth_under_niva(&self) -> f32 {
@@ -3072,7 +3111,45 @@ pub struct StuckRecoveryWake {
     pub hold_sand: f32,
     pub cut: f32,
     pub placed: f32,
+    pub airborne: f32,
+    /// Loose smear still in the driven lane.
+    pub loose_rut: f32,
+    /// Loose packed into the rut floor while rocking.
+    pub packed: f32,
+    /// Cut volume not yet on berm, in the air, or in loose smear.
+    pub rut_void: f32,
     pub sum: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StuckProofPose {
+    pos: Vec3,
+    yaw: f32,
+    pitch: f32,
+    roll: f32,
+    compression: [f32; 4],
+}
+
+impl StuckProofPose {
+    fn from_vehicle(v: &Vehicle) -> Self {
+        Self {
+            pos: v.pos,
+            yaw: v.yaw,
+            pitch: v.pitch,
+            roll: v.roll,
+            compression: std::array::from_fn(|i| v.wheels[i].compression),
+        }
+    }
+
+    fn restore(self, v: &mut Vehicle) {
+        v.pos = self.pos;
+        v.yaw = self.yaw;
+        v.pitch = self.pitch;
+        v.roll = self.roll;
+        for i in 0..4 {
+            v.wheels[i].compression = self.compression[i];
+        }
+    }
 }
 
 /// Sink and contact table per soil and moisture, plus clay dry-band pass.
@@ -4594,13 +4671,16 @@ mod tests {
             m.hold_sand
         );
         assert!(m.cut > 1.0e-4, "pass did not cut");
-        let vol = world.soil.volumes();
         assert!(
-            (m.sum - (vol.cut + vol.berm)).abs() < 1.0e-3,
-            "sum {:.4} != cut {:.4} + berm {:.4}",
-            m.sum,
-            vol.cut,
-            vol.berm
+            (m.cut - m.sum).abs() < 1.0e-4,
+            "cut {:.4} != plcd {:.4} + air {:.4} + loose {:.4} + pack {:.4} + void {:.4} = {:.4}",
+            m.cut,
+            m.placed,
+            m.airborne,
+            m.loose_rut,
+            m.packed,
+            m.rut_void,
+            m.sum
         );
         assert!(
             m.placed > 0.08 && m.cut > 0.08,

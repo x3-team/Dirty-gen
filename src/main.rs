@@ -2315,28 +2315,26 @@ fn moisture_sinkage_camera(world: &World) -> CameraPose {
 fn capture_stuck_recovery(renderer: &mut Renderer, parsed: &CaptureArgs) {
     renderer.daylight = true;
     renderer.show_props = false;
+    renderer.show_environment = false;
     renderer.show_bike = false;
     renderer.niva_picture = true;
 
     let mut world = World::wet_clay();
     let out = world.stuck_recovery_in_saturated_clay();
-    silence_soil_clods(&mut world);
+    silence_chunks(&mut world);
 
     println!(
-        "stuck-recovery rut {:.4}->{:.4}->{:.4}->{:.4} m  belly {:.4}->{:.4}->{:.4} m  \
-         drag {:.0}->{:.0} N",
+        "stuck-recovery rut {:.4}->{:.4}->{:.4}->{:.4} m  belly {:.4}->{:.4} m  drag {:.0} n",
         out.rut_before,
         out.rut_after_spin,
         out.rut_after_rock,
         out.rut_after_exit,
         out.belly_before,
         out.belly_spin,
-        out.belly_rock,
-        out.belly_drag_before,
-        out.belly_drag_rock
+        out.belly_drag_before
     );
     println!(
-        "stuck-recovery grip {:.0}->{:.0} N  speed {:.3}->{:.3}->{:.3} m/s  \
+        "stuck-recovery grip {:.0}->{:.0} n  spd {:.3}->{:.3}->{:.3} m/s  \
          hold clay {:.2} silt {:.2} sand {:.2}",
         out.grip_before,
         out.grip_after_rock,
@@ -2348,36 +2346,44 @@ fn capture_stuck_recovery(renderer: &mut Renderer, parsed: &CaptureArgs) {
         out.hold_sand
     );
     println!(
-        "stuck-recovery cut {:.4} m3  placed {:.4} m3  sum {:.4} m3",
-        out.cut, out.placed, out.sum
+        "stuck-recovery cut {:.4} plcd {:.4} air {:.4} loose {:.4} pack {:.4} void {:.4} sum {:.4} m3",
+        out.cut,
+        out.placed,
+        out.airborne,
+        out.loose_rut,
+        out.packed,
+        out.rut_void,
+        out.sum
     );
 
     let lines = [
         format!(
-            "rut {:.4}->{:.4}->{:.4} m spin dig",
-            out.rut_before,
-            out.rut_after_spin,
-            out.rut_after_rock
+            "rut {:.4} {:.4} {:.4} m bef spin rock",
+            out.rut_before, out.rut_after_spin, out.rut_after_rock
         ),
         format!(
-            "belly {:.4} m drag {:.0}N  grip {:.0}->{:.0}N",
-            out.belly_rock, out.belly_drag_rock, out.grip_before, out.grip_after_rock
+            "belly {:.4} m drag {:.0} n stuck",
+            out.belly_before, out.belly_drag_before
         ),
         format!(
-            "speed {:.3}->{:.3} m/s after rock",
-            out.speed_before, out.speed_after_rock
+            "grip {:.0} to {:.0} n bef rock",
+            out.grip_before, out.grip_after_rock
         ),
         format!(
-            "speed exit {:.3} m/s  rut {:.4} m",
-            out.speed_after_exit, out.rut_after_exit
+            "spd {:.3} to {:.3} to {:.3} m/s",
+            out.speed_before, out.speed_after_rock, out.speed_after_exit
         ),
         format!(
             "hold clay {:.2} silt {:.2} sand {:.2}",
             out.hold_clay, out.hold_silt, out.hold_sand
         ),
         format!(
-            "cut {:.4} m3  placed {:.4} m3  sum {:.4} m3",
-            out.cut, out.placed, out.sum
+            "cut {:.4} plcd {:.4} air {:.4} loose {:.4}",
+            out.cut, out.placed, out.airborne, out.loose_rut
+        ),
+        format!(
+            "pack {:.4} void {:.4} sum {:.4} m3",
+            out.packed, out.rut_void, out.sum
         ),
     ];
     let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
@@ -2408,21 +2414,7 @@ fn capture_stuck_recovery(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn stuck_recovery_camera(world: &World) -> CameraPose {
-    let vehicle = &world.vehicle;
-    let fwd = vehicle.forward();
-    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    let center = vehicle.pos + fwd * 0.2;
-    let ground = world.soil.sample(center.x, center.z).height;
-    let rut = world
-        .soil
-        .max_bed_cut_in(center.x - 0.5, center.x + 0.5, center.z - 0.8, center.z + 0.8);
-    let look = Vec3::new(center.x, ground + rut * 0.35 + 0.04, center.z);
-    let eye = look + right * 3.1 + fwd * (-4.6) + Vec3::Y * 2.55;
-    CameraPose {
-        eye: clear_ortho_eye(world, eye, look, 7.4),
-        target: look,
-        ortho_width: Some(7.4),
-    }
+    moisture_pad_camera(world, 6.4)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4175,7 +4167,7 @@ fn capture_cc0(renderer: &mut Renderer, parsed: &CaptureArgs) {
 /// readable on the mud without a shader change.
 #[cfg(not(target_arch = "wasm32"))]
 fn stamp_proof_lines(rgba: &mut [u8], width: u32, height: u32, lines: &[&str]) {
-    let scale = 3u32;
+    let scale = 2u32;
     let gap = scale;
     let cw = 5 * scale + gap;
     let ch = 7 * scale + gap * 2;
@@ -4271,6 +4263,12 @@ fn glyph_rows(ch: char) -> Option<[u8; 7]> {
         'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
         'k' => [0b00000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10100, 0b10010],
         'y' => [0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        'f' => [0b00000, 0b00000, 0b01111, 0b10000, 0b11110, 0b10000, 0b10000],
+        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+        '>' => [0b00000, 0b10000, 0b01000, 0b00100, 0b01000, 0b10000, 0b00000],
+        '/' => [0b00000, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         _ => return None,
     };
     Some(rows)

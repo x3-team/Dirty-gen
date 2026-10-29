@@ -1321,6 +1321,17 @@ impl SoilField {
         self.height[idx] = self.bed[idx] + self.placed[idx] + self.slurry[idx];
     }
 
+    /// Put bed, placed, and loose back and rebuild height. For proof stills after
+    /// a later drive phase that should not change the frame geometry.
+    pub fn restore_bed_layers(&mut self, bed: Vec<f32>, placed: Vec<f32>, loose: Vec<f32>) {
+        self.bed = bed;
+        self.placed = placed;
+        self.loose = loose;
+        for idx in 0..self.bed.len() {
+            self.sync(idx);
+        }
+    }
+
     /// Remove `drop` metres. Placed spoil comes off before the bed is cut.
     /// The returned thickness is volume that has to be put down somewhere else.
     fn excavate(&mut self, idx: usize, drop: f32) -> f32 {
@@ -3095,6 +3106,11 @@ impl SoilField {
     /// Cubic metres of placed soil whose cell centers lie in the rectangle.
     pub fn placed_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
         self.column_volume_in(x0, x1, z0, z1, &self.placed)
+    }
+
+    /// Cubic metres of loose smear in the rectangle (depth × cell area).
+    pub fn loose_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        self.column_volume_in(x0, x1, z0, z1, &self.loose)
     }
 
     /// World XZ of the wet berm centroid in a rectangle, for parking load on it.
