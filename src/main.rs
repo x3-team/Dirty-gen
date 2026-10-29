@@ -2673,20 +2673,7 @@ fn sculpt_ford_exit_still(world: &mut World) {
                 + (x * 1.15).sin() * 0.07
                 + (x * 0.37 + 0.6).sin() * 0.05;
             let up = smooth(-0.02, shore, climb);
-            let mut column = 0.32 * (1.0 - up) * side;
-            // Same pool water, one cell wide, from the rear arch lip back
-            // into the standing surface. A wider column was a wedge on the tire.
-            // A shallow reach of the same pool, one cell wide, toward the
-            // rear arch. Taller than this stood up as a wedge on the tire.
-            let pour_x = -1.1458;
-            if (x - pour_x).abs() < cell * 0.45 && (0.78..0.98).contains(&z) {
-                let bed = world.soil.height[idx];
-                let u = ((z - 0.78) / (0.96 - 0.78)).clamp(0.0, 1.0);
-                let y_pool = bed + 0.32;
-                let y_lip = bed + 0.46;
-                let want = (y_pool + (y_lip - y_pool) * u - bed).clamp(0.05, 0.48);
-                column = column.max(want);
-            }
+            let column = 0.32 * (1.0 - up) * side;
             // Below ~0.05 the packed column leaves the free surface and the
             // old sheet path draws a card.
             world.soil.water[idx] = if column >= 0.05 { column } else { 0.0 };
@@ -2711,23 +2698,24 @@ fn sculpt_ford_exit_still(world: &mut World) {
             spray_i.push(i);
         }
     }
-    // From the rear lip down into the standing water. Not a straight bead.
+    // Same short ribbons as the tread spray, from the rear arch lip down
+    // into the pool. A raised column here stood up as a wedge on the tire.
     let drains = [
         (
-            Vec3::new(-1.12, 0.30, 1.18),
-            Vec3::new(-0.20, -0.90, -0.50),
+            Vec3::new(-1.08, 0.29, 1.03),
+            Vec3::new(-0.16, -0.94, -0.28),
         ),
         (
-            Vec3::new(-1.20, 0.08, 0.96),
-            Vec3::new(-0.16, -0.75, -0.55),
+            Vec3::new(-1.08, 0.10, 0.98),
+            Vec3::new(-0.14, -0.93, -0.32),
         ),
         (
-            Vec3::new(-1.26, -0.08, 0.80),
-            Vec3::new(-0.18, -0.55, -0.65),
+            Vec3::new(-1.08, -0.07, 0.92),
+            Vec3::new(-0.12, -0.92, -0.36),
         ),
         (
-            Vec3::new(-1.32, -0.18, 0.66),
-            Vec3::new(-0.10, -0.35, -0.75),
+            Vec3::new(-1.08, -0.18, 0.88),
+            Vec3::new(-0.10, -0.90, -0.40),
         ),
     ];
     // In the air just behind the rear tread. Not on the bumper.
