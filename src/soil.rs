@@ -3211,6 +3211,114 @@ impl SoilField {
         self.slurry.iter().sum::<f32>() * area
     }
 
+    /// Move slurry on the heightfield so a wide still reads a crest ahead of
+    /// the front treads and a thinned lane behind the rears. Column volume is
+    /// unchanged; bow and wake ledger lines are not touched.
+    pub fn accentuate_plow_bow_wake(
+        &mut self,
+        pool_x0: f32,
+        pool_x1: f32,
+        pool_z0: f32,
+        pool_z1: f32,
+        front_hub: (f32, f32),
+        rear_left: (f32, f32),
+        rear_right: (f32, f32),
+        track_half: f32,
+        forward: Vec3,
+    ) {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let area = self.cell * self.cell;
+        let margin = self.cell * 1.2;
+        let half = self.size * 0.5;
+        let mut moved = 0.0_f32;
+        let mut donors: Vec<(usize, f32)> = Vec::new();
+        let mut crests: Vec<(usize, f32)> = Vec::new();
+        let rear_z = rear_left.1.min(rear_right.1);
+        let front_z = front_hub.1;
+        let wake_back = pool_z0 + margin;
+        let wake_front = rear_z - self.cell * 0.8;
+        let bow_near = front_z + self.cell * 0.55;
+        let bow_far = (front_z + 1.25).min(pool_z1 - margin);
+        if bow_far <= bow_near + 0.05 || wake_front <= wake_back + 0.05 {
+            return;
+        }
+        let on_rut = |cx: f32| {
+            (cx - rear_left.0).abs() <= track_half || (cx - rear_right.0).abs() <= track_half
+        };
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                if cx < pool_x0 + margin
+                    || cx >= pool_x1 - margin
+                    || cz < pool_z0 + margin
+                    || cz >= pool_z1 - margin
+                {
+                    continue;
+                }
+                if cz < wake_back || cz > wake_front || !on_rut(cx) {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.slurry[idx] <= 0.01 {
+                    continue;
+                }
+                let take = self.slurry[idx] * 0.48;
+                if take > 1.0e-6 {
+                    donors.push((idx, take));
+                    moved += take * area;
+                }
+            }
+        }
+        if moved <= 1.0e-6 {
+            return;
+        }
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                if cx < pool_x0 + margin
+                    || cx >= pool_x1 - margin
+                    || cz < pool_z0 + margin
+                    || cz >= pool_z1 - margin
+                {
+                    continue;
+                }
+                let rel_x = cx - front_hub.0;
+                let rel_z = cz - front_z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                if !(bow_near..=bow_far).contains(&along) || lat.abs() > track_half + self.cell {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let span = (bow_far - bow_near).max(0.05);
+                let u = ((along - bow_near) / span).clamp(0.0, 1.0);
+                let crest = (1.0 - (u - 0.38).abs() / 0.62).max(0.0);
+                let across = 1.0 - (lat.abs() / (track_half + self.cell)).clamp(0.0, 1.0);
+                let w = crest * across;
+                if w > 0.04 {
+                    crests.push((idx, w));
+                }
+            }
+        }
+        let wsum: f32 = crests.iter().map(|(_, w)| *w).sum();
+        if wsum <= 1.0e-6 {
+            return;
+        }
+        for (idx, take) in &donors {
+            self.slurry[*idx] -= *take;
+        }
+        let add_depth = moved / area;
+        for (idx, w) in &crests {
+            self.slurry[*idx] += add_depth * (*w / wsum);
+        }
+        for (idx, _) in donors.iter().chain(crests.iter()) {
+            self.sync(*idx);
+        }
+    }
+
     /// Cut a lane and split that volume into a berm, a throw, and slurry that
     /// stays in the rut. The three add up to the bed that was removed.
     ///

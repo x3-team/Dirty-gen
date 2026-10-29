@@ -1080,12 +1080,8 @@ impl World {
             self.soil.airborne += scraped;
         }
         if throw_vol > 1.0e-6 {
-            let burst = self.particles.throw_slurry(
-                rear + Vec3::Y * 0.22 + right * 0.18,
-                fwd,
-                right,
-                throw_vol,
-            );
+            let origin = rear + Vec3::Y * 0.38 + right * 0.42 - fwd * 0.12;
+            let burst = self.particles.throw_slurry(origin, fwd, right, throw_vol);
             throw_ribbons = burst.ribbons;
             throw_spray = burst.drops;
         }
@@ -1134,6 +1130,34 @@ impl World {
         let (bow_m3, wake_m3) = self.slurry_plow_m3;
         let slurry = (pool - bow_m3 - wake_m3 - groove - ribbons - spray).max(0.0);
         let _ = slurry_column;
+        let front = self.vehicle.pos + ori * self.vehicle.wheel_center_local(0);
+        let rear_l = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
+        let rear_r = self.vehicle.pos + ori * self.vehicle.wheel_center_local(3);
+        let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        for p in &mut self.particles.items {
+            if !p.alive {
+                continue;
+            }
+            if p.kind != crate::particles::KIND_SLURRY_RIBBON
+                && p.kind != crate::particles::KIND_SLURRY_DROP
+            {
+                continue;
+            }
+            p.life = p.life.max(3.6);
+            p.max_life = p.max_life.max(3.6);
+            p.vel.y = p.vel.y.max(0.35);
+        }
         SlurryPlowWake {
             pool,
             slurry0,

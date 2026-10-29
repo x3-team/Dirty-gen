@@ -1835,7 +1835,6 @@ fn capture_slurry_plow(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
     let mut world = World::wet_clay();
     let out = world.plow_through_deep_slurry(3.6);
-    world.particles.land_ledger(&mut world.soil);
     silence_soil_clods(&mut world);
     let sum = out.slurry + out.bow_m3 + out.wake_m3 + out.groove + out.ribbons + out.spray;
     println!(
@@ -1899,9 +1898,9 @@ fn slurry_plow_camera(world: &World) -> CameraPose {
     let p = world.vehicle.pos;
     let floor = world.soil.sample(p.x, p.z).height;
     // Side-on to the whole Niva: bow ahead (+fwd) and wake behind (-fwd) in frame.
-    let look = p + fwd * 0.35 + Vec3::Y * (floor - p.y + 0.38);
-    let eye = p + right * 7.8 + fwd * (-2.6) + Vec3::Y * 2.05;
-    let ortho = 11.8;
+    let look = p + fwd * 0.2 + Vec3::Y * (floor - p.y + 0.62);
+    let eye = p + right * 8.4 + fwd * (-3.2) + Vec3::Y * 3.6;
+    let ortho = 12.5;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
