@@ -838,6 +838,66 @@ impl World {
         roll
     }
 
+    /// Roll the Niva onto its side in a slurry lane and shove that slurry
+    /// sideways. The cut equals the berm, the throw, and the slurry left in
+    /// the rut. The throw is sheets from the roll and ribbons from the spin.
+    /// Clay holds, so the shove does not empty the rut.
+    pub fn roll_and_slide_in_slurry(&mut self) -> SlurryManeuver {
+        let before_cut = self.soil.cut_volume();
+        let before_placed = self.soil.placed_volume();
+        let before_air = self.soil.airborne;
+        let from = Vec3::new(0.55, 0.0, -1.85);
+        let to = Vec3::new(0.55, 0.0, 1.85);
+        let dug = self
+            .soil
+            .cut_lane_in_slurry(from, to, 0.52, 0.22, 0.32);
+        let _slide = self.soil.slide_slurry(-0.15, 1.30, -2.05, 2.05, Vec3::X);
+        let ribbons = self.soil.peel_slurry(-0.10, 1.25, -2.00, 2.00, 0.18);
+        self.seat_skin(1.40, 0.15, 0.02, Vec3::new(-1.15, 0.0, 0.05));
+        let yaw = self.vehicle.yaw;
+        let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        // In the air between the Niva and the trench, not on the roof.
+        // The long axis runs across the camera so each piece reads as a sheet.
+        let shed = Vec3::new(0.35, 0.0, 0.05);
+        let across = Vec3::X;
+        let lane = Vec3::Z;
+        let sheets = dug.thrown;
+        let carried_sheets = self
+            .particles
+            .throw_roll_sheets(shed, lane, across, sheets);
+        let carried_ribbons = self.particles.throw_spin_ribbons(
+            shed + Vec3::new(0.05, 0.0, 0.15),
+            lane,
+            across,
+            ribbons,
+        );
+        let _ = (fwd, right);
+        let mut bed = 0.0_f32;
+        let mut berm_height = 0.0_f32;
+        for idx in 0..self.soil.bed.len() {
+            bed = bed.max((self.soil.initial_height[idx] - self.soil.bed[idx]).max(0.0));
+            berm_height = berm_height.max(self.soil.placed[idx]);
+        }
+        let slurry = self.soil.slurry_volume();
+        let placed = self.soil.placed_volume() - before_placed;
+        let airborne = self.soil.airborne - before_air;
+        let cut = self.soil.cut_volume() - before_cut;
+        let _ = (carried_sheets, carried_ribbons);
+        SlurryManeuver {
+            cut,
+            berm: dug.berm,
+            thrown: sheets + ribbons,
+            slurry,
+            placed,
+            airborne,
+            sheets,
+            ribbons,
+            bed,
+            berm_height,
+        }
+    }
+
     fn plow_pose(
         &mut self,
         roll: f32,
@@ -985,6 +1045,25 @@ impl World {
         };
         self.vehicle.pos.y += (ground - embed) - low_y;
     }
+}
+
+/// A roll and a sideways shove in slurry. Cubic metres, except `bed` and
+/// `berm_height`, which are metres.
+///
+/// `cut == berm + thrown + slurry`. `thrown` is the sheets plus the ribbons.
+/// The solid share is the #61 identity: `cut - slurry == placed + airborne`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlurryManeuver {
+    pub cut: f32,
+    pub berm: f32,
+    pub thrown: f32,
+    pub slurry: f32,
+    pub placed: f32,
+    pub airborne: f32,
+    pub sheets: f32,
+    pub ribbons: f32,
+    pub bed: f32,
+    pub berm_height: f32,
 }
 
 /// Volumes from a roll. Cubic metres, except `bed`, which is metres of cut
@@ -1569,6 +1648,84 @@ mod tests {
             .filter(|p| p.alive && p.ledger && !p.deposited && p.volume > 1.0e-8)
             .count();
         assert_eq!(lumps, 0, "thrown soil is still a loose lump");
+    }
+
+    #[test]
+    fn roll_and_slide_in_slurry_keeps_the_cut() {
+        use crate::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON, KIND_SLURRY_SHEET};
+
+        let mut world = World::wet_clay();
+        assert!(world.soil.volumes().cut < 1.0e-6, "the pad was already cut");
+        assert!(world.soil.slurry_volume() < 1.0e-6, "the pad already held slurry");
+        let m = world.roll_and_slide_in_slurry();
+        eprintln!(
+            "slurry roll cut {:.4} berm {:.4} thrown {:.4} slurry {:.4} placed {:.4} air {:.4} \
+             sheets {:.4} ribbons {:.4} bed {:.4} m berm_h {:.4} m",
+            m.cut, m.berm, m.thrown, m.slurry, m.placed, m.airborne, m.sheets, m.ribbons, m.bed,
+            m.berm_height
+        );
+        assert!(m.cut > 0.08, "cut {:.4}", m.cut);
+        assert!(m.berm > 0.02, "berm {:.4}", m.berm);
+        assert!(m.thrown > 0.01, "thrown {:.4}", m.thrown);
+        assert!(m.slurry > 0.02, "slurry left in the rut {:.4}", m.slurry);
+        assert!(m.sheets > 0.004, "the roll did not shed sheets");
+        assert!(m.ribbons > 0.002, "the spin did not shed ribbons");
+        let split = (m.cut - m.berm - m.thrown - m.slurry).abs();
+        assert!(
+            split < 1.0e-3,
+            "cut {:.4} != berm {:.4} + thrown {:.4} + slurry {:.4}",
+            m.cut, m.berm, m.thrown, m.slurry
+        );
+        let solid = (m.cut - m.slurry - m.placed - m.airborne).abs();
+        assert!(
+            solid < 1.0e-3,
+            "solid cut is not placed + airborne, gap {solid} cut {:.4} slurry {:.4} placed {:.4} air {:.4}",
+            m.cut, m.slurry, m.placed, m.airborne
+        );
+        assert!(
+            (m.placed - m.berm).abs() < 1.0e-3,
+            "placed {:.4} is not the berm {:.4}",
+            m.placed, m.berm
+        );
+        assert!(
+            (m.airborne - m.thrown).abs() < 1.0e-3,
+            "airborne {:.4} is not the throw {:.4}",
+            m.airborne, m.thrown
+        );
+        assert!(m.bed > 0.12 && m.bed < 0.28, "trench depth {:.3}", m.bed);
+        assert!(
+            m.berm_height > 0.14 && m.berm_height < 0.28,
+            "berm is not a ridge, {:.3} m",
+            m.berm_height
+        );
+        assert!(world.vehicle.roll.abs() > 1.0, "roll {}", world.vehicle.roll);
+        let mut sheets = 0;
+        let mut ribbons = 0;
+        for p in &world.particles.items {
+            if p.volume <= 1.0e-8 {
+                continue;
+            }
+            assert!(
+                p.kind == KIND_SLURRY_SHEET || p.kind == KIND_SLURRY_RIBBON,
+                "shed kind {} is not a sheet or a ribbon",
+                p.kind
+            );
+            assert_ne!(p.kind, KIND_SLURRY_DROP);
+            assert_ne!(p.kind, 1);
+            assert_ne!(p.kind, 0);
+            if p.kind == KIND_SLURRY_SHEET {
+                sheets += 1;
+            } else {
+                ribbons += 1;
+            }
+        }
+        assert!(sheets >= 3 && ribbons >= 3, "sheets {sheets} ribbons {ribbons}");
+        let carried: f32 = world.particles.items.iter().map(|p| p.volume).sum();
+        assert!(
+            (carried - m.thrown).abs() < 1.0e-3,
+            "pieces carry {carried:.4} of the throw {:.4}",
+            m.thrown
+        );
     }
 }
 

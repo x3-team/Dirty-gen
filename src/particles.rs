@@ -11,6 +11,8 @@ use crate::soil::SoilField;
 pub const KIND_SLURRY_RIBBON: u8 = 5;
 /// Liquid mud torn off a slurry seal. A small fleck, not a teardrop blob.
 pub const KIND_SLURRY_DROP: u8 = 6;
+/// A wider sheet from a roll in slurry. Still a ribbon, not a tablet.
+pub const KIND_SLURRY_SHEET: u8 = 7;
 
 /// Volume accepted into ribbon pieces and drop pieces.
 #[derive(Clone, Copy, Debug, Default)]
@@ -33,7 +35,8 @@ pub struct Particle {
     pub max_life: f32,
     pub size: f32,
     /// 0 tire droplet, 1 flung clod, 2 drip, 3 impact chunk, 4 impact droplet,
-    /// 5 slurry ribbon, 6 slurry drop. The last two are the breakaway mud.
+    /// 5 slurry ribbon, 6 slurry drop, 7 slurry sheet. The last three are
+    /// liquid mud. A roll sheds sheets. A sideways spin sheds ribbons.
     pub kind: u8,
     pub alive: bool,
     pub seed: u32,
@@ -266,6 +269,72 @@ impl Particles {
             // Rearward and outboard. The long axis crosses a camera behind
             // the tire, and the curl reads as a ribbon leaving the tread.
             let vel = -forward * (1.6 + t * 0.2) - right * (2.8 + t * 0.25) + Vec3::Y * (0.85 + t * 0.12);
+            carried += self.spawn_slurry(pos, vel, share, KIND_SLURRY_RIBBON, true);
+        }
+        carried
+    }
+
+    /// Slurry torn off by a roll. Wide sheets, not spheres, drops, or tablets.
+    /// The volume is already in the thrown account.
+    pub fn throw_roll_sheets(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        volume: f32,
+    ) -> f32 {
+        let forward = horizontal_axis(forward, Vec3::Z);
+        let right = horizontal_axis(right, Vec3::X);
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return 0.0;
+        }
+        // Spread through the air beside the rut. Stacked stations read as one lump.
+        let stations = [
+            (-1.05_f32, -0.15, 1.15),
+            (0.45, 0.65, 0.72),
+            (1.20, -0.15, 0.32),
+            (-0.25, 0.55, 0.98),
+        ];
+        let n = stations.len();
+        let mut carried = 0.0_f32;
+        for (i, (along, out, up)) in stations.into_iter().enumerate() {
+            let share = volume / n as f32;
+            let pos = origin + forward * along + right * out + Vec3::Y * up;
+            let t = i as f32;
+            // Along the sheet, slightly upward, so the long axis is a ribbon
+            // in the air beside the berm and not a lump on the tire.
+            let vel = right * (2.4 + t * 0.15) + forward * 0.35 + Vec3::Y * 0.55;
+            carried += self.spawn_slurry(pos, vel, share, KIND_SLURRY_SHEET, false);
+        }
+        carried
+    }
+
+    /// Slurry torn off by a sideways spin. Ribbons only. No drops.
+    /// The volume is already in the thrown account. Landing returns it to the rut.
+    pub fn throw_spin_ribbons(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        volume: f32,
+    ) -> f32 {
+        let forward = horizontal_axis(forward, Vec3::Z);
+        let right = horizontal_axis(right, Vec3::X);
+        if volume <= 1.0e-8 || !volume.is_finite() {
+            return 0.0;
+        }
+        let stations = [
+            (0.75_f32, 0.20, 0.52),
+            (-0.90, 0.95, 1.15),
+            (-1.10, -0.45, 0.48),
+        ];
+        let n = stations.len();
+        let mut carried = 0.0_f32;
+        for (i, (along, out, up)) in stations.into_iter().enumerate() {
+            let share = volume / n as f32;
+            let pos = origin + forward * along + right * out + Vec3::Y * up;
+            let t = i as f32;
+            let vel = right * (8.5 + t * 0.4) + Vec3::Y * (1.2 + t * 0.15) + forward * 0.35;
             carried += self.spawn_slurry(pos, vel, share, KIND_SLURRY_RIBBON, true);
         }
         carried
@@ -722,5 +791,40 @@ mod tests {
             (coat_held + soil.airborne + coat_returned - packed_coat).abs() < 1.0e-4,
             "coat shed deleted volume"
         );
+    }
+
+    /// A roll sheds sheets. A sideways spin sheds ribbons. Neither is a drop,
+    /// a sphere, or a clod, and both carry the volume they were given.
+    #[test]
+    fn roll_sheets_and_spin_ribbons_carry_the_volume() {
+        let mut particles = Particles::new();
+        let sheets = particles.throw_roll_sheets(Vec3::new(0.2, 0.4, 0.0), Vec3::Z, Vec3::X, 0.018);
+        let ribbons = particles.throw_spin_ribbons(Vec3::new(0.2, 0.3, 0.1), Vec3::Z, Vec3::X, 0.006);
+        assert!((sheets - 0.018).abs() < 1.0e-5, "sheets {sheets}");
+        assert!((ribbons - 0.006).abs() < 1.0e-5, "ribbons {ribbons}");
+        let mut sheet_n = 0;
+        let mut ribbon_n = 0;
+        for p in &particles.items {
+            if p.volume <= 1.0e-8 {
+                continue;
+            }
+            assert!(
+                p.kind == KIND_SLURRY_SHEET || p.kind == KIND_SLURRY_RIBBON,
+                "shed kind {} is not a sheet or a ribbon",
+                p.kind
+            );
+            assert_ne!(p.kind, KIND_SLURRY_DROP);
+            assert_ne!(p.kind, 1, "shed a clod");
+            assert_ne!(p.kind, 0, "shed a sphere droplet");
+            if p.kind == KIND_SLURRY_SHEET {
+                sheet_n += 1;
+                assert!(!p.returns_to_rut);
+            } else {
+                ribbon_n += 1;
+                assert!(p.returns_to_rut);
+            }
+        }
+        assert!(sheet_n >= 3, "sheet count {sheet_n}");
+        assert!(ribbon_n >= 3, "ribbon count {ribbon_n}");
     }
 }

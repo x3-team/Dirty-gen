@@ -524,6 +524,8 @@ struct CaptureArgs {
     slurry_suction_proof: PathBuf,
     slurry_groove: bool,
     slurry_groove_proof: PathBuf,
+    slurry_roll: bool,
+    slurry_roll_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -608,6 +610,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_groove {
         capture_slurry_groove(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_roll {
+        capture_slurry_roll(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -794,6 +800,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_suction_proof = PathBuf::from(format!("{MEDIA}/slurry-suction-proof.png"));
     let mut slurry_groove = false;
     let mut slurry_groove_proof = PathBuf::from(format!("{MEDIA}/slurry-groove-proof.png"));
+    let mut slurry_roll = false;
+    let mut slurry_roll_proof = PathBuf::from(format!("{MEDIA}/slurry-roll-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -864,6 +872,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_groove = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_groove_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-roll-proof" => {
+                slurry_roll = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_roll_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -953,6 +967,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_suction_proof,
         slurry_groove,
         slurry_groove_proof,
+        slurry_roll,
+        slurry_roll_proof,
     }
 }
 
@@ -1694,6 +1710,123 @@ fn roll_camera(world: &World) -> CameraPose {
     // ground beside the rolled Niva instead of sitting in a wide empty frame.
     let eye = look + fwd * 2.85 - right * 0.55 + Vec3::Y * 0.92;
     let ortho = 4.15;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
+/// The Niva on its side beside a slurry trench. The berm is the ridge on
+/// the far flank. The numbers are the cut, the berm, the throw, and the
+/// slurry left in the rut.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let roll = world.roll_and_slide_in_slurry();
+    println!(
+        "slurry-roll cut {:.4} m3  berm {:.4} m3  thrown {:.4} m3  slurry {:.4} m3  \
+         placed {:.4} m3  airborne {:.4} m3  sheets {:.4} m3  ribbons {:.4} m3  \
+         bed {:.4} m  berm_h {:.4} m  sum {:.4} m3",
+        roll.cut,
+        roll.berm,
+        roll.thrown,
+        roll.slurry,
+        roll.placed,
+        roll.airborne,
+        roll.sheets,
+        roll.ribbons,
+        roll.bed,
+        roll.berm_height,
+        roll.berm + roll.thrown + roll.slurry
+    );
+    let lines = [
+        format!("cut {:.4}", roll.cut),
+        format!("berm {:.4}", roll.berm),
+        format!("thrown {:.4}", roll.thrown),
+        format!("slurry {:.4}", roll.slurry),
+        format!("placed {:.4}", roll.placed),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = lift_camera(&world, slurry_roll_camera(&world));
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_roll_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_roll_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry roll still");
+    println!(
+        "cc0 slurry-roll {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_roll_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_roll_camera(world: &World) -> CameraPose {
+    let soil = &world.soil;
+    let half = soil.size * 0.5;
+    let mut tx = 0.0_f32;
+    let mut tz = 0.0_f32;
+    let mut tw = 0.0_f32;
+    let mut bx = 0.0_f32;
+    let mut bz = 0.0_f32;
+    let mut bw = 0.0_f32;
+    for idx in 0..soil.bed.len() {
+        let depth = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+        let placed = soil.placed[idx];
+        let i = idx % soil.res;
+        let j = idx / soil.res;
+        let x = (i as f32 + 0.5) * soil.cell - half;
+        let z = (j as f32 + 0.5) * soil.cell - half;
+        if depth > 0.05 {
+            tx += x * depth;
+            tz += z * depth;
+            tw += depth;
+        }
+        if placed > 0.04 {
+            bx += x * placed;
+            bz += z * placed;
+            bw += placed;
+        }
+    }
+    let trench = if tw > 1.0e-4 {
+        Vec3::new(tx / tw, 0.0, tz / tw)
+    } else {
+        Vec3::new(0.55, 0.0, 0.0)
+    };
+    let berm = if bw > 1.0e-4 {
+        Vec3::new(bx / bw, 0.0, bz / bw)
+    } else {
+        trench + Vec3::X
+    };
+    // Midway between the trench floor and the berm crest, with the Niva
+    // still in the frame on the near side.
+    let p = world.vehicle.pos;
+    let look = Vec3::new(
+        trench.x * 0.42 + berm.x * 0.38 + p.x * 0.20,
+        0.02,
+        trench.z * 0.50 + berm.z * 0.30 + p.z * 0.20,
+    );
+    let along = Vec3::new(0.0, 0.0, 1.0);
+    let eye = look + along * 3.15 + Vec3::new(0.35, 0.0, 0.0) + Vec3::Y * 1.05;
+    let ortho = 6.4;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,
@@ -2963,6 +3096,107 @@ fn capture_cc0(renderer: &mut Renderer, parsed: &CaptureArgs) {
         parsed,
         cc0_puddle_camera(&world),
     );
+}
+
+/// Volume numbers on the proof still. A dark plate, so the figures stay
+/// readable on the mud without a shader change.
+#[cfg(not(target_arch = "wasm32"))]
+fn stamp_proof_lines(rgba: &mut [u8], width: u32, height: u32, lines: &[&str]) {
+    let scale = 3u32;
+    let gap = scale;
+    let cw = 5 * scale + gap;
+    let ch = 7 * scale + gap * 2;
+    let x0 = 18u32;
+    let y0 = 16u32;
+    let mut max_w = 0u32;
+    for line in lines {
+        max_w = max_w.max(line.chars().count() as u32 * cw);
+    }
+    let plate_w = max_w + 20;
+    let plate_h = lines.len() as u32 * ch + 14;
+    for y in y0..y0.saturating_add(plate_h).min(height) {
+        for x in x0..x0.saturating_add(plate_w).min(width) {
+            let i = ((y * width + x) * 4) as usize;
+            rgba[i] = 18;
+            rgba[i + 1] = 14;
+            rgba[i + 2] = 10;
+            rgba[i + 3] = 255;
+        }
+    }
+    for (li, line) in lines.iter().enumerate() {
+        let y = y0 + 8 + li as u32 * ch;
+        let mut x = x0 + 10;
+        for ch in line.chars() {
+            blit_glyph(rgba, width, height, x, y, ch, scale);
+            x += cw;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn blit_glyph(rgba: &mut [u8], width: u32, height: u32, x: u32, y: u32, ch: char, scale: u32) {
+    let Some(rows) = glyph_rows(ch) else {
+        return;
+    };
+    for (row, bits) in rows.iter().enumerate() {
+        for col in 0..5u32 {
+            if bits & (1 << (4 - col)) == 0 {
+                continue;
+            }
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let px = x + col * scale + dx;
+                    let py = y + row as u32 * scale + dy;
+                    if px >= width || py >= height {
+                        continue;
+                    }
+                    let i = ((py * width + px) * 4) as usize;
+                    rgba[i] = 236;
+                    rgba[i + 1] = 228;
+                    rgba[i + 2] = 210;
+                    rgba[i + 3] = 255;
+                }
+            }
+        }
+    }
+}
+
+/// 5×7 glyphs, five low bits, left to right. Missing letters are skipped.
+#[cfg(not(target_arch = "wasm32"))]
+fn glyph_rows(ch: char) -> Option<[u8; 7]> {
+    let rows: [u8; 7] = match ch {
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+        '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
+        ' ' => [0, 0, 0, 0, 0, 0, 0],
+        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'b' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110],
+        'c' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10000, 0b01110],
+        'd' => [0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111],
+        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
+        'h' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
+        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001],
+        'n' => [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
+        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
+        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000],
+        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
+        's' => [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+        't' => [0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00100, 0b00011],
+        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        'w' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010],
+        'y' => [0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110],
+        _ => return None,
+    };
+    Some(rows)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
