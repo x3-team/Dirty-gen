@@ -562,10 +562,10 @@ struct CaptureArgs {
 fn through_chase(world: &World) -> CameraPose {
     let fwd = world.vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    // Behind and a little to the left so the wind lean sits in frame, and low
-    // enough that the track behind the car is in the picture.
-    let eye = world.vehicle.pos - fwd * 8.4 - right * 3.6 + Vec3::Y * 2.6;
-    let target = world.vehicle.pos + fwd * 1.6 + Vec3::Y * 0.45;
+    // High enough to see the bow over the hood, close enough that the wake
+    // behind the car stays in frame instead of a corner.
+    let eye = world.vehicle.pos - fwd * 9.0 - right * 2.05 + Vec3::Y * 3.35;
+    let target = world.vehicle.pos - fwd * 1.15 + Vec3::Y * 0.32;
     CameraPose {
         eye,
         target,
@@ -684,7 +684,6 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
         panic!("ffmpeg failed: {status}");
     }
     println!("video {}", video.display());
-    capture_belly_shelf(renderer, width, height);
 }
 
 fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
