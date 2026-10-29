@@ -1887,7 +1887,8 @@ impl SoilField {
         let i1 = (((center.x + half_l - half) / self.cell).ceil() as isize).clamp(0, self.res as isize - 1);
         let j0 = (((center.z - half_l - half) / self.cell).floor() as isize).clamp(0, self.res as isize - 1);
         let j1 = (((center.z + half_l - half) / self.cell).ceil() as isize).clamp(0, self.res as isize - 1);
-        let blend = (1.0 - (-pace * dt).exp()).min(0.35);
+        let blend_cap = if pace > 2.0 { 0.58 } else { 0.35 };
+        let blend = (1.0 - (-pace * dt).exp()).min(blend_cap);
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let x = (i as f32 + 0.5) * self.cell - half;
@@ -1920,6 +1921,93 @@ impl SoilField {
                 self.sync(idx);
             }
         }
+    }
+
+    /// Pack loose smear from the lane into the deepest rut floor (m³ budget).
+    pub fn pack_loose_in_region(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        mut budget_m3: f32,
+    ) -> f32 {
+        if budget_m3 <= 1.0e-8 {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let half = self.size * 0.5;
+        let mut loose_cells: Vec<(usize, f32)> = Vec::new();
+        let mut deep_cells: Vec<(usize, f32)> = Vec::new();
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let depth = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                if depth >= 0.012 {
+                    deep_cells.push((idx, depth));
+                }
+                let loose = self.loose[idx];
+                if loose >= 1.0e-5 {
+                    loose_cells.push((idx, loose));
+                }
+            }
+        }
+        if loose_cells.is_empty() || deep_cells.is_empty() {
+            return 0.0;
+        }
+        deep_cells.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        loose_cells.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut loose_i = 0usize;
+        let mut packed = 0.0_f32;
+        for (floor_idx, _) in deep_cells {
+            if budget_m3 <= 1.0e-8 || loose_i >= loose_cells.len() {
+                break;
+            }
+            let mut lift = (budget_m3 / area).min(0.06);
+            if lift < 1.0e-6 {
+                break;
+            }
+            let mut gathered = 0.0_f32;
+            while gathered < lift && loose_i < loose_cells.len() {
+                let src = loose_cells[loose_i].0;
+                let avail = self.loose[src];
+                let need = lift - gathered;
+                let take = avail.min(need);
+                if take < 1.0e-6 {
+                    loose_i += 1;
+                    continue;
+                }
+                self.loose[src] = avail - take;
+                gathered += take;
+                if self.loose[src] < 1.0e-5 {
+                    loose_i += 1;
+                }
+            }
+            if gathered < 1.0e-6 {
+                continue;
+            }
+            self.bed[floor_idx] += gathered;
+            self.height[floor_idx] += gathered;
+            let wet = self.wetness[floor_idx];
+            self.darken[floor_idx] = (self.darken[floor_idx] + 0.14 * (0.40 + wet)).min(1.0);
+            self.roughness[floor_idx] = lerp(self.roughness[floor_idx], 0.22, 0.32);
+            self.sync(floor_idx);
+            let vol = gathered * area;
+            packed += vol;
+            budget_m3 -= vol;
+        }
+        packed
     }
 
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {

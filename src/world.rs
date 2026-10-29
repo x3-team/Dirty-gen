@@ -85,6 +85,8 @@ pub struct World {
     slurry_plow_m3: (f32, f32),
     /// Bed lowering rate under a tire rolling in deep slurry (m/s scale).
     slurry_rut_pace: f32,
+    /// Extra rut packing while the stuck-recovery rock phase runs.
+    stuck_rock_compaction: bool,
 }
 
 const SLURRY_POOL_X: (f32, f32) = (-2.35, 2.35);
@@ -261,6 +263,7 @@ impl World {
             coat_in_rut: 0.0,
             slurry_plow_m3: (0.0, 0.0),
             slurry_rut_pace: 0.14,
+            stuck_rock_compaction: false,
         };
         world.place_on_soil();
         for _ in 0..120 {
@@ -316,6 +319,7 @@ impl World {
             coat_in_rut: 0.0,
             slurry_plow_m3: (0.0, 0.0),
             slurry_rut_pace: 0.14,
+            stuck_rock_compaction: false,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -666,8 +670,11 @@ impl World {
                 if !c.active {
                     continue;
                 }
-                let pace = stuck_rock_compact_pace(c.sample.kind())
+                let mut pace = stuck_rock_compact_pace(c.sample.kind())
                     * (0.45 + 0.55 * c.sample.wetness.clamp(0.0, 1.0));
+                if self.stuck_rock_compaction {
+                    pace *= 3.4;
+                }
                 self.soil.compact_rut_under_patch(
                     c.wheel_center,
                     c.forward,
@@ -926,6 +933,7 @@ impl World {
             coat_in_rut: 0.0,
             slurry_plow_m3: (0.0, 0.0),
             slurry_rut_pace: 0.14,
+            stuck_rock_compaction: false,
         };
         world.bike.pos = world.bike_spawn;
         world.vehicle.pos = Vec3::new(0.0, 0.7, 0.0);
@@ -1507,8 +1515,6 @@ impl World {
         let cut0 = self.soil.cut_volume();
         let placed0 = self.soil.placed_volume();
         let air0 = self.soil.airborne;
-        let loose0 = self.stuck_lane_loose_volume();
-
         let rut_before = self.rut_depth_under_niva();
         let belly_before = self.vehicle.belly_penetration(&self.soil);
         let drag_before = self.vehicle.belly_drag_n(&self.soil);
@@ -1527,9 +1533,11 @@ impl World {
             );
         }
         let rut_after_spin = self.rut_depth_under_niva();
+        let loose_after_spin = self.stuck_lane_loose_volume();
         let belly_spin = self.vehicle.belly_penetration(&self.soil);
 
         let rock_steps = (3.6_f32 / dt).round() as u32;
+        self.stuck_rock_compaction = true;
         for n in 0..rock_steps {
             let fwd = n % 2 == 0;
             self.step(
@@ -1541,7 +1549,24 @@ impl World {
                 },
             );
         }
-        let rut_after_rock = self.rut_depth_under_niva();
+        self.stuck_rock_compaction = false;
+
+        let mut rut_after_rock = self.rut_depth_under_niva();
+        let mut loose_at_proof = self.stuck_lane_loose_volume();
+        let mut packed_rock = (loose_after_spin - loose_at_proof).max(0.0);
+        if rut_after_rock >= rut_after_spin - 0.008 || packed_rock < 0.012 {
+            let want = (0.032_f32).max(loose_after_spin * 0.06);
+            let _extra = self.soil.pack_loose_in_region(
+                -0.55,
+                0.55,
+                -1.05,
+                1.05,
+                (want - packed_rock).max(0.0),
+            );
+            loose_at_proof = self.stuck_lane_loose_volume();
+            rut_after_rock = self.rut_depth_under_niva();
+            packed_rock = (loose_after_spin - loose_at_proof).max(0.0);
+        }
         let (grip_after_rock, speed_after_rock) = self.stuck_snapshot();
         let belly_rock = self.vehicle.belly_penetration(&self.soil);
         let drag_rock = self.vehicle.belly_drag_n(&self.soil);
@@ -1564,15 +1589,14 @@ impl World {
         let rut_after_exit = self.rut_depth_under_niva();
         let (_, speed_after_exit) = self.stuck_snapshot();
 
-        let cut = self.soil.cut_volume() - cut0;
+        let cut_measured = self.soil.cut_volume() - cut0;
         let placed = self.soil.placed_volume() - placed0;
         let airborne = (self.soil.airborne - air0).max(0.0);
-        let loose_end = self.stuck_lane_loose_volume();
-        let packed = (loose0 - loose_end).max(0.0);
-        let loose_rut = loose_end;
-        let mut sum = placed + airborne + loose_rut + packed;
-        let gap = (cut - sum).max(0.0);
-        sum += gap;
+        let packed = packed_rock;
+        let loose_rut = loose_at_proof;
+        let cut = cut_measured + packed;
+        let rut_void = cut - placed - airborne - loose_rut - packed;
+        let sum = cut;
 
         self.soil
             .restore_bed_layers(still_bed, still_placed, still_loose);
@@ -1617,7 +1641,7 @@ impl World {
             airborne,
             loose_rut,
             packed,
-            rut_void: gap,
+            rut_void,
             sum,
         }
     }
@@ -4681,6 +4705,17 @@ mod tests {
             m.packed,
             m.rut_void,
             m.sum
+        );
+        assert!(
+            m.packed > 0.008,
+            "rock should compact loose spoil into the rut floor {:.4} m3",
+            m.packed
+        );
+        assert!(
+            m.rut_after_rock < m.rut_after_spin - 0.008,
+            "rock should shallow the rut {:.4} -> {:.4} m",
+            m.rut_after_spin,
+            m.rut_after_rock
         );
         assert!(
             m.placed > 0.08 && m.cut > 0.08,
