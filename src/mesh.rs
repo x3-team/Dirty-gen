@@ -1099,18 +1099,16 @@ fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32
         add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
         add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
     }
-    let a = ring[0];
-    let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
 /// roll sheet, not a flat tablet, a ground stamp, or a box.
 fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet: bool) {
-    let mut dir = Vec3::new(p.vel.x, p.vel.y * 0.35, p.vel.z);
+    // Long axis stays in the XZ plane so a side camera sees a ribbon, not a
+    // vertical sheet or a tablet on the tread.
+    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
-        dir = Vec3::Z;
+        dir = Vec3::new(p.vel.x.max(0.2), 0.0, -1.0);
     }
     dir = dir.normalize();
     let mut side = dir.cross(Vec3::Y);
@@ -1122,16 +1120,20 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     let speed = p.vel.length();
     let length = if roll_sheet {
         (0.52 + speed * 0.03).clamp(0.58, 0.96)
+    } else if p.size > 0.14 {
+        (0.78 + speed * 0.04).clamp(0.82, 1.18)
     } else {
-        (0.34 + speed * 0.04).clamp(0.42, 0.78)
+        (0.52 + speed * 0.05).clamp(0.58, 0.92)
     };
     let width = (p.volume / length).sqrt();
     let width = if roll_sheet {
         width.clamp(0.15, 0.24)
+    } else if p.size > 0.14 {
+        width.clamp(0.028, 0.062)
     } else {
-        width.clamp(0.022, 0.10)
+        width.clamp(0.012, 0.048)
     };
-    let thick = (p.volume / (length * width * 0.55)).clamp(0.004, 0.014);
+    let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.028);
     let segs = 8usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
@@ -1201,42 +1203,9 @@ fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 /// The ledger volume stays on the particle; this mark does not swell into a
 /// teardrop blob, a sphere, or a tablet.
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    // Long axis in the horizontal plane, width vertical, thickness to the side.
-    // A side camera then sees a small fleck instead of an edge-on hair.
-    let mut dir = Vec3::new(p.vel.x * 0.2, 0.0, p.vel.z);
-    if dir.length_squared() < 1.0e-4 {
-        dir = Vec3::new(p.vel.x, 0.0, -1.0);
-    }
-    dir = dir.normalize();
-    let up = Vec3::Y;
-    let side = dir.cross(up).normalize();
-    let wobble = (p.seed % 5) as f32;
-    let length = 0.048 + wobble * 0.003;
-    let width = 0.016;
-    let thick = 0.0026;
-    let segs = 4usize;
-    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
-    for s in 0..=segs {
-        let t = s as f32 / segs as f32;
-        let taper = (t * (1.0 - t) * 4.0).powf(0.7).clamp(0.16, 1.0);
-        let arc = (t * std::f32::consts::PI).sin();
-        let c = p.pos + dir * (length * (t - 0.5)) + up * (arc - 0.5) * length * 0.06;
-        let w = side * width * 0.5 * taper;
-        let h = up * thick * 0.5 * (0.55 + 0.45 * taper);
-        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
-    }
-    for s in 0..segs {
-        let a = ring[s];
-        let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
-    }
-    let a = ring[0];
-    let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+    let mut q = *p;
+    q.size = p.size.clamp(0.02, 0.05);
+    add_slurry_curl(mesh, &q, false);
 }
 
 #[cfg(test)]
