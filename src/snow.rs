@@ -7,6 +7,11 @@
 //! about one centre, so the four tires draw four concentric circles. A boot
 //! is a small punch: it sinks, and the displaced snow sits in a low rim.
 //!
+//! When the blanket is deeper than the Niva's clearance, the belly, the axle
+//! tubes, and the transfer case plane the snow between the ruts. Each part
+//! cuts at its own height. The spare is packed into the floor and shoved
+//! forward and sideways into a bow. The contact force is kilonewtons.
+//!
 //! The closed ledger is mass. Compaction changes thickness and density.
 //! Their product, summed over the grid plus anything that could not be
 //! placed, stays at the blanket mass.
@@ -30,6 +35,17 @@ pub const SNOW_K: f32 = 15_000.0;
 pub const SNOW_N: f32 = 1.2;
 
 pub const BLANKET_M: f32 = 0.48;
+/// Belly pan above the tire contact. Deeper snow is planed off.
+pub const BELLY_CLEARANCE_M: f32 = 0.22;
+/// Axle tubes hang a little lower than the pan.
+const AXLE_CLEARANCE_M: f32 = 0.20;
+/// Transfer case, the low point on the centreline.
+const TCASE_CLEARANCE_M: f32 = 0.185;
+/// Share of the shaved column packed into the floor. The rest is the bow.
+const BELLY_PACK: f32 = 0.40;
+/// The bow meets the pan on a sloping face. Drag is the longitudinal part
+/// of the same Bekker pressure that unloads the wheels.
+const BOW_FACE_DEG: f32 = 36.0;
 /// Static load on one Niva tire, curb weight plus a driver.
 pub const NIVA_WHEEL_LOAD_N: f32 = 2_850.0;
 pub const FOOT_LOAD_N: f32 = 780.0;
@@ -115,6 +131,13 @@ pub struct SnowField {
     pub density: Vec<f32>,
     /// Mass that had nowhere to land, kilograms.
     pub held: f32,
+    /// Mass the underbody has shaved and not yet pushed into the bow.
+    plow_kg: f64,
+    /// Sum of vertical contact force on stamps where the pan is planted, N.
+    belly_normal_n: f64,
+    /// Sum of longitudinal contact force on those stamps, N.
+    belly_drag_n: f64,
+    belly_plants: u32,
     blanket: f32,
     initial_mass: f64,
     /// Radial profile of the turn, once the crest has been laid on the circle.
@@ -143,6 +166,17 @@ pub struct SnowReport {
     pub turn_trough_m: [f32; 4],
     pub foot_fresh_m: f32,
     pub foot_packed_m: f32,
+    /// Mean longitudinal force while the underbody is planted, kilonewtons.
+    pub belly_drag_kn: f32,
+    /// Mean upward force the snow takes off the wheels, kilonewtons.
+    pub belly_unload_kn: f32,
+    /// Snow left between the ruts after the pan has planed it.
+    pub shelf_m: f32,
+    /// Highest sample minus lowest across that shelf.
+    pub shelf_flat_m: f32,
+    pub shelf_rho: f32,
+    /// How far the bow stands above the blanket.
+    pub bow_rise_m: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +207,10 @@ impl SnowField {
             depth: vec![depth; n],
             density: vec![RHO_FRESH; n],
             held: 0.0,
+            plow_kg: 0.0,
+            belly_normal_n: 0.0,
+            belly_drag_n: 0.0,
+            belly_plants: 0,
             blanket: depth,
             initial_mass: 0.0,
             arc: None,
@@ -196,7 +234,7 @@ impl SnowField {
         for i in 0..self.depth.len() {
             mass += self.depth[i] as f64 * self.density[i] as f64 * area;
         }
-        mass + self.held as f64
+        mass + self.held as f64 + self.plow_kg
     }
 
     pub fn geometric_m3(&self) -> f64 {
@@ -292,6 +330,9 @@ impl SnowField {
             let t = i as f32 / n as f32;
             origin = origin0 + fwd * (distance * t);
             self.stamp_axle(origin, fwd, right, wheels, tire);
+            // The pan follows the tires. The arc smoother never rewrites this
+            // straight, so the shelf between the ruts stays planed.
+            self.scrape_underbody(origin, fwd, right, wheels, false);
         }
         DrivePose {
             origin,
@@ -458,6 +499,255 @@ impl SnowField {
         for wheel in wheels {
             let p = origin + right * wheel.x + fwd * wheel.y;
             self.stamp_tire(p, fwd, right, tire);
+        }
+    }
+
+    /// Replay the turn and plane virgin snow between the circles. Berm crests
+    /// stay. The arc smoother has already run, so this cut is the one that
+    /// remains. Thrown mass joins the bow.
+    fn scrape_along_turn(
+        &mut self,
+        origin0: Vec2,
+        forward: Vec2,
+        radius: f32,
+        sweep: f32,
+        wheels: &[Vec2],
+    ) {
+        let fwd0 = forward.normalize_or_zero();
+        let right0 = Vec2::new(fwd0.y, -fwd0.x);
+        let rear_z = rear_axle_z(wheels);
+        let rear0 = origin0 + fwd0 * rear_z;
+        let center = rear0 - right0 * radius;
+        let arm0 = rear0 - center;
+        let arc = radius.abs() * sweep.abs();
+        let step = (self.cell * 0.42).max(0.06);
+        let n = ((arc / step).ceil() as i32).max(1);
+        let dtheta = sweep / n as f32;
+        for i in 0..=n {
+            let arm = rot(arm0, dtheta * i as f32);
+            let rear = center + arm;
+            let fwd = Vec2::new(-arm.y, arm.x).normalize_or_zero();
+            let right = Vec2::new(fwd.y, -fwd.x);
+            let origin = rear - fwd * rear_z;
+            self.scrape_underbody(origin, fwd, right, wheels, true);
+        }
+    }
+
+    /// Cut every underbody part to its own clearance above the tire contact.
+    /// `keep_berms` leaves a shoulder that is already standing above the
+    /// blanket, so a turn crest is not shaved back into a tooth.
+    fn scrape_underbody(
+        &mut self,
+        origin: Vec2,
+        fwd: Vec2,
+        right: Vec2,
+        wheels: &[Vec2],
+        keep_berms: bool,
+    ) {
+        let contact = self.tire_floor(origin, fwd, right, wheels);
+        let parts = under_parts();
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+        for part in parts {
+            for (x, z) in [
+                (part.x0, part.z0),
+                (part.x0, part.z1),
+                (part.x1, part.z0),
+                (part.x1, part.z1),
+            ] {
+                let p = origin + right * x + fwd * z;
+                min_x = min_x.min(p.x);
+                max_x = max_x.max(p.x);
+                min_z = min_z.min(p.y);
+                max_z = max_z.max(p.y);
+            }
+        }
+        let pad = self.cell;
+        let half = self.size * 0.5;
+        let i0 = (((min_x - pad) + half) / self.cell).floor() as isize;
+        let i1 = (((max_x + pad) + half) / self.cell).floor() as isize;
+        let j0 = (((min_z - pad) + half) / self.cell).floor() as isize;
+        let j1 = (((max_z + pad) + half) / self.cell).floor() as isize;
+        let area = self.area();
+        let mut cuts: Vec<(usize, f32, f32)> = Vec::new();
+        let mut normal = 0.0f32;
+        let mut thrown = 0.0f64;
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                if i < 0 || j < 0 || i >= self.res as isize || j >= self.res as isize {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let p = self.cell_xz(idx);
+                let rel = p - origin;
+                let along = rel.dot(fwd);
+                let lat = rel.dot(right);
+                let mut clearance = f32::MAX;
+                let mut hit = false;
+                for part in parts {
+                    if lat < part.x0 || lat > part.x1 || along < part.z0 || along > part.z1 {
+                        continue;
+                    }
+                    hit = true;
+                    clearance = clearance.min(part.clearance);
+                }
+                if !hit {
+                    continue;
+                }
+                let depth = self.depth[idx];
+                if keep_berms && depth > self.blanket + 0.03 {
+                    continue;
+                }
+                let plane = contact + clearance;
+                if depth <= plane + 0.008 {
+                    continue;
+                }
+                let rho = self.density[idx].max(1.0);
+                let mass = depth * rho * area;
+                let excess_h = depth - plane;
+                let excess_m = excess_h * rho * area;
+                let mut kept = plane * rho * area + excess_m * BELLY_PACK;
+                let cap = RHO_PACKED * plane.max(1.0e-4) * area;
+                if kept > cap {
+                    kept = cap;
+                }
+                let throw = (mass - kept).max(0.0);
+                thrown += throw as f64;
+                cuts.push((idx, plane, kept));
+                normal += snow_pressure(excess_h, rho) * area;
+            }
+        }
+        for (idx, h, m) in cuts {
+            self.write_column(idx, h, m);
+        }
+        self.plow_kg += thrown;
+        // A lip in already-planed snow is tens of newtons. The plant is the
+        // stamp where the whole pan is still in the blanket.
+        if normal > 1_000.0 {
+            let drag = normal * BOW_FACE_DEG.to_radians().tan();
+            self.belly_normal_n += normal as f64;
+            self.belly_drag_n += drag as f64;
+            self.belly_plants += 1;
+        }
+    }
+
+    fn tire_floor(&self, origin: Vec2, fwd: Vec2, right: Vec2, wheels: &[Vec2]) -> f32 {
+        let mut acc = 0.0f32;
+        let mut n = 0.0f32;
+        for w in wheels.iter().take(4) {
+            let p = origin + right * w.x + fwd * w.y;
+            let mut best = self.depth_nearest(p.x, p.y);
+            for (du, dv) in [(-0.10, 0.0), (0.10, 0.0), (0.0, -0.10), (0.0, 0.10)] {
+                let q = p + right * du + fwd * dv;
+                best = best.min(self.depth_nearest(q.x, q.y));
+            }
+            acc += best;
+            n += 1.0;
+        }
+        if n > 0.0 {
+            acc / n
+        } else {
+            self.blanket
+        }
+    }
+
+    /// Push the shaved mass into a bow ahead of the nose, wider than the pan
+    /// so the pile spreads sideways as well as forward.
+    fn deposit_plow(&mut self, pose: DrivePose) {
+        let mass_f = self.plow_kg;
+        self.plow_kg = 0.0;
+        if mass_f <= 1.0e-6 {
+            return;
+        }
+        let mass = mass_f as f32;
+        self.held += (mass_f - mass as f64) as f32;
+        let fwd = pose.forward.normalize_or_zero();
+        let right = Vec2::new(fwd.y, -fwd.x);
+        let origin = pose.origin;
+        let reach = 3.1_f32;
+        let half = self.size * 0.5;
+        let i0 = (((origin.x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((origin.x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((origin.y - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((origin.y + reach) + half) / self.cell).floor() as isize;
+        let mut weights: Vec<(usize, f32)> = Vec::new();
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                if i < 0 || j < 0 || i >= self.res as isize || j >= self.res as isize {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let p = self.cell_xz(idx);
+                let rel = p - origin;
+                let along = rel.dot(fwd);
+                let lat = rel.dot(right);
+                // A wide, flat-topped pile. A tight gaussian stacked the
+                // whole plow into a spire on one cell.
+                if !(1.20..=3.85).contains(&along) || lat.abs() > 1.25 {
+                    continue;
+                }
+                let fore = ((along - 2.35) / 1.25).abs();
+                let side = (lat / 1.15).abs();
+                if fore > 1.0 || side > 1.0 {
+                    continue;
+                }
+                // Leave the packed ruts alone if the nose still overlaps one.
+                if self.depth[idx] < self.blanket * 0.45 {
+                    continue;
+                }
+                let w = (1.0 - fore * fore) * (1.0 - 0.25 * side * side);
+                if w > 0.05 {
+                    weights.push((idx, w));
+                }
+            }
+        }
+        self.deposit(&weights, mass, RHO_BERM);
+    }
+
+    /// The picture of the turn follows the radial profile. Where the pan
+    /// lowered the grid, lower that bin too. Berm bins stay on the circle.
+    fn refit_arc_shelf(&mut self) {
+        let Some(arc) = self.arc else {
+            return;
+        };
+        let mut depth = arc.depth;
+        for i in 0..ARC_BINS {
+            let radius = arc.r_lo + arc.dr * i as f32;
+            let mut samples: Vec<f32> = Vec::new();
+            let mut theta = 0.50_f32;
+            while theta < 1.32 {
+                let dir = Vec2::new(theta.cos(), theta.sin());
+                let p = arc.center + dir * radius;
+                samples.push(self.depth_nearest(p.x, p.y));
+                theta += 0.07;
+            }
+            if samples.len() < 4 {
+                continue;
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med = samples[samples.len() / 2];
+            if med + 0.05 < depth[i] {
+                depth[i] = med;
+            }
+        }
+        self.arc = Some(SnowArc { depth, ..arc });
+    }
+
+    fn belly_drag_kn(&self) -> f32 {
+        if self.belly_plants == 0 {
+            0.0
+        } else {
+            (self.belly_drag_n / self.belly_plants as f64 / 1000.0) as f32
+        }
+    }
+
+    fn belly_unload_kn(&self) -> f32 {
+        if self.belly_plants == 0 {
+            0.0
+        } else {
+            (self.belly_normal_n / self.belly_plants as f64 / 1000.0) as f32
         }
     }
 
@@ -1072,6 +1362,59 @@ impl SnowField {
     }
 }
 
+/// Bekker pressure under a plate that has sunk `pen` metres.
+fn snow_pressure(pen: f32, density: f32) -> f32 {
+    if pen <= 0.0 {
+        return 0.0;
+    }
+    let stiff = (density / RHO_FRESH).clamp(1.0, 8.0).powf(1.7);
+    SNOW_K * stiff * pen.powf(SNOW_N)
+}
+
+#[derive(Clone, Copy)]
+struct UnderPart {
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
+    clearance: f32,
+}
+
+/// Belly pan across the gap between the inner sidewalls, axle tubes a little
+/// narrower and lower, transfer case the low keel on the centreline.
+fn under_parts() -> [UnderPart; 4] {
+    [
+        UnderPart {
+            x0: -0.54,
+            x1: 0.54,
+            z0: -1.05,
+            z1: 0.95,
+            clearance: BELLY_CLEARANCE_M,
+        },
+        UnderPart {
+            x0: -0.48,
+            x1: 0.48,
+            z0: 0.98,
+            z1: 1.22,
+            clearance: AXLE_CLEARANCE_M,
+        },
+        UnderPart {
+            x0: -0.48,
+            x1: 0.48,
+            z0: -1.34,
+            z1: -1.06,
+            clearance: AXLE_CLEARANCE_M,
+        },
+        UnderPart {
+            x0: -0.20,
+            x1: 0.20,
+            z0: -0.06,
+            z1: 0.44,
+            clearance: TCASE_CLEARANCE_M,
+        },
+    ]
+}
+
 /// Fresh-snow sinkage under a uniform pressure. Density stiffens the modulus.
 pub fn snow_sinkage(pressure: f32, density: f32, depth: f32) -> f32 {
     if depth <= 1.0e-5 || pressure <= 0.0 {
@@ -1129,8 +1472,13 @@ pub fn niva_snow_scene() -> SnowScene {
     // The crest of a curve snaps between grid cells. Spread each arc slice
     // back onto a smooth shoulder so the ridge follows the circle.
     snow.smooth_turn_berms(turn.center, turn.radii, 1.7);
+    // The smoother rewrites the arc, so the pan has to plane the circles
+    // after it. Berms above the blanket are left on the circle.
+    snow.scrape_along_turn(straight.origin, straight.forward, 3.55, 1.7, &wheels);
+    snow.refit_arc_shelf();
     let foot_origin = Vec2::new(straight_x + 2.15, -5.6);
     let (foot_at, foot_fresh) = snow.walk(foot_origin, Vec2::new(0.0, 1.0), 8, 0.58);
+    snow.deposit_plow(turn.end);
 
     let mut packed = SnowField::blanket(BLANKET_M);
     packed.pack_disc(Vec2::ZERO, 1.4, RHO_PACKED);
@@ -1139,6 +1487,8 @@ pub fn niva_snow_scene() -> SnowScene {
     let straight_z = straight_from.y + straight_len * 0.48;
     let (rut_drop, berm_rise, berm_round, rut_rho, berm_rho) =
         cross_section(&snow, straight_x, straight_z);
+    let (shelf_m, shelf_flat_m, shelf_rho) = shelf_between(&snow, straight_x, straight_z);
+    let bow_rise_m = bow_rise(&snow, turn.end);
 
     let mut troughs = [0.0f32; 4];
     for i in 0..4 {
@@ -1173,6 +1523,12 @@ pub fn niva_snow_scene() -> SnowScene {
         turn_trough_m: troughs,
         foot_fresh_m: foot_fresh,
         foot_packed_m: foot_packed,
+        belly_drag_kn: snow.belly_drag_kn(),
+        belly_unload_kn: snow.belly_unload_kn(),
+        shelf_m,
+        shelf_flat_m,
+        shelf_rho,
+        bow_rise_m,
     };
     SnowScene {
         snow,
@@ -1186,6 +1542,39 @@ pub fn niva_snow_scene() -> SnowScene {
         foot_at,
         report,
     }
+}
+
+fn shelf_between(snow: &SnowField, track_x: f32, z: f32) -> (f32, f32, f32) {
+    let samples = [
+        snow.depth_nearest(track_x, z),
+        snow.depth_nearest(track_x - 0.30, z),
+        snow.depth_nearest(track_x + 0.30, z),
+    ];
+    let mean = (samples[0] + samples[1] + samples[2]) / 3.0;
+    let mut hi = samples[0];
+    let mut lo = samples[0];
+    for s in samples {
+        hi = hi.max(s);
+        lo = lo.min(s);
+    }
+    (mean, hi - lo, snow.density_nearest(track_x, z))
+}
+
+fn bow_rise(snow: &SnowField, pose: DrivePose) -> f32 {
+    let fwd = pose.forward.normalize_or_zero();
+    let right = Vec2::new(fwd.y, -fwd.x);
+    let mut best = 0.0f32;
+    let mut along = 1.15_f32;
+    while along <= 4.0 {
+        let mut lat = -1.30_f32;
+        while lat <= 1.30 {
+            let p = pose.origin + fwd * along + right * lat;
+            best = best.max(snow.depth_nearest(p.x, p.y));
+            lat += snow.cell * 0.5;
+        }
+        along += snow.cell * 0.5;
+    }
+    (best - snow.blanket_m()).max(0.0)
 }
 
 fn cross_section(snow: &SnowField, track_x: f32, z: f32) -> (f32, f32, f32, f32, f32) {
@@ -1552,5 +1941,78 @@ mod tests {
             prev = Some(crest);
             theta += 0.06;
         }
+    }
+
+    #[test]
+    fn belly_planes_between_the_ruts() {
+        let scene = scene();
+        let r = scene.report;
+        assert!(
+            (r.mass1_kg - r.mass0_kg).abs() < 0.05,
+            "mass {} -> {} held {}",
+            r.mass0_kg,
+            r.mass1_kg,
+            r.held_kg
+        );
+        assert!(
+            (r.rut_drop_m - 0.4376).abs() < 0.001,
+            "rut drop {}",
+            r.rut_drop_m
+        );
+        assert!(
+            (r.berm_rise_m - 0.1863).abs() < 0.001,
+            "berm rise {}",
+            r.berm_rise_m
+        );
+        let snow = &scene.snow;
+        let blanket = snow.blanket_m();
+        let x = scene.straight_x;
+        let z = scene.straight_z;
+        let samples = [
+            snow.depth_nearest(x, z),
+            snow.depth_nearest(x - 0.30, z),
+            snow.depth_nearest(x + 0.30, z),
+        ];
+        let mut hi = samples[0];
+        let mut lo = samples[0];
+        for d in samples {
+            hi = hi.max(d);
+            lo = lo.min(d);
+            assert!(
+                d < blanket - 0.18,
+                "shelf {d} is still a crest, blanket {blanket}"
+            );
+            let floor = blanket - r.rut_drop_m;
+            assert!(
+                d > floor + 0.10,
+                "shelf {d} fell into the rut floor {floor}"
+            );
+        }
+        assert!(hi - lo < 0.05, "shelf not flat {lo}..{hi}");
+        assert!(
+            r.shelf_rho > RHO_FRESH + 15.0,
+            "shelf density {}",
+            r.shelf_rho
+        );
+        assert!(
+            r.bow_rise_m > 0.08,
+            "bow rise {}",
+            r.bow_rise_m
+        );
+        assert!(
+            r.bow_rise_m < 0.75,
+            "bow is a spire {}",
+            r.bow_rise_m
+        );
+        assert!(
+            r.belly_drag_kn > 1.0,
+            "drag {:.3} kN",
+            r.belly_drag_kn
+        );
+        assert!(
+            r.belly_unload_kn > 1.0,
+            "unload {:.3} kN",
+            r.belly_unload_kn
+        );
     }
 }

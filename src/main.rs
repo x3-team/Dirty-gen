@@ -554,6 +554,8 @@ struct CaptureArgs {
     drying_crust_proof: PathBuf,
     snow_ruts: bool,
     snow_ruts_proof: PathBuf,
+    snow_belly: bool,
+    snow_belly_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -704,6 +706,10 @@ fn capture(args: &[String]) {
     }
     if parsed.snow_ruts {
         capture_snow_ruts(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.snow_belly {
+        capture_snow_belly(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -931,6 +937,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         PathBuf::from(format!("{MEDIA}/drying-crust-proof.png"));
     let mut snow_ruts = false;
     let mut snow_ruts_proof = PathBuf::from(format!("{MEDIA}/snow-ruts-proof.png"));
+    let mut snow_belly = false;
+    let mut snow_belly_proof = PathBuf::from(format!("{MEDIA}/snow-belly-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1093,6 +1101,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     snow_ruts_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--snow-belly-proof" => {
+                snow_belly = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    snow_belly_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1210,6 +1224,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         drying_crust_proof,
         snow_ruts,
         snow_ruts_proof,
+        snow_belly,
+        snow_belly_proof,
     }
 }
 
@@ -2934,6 +2950,136 @@ fn snow_ruts_camera(scene: &silt::snow::SnowScene) -> CameraPose {
     CameraPose {
         eye,
         target: look,
+        ortho_width: None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_snow_belly(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use glam::Vec2;
+    use silt::particles::Particles;
+    use silt::snow::{niva_snow_scene, yaw_for_forward};
+    use silt::soil::SoilField;
+    use silt::vehicle::WHEEL_RADIUS;
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = false;
+    renderer.snow = true;
+
+    let scene = niva_snow_scene();
+    let mut world = World::flat(0.1);
+    world.soil = SoilField::flat(0.1);
+    world.particles = Particles::new();
+    world.vehicle.clear_loose_mud();
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw_rate = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    // Park on the straight so the planed shelf is the wake under the rear bumper.
+    let facing = Vec2::new(0.0, 1.0);
+    world.vehicle.pos = Vec3::new(scene.straight_x, 0.0, scene.straight_z + 1.55);
+    world.vehicle.yaw = yaw_for_forward(facing);
+    for w in &mut world.vehicle.wheels {
+        w.compression = 0.08;
+        w.sinkage = 0.0;
+        w.normal = 0.0;
+        w.steer = 0.0;
+    }
+    scene.snow.paint_height(
+        &mut world.soil.height,
+        &world.soil.bed,
+        &world.soil.placed,
+        &world.soil.slurry,
+    );
+    for i in 0..world.soil.darken.len() {
+        world.soil.darken[i] = scene.snow.compaction(i);
+        world.soil.water[i] = 0.0;
+        world.soil.slurry[i] = 0.0;
+        world.soil.wetness[i] = 0.0;
+    }
+    let ori = world.vehicle.orientation();
+    let mut surface = 0.0;
+    for i in 0..4 {
+        let center = world.vehicle.pos + ori * world.vehicle.wheel_center_local(i);
+        surface += scene.snow.depth_at(center.x, center.z);
+    }
+    surface /= 4.0;
+    let bottom = world.vehicle.wheel_center_local(0).y - WHEEL_RADIUS;
+    world.vehicle.pos.y = surface - bottom;
+
+    let r = &scene.report;
+    println!(
+        "snow blanket {:.3} m fresh {:.1} packed {:.1} berm {:.1} kg/m3",
+        r.blanket_m, r.rho_fresh, r.rho_packed, r.rho_berm
+    );
+    println!(
+        "snow mass {:.4} -> {:.4} kg held {:.4} kg geom {:.4} -> {:.4} m3 solid {:.6} -> {:.6} m3",
+        r.mass0_kg, r.mass1_kg, r.held_kg, r.geom0_m3, r.geom1_m3, r.solid0_m3, r.solid1_m3
+    );
+    println!(
+        "snow rut drop {:.4} m rise {:.4} m round {:.4} rut rho {:.1} berm rho {:.1}",
+        r.rut_drop_m, r.berm_rise_m, r.berm_round, r.rut_rho, r.berm_rho
+    );
+    println!(
+        "snow turn radii {:.3} {:.3} {:.3} {:.3} troughs {:.3} {:.3} {:.3} {:.3}",
+        r.turn_radii_m[0],
+        r.turn_radii_m[1],
+        r.turn_radii_m[2],
+        r.turn_radii_m[3],
+        r.turn_trough_m[0],
+        r.turn_trough_m[1],
+        r.turn_trough_m[2],
+        r.turn_trough_m[3]
+    );
+    println!(
+        "snow foot fresh {:.4} m packed {:.4} m",
+        r.foot_fresh_m, r.foot_packed_m
+    );
+    println!(
+        "snow belly drag {:.3} kN unload {:.3} kN shelf {:.4} m flat {:.4} m rho {:.1} bow rise {:.4} m",
+        r.belly_drag_kn, r.belly_unload_kn, r.shelf_m, r.shelf_flat_m, r.shelf_rho, r.bow_rise_m
+    );
+
+    let pose = snow_belly_camera(&scene);
+    renderer.snow_bed = world.soil.bed[0];
+    renderer.snow_arc = scene.snow.arc;
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    if let Some(parent) = parsed.snow_belly_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(&parsed.snow_belly_proof, parsed.width, parsed.height, &rgba)
+        .expect("snow belly still");
+    println!(
+        "snow-belly {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2}) niva=({:.2},{:.2},{:.2})",
+        parsed.snow_belly_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z,
+        world.vehicle.pos.x,
+        world.vehicle.pos.y,
+        world.vehicle.pos.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn snow_belly_camera(scene: &silt::snow::SnowScene) -> CameraPose {
+    // Low, just behind the lane. Look down the planed floor so the shelf
+    // between the ruts is the ground in front of the Niva, with the berms
+    // standing on either side.
+    let x = scene.straight_x;
+    let z = scene.straight_z;
+    let eye = Vec3::new(x + 0.62, 1.62, z - 3.05);
+    let target = Vec3::new(x - 0.02, 0.30, z + 0.75);
+    CameraPose {
+        eye,
+        target,
         ortho_width: None,
     }
 }
