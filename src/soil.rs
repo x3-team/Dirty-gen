@@ -3321,8 +3321,8 @@ impl SoilField {
                 || cx <= pool_x0 + lip
                 || cz <= pool_z0 + lip
         };
-        let wake_target = 0.048_f32;
-        let bow_peak = 0.265_f32;
+        let wake_target = 0.024_f32;
+        let bow_peak = 0.395_f32;
         let mut moved = 0.0_f32;
         let mut donors: Vec<(usize, f32)> = Vec::new();
         let mut crests: Vec<(usize, f32)> = Vec::new();
@@ -3341,10 +3341,10 @@ impl SoilField {
                 let mut take = 0.0_f32;
                 if cz <= wake_top && cz >= wake_floor && on_rut(cx) {
                     take = (self.slurry[idx] - wake_target).max(0.0);
-                } else if near_lip(cx, cz) && in_pool(cx, cz) {
-                    take = (self.slurry[idx] - 0.13).max(0.0);
+                } else if near_lip(cx, cz) {
+                    take = self.slurry[idx].max(0.0);
                 } else if cz >= rear_z + 0.08 && cz <= front_z - 0.08 && on_rut(cx) {
-                    take = self.slurry[idx] * 0.12;
+                    take = self.slurry[idx] * 0.14;
                 }
                 if take > 1.0e-6 {
                     donors.push((idx, take));

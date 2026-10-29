@@ -1893,17 +1893,31 @@ fn capture_slurry_plow(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn slurry_plow_camera(world: &World) -> CameraPose {
-    let fwd = world.vehicle.forward();
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    let p = world.vehicle.pos;
-    let floor = world.soil.sample(p.x, p.z).height;
-    // Side-on to the whole Niva: bow ahead (+fwd) and wake behind (-fwd) in frame.
-    let look = p + fwd * 0.2 + Vec3::Y * (floor - p.y + 0.62);
-    let eye = p + right * 8.4 + fwd * (-3.2) + Vec3::Y * 3.6;
-    let ortho = 12.5;
+    let driver = -right;
+    let ori = vehicle.orientation();
+    let front = vehicle.pos + ori * vehicle.wheel_center_local(0);
+    let rear = vehicle.pos + ori * vehicle.wheel_center_local(2);
+    let bow_x = front.x + fwd.x * 0.62;
+    let bow_z = front.z + fwd.z * 0.62;
+    let wake_x = rear.x - fwd.x * 0.52;
+    let wake_z = rear.z - fwd.z * 0.52;
+    let bow_h = world.soil.sample(bow_x, bow_z).height;
+    let wake_h = world.soil.sample(wake_x, wake_z).height;
+    // Low on the driver’s side, sight line along the pool so the bow crest
+    // and the wake trough share one grazing profile.
+    let target = Vec3::new(
+        (bow_x + wake_x) * 0.5,
+        (bow_h + wake_h) * 0.5 + 0.02,
+        (bow_z + wake_z) * 0.5,
+    );
+    let eye = rear + driver * 3.6 + fwd * (-1.35) + Vec3::Y * (wake_h + 0.22);
+    let ortho = 7.8;
     CameraPose {
-        eye: clear_ortho_eye(world, eye, look, ortho),
-        target: look,
+        eye: clear_ortho_eye(world, eye, target, ortho),
+        target,
         ortho_width: Some(ortho),
     }
 }

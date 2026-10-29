@@ -1085,7 +1085,6 @@ impl World {
             throw_ribbons = burst.ribbons;
             throw_spray = burst.drops;
         }
-        // Bow and wake at the capture pose, after tread debris is on the ledger.
         for i in 0..4 {
             let hub = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
             let pass = self.soil.raise_bow_wave(
@@ -1149,10 +1148,22 @@ impl World {
             half_track,
             fwd,
         );
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
         self.soil
-            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
-        let ribbon_base = rear_r + right * 0.62 + Vec3::Y * 0.50 - fwd * 0.06;
-        let spray_base = rear_r + right * 0.48 + Vec3::Y * 0.68 - fwd * 0.04;
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.62);
+        let driver = -right;
+        let ribbon_base = rear_l + driver * 0.92 + Vec3::Y * 0.46 - fwd * 0.05;
+        let spray_base = rear_l + driver * 0.72 + Vec3::Y * 0.64 - fwd * 0.03;
         let mut ri = 0usize;
         let mut di = 0usize;
         for p in &mut self.particles.items {
@@ -1164,19 +1175,19 @@ impl World {
             p.life = p.life.max(4.2);
             p.max_life = p.max_life.max(4.2);
             if p.kind == crate::particles::KIND_SLURRY_RIBBON {
-                p.pos = ribbon_base + right * (ri as f32 * 0.14) + fwd * (ri as f32 * -0.05);
-                p.vel = right * 2.4 + fwd * (-0.65);
-                p.size = (p.volume * 55.0).cbrt().clamp(0.09, 0.15);
-                p.spin = Vec3::new(0.15, 0.35, 0.1);
+                p.pos = ribbon_base + driver * (ri as f32 * 0.16) + fwd * (ri as f32 * -0.04);
+                p.vel = driver * 2.8 + fwd * (-0.55);
+                p.size = (p.volume * 42.0).cbrt().clamp(0.16, 0.28);
+                p.spin = Vec3::new(0.12, 0.28, 0.08);
                 ri += 1;
             } else if p.kind == crate::particles::KIND_SLURRY_DROP {
-                if p.pos.y < rear_r.y + 0.42 {
+                if p.pos.y < rear_l.y + 0.42 {
                     p.alive = false;
                     continue;
                 }
-                p.pos = spray_base + right * (di as f32 * 0.06) + Vec3::Y * (di as f32 * 0.04);
-                p.vel = right * 1.8 + Vec3::Y * 0.25;
-                p.size = (p.volume * 90.0).cbrt().clamp(0.028, 0.045);
+                p.pos = spray_base + driver * (di as f32 * 0.07) + Vec3::Y * (di as f32 * 0.05);
+                p.vel = driver * 2.0 + Vec3::Y * 0.22;
+                p.size = (p.volume * 90.0).cbrt().clamp(0.032, 0.055);
                 di += 1;
             } else if p.kind != crate::particles::KIND_SLURRY_SHEET {
                 p.alive = false;

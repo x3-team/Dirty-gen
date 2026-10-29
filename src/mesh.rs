@@ -1120,16 +1120,20 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     let speed = p.vel.length();
     let length = if roll_sheet {
         (0.52 + speed * 0.03).clamp(0.58, 0.96)
+    } else if p.size > 0.14 {
+        (0.78 + speed * 0.04).clamp(0.82, 1.18)
     } else {
         (0.52 + speed * 0.05).clamp(0.58, 0.92)
     };
     let width = (p.volume / length).sqrt();
     let width = if roll_sheet {
         width.clamp(0.15, 0.24)
+    } else if p.size > 0.14 {
+        width.clamp(0.028, 0.062)
     } else {
         width.clamp(0.012, 0.048)
     };
-    let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.022);
+    let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.028);
     let segs = 8usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
