@@ -28,7 +28,7 @@
 //! A track that has rested on that crust hardens: the same tire sinks less
 //! and cuts less. Sand, silt, and gravel do not crust. The bed, the placed
 //! pile, and the cloud stay put. Thickness and crack opening are exported
-//! for a shader. They are not a second height and they do not retint the soil.
+//! for a shader. They are not a second height. A fissure is the same mud, opened.
 //!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
@@ -6947,9 +6947,9 @@ impl SoilField {
         field
     }
 
-    /// Two wet tracks. The east pair bakes into a crust and cracks. The west
-    /// pair is put back to the wet state so one frame can show both. The bed
-    /// and the placed pile are the wet cut on both sides.
+    /// Tracks on one pad. The dry spell bakes a crust and opens cracks. A
+    /// warped front leaves the same clay wet where it has not finished drying.
+    /// The bed and the placed pile stay the wet cut.
     pub fn drying_pair() -> (Self, DryingCrust) {
         let mut field = Self::mud_pad();
         let paint = |field: &mut SoilField, x: f32, z: f32, kind: SurfaceKind, wet: f32| {
@@ -7048,16 +7048,26 @@ impl SoilField {
         let silt_crust = field.patch_max_crust(7.2, 6.0);
         let cut = field.volumes().cut;
         let placed = field.volumes().placed;
-        // West half is the wet track again. East keeps the crust. The cut stays.
+        // One pad, drying. Wet clay and the crust are the same soil. The
+        // front is wide and warped, so the picture is not two tiles split
+        // on x = 0. The bed and the placed pile stay the wet cut.
         for idx in 0..field.bed.len() {
-            let (x, _) = field.cell_xz(idx);
-            if x < 0.0 {
-                field.wetness[idx] = wet_snap.0[idx];
-                field.water[idx] = wet_snap.1[idx];
+            let (x, z) = field.cell_xz(idx);
+            let mut d = drying_front(x, z);
+            // The measured wet lane stays wet. The box is off the close frame.
+            if (x + 0.96).abs() < 0.48 && z.abs() < 0.48 {
+                d = 0.0;
+            }
+            if d >= 0.999 {
+                continue;
+            }
+            field.wetness[idx] = lerp(wet_snap.0[idx], field.wetness[idx], d);
+            field.water[idx] = lerp(wet_snap.1[idx], field.water[idx], d);
+            field.roughness[idx] = lerp(wet_snap.3[idx], field.roughness[idx], d);
+            field.crust[idx] *= d;
+            field.crack[idx] *= d;
+            if d < 0.82 {
                 field.kind[idx] = wet_snap.2[idx];
-                field.roughness[idx] = wet_snap.3[idx];
-                field.crust[idx] = wet_snap.4[idx];
-                field.crack[idx] = wet_snap.5[idx];
             }
         }
         let west_floor = field.floor_sample(-0.96, 0.0);
@@ -7737,6 +7747,17 @@ pub struct DryingCrust {
     pub east_crust: f32,
     pub east_crack: f32,
 }
+/// How far a cell has dried for the still. 0 is the wet cut, 1 is the rested crust.
+/// The front wanders, so wet ground and crust are one pad rather than a straight cut.
+fn drying_front(x: f32, z: f32) -> f32 {
+    let n = noise2(x * 0.45 + 1.7, z * 0.38 + 0.4);
+    let n2 = noise2(x * 1.15 - 2.2, z * 0.72 + 3.1);
+    let across = (x + 0.15 + (n - 0.5) * 2.4) / 2.1;
+    let along = (z + 0.2) * 0.22 + (n2 - 0.5) * 0.85;
+    let t = (across + along).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Metres per second the skin grows at a full moisture deficit, before the track bonus.
 /// A twelve-second lap stays under the harden threshold. A dry spell does not.
 const CRUST_GROW: f32 = 0.00022;

@@ -1120,7 +1120,7 @@ impl World {
         }
     }
 
-    /// Wet tracks on the west, crusted tracks on the east, Niva on the crust.
+    /// One pad drying. The Niva sits on the rested, cracked tracks.
     /// The dry spell does not move the cut or the pile.
     pub fn drying_crust_frame(&mut self) -> DryingCrust {
         let (soil, stats) = SoilField::drying_pair();

@@ -233,6 +233,48 @@ fn crust_at(ij: vec2<i32>) -> vec4<f32> {
     return textureLoad(crust_tex, c, 0);
 }
 
+// Thickness and opening, bilinear, in the export's 0..1 range.
+fn crust_bilinear(xz: vec2<f32>) -> vec2<f32> {
+    let ij = world_to_ij(xz);
+    let i = floor(ij);
+    let f = fract(ij);
+    let i0 = vec2<i32>(i);
+    let c00 = crust_at(i0).rg;
+    let c10 = crust_at(i0 + vec2<i32>(1, 0)).rg;
+    let c01 = crust_at(i0 + vec2<i32>(0, 1)).rg;
+    let c11 = crust_at(i0 + vec2<i32>(1, 1)).rg;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+// Same network the solver opens. Gap is in cell units of the 0.48 m lattice.
+fn crack_gap(xz: vec2<f32>) -> f32 {
+    let scale = 0.48;
+    let fx = xz.x / scale;
+    let fz = xz.y / scale;
+    let ix = floor(fx);
+    let iz = floor(fz);
+    var best = 1e9;
+    var second = 1e9;
+    for (var dj: i32 = -1; dj <= 1; dj++) {
+        for (var di: i32 = -1; di <= 1; di++) {
+            let gx = ix + f32(di);
+            let gz = iz + f32(dj);
+            let jx = hash12(vec2<f32>(gx, gz)) - 0.5;
+            let jz = hash12(vec2<f32>(gx + 4.2, gz + 1.7)) - 0.5;
+            let cx = gx + 0.5 + jx * 0.8;
+            let cz = gz + 0.5 + jz * 0.8;
+            let d = length(vec2<f32>(fx - cx, fz - cz));
+            if (d < best) {
+                second = best;
+                best = d;
+            } else if (d < second) {
+                second = d;
+            }
+        }
+    }
+    return max(second - best, 0.0);
+}
+
 fn cell_center(ij: vec2<i32>) -> vec2<f32> {
     let cell = max(frame.params.z, 1e-4);
     let half = cell * frame.params.w * 0.5;
@@ -661,9 +703,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let wet = mat.r;
     let water = mat.g * 0.34;
     let darken = mat.b;
-    // Thickness and opening stay on the export. A zero weight does not retint.
-    let crust_px = crust_at(vec2<i32>(in.ij));
-    let crust_keep = (crust_px.r + crust_px.g) * 0.0;
+    // Exported skin, metres. Zero where the pad has not baked.
+    let crust_rg = crust_bilinear(xz);
+    let thickness = crust_rg.x * 0.04;
 
     let uv0 = xz / 3.2;
     let uv1 = xz / 2.7;
@@ -741,6 +783,19 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         albedo = albedo * vec3<f32>(0.98, 0.94, 0.82);
         albedo = mix(albedo, albedo * vec3<f32>(0.52, 0.48, 0.42), smoothstep(0.2, 0.85, wet));
     }
+    // Where the skin is still growing, blend the two maps already on the
+    // ground. A hard kind edge was a tile. Full wet and full crust stay
+    // on the branches above.
+    let skin = smoothstep(0.006, 0.028, thickness);
+    let clay = kind == 3u || kind == 4u || kind == 5u || kind == 9u || kind == 6u || kind == 7u || kind == 8u;
+    if (clay && skin > 0.04 && skin < 0.96) {
+        let wet_tex = textureSample(ground_diff, ground_samp, uv0, 0).rgb;
+        let dry_tex = textureSample(ground_diff, ground_samp, uv1, 1).rgb;
+        let wet_c = wet_tex * mix(vec3<f32>(1.0), vec3<f32>(0.66, 0.58, 0.48), 0.55);
+        var dry_c = dry_tex;
+        dry_c = mix(dry_c, dry_c * vec3<f32>(1.22, 1.1, 0.9), 0.7);
+        albedo = mix(wet_c, dry_c, skin);
+    }
 
     let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
     let drowned = smoothstep(0.012, 0.05, water);
@@ -775,7 +830,29 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let k = clamp(-lug_h / 0.045, 0.0, 1.0);
         albedo *= mix(1.0, 0.52, k);
     }
-    albedo = albedo * (1.0 + crust_keep);
+    // Shrinkage opening. Width is the solver's centimetre fissure. The
+    // interior is the mud already bound, shadowed the way a lug void is.
+    if (thickness > 0.008) {
+        let gap = crack_gap(xz);
+        let mask = clamp(1.0 - gap / 0.11, 0.0, 1.0);
+        let skin_m = clamp((thickness - 0.008) / 0.028, 0.0, 1.0);
+        let plate = mix(0.45, 1.0, skin_m);
+        let opening = 0.016 * skin_m * mask * plate;
+        let dist = gap * 0.24;
+        let half = opening * 0.5;
+        if (mask > 0.12 && half > 0.0025 && dist < half) {
+            let u = clamp(dist / half, 0.0, 1.0);
+            let gx = crack_gap(xz + vec2<f32>(0.004, 0.0)) - crack_gap(xz - vec2<f32>(0.004, 0.0));
+            let gz = crack_gap(xz + vec2<f32>(0.0, 0.004)) - crack_gap(xz - vec2<f32>(0.0, 0.004));
+            let side = normalize(vec2<f32>(gx, gz) + vec2<f32>(1e-4, 0.0));
+            n = normalize(n + vec3<f32>(-side.x, -0.05, -side.y) * mix(4.4, 0.35, u));
+            let mud = textureSampleLevel(ground_diff, ground_samp, uv0, 0, 0.0).rgb;
+            // The whole centimetre stays open. Only the lip fades back to the plate.
+            albedo = mix(albedo, mud, 1.0 - smoothstep(0.78, 1.0, u));
+            albedo *= mix(0.30, 1.0, smoothstep(0.7, 1.0, u));
+            rough_out = max(rough_out, 0.94);
+        }
+    }
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
     // The sun sits low, so a tight Phong highlight misses this camera.
     // A wide lobe on the shore is the wet sheen. Inside the cut it stays small

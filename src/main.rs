@@ -2677,15 +2677,16 @@ fn capture_drying_crust(renderer: &mut Renderer, parsed: &CaptureArgs) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn drying_crust_camera(world: &World) -> CameraPose {
-    // West tracks stay wet. The Niva sits on the crusted pair to the east.
-    // High enough that the ortho window lands on the pad, not the clear color.
-    let ground = world.soil.sample(0.4, 0.1).height;
-    let look = Vec3::new(0.40, ground + 0.22, 0.15);
-    let eye = Vec3::new(-2.2, ground + 3.2, -5.8);
+    // Close on the rear wheel. A centimetre fissure is several pixels.
+    // Wetter clay of the same pad sits in the frame. The ortho window
+    // stays on the ground.
+    let ground = world.soil.sample(1.15, -1.2).height;
+    let look = Vec3::new(1.20, ground + 0.10, -1.20);
+    let eye = Vec3::new(0.15, ground + 0.78, -2.05);
     CameraPose {
         eye,
         target: look,
-        ortho_width: Some(8.2),
+        ortho_width: Some(1.85),
     }
 }
 
