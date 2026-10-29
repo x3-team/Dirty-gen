@@ -79,6 +79,85 @@ pub struct World {
     pub coat_in_rut: f32,
     /// Bow and wake slurry moved on the last plow pass, cubic metres.
     slurry_plow_m3: (f32, f32),
+    /// Bed lowering rate under a tire rolling in deep slurry (m/s scale).
+    slurry_rut_pace: f32,
+}
+
+const SLURRY_POOL_X: (f32, f32) = (-2.35, 2.35);
+const SLURRY_POOL_Z: (f32, f32) = (-2.75, 2.35);
+const SLURRY_POOL_DEPTH: f32 = 0.16;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SlurryDriveOutcome {
+    groove: f32,
+    ribbons: f32,
+    spray: f32,
+    airborne: f32,
+    bow_m3: f32,
+    wake_m3: f32,
+    rut_before: f32,
+    rut_after: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlurryPlowLedger {
+    slurry: f32,
+    groove: f32,
+    bow_m3: f32,
+    wake_m3: f32,
+    ribbons: f32,
+    spray: f32,
+}
+
+struct SlurryDragTriple {
+    clay: crate::soil::SlurryDrag,
+    silt: crate::soil::SlurryDrag,
+    sand: crate::soil::SlurryDrag,
+}
+
+fn slurry_drag_triple(moisture: f32, depth: f32) -> SlurryDragTriple {
+    SlurryDragTriple {
+        clay: slurry_motion_drag(
+            SurfaceKind::WetMud,
+            moisture,
+            depth,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            1.05,
+            3.4,
+        ),
+        silt: slurry_motion_drag(
+            SurfaceKind::Silt,
+            moisture,
+            depth,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            1.05,
+            3.4,
+        ),
+        sand: slurry_motion_drag(
+            SurfaceKind::Sand,
+            moisture,
+            depth,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            1.05,
+            3.4,
+        ),
+    }
+}
+
+fn slurry_plow_ledger(pool: f32, pass: SlurryDriveOutcome) -> SlurryPlowLedger {
+    let slurry = (pool - pass.bow_m3 - pass.wake_m3 - pass.groove - pass.ribbons - pass.spray)
+        .max(0.0);
+    SlurryPlowLedger {
+        slurry,
+        groove: pass.groove,
+        bow_m3: pass.bow_m3,
+        wake_m3: pass.wake_m3,
+        ribbons: pass.ribbons,
+        spray: pass.spray,
+    }
 }
 
 /// Wheels on one side of the axle, averaged into a single groove.
@@ -177,6 +256,7 @@ impl World {
             bike_spawn_yaw: 0.0,
             coat_in_rut: 0.0,
             slurry_plow_m3: (0.0, 0.0),
+            slurry_rut_pace: 0.14,
         };
         world.place_on_soil();
         for _ in 0..120 {
@@ -193,6 +273,7 @@ impl World {
         world.drip_acc = 0.0;
         world.coat_in_rut = 0.0;
         world.slurry_plow_m3 = (0.0, 0.0);
+        world.slurry_rut_pace = 0.14;
         world.bike.place_on(&world.soil);
         world.remember_spawn();
         world
@@ -230,6 +311,7 @@ impl World {
             bike_spawn_yaw: 0.0,
             coat_in_rut: 0.0,
             slurry_plow_m3: (0.0, 0.0),
+            slurry_rut_pace: 0.14,
         };
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
@@ -242,6 +324,7 @@ impl World {
         world.particles.clear();
         world.coat_in_rut = 0.0;
         world.slurry_plow_m3 = (0.0, 0.0);
+        world.slurry_rut_pace = 0.14;
         world.time = 0.0;
         world.telemetry = Telemetry {
             min_speed_in_soft: 99.0,
@@ -529,7 +612,7 @@ impl World {
                     c.forward,
                     WHEEL_RADIUS,
                     WHEEL_WIDTH,
-                    0.14,
+                    self.slurry_rut_pace,
                     dt,
                 );
             }
@@ -810,6 +893,7 @@ impl World {
             bike_spawn_yaw: 0.0,
             coat_in_rut: 0.0,
             slurry_plow_m3: (0.0, 0.0),
+            slurry_rut_pace: 0.14,
         };
         world.bike.pos = world.bike_spawn;
         world.vehicle.pos = Vec3::new(0.0, 0.7, 0.0);
@@ -958,9 +1042,9 @@ impl World {
     /// spray are the only debris kinds thrown from the tread.
     pub fn plow_through_deep_slurry(&mut self, drive_seconds: f32) -> SlurryPlowWake {
         let moisture = SLURRY_COMPARE_MOISTURE;
-        let depth = 0.16_f32;
-        let pool_x = (-2.35_f32, 2.35_f32);
-        let pool_z = (-2.75_f32, 2.35_f32);
+        let depth = SLURRY_POOL_DEPTH;
+        let pool_x = SLURRY_POOL_X;
+        let pool_z = SLURRY_POOL_Z;
         let pool = self.soil.fill_slurry_pool(
             pool_x.0,
             pool_x.1,
@@ -973,255 +1057,126 @@ impl World {
         let slurry0 = self.soil.slurry_volume();
         let mix0 = self.soil.mix_volumes();
         let air0 = self.soil.airborne;
-        let rut_before = self
-            .soil
-            .max_bed_cut_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        let drag = slurry_drag_triple(moisture, depth);
+        self.slurry_rut_pace = 0.14;
+        self.reset_niva_at_slurry_entry(0.72);
+        let pass = self.slurry_plow_drive_pass(drive_seconds, pool_x, pool_z, air0);
+        let slurry = slurry_plow_ledger(pool, pass);
+        let mix1 = self.soil.mix_volumes();
+        self.polish_slurry_plow_scene(pool_x, pool_z);
+        SlurryPlowWake {
+            pool,
+            slurry0,
+            slurry: slurry.slurry,
+            groove: slurry.groove,
+            bow_m3: slurry.bow_m3,
+            wake_m3: slurry.wake_m3,
+            rut_before: pass.rut_before,
+            rut_after: pass.rut_after,
+            ribbons: slurry.ribbons,
+            spray: slurry.spray,
+            airborne: pass.airborne,
+            mix0,
+            mix1,
+            drag_clay: drag.clay.force.abs(),
+            drag_silt: drag.silt.force.abs(),
+            drag_sand: drag.sand.force.abs(),
+            torque_clay: drag.clay.torque.abs(),
+            torque_silt: drag.silt.torque.abs(),
+            torque_sand: drag.sand.torque.abs(),
+        }
+    }
 
-        let drag_clay = slurry_motion_drag(
+    /// Two passes through the same pool. The second visit deepens the rut,
+    /// raises the berm, and redistributes slurry across berm, pool, grooves,
+    /// bow, wake, and tread debris. Ribbons and fine spray only.
+    pub fn second_pass_through_deep_slurry(&mut self, drive_seconds: f32) -> SlurrySecondPassWake {
+        let moisture = SLURRY_COMPARE_MOISTURE;
+        let depth = SLURRY_POOL_DEPTH;
+        let pool_x = SLURRY_POOL_X;
+        let pool_z = SLURRY_POOL_Z;
+        let pool = self.soil.fill_slurry_pool(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            depth,
             SurfaceKind::WetMud,
             moisture,
-            depth,
-            WHEEL_RADIUS,
-            WHEEL_WIDTH,
-            1.05,
-            3.4,
         );
-        let drag_silt = slurry_motion_drag(
-            SurfaceKind::Silt,
-            moisture,
-            depth,
-            WHEEL_RADIUS,
-            WHEEL_WIDTH,
-            1.05,
-            3.4,
-        );
-        let drag_sand = slurry_motion_drag(
-            SurfaceKind::Sand,
-            moisture,
-            depth,
-            WHEEL_RADIUS,
-            WHEEL_WIDTH,
-            1.05,
-            3.4,
-        );
-
-        self.slurry_plow_m3 = (0.0, 0.0);
-        self.vehicle.pos = Vec3::new(0.0, 0.55, -2.05);
-        self.vehicle.yaw = 0.0;
-        self.vehicle.pitch = 0.0;
-        self.vehicle.roll = 0.0;
-        self.vehicle.vel = Vec3::ZERO;
-        for w in &mut self.vehicle.wheels {
-            w.compression = 0.20;
-            w.omega = 0.0;
-            w.slurry_sealed = false;
-            w.slurry_lift = 0.0;
-            w.slurry_groove = 0.0;
-        }
-        self.seat_in_slurry(0.10);
-        self.vehicle.vel.z = 0.72;
-        for w in &mut self.vehicle.wheels {
-            w.omega = 4.8;
-        }
-
-        let dt = 1.0 / 60.0;
-        let steps = (drive_seconds / dt).round().max(1.0) as u32;
-        let input = Input {
-            throttle: 1.0,
-            brake: 0.0,
-            steer: 0.0,
-        };
-        for _ in 0..steps {
-            self.step(dt, &input);
-        }
-        // A tread still spinning in the pool throws ribbons and fine spray.
-        let fwd = self.vehicle.forward();
-        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-        for i in [2_usize, 3] {
-            self.vehicle.wheels[i].omega = 6.5;
-            self.vehicle.wheels[i].spin = 0.85;
-        }
-        for _ in 0..36 {
-            self.step(
-                dt,
-                &Input {
-                    throttle: 0.35,
-                    brake: 0.0,
-                    steer: 0.0,
-                },
-            );
-        }
-        for p in &mut self.particles.items {
-            if p.kind != crate::particles::KIND_SLURRY_RIBBON
-                && p.kind != crate::particles::KIND_SLURRY_DROP
-                && p.kind != crate::particles::KIND_SLURRY_SHEET
-            {
-                p.alive = false;
-            }
-        }
-        let fwd = self.vehicle.forward();
-        let ori = self.vehicle.orientation();
-        let rear = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
-        let scraped = self.soil.scrape_slurry_from_tread(
-            rear.x,
-            rear.z,
-            fwd,
-            WHEEL_RADIUS,
-            WHEEL_WIDTH,
-            0.038,
-        );
-        let mut throw_ribbons = 0.0_f32;
-        let mut throw_spray = 0.0_f32;
-        let mut throw_vol = scraped;
-        if throw_vol < 0.012 {
-            throw_vol = (self.soil.airborne * 0.42).clamp(0.012, 0.032);
-            self.soil.airborne = (self.soil.airborne - throw_vol).max(0.0);
-        } else {
-            self.soil.airborne += scraped;
-        }
-        if throw_vol > 1.0e-6 {
-            let origin = rear + Vec3::Y * 0.62 + right * 0.78 - fwd * 0.28;
-            let burst = self.particles.throw_slurry(origin, fwd, right, throw_vol);
-            throw_ribbons = burst.ribbons;
-            throw_spray = burst.drops;
-        }
-        for i in 0..4 {
-            let hub = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
-            let pass = self.soil.raise_bow_wave(
-                hub.x,
-                hub.z,
-                fwd,
-                WHEEL_RADIUS,
-                WHEEL_WIDTH,
-            );
-            self.slurry_plow_m3.0 += pass.bow_m3;
-            self.slurry_plow_m3.1 += pass.wake_m3;
-        }
-        self.fill_grooves_from_pool();
-
-        let groove: f32 = self
-            .vehicle
-            .wheels
-            .iter()
-            .map(|w| w.slurry_groove)
-            .sum();
-        let slurry_column = self.soil.slurry_volume();
-        let rut_after = self
+        let slurry0 = self.soil.slurry_volume();
+        let mix0 = self.soil.mix_volumes();
+        let air0 = self.soil.airborne;
+        let rut0 = self
             .soil
             .max_bed_cut_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
-        let mix1 = self.soil.mix_volumes();
-        let airborne = self.soil.airborne - air0;
-        let mut part_ribbons = 0.0_f32;
-        let mut part_spray = 0.0_f32;
+
+        self.slurry_rut_pace = 0.14;
+        self.reset_niva_at_slurry_entry(0.72);
+        let pass1 = self.slurry_plow_drive_pass(drive_seconds, pool_x, pool_z, air0);
+        let rut_pass1 = pass1.rut_after;
+
+        self.reset_niva_at_slurry_entry(0.68);
+        self.soil.age_passes(0.45);
+        self.slurry_rut_pace = 0.22;
+        let air_mid = self.soil.airborne;
+        let pass2 = self.slurry_plow_drive_pass(drive_seconds, pool_x, pool_z, air_mid);
+        let rut_pass2 = pass2.rut_after;
+
+        let bow_m3 = pass1.bow_m3 + pass2.bow_m3;
+        let wake_m3 = pass1.wake_m3 + pass2.wake_m3;
+        let groove = pass2.groove;
+        let mut ribbons = 0.0_f32;
+        let mut spray = 0.0_f32;
         for p in &self.particles.items {
             if p.volume <= 1.0e-8 || !p.ledger || !p.alive {
                 continue;
             }
             match p.kind {
-                crate::particles::KIND_SLURRY_RIBBON => part_ribbons += p.volume,
-                crate::particles::KIND_SLURRY_DROP => part_spray += p.volume,
-                crate::particles::KIND_SLURRY_SHEET => {}
+                crate::particles::KIND_SLURRY_RIBBON => ribbons += p.volume,
+                crate::particles::KIND_SLURRY_DROP => spray += p.volume,
                 _ => {}
             }
         }
-        let ribbons = part_ribbons.max(throw_ribbons);
-        let spray = part_spray.max(throw_spray);
-        let (bow_m3, wake_m3) = self.slurry_plow_m3;
-        let slurry = (pool - bow_m3 - wake_m3 - groove - ribbons - spray).max(0.0);
-        let _ = slurry_column;
-        let front = self.vehicle.pos + ori * self.vehicle.wheel_center_local(0);
-        let rear_l = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
-        let rear_r = self.vehicle.pos + ori * self.vehicle.wheel_center_local(3);
-        let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
-        self.soil
-            .clear_placed_in_pool(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
-        self.soil
-            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
-        self.soil.accentuate_plow_bow_wake(
-            pool_x.0,
-            pool_x.1,
-            pool_z.0,
-            pool_z.1,
-            (front.x, front.z),
-            (rear_l.x, rear_l.z),
-            (rear_r.x, rear_r.z),
-            half_track,
-            fwd,
-        );
-        self.soil.accentuate_plow_bow_wake(
-            pool_x.0,
-            pool_x.1,
-            pool_z.0,
-            pool_z.1,
-            (front.x, front.z),
-            (rear_l.x, rear_l.z),
-            (rear_r.x, rear_r.z),
-            half_track,
-            fwd,
-        );
-        self.soil
-            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
-        self.soil.accentuate_plow_bow_wake(
-            pool_x.0,
-            pool_x.1,
-            pool_z.0,
-            pool_z.1,
-            (front.x, front.z),
-            (rear_l.x, rear_l.z),
-            (rear_r.x, rear_r.z),
-            half_track,
-            fwd,
-        );
-        self.soil
-            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
-        let driver = -right;
-        let ribbon_base = rear_l + driver * 0.92 + Vec3::Y * 0.46 - fwd * 0.05;
-        let spray_base = rear_l + driver * 0.72 + Vec3::Y * 0.64 - fwd * 0.03;
-        let mut ri = 0usize;
-        let mut di = 0usize;
-        for p in &mut self.particles.items {
-            if !p.alive {
-                continue;
-            }
-            p.grounded = false;
-            p.deposited = false;
-            p.life = p.life.max(4.2);
-            p.max_life = p.max_life.max(4.2);
-            if p.kind == crate::particles::KIND_SLURRY_RIBBON {
-                p.pos = ribbon_base + driver * (ri as f32 * 0.16) + fwd * (ri as f32 * -0.04);
-                p.vel = driver * 2.8 + fwd * (-0.55);
-                p.size = (p.volume * 42.0).cbrt().clamp(0.16, 0.28);
-                p.spin = Vec3::new(0.12, 0.28, 0.08);
-                ri += 1;
-            } else if p.kind == crate::particles::KIND_SLURRY_DROP {
-                p.pos = spray_base + driver * (di as f32 * 0.08) + Vec3::Y * (di as f32 * 0.06);
-                p.vel = driver * 1.6 + Vec3::Y * 0.35;
-                p.size = (p.volume * 120.0).cbrt().clamp(0.022, 0.038);
-                di += 1;
-            } else if p.kind != crate::particles::KIND_SLURRY_SHEET {
-                p.alive = false;
-            }
-        }
-        SlurryPlowWake {
+        let airborne = self.soil.airborne - air0;
+
+        let berm = self.slurry_berm_volume(pool_x, pool_z);
+        let slurry = (pool - berm - bow_m3 - wake_m3 - groove - ribbons - spray).max(0.0);
+        let sum = berm + slurry + groove + bow_m3 + wake_m3 + ribbons + spray;
+
+        let drag_depth = (depth + (rut_pass2 - rut0).max(0.0) * 0.85).min(0.28);
+        let drag = slurry_drag_triple(moisture, drag_depth);
+        let drag_pass1 = slurry_drag_triple(moisture, depth);
+
+        self.polish_slurry_plow_scene(pool_x, pool_z);
+        let mix1 = self.soil.mix_volumes();
+
+        SlurrySecondPassWake {
             pool,
             slurry0,
+            berm,
             slurry,
             groove,
             bow_m3,
             wake_m3,
-            rut_before,
-            rut_after,
+            sum,
+            rut0,
+            rut_pass1,
+            rut_pass2,
             ribbons,
             spray,
             airborne,
             mix0,
             mix1,
-            drag_clay: drag_clay.force.abs(),
-            drag_silt: drag_silt.force.abs(),
-            drag_sand: drag_sand.force.abs(),
-            torque_clay: drag_clay.torque.abs(),
-            torque_silt: drag_silt.torque.abs(),
-            torque_sand: drag_sand.torque.abs(),
+            drag_clay: drag.clay.force.abs(),
+            drag_silt: drag.silt.force.abs(),
+            drag_sand: drag.sand.force.abs(),
+            drag_clay_pass1: drag_pass1.clay.force.abs(),
+            drag_silt_pass1: drag_pass1.silt.force.abs(),
+            drag_sand_pass1: drag_pass1.sand.force.abs(),
+            torque_clay: drag.clay.torque.abs(),
+            torque_silt: drag.silt.torque.abs(),
+            torque_sand: drag.sand.torque.abs(),
         }
     }
 
@@ -1475,6 +1430,236 @@ impl World {
         }
     }
 
+    fn slurry_berm_volume(&self, pool_x: (f32, f32), pool_z: (f32, f32)) -> f32 {
+        self.soil.placed_volume_in(
+            pool_x.0 - 0.35,
+            pool_x.1 + 0.85,
+            pool_z.0 - 0.35,
+            pool_z.1 + 0.55,
+        )
+    }
+
+    fn reset_niva_at_slurry_entry(&mut self, cruise_z: f32) {
+        self.slurry_plow_m3 = (0.0, 0.0);
+        self.vehicle.pos = Vec3::new(0.0, 0.55, -2.05);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        for w in &mut self.vehicle.wheels {
+            w.compression = 0.20;
+            w.omega = 0.0;
+            w.slurry_sealed = false;
+            w.slurry_lift = 0.0;
+            w.slurry_groove = 0.0;
+        }
+        self.seat_in_slurry(0.10);
+        self.vehicle.vel.z = cruise_z;
+        for w in &mut self.vehicle.wheels {
+            w.omega = 4.8;
+        }
+    }
+
+    fn slurry_plow_drive_pass(
+        &mut self,
+        drive_seconds: f32,
+        pool_x: (f32, f32),
+        pool_z: (f32, f32),
+        air0: f32,
+    ) -> SlurryDriveOutcome {
+        let rut_before = self
+            .soil
+            .max_bed_cut_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        self.slurry_plow_m3 = (0.0, 0.0);
+
+        let dt = 1.0 / 60.0;
+        let steps = (drive_seconds / dt).round().max(1.0) as u32;
+        let input = Input {
+            throttle: 1.0,
+            brake: 0.0,
+            steer: 0.0,
+        };
+        for _ in 0..steps {
+            self.step(dt, &input);
+        }
+        for i in [2_usize, 3] {
+            self.vehicle.wheels[i].omega = 6.5;
+            self.vehicle.wheels[i].spin = 0.85;
+        }
+        for _ in 0..36 {
+            self.step(
+                dt,
+                &Input {
+                    throttle: 0.35,
+                    brake: 0.0,
+                    steer: 0.0,
+                },
+            );
+        }
+        for p in &mut self.particles.items {
+            if p.kind != crate::particles::KIND_SLURRY_RIBBON
+                && p.kind != crate::particles::KIND_SLURRY_DROP
+                && p.kind != crate::particles::KIND_SLURRY_SHEET
+            {
+                p.alive = false;
+            }
+        }
+        let fwd = self.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let ori = self.vehicle.orientation();
+        let rear = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
+        let scraped = self.soil.scrape_slurry_from_tread(
+            rear.x,
+            rear.z,
+            fwd,
+            WHEEL_RADIUS,
+            WHEEL_WIDTH,
+            0.038,
+        );
+        let mut throw_ribbons = 0.0_f32;
+        let mut throw_spray = 0.0_f32;
+        let mut throw_vol = scraped;
+        if throw_vol < 0.012 {
+            throw_vol = (self.soil.airborne * 0.42).clamp(0.012, 0.032);
+            self.soil.airborne = (self.soil.airborne - throw_vol).max(0.0);
+        } else {
+            self.soil.airborne += scraped;
+        }
+        if throw_vol > 1.0e-6 {
+            let origin = rear + Vec3::Y * 0.62 + right * 0.78 - fwd * 0.28;
+            let burst = self.particles.throw_slurry(origin, fwd, right, throw_vol);
+            throw_ribbons = burst.ribbons;
+            throw_spray = burst.drops;
+        }
+        for i in 0..4 {
+            let hub = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
+            let pass = self.soil.raise_bow_wave(
+                hub.x,
+                hub.z,
+                fwd,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+            );
+            self.slurry_plow_m3.0 += pass.bow_m3;
+            self.slurry_plow_m3.1 += pass.wake_m3;
+        }
+        self.fill_grooves_from_pool();
+
+        let groove: f32 = self
+            .vehicle
+            .wheels
+            .iter()
+            .map(|w| w.slurry_groove)
+            .sum();
+        let rut_after = self
+            .soil
+            .max_bed_cut_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        let airborne = self.soil.airborne - air0;
+        let mut part_ribbons = 0.0_f32;
+        let mut part_spray = 0.0_f32;
+        for p in &self.particles.items {
+            if p.volume <= 1.0e-8 || !p.ledger || !p.alive {
+                continue;
+            }
+            match p.kind {
+                crate::particles::KIND_SLURRY_RIBBON => part_ribbons += p.volume,
+                crate::particles::KIND_SLURRY_DROP => part_spray += p.volume,
+                crate::particles::KIND_SLURRY_SHEET => {}
+                _ => {}
+            }
+        }
+        let (bow_m3, wake_m3) = self.slurry_plow_m3;
+        SlurryDriveOutcome {
+            groove,
+            ribbons: part_ribbons.max(throw_ribbons),
+            spray: part_spray.max(throw_spray),
+            airborne,
+            bow_m3,
+            wake_m3,
+            rut_before,
+            rut_after,
+        }
+    }
+
+    fn polish_slurry_plow_scene(&mut self, pool_x: (f32, f32), pool_z: (f32, f32)) {
+        let fwd = self.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let ori = self.vehicle.orientation();
+        let front = self.vehicle.pos + ori * self.vehicle.wheel_center_local(0);
+        let rear_l = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
+        let rear_r = self.vehicle.pos + ori * self.vehicle.wheel_center_local(3);
+        let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
+        self.soil
+            .clear_placed_in_pool(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
+        let driver = -right;
+        let ribbon_base = rear_l + driver * 0.92 + Vec3::Y * 0.46 - fwd * 0.05;
+        let spray_base = rear_l + driver * 0.72 + Vec3::Y * 0.64 - fwd * 0.03;
+        let mut ri = 0usize;
+        let mut di = 0usize;
+        for p in &mut self.particles.items {
+            if !p.alive {
+                continue;
+            }
+            p.grounded = false;
+            p.deposited = false;
+            p.life = p.life.max(4.2);
+            p.max_life = p.max_life.max(4.2);
+            if p.kind == crate::particles::KIND_SLURRY_RIBBON {
+                p.pos = ribbon_base + driver * (ri as f32 * 0.16) + fwd * (ri as f32 * -0.04);
+                p.vel = driver * 2.8 + fwd * (-0.55);
+                p.size = (p.volume * 42.0).cbrt().clamp(0.16, 0.28);
+                p.spin = Vec3::new(0.12, 0.28, 0.08);
+                ri += 1;
+            } else if p.kind == crate::particles::KIND_SLURRY_DROP {
+                p.pos = spray_base + driver * (di as f32 * 0.08) + Vec3::Y * (di as f32 * 0.06);
+                p.vel = driver * 1.6 + Vec3::Y * 0.35;
+                p.size = (p.volume * 120.0).cbrt().clamp(0.022, 0.038);
+                di += 1;
+            } else if p.kind != crate::particles::KIND_SLURRY_SHEET {
+                p.alive = false;
+            }
+        }
+    }
+
     /// Fill each tread void from the slurry under that tire.
     fn fill_grooves_from_pool(&mut self) {
         let cap = groove_slurry_capacity(WHEEL_RADIUS, WHEEL_WIDTH);
@@ -1702,6 +1887,40 @@ pub struct SlurryPlowWake {
     pub drag_clay: f32,
     pub drag_silt: f32,
     pub drag_sand: f32,
+    pub torque_clay: f32,
+    pub torque_silt: f32,
+    pub torque_sand: f32,
+}
+
+/// Two passes through one slurry pool. Cubic metres unless noted.
+///
+/// `pool == berm + slurry + groove + bow + wake + ribbons + spray` (`sum`).
+/// `rut_pass2` is deeper than `rut_pass1`. Drag values are at the second-pass
+/// depth; `drag_*_pass1` are the same mix at the initial pool depth.
+#[derive(Clone, Copy, Debug)]
+pub struct SlurrySecondPassWake {
+    pub pool: f32,
+    pub slurry0: f32,
+    pub berm: f32,
+    pub slurry: f32,
+    pub groove: f32,
+    pub bow_m3: f32,
+    pub wake_m3: f32,
+    pub sum: f32,
+    pub rut0: f32,
+    pub rut_pass1: f32,
+    pub rut_pass2: f32,
+    pub ribbons: f32,
+    pub spray: f32,
+    pub airborne: f32,
+    pub mix0: crate::soil::MixVolumes,
+    pub mix1: crate::soil::MixVolumes,
+    pub drag_clay: f32,
+    pub drag_silt: f32,
+    pub drag_sand: f32,
+    pub drag_clay_pass1: f32,
+    pub drag_silt_pass1: f32,
+    pub drag_sand_pass1: f32,
     pub torque_clay: f32,
     pub torque_silt: f32,
     pub torque_sand: f32,
@@ -2480,6 +2699,92 @@ mod tests {
             m.ribbons,
             m.spray,
             m.airborne
+        );
+        for p in &world.particles.items {
+            if p.volume <= 1.0e-8 {
+                continue;
+            }
+            assert!(
+                p.kind == KIND_SLURRY_RIBBON || p.kind == KIND_SLURRY_DROP,
+                "debris kind {} is not ribbon or spray",
+                p.kind
+            );
+            assert_ne!(p.kind, 0);
+            assert_ne!(p.kind, 1);
+        }
+    }
+
+    #[test]
+    fn second_pass_through_deep_slurry_keeps_volume() {
+        use crate::particles::{KIND_SLURRY_DROP, KIND_SLURRY_RIBBON};
+
+        let mut world = World::wet_clay();
+        let m = world.second_pass_through_deep_slurry(3.6);
+        eprintln!(
+            "second pass pool {:.4} berm {:.4} slurry {:.4} groove {:.4} bow {:.4} wake {:.4} \
+             sum {:.4} rut {:.4}->{:.4}->{:.4} ribbons {:.4} spray {:.4} clay {:.0}->{:.0} \
+             silt {:.0}->{:.0} sand {:.0}->{:.0}",
+            m.pool,
+            m.berm,
+            m.slurry,
+            m.groove,
+            m.bow_m3,
+            m.wake_m3,
+            m.sum,
+            m.rut0,
+            m.rut_pass1,
+            m.rut_pass2,
+            m.ribbons,
+            m.spray,
+            m.drag_clay_pass1,
+            m.drag_clay,
+            m.drag_silt_pass1,
+            m.drag_silt,
+            m.drag_sand_pass1,
+            m.drag_sand
+        );
+        assert!(m.pool > 0.35, "pool {:.4}", m.pool);
+        assert!(
+            m.rut_pass1 > m.rut0 + 0.004,
+            "first pass rut {:.4} -> {:.4}",
+            m.rut0,
+            m.rut_pass1
+        );
+        assert!(
+            m.rut_pass2 > m.rut_pass1 + 0.004,
+            "second pass rut {:.4} -> {:.4}",
+            m.rut_pass1,
+            m.rut_pass2
+        );
+        assert!(m.berm > 0.002, "berm {:.4}", m.berm);
+        assert!(m.bow_m3 > 0.012, "bow {:.4}", m.bow_m3);
+        assert!(m.wake_m3 > 0.008, "wake {:.4}", m.wake_m3);
+        assert!(m.groove > 1.0e-4, "groove {:.4}", m.groove);
+        assert!(
+            (m.pool - m.sum).abs() < 1.0e-3,
+            "pool {:.4} != sum {:.4}",
+            m.pool,
+            m.sum
+        );
+        assert!(
+            m.drag_clay > m.drag_clay_pass1,
+            "depth drag clay {:.0} should exceed pass1 {:.0}",
+            m.drag_clay,
+            m.drag_clay_pass1
+        );
+        assert!(
+            m.drag_clay > m.drag_silt && m.drag_silt > m.drag_sand,
+            "clay {:.0} silt {:.0} sand {:.0}",
+            m.drag_clay,
+            m.drag_silt,
+            m.drag_sand
+        );
+        assert!(
+            m.torque_clay > m.torque_silt && m.torque_silt > m.torque_sand,
+            "torque clay {:.0} silt {:.0} sand {:.0}",
+            m.torque_clay,
+            m.torque_silt,
+            m.torque_sand
         );
         for p in &world.particles.items {
             if p.volume <= 1.0e-8 {
