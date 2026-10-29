@@ -2409,26 +2409,23 @@ impl World {
         let ori = self.vehicle.orientation();
         let fwd = self.vehicle.forward();
         let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-        // Off the sheet metal. Each film leaves an arch and falls back into the ford.
+        // Films sit in the wheel opening and fall out of the arch. They do not
+        // float beside the doors.
         let mut drain_pts: Vec<(Vec3, Vec3)> = Vec::new();
         for i in 0..4 {
             let local = self.vehicle.wheel_center_local(i);
             let hub = self.vehicle.pos + ori * local;
             let out = if local.x >= 0.0 { 1.0 } else { -1.0 };
-            let x = hub.x + right.x * out * 0.58 - fwd.x * 0.62;
-            let z = hub.z - fwd.z * 0.62;
-            let ground = self.soil.sample(x, z).height;
-            let center = Vec3::new(x, ground + 0.44, z);
-            let vel = -fwd * 1.05 - Vec3::Y * 0.95 + right * out * 0.1;
-            drain_pts.push((center, vel));
-        }
-        for side in [-1.0_f32, 1.0] {
-            let x = self.vehicle.pos.x + right.x * side * 0.78 - fwd.x * 1.42;
-            let z = self.vehicle.pos.z - fwd.z * 1.42;
-            let ground = self.soil.sample(x, z).height;
-            let center = Vec3::new(x, ground + 0.36, z);
-            let vel = -fwd * 0.55 - Vec3::Y * 1.35 + right * side * 0.08;
-            drain_pts.push((center, vel));
+            let streams = if i >= 2 { 3 } else { 1 };
+            for k in 0..streams {
+                let across = (k as f32 - (streams - 1) as f32 * 0.5) * 0.08;
+                let x = hub.x + right.x * (out * 0.05 + across);
+                let z = hub.z - fwd.z * 0.44;
+                let ground = self.soil.sample(x, z).height;
+                let center = Vec3::new(x, ground + 0.06, z);
+                let vel = -fwd * 1.5 + right * across * 0.45 - Vec3::Y * 0.12;
+                drain_pts.push((center, vel));
+            }
         }
         if drain > 1.0e-8 && !drain_pts.is_empty() {
             let share = drain / drain_pts.len() as f32;
@@ -2437,23 +2434,20 @@ impl World {
                     .spawn_water_sheet(pos, vel, share, KIND_WATER_DRAIN);
             }
         }
+        // Fine ribbons off the rear tread only, trailing back over the ford.
         let mut spray_pts: Vec<(Vec3, Vec3)> = Vec::new();
-        for i in 0..4 {
+        for i in 2..4 {
             let local = self.vehicle.wheel_center_local(i);
             let hub = self.vehicle.pos + ori * local;
             let out = if local.x >= 0.0 { 1.0 } else { -1.0 };
-            let n = if i >= 2 { 2 } else { 1 };
-            for k in 0..n {
-                // Clear of the carcass. A small lateral component keeps the
-                // face toward a side camera; the throw itself is aft.
-                let back = if i >= 2 { 1.05 + k as f32 * 0.38 } else { 0.70 };
-                let lat = if i >= 2 { 0.42 + k as f32 * 0.18 } else { 0.62 };
-                let up = if i >= 2 { 0.58 + k as f32 * 0.28 } else { 0.64 };
-                let x = hub.x - fwd.x * back + right.x * out * lat;
-                let z = hub.z - fwd.z * back + right.z * out * lat;
+            for k in 0..5 {
+                let fan = (k as f32 - 2.0) * 0.14;
+                let back = 0.70 + k as f32 * 0.045;
+                let x = hub.x + right.x * (out * 0.02 + fan) - fwd.x * back;
+                let z = hub.z - fwd.z * back;
                 let ground = self.soil.sample(x, z).height;
-                let center = Vec3::new(x, ground + up, z);
-                let vel = -fwd * 1.7 + right * out * 0.16 + Vec3::Y * (0.22 + k as f32 * 0.16);
+                let center = Vec3::new(x, ground + 0.055, z);
+                let vel = -fwd * 1.7 + right * fan - Vec3::Y * 0.04;
                 spray_pts.push((center, vel));
             }
         }

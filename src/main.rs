@@ -2604,14 +2604,14 @@ fn ford_exit_camera(world: &World) -> CameraPose {
     let vehicle = &world.vehicle;
     let fwd = vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-    // Low rear quarter, close. Water sits under the rear tires and the
-    // bank is ahead of the front wheels. Films stay large enough to read.
-    let look = vehicle.pos + fwd * 0.35 + Vec3::Y * 0.36;
-    let eye = vehicle.pos - right * 2.85 - fwd * 3.25 + Vec3::Y * 0.58;
+    // Side-rear, looking down. The ford is the dark surface under the rear
+    // tires. The bank is the ground under the front tires.
+    let look = vehicle.pos + fwd * 0.05 + Vec3::Y * 0.16;
+    let eye = vehicle.pos - right * 3.45 - fwd * 1.7 + Vec3::Y * 1.72;
     CameraPose {
         eye,
         target: look,
-        ortho_width: Some(5.6),
+        ortho_width: Some(5.4),
     }
 }
 

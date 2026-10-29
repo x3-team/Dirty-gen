@@ -1199,8 +1199,8 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
     } else if (panel < 47.5) {
-        // Exit film. The ford sheet's brown, on the strip the solver threw.
-        return vec4<f32>(vec3<f32>(0.20, 0.085, 0.030), 0.14);
+        // Exit film. Ford brown, matte enough that the sun does not turn it tan.
+        return vec4<f32>(vec3<f32>(0.11, 0.044, 0.016), 0.55);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
