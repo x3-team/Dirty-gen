@@ -961,18 +961,18 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let solved = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
     // A bowl is a cut, and the groove path opens that cut. The ford sheet is
     // the free surface, so the crest stays a surface instead of a tint.
-    let shore_fade = smoothstep(0.001, 0.24, in.depth);
+    let shore_fade = smoothstep(0.003, 0.07, in.depth);
     let alpha = select(solved, shore_fade, free);
     if (free) {
-        // Shallow muddy water. The shore shows the bed. The bow catches a
-        // dull sheen. A near-black fill read as a pit.
-        let slope_amt = clamp((1.0 - nrm.y) * 3.2, 0.0, 1.0);
-        let deep = vec3<f32>(0.055, 0.034, 0.016);
-        let thin = bed * vec3<f32>(0.62, 0.48, 0.32);
-        let depth_mix = smoothstep(0.012, 0.07, in.depth);
+        // Dark water, soft at the rim. The bow face is the lighter slope.
+        // A bed-colored fill read as a flat tan disc.
+        let slope_amt = clamp((1.0 - nrm.y) * 6.0, 0.0, 1.0);
+        let deep = vec3<f32>(0.012, 0.028, 0.034);
+        let thin = vec3<f32>(0.04, 0.055, 0.052);
+        let depth_mix = smoothstep(0.02, 0.10, in.depth);
         col = mix(thin, deep, depth_mix);
-        col += vec3<f32>(0.16, 0.11, 0.06) * slope_amt;
-        col += vec3<f32>(0.14, 0.10, 0.05) * spec;
+        col += vec3<f32>(0.62, 0.52, 0.34) * slope_amt;
+        col += vec3<f32>(0.22, 0.18, 0.12) * spec;
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
@@ -1428,6 +1428,13 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let belly = smoothstep(0.2, -0.45, n.y);
         lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
     }
+    if (in.panel > 45.0 && in.panel < 46.0) {
+        let lip = smoothstep(0.40, 0.96, in.uv.y);
+        let body = vec3<f32>(0.025, 0.055, 0.060);
+        let shine = vec3<f32>(0.78, 0.68, 0.46);
+        let col = mix(body, shine, lip * lip);
+        return vec4<f32>(present(col).rgb, 1.0);
+    }
     if (in.panel > 46.5 && in.panel < 47.5) {
         let d = length(in.uv - vec2<f32>(0.5, 0.5));
         let soft = smoothstep(0.52, 0.0, d);
@@ -1439,7 +1446,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let sun = normalize(frame.sun_dir.xyz);
         let ndl = clamp(dot(normalize(in.nrm), sun), 0.0, 1.0);
         let film = in.panel > 47.15;
-        let strength = select(0.36, 0.40, film);
+        let strength = select(0.50, 0.18, film);
         let mapped_dust = present(col * (0.72 + 0.28 * ndl));
         return vec4<f32>(mapped_dust.rgb, soft * strength);
     }
@@ -1449,8 +1456,8 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
     if (in.panel > 48.5 && in.panel < 49.5) {
         let g = noise(in.world.xz * 4.0 + vec2<f32>(in.world.y * 2.0, 0.2));
-        let clay = mix(vec3<f32>(0.16, 0.055, 0.018), vec3<f32>(0.30, 0.11, 0.035), g);
-        let lit_rib = shade(in.world, in.nrm, clay, 0.22, vec3<f32>(0.10, 0.035, 0.012));
+        let clay = mix(vec3<f32>(0.07, 0.026, 0.010), vec3<f32>(0.13, 0.048, 0.016), g);
+        let lit_rib = shade(in.world, in.nrm, clay, 0.28, vec3<f32>(0.05, 0.018, 0.006));
         return vec4<f32>(present(lit_rib).rgb, 1.0);
     }
     let mapped = present(lit);

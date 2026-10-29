@@ -471,16 +471,17 @@ impl Particles {
         let n = count.clamp(1, 8);
         for i in 0..n {
             let side = if i % 2 == 0 { 1.0 } else { -1.0 };
-            let spread = 0.20 + (i as f32) * 0.04;
-            let vel = -forward * (1.1 + speed * 0.04)
-                + right * side * (2.4 + self.rnd() * 0.7)
-                + Vec3::Y * (1.5 + self.rnd() * 0.7);
-            let life = 0.32 + self.rnd() * 0.08;
+            let spread = 0.16 + (i as f32) * 0.07;
+            // Up and out, off the bow. A flat fleck on the water reads as a speck.
+            let vel = -forward * (0.35 + speed * 0.02)
+                + right * side * (1.9 + self.rnd() * 0.7)
+                + Vec3::Y * (3.6 + self.rnd() * 1.1);
+            let life = 0.36 + self.rnd() * 0.08;
             let pos = origin
                 + right * side * spread
-                + Vec3::Y * (0.32 + self.rnd() * 0.38)
-                - forward * self.rnd() * 0.08;
-            self.spawn(pos, vel, life, 0.05, 0);
+                + Vec3::Y * (0.28 + self.rnd() * 0.16)
+                - forward * self.rnd() * 0.04;
+            self.spawn(pos, vel, life, 0.11, 0);
         }
     }
 
@@ -493,16 +494,22 @@ impl Particles {
         }
     }
 
-    /// Ribbons off the body. Volume is only the mesh width. It is not soil.
-    pub fn visual_ribbons(&mut self, origin: Vec3, forward: Vec3, right: Vec3) {
-        for side in [1.0_f32, -1.0] {
-            // Sill height, just outside the body. Length runs outboard so the
-            // chase camera sees a strip, and the throw peels it backward.
-            let pos = origin + right * side * 0.98 + Vec3::Y * 0.02 - forward * 0.12;
-            let vel = right * side * 2.1 - forward * 0.85 + Vec3::Y * 0.35;
-            self.spawn(pos, vel, 0.7, 0.24, KIND_SLURRY_RIBBON);
+    /// Sheets leaving a tire or an arch. They hang down and back. They are not
+    /// planks through the door. Volume is only the mesh. It is not soil.
+    pub fn shed_wheel_ribbon(&mut self, origin: Vec3, forward: Vec3, right: Vec3, side: f32) {
+        let vel = -forward * 1.4 + Vec3::Y * -0.85 + right * side * 0.22;
+        for k in 0..2 {
+            let age = k as f32 * 0.16;
+            let pos = origin
+                + right * side * (0.06 + k as f32 * 0.04)
+                + Vec3::Y * (0.10 - k as f32 * 0.05)
+                - forward * (0.05 + age);
+            if pos.y < 0.12 {
+                continue;
+            }
+            self.spawn(pos, vel, 0.48, 0.24, KIND_SLURRY_RIBBON);
             if let Some(p) = self.items.last_mut() {
-                p.volume = 0.010;
+                p.volume = 0.016;
                 p.ledger = false;
             }
         }
