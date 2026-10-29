@@ -1093,10 +1093,10 @@ fn arch_film_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
     (dir, side, thin)
 }
 
-/// Tread ribbon. Long axis is the throw. The sheet lies flat, so a camera
-/// looking down on the ford sees a fine streak, not a standing board.
+/// Tread ribbon. Long axis is the throw. A little of the fall stays, so the
+/// ribbon leaves the tread instead of lying as a bar on the water.
 fn tread_ribbon_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
-    let mut dir = Vec3::new(vel.x, vel.y * 0.12, vel.z);
+    let mut dir = Vec3::new(vel.x, vel.y * 0.7, vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::new(0.0, 0.0, -1.0);
     }
@@ -1150,23 +1150,23 @@ fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
         add_open_sheet(
             mesh,
             p,
-            0.86,
-            0.088,
-            0.0020,
+            0.38,
+            0.034,
+            0.0015,
             PANEL_WATER_FILM,
             tread_ribbon_axes(p.vel),
-            0.20,
+            0.22,
         );
     } else {
         add_open_sheet(
             mesh,
             p,
-            0.58,
-            0.082,
+            0.36,
+            0.052,
             0.0020,
             PANEL_WATER_FILM,
             arch_film_axes(p.vel),
-            0.22,
+            0.30,
         );
     }
 }

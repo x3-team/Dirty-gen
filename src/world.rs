@@ -2575,20 +2575,24 @@ impl World {
         let ori = self.vehicle.orientation();
         let fwd = self.vehicle.forward();
         let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-        // Films leave the left arch and the sill, then lie on the wet ground.
-        // This camera sits on that side. A sheet on the dry bank reads as a
-        // board, so these stay in the ford, trailing back. Nothing on the centerline.
+        // Films fall out of the left arches. This camera faces that side.
+        // The sheet hangs in the opening and falls away. A sheet on the
+        // water reads as a bar.
         let mut drain_pts: Vec<(Vec3, Vec3)> = Vec::new();
-        let marks = [
-            (Vec3::new(-1.02, 0.0, -1.22), -fwd * 1.7 - Vec3::Y * 0.04 - right * 0.22),
-            (Vec3::new(-0.86, 0.0, -1.05), -fwd * 1.55 - Vec3::Y * 0.04 - right * 0.08),
-            (Vec3::new(-0.98, 0.0, -0.78), -fwd * 1.6 - Vec3::Y * 0.04 - right * 0.40),
-            (Vec3::new(-0.90, 0.0, -0.48), -fwd * 1.45 - Vec3::Y * 0.04 - right * 0.16),
-        ];
-        for (local, vel) in marks {
-            let p = self.vehicle.pos + ori * local;
-            let ground = self.soil.sample(p.x, p.z).height;
-            drain_pts.push((Vec3::new(p.x, ground + 0.012, p.z), vel));
+        for i in [2usize, 2, 0, 0] {
+            let local = self.vehicle.wheel_center_local(i);
+            let hub = self.vehicle.pos + ori * local;
+            let out = if local.x >= 0.0 { 1.0 } else { -1.0 };
+            let odd = drain_pts.len() % 2 == 1;
+            let drop = if odd { 0.09 } else { 0.0 };
+            let back = if odd { 0.16 } else { 0.0 };
+            let lip = hub
+                + right * out * (0.26 + if odd { 0.05 } else { 0.0 })
+                + Vec3::Y * (0.24 - drop)
+                - fwd * (0.04 + back);
+            let vel = right * out * 0.58 - Vec3::Y * 1.08 - fwd * (0.10 + back * 0.4);
+            let dir = vel.normalize();
+            drain_pts.push((lip + dir * 0.08, vel));
         }
         if drain > 1.0e-8 && !drain_pts.is_empty() {
             let share = drain / drain_pts.len() as f32;
@@ -2597,22 +2601,18 @@ impl World {
                     .spawn_water_sheet(pos, vel, share, KIND_WATER_DRAIN);
             }
         }
-        // Ribbons off the rear tread, lying flat and trailing back over the ford.
+        // Short ribbons off the left rear tread. They leave the rubber and
+        // fall away. The right tire is away from this camera.
         let mut spray_pts: Vec<(Vec3, Vec3)> = Vec::new();
-        for i in 2..4 {
-            let local = self.vehicle.wheel_center_local(i);
-            let hub = self.vehicle.pos + ori * local;
-            let out = if local.x >= 0.0 { 1.0 } else { -1.0 };
-            for k in 0..5 {
-                let fan = (k as f32 - 2.0) * 0.18;
-                let back = 0.42 + k as f32 * 0.07;
-                let x = hub.x + right.x * (out * 0.04 + fan) - fwd.x * back;
-                let z = hub.z - fwd.z * back;
-                let ground = self.soil.sample(x, z).height;
-                let center = Vec3::new(x, ground + 0.045, z);
-                let vel = -fwd * 2.05 + right * fan * 0.65 - Vec3::Y * 0.04;
-                spray_pts.push((center, vel));
-            }
+        let rear = self.vehicle.wheel_center_local(2);
+        let hub = self.vehicle.pos + ori * rear;
+        let out = if rear.x >= 0.0 { 1.0 } else { -1.0 };
+        for k in 0..4 {
+            let fan = (k as f32 - 1.5) * 0.06;
+            let tread = hub - fwd * 0.33 + right * (out * 0.11 + fan) + Vec3::Y * 0.06;
+            let vel = -fwd * 0.50 + right * (out * 0.20 + fan * 1.5) - Vec3::Y * 1.20;
+            let dir = Vec3::new(vel.x, vel.y * 0.7, vel.z).normalize();
+            spray_pts.push((tread + dir * 0.14, vel));
         }
         if spray > 1.0e-8 && !spray_pts.is_empty() {
             let share = spray / spray_pts.len() as f32;
