@@ -1910,24 +1910,28 @@ fn slurry_tear_out_camera(world: &World) -> CameraPose {
         rear - fwd * 0.42 - right * 0.30 + Vec3::Y * 0.75
     };
 
-    let pool_back = rear - fwd * 0.72;
+    let tread_lip = Vec3::new(
+        rear_l.x - fwd.x * 0.12,
+        world.soil.sample(rear_l.x, rear_l.z).height + 0.04,
+        rear_l.z - fwd.z * 0.12,
+    );
+    let pool_back = rear - fwd * 0.95;
     let pool_back = Vec3::new(
         pool_back.x,
         world.soil.sample(pool_back.x, pool_back.z).height + 0.05,
         pool_back.z,
     );
-    let nose = vehicle.pos + fwd * 0.95 + Vec3::Y * 0.18;
 
-    // Beside the rear treads: debris, pool behind, nose-up exit still in frame.
-    let look = debris * 0.52 + rear * 0.24 + pool_back * 0.14 + nose * 0.10;
+    // Beside the rear treads: debris, pool lip, left rear leaving the rut.
+    let look = debris * 0.36 + rear_l * 0.22 + tread_lip * 0.20 + pool_back * 0.22;
     let look = Vec3::new(
         look.x,
-        look.y.max(world.soil.sample(look.x, look.z).height + 0.14),
+        look.y.max(world.soil.sample(look.x, look.z).height + 0.12),
         look.z,
     );
-    // Driver-side rear quarter — groove ribbons and roll sheets face this way.
-    let eye = rear - right * 2.05 - fwd * 2.25 + Vec3::Y * 0.62;
-    let ortho = 3.55;
+    // Same rear-quarter axis, pulled back for lip + tire + spray in one frame.
+    let eye = rear - right * 2.75 - fwd * 3.45 + Vec3::Y * 0.82;
+    let ortho = 4.85;
     CameraPose {
         eye: clear_ortho_eye(world, eye, look, ortho),
         target: look,

@@ -1025,16 +1025,15 @@ impl World {
             + fwd * 0.08;
 
         if dug.thrown > 1.0e-8 {
-            // Sheets leave beside the rear tread in the air, not on the lip floor.
-            let _ = self.particles.throw_roll_sheets(
-                shed_origin + Vec3::Y * 0.52,
+            let _ = self.particles.throw_exit_sheets(
+                shed_origin + Vec3::Y * 0.22,
                 fwd,
                 right,
                 dug.thrown,
             );
         }
         if peel > 1.0e-8 {
-            let peel_origin = shed_origin + right * 0.18 + Vec3::Y * 0.12;
+            let peel_origin = shed_origin - fwd * 0.28 + right * (-0.34) + Vec3::Y * 0.14;
             let ribbon_vol = peel * 0.35;
             let _ = self.particles.throw_groove_ribbons(
                 peel_origin,
@@ -1044,7 +1043,7 @@ impl World {
             );
         }
         if seal_thrown > 1.0e-8 {
-            let break_origin = shed_origin + right * 0.32 + Vec3::Y * 0.28;
+            let break_origin = shed_origin - fwd * 0.14 + right * 0.26 + Vec3::Y * 0.06;
             let _ = self
                 .particles
                 .throw_slurry(break_origin, fwd, right, seal_thrown);
@@ -1069,15 +1068,13 @@ impl World {
                 pending[i] += left;
             }
         }
-        for i in 0..4 {
-            if pending[i] <= 1.0e-8 {
-                continue;
-            }
-            let local = ori * self.vehicle.wheel_center_local(i);
+        let shed_total: f32 = pending.iter().sum();
+        if shed_total > 1.0e-8 {
+            let local = ori * self.vehicle.wheel_center_local(2);
             let wc = self.vehicle.pos + local + Vec3::Y * 0.18 + right * 0.14;
-            groove_shed += self
+            groove_shed = self
                 .particles
-                .throw_groove_ribbons(wc, fwd, right, pending[i]);
+                .throw_groove_ribbons(wc, fwd, right, shed_total);
         }
 
         let groove: f32 = self
@@ -1107,12 +1104,10 @@ impl World {
         let spawned = ribbons + sheets + spray;
         let loose = airborne - spawned;
         if loose > 1.0e-4 {
-            let _ = self.particles.throw_slurry(
-                self.vehicle.pos + Vec3::new(0.18, 0.42, 0.08),
-                fwd,
-                right,
-                loose,
-            );
+            let loose_origin = shed_origin - fwd * 0.10 + right * 0.20 + Vec3::Y * 0.04;
+            let _ = self
+                .particles
+                .throw_slurry(loose_origin, fwd, right, loose);
             ribbons = 0.0;
             sheets = 0.0;
             spray = 0.0;
