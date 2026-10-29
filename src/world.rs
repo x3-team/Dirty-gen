@@ -4292,7 +4292,6 @@ impl ThroughDrive {
         self.fluid.recenter([0.0, z]);
         pull_substrate(&mut self.fluid, &self.world.soil);
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let right = Vec3::X;
         let tires = crate::dust::tires_at(z, 8.0, 1.6);
         for tire in tires {
             self.fluid.push_tire(TirePush {
@@ -4306,33 +4305,10 @@ impl ThroughDrive {
                 slip: 1.6,
             });
             self.stick_and_dust(tire.index as usize, tire.contact, 1.6, dt, forward);
-            let peel = self.ribbon_tick % 4 == 0;
             if (-18.8..-11.6).contains(&self.chassis_z)
                 && (-19.2..-11.2).contains(&tire.contact.z)
             {
                 self.report.saw_wave = true;
-                if peel {
-                    let side = if tire.contact.x < 0.0 { -1.0 } else { 1.0 };
-                    let ground = self.world.soil.sample(tire.contact.x, tire.contact.z).height;
-                    self.world.particles.shed_tread_ribbon(
-                        tire.contact,
-                        forward,
-                        right,
-                        side,
-                        ground,
-                    );
-                }
-            }
-            if peel && (-11.2..-1.2).contains(&z) {
-                let side = if tire.contact.x < 0.0 { -1.0 } else { 1.0 };
-                let ground = self.world.soil.sample(tire.contact.x, tire.contact.z).height;
-                self.world.particles.shed_tread_ribbon(
-                    tire.contact,
-                    forward,
-                    right,
-                    side,
-                    ground,
-                );
             }
             if (-13.5..-1.0).contains(&z) {
                 cut_rut_groove(&mut self.world.soil, tire.contact.x, tire.contact.z);
@@ -4428,6 +4404,7 @@ impl ThroughDrive {
             }
             true
         });
+        self.lay_rut_ribbons();
         self.paint_dust_picture();
         self.note_rut();
         let dust_books = self.dust.ledger();
@@ -4438,6 +4415,69 @@ impl ThroughDrive {
         self.report.removed_m3 = self.coat.removed;
         self.report.stuck_m3 = self.coat.stuck;
         self.report.shed_m3 = self.coat.shed;
+    }
+
+    /// One ribbon in each rut. The head stays at the rear tire while the car
+    /// is in the water and the slurry, and the tail stays where the ribbon
+    /// started, so the strip lies in the track instead of a row of blocks.
+    fn lay_rut_ribbons(&mut self) {
+        let z = self.chassis_z;
+        if !(-18.8..-1.2).contains(&z) {
+            return;
+        }
+        for tire in crate::dust::tires_at(z, 8.0, 1.6) {
+            // Rear hubs only. The front tires share these two ruts.
+            if tire.index < 2 {
+                continue;
+            }
+            self.lay_one_rut_ribbon(tire.contact.x, tire.contact.z);
+        }
+    }
+
+    fn lay_one_rut_ribbon(&mut self, x: f32, head_z: f32) {
+        const LEFT: u32 = 0x71B0_0001;
+        const RIGHT: u32 = 0x71B0_0002;
+        let mark = if x < 0.0 { LEFT } else { RIGHT };
+        let mut ground = self.world.soil.sample(x, head_z).height;
+        if ground < 0.05 {
+            ground = 0.35;
+        }
+        if let Some(p) = self
+            .world
+            .particles
+            .items
+            .iter_mut()
+            .find(|p| p.alive && p.seed == mark)
+        {
+            let tail = p.spin.x;
+            p.pos = Vec3::new(x, ground, head_z);
+            p.vel = Vec3::new(0.0, 0.0, -1.0);
+            p.size = (head_z - tail).max(0.7);
+            p.life = 40.0;
+            p.max_life = 40.0;
+            p.grounded = true;
+            p.deposited = true;
+            p.ledger = false;
+            p.volume = 0.0024;
+            p.kind = crate::particles::KIND_SLURRY_RIBBON;
+            return;
+        }
+        self.world.particles.spawn(
+            Vec3::new(x, ground, head_z),
+            Vec3::new(0.0, 0.0, -1.0),
+            40.0,
+            0.7,
+            crate::particles::KIND_SLURRY_RIBBON,
+        );
+        if let Some(p) = self.world.particles.items.last_mut() {
+            p.seed = mark;
+            p.spin = Vec3::new(head_z, 0.0, 0.0);
+            p.ledger = false;
+            p.volume = 0.0024;
+            p.grounded = true;
+            p.deposited = true;
+            p.size = 0.7;
+        }
     }
 
     fn coat_body(&mut self, amount: f32) {

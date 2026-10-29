@@ -13,7 +13,8 @@ use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
 use crate::mesh::{
-    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks, terrain_mesh,
+    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_with_ground,
+    terrain_mesh,
     wheel_mesh, CpuMesh,
     MeshVertex, ParticleVertex, TerrainVertex,
 };
@@ -1250,7 +1251,7 @@ impl Renderer {
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
-        let chunks = mud_chunks(&world.particles.items);
+        let chunks = mud_chunks_with_ground(&world.particles.items, Some(&world.soil));
         let chunk_count = chunks.indices.len() as u32;
         if chunk_count > 0 {
             self.queue
