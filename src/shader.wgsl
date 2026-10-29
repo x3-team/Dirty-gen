@@ -826,31 +826,45 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         // A flat highlight on the print was a white sheet over the lugs.
         rough_out = max(rough_out, 0.92);
     }
+    // Fissure colours come from the crust, not from the darkened lug groove.
+    let skin_albedo = albedo;
     if (lug_h < -0.003) {
         let k = clamp(-lug_h / 0.045, 0.0, 1.0);
         albedo *= mix(1.0, 0.52, k);
     }
-    // Shrinkage opening. Width is the solver's centimetre fissure. The
-    // interior is the mud already bound, shadowed the way a lug void is.
+    // Opening in the crust. The stored fissure is about a centimetre, a few
+    // pixels here, so the draw is wider. Centre is the gap (clay, lighter
+    // than the walls). Each side is a wall, the sunless one darker. Both
+    // outer lips are the plate edge that pulled back.
     if (thickness > 0.008) {
-        let gap = crack_gap(xz);
-        let mask = clamp(1.0 - gap / 0.11, 0.0, 1.0);
+        let gapv = crack_gap(xz);
         let skin_m = clamp((thickness - 0.008) / 0.028, 0.0, 1.0);
-        let plate = mix(0.45, 1.0, skin_m);
-        let opening = 0.016 * skin_m * mask * plate;
-        let dist = gap * 0.24;
-        let half = opening * 0.5;
-        if (mask > 0.12 && half > 0.0025 && dist < half) {
-            let u = clamp(dist / half, 0.0, 1.0);
+        let half = mix(0.022, 0.034, skin_m);
+        let dist = gapv * 0.24;
+        if (skin_m > 0.2 && dist < half * 1.12) {
+            let u = clamp(dist / half, 0.0, 1.12);
             let gx = crack_gap(xz + vec2<f32>(0.004, 0.0)) - crack_gap(xz - vec2<f32>(0.004, 0.0));
             let gz = crack_gap(xz + vec2<f32>(0.0, 0.004)) - crack_gap(xz - vec2<f32>(0.0, 0.004));
             let side = normalize(vec2<f32>(gx, gz) + vec2<f32>(1e-4, 0.0));
-            n = normalize(n + vec3<f32>(-side.x, -0.05, -side.y) * mix(4.4, 0.35, u));
-            let mud = textureSampleLevel(ground_diff, ground_samp, uv0, 0, 0.0).rgb;
-            // The whole centimetre stays open. Only the lip fades back to the plate.
-            albedo = mix(albedo, mud, 1.0 - smoothstep(0.78, 1.0, u));
-            albedo *= mix(0.30, 1.0, smoothstep(0.7, 1.0, u));
-            rough_out = max(rough_out, 0.94);
+            let sun_xz = frame.sun_dir.xz;
+            // side points out of the gap. This wall faces the sun when -side does.
+            let faces_sun = dot(side, sun_xz) < 0.0;
+            let floor_w = 1.0 - smoothstep(0.26, 0.42, u);
+            let wall_w = smoothstep(0.34, 0.48, u) * (1.0 - smoothstep(0.64, 0.78, u));
+            let lip_w = smoothstep(0.72, 0.84, u) * (1.0 - smoothstep(1.00, 1.12, u));
+            let plate = skin_albedo;
+            let floor_c = plate * vec3<f32>(0.58, 0.36, 0.20);
+            let wall_c = plate * select(vec3<f32>(0.30, 0.20, 0.13), vec3<f32>(0.12, 0.07, 0.045), !faces_sun);
+            let lip_c = plate * vec3<f32>(1.72, 1.40, 1.08);
+            albedo = mix(albedo, lip_c, lip_w);
+            albedo = mix(albedo, wall_c, wall_w);
+            albedo = mix(albedo, floor_c, floor_w);
+            let floor_n = vec3<f32>(0.0, 1.0, 0.0);
+            let wall_n = normalize(vec3<f32>(-side.x * 0.45, 0.78, -side.y * 0.45));
+            let lip_n = vec3<f32>(0.0, 1.0, 0.0);
+            let keep = clamp(1.0 - max(floor_w, max(wall_w, lip_w)), 0.0, 1.0);
+            n = normalize(floor_n * floor_w + wall_n * wall_w + lip_n * lip_w + n * keep);
+            rough_out = mix(rough_out, 0.97, clamp(floor_w + wall_w, 0.0, 1.0));
         }
     }
     var lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
