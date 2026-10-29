@@ -231,33 +231,10 @@ fn cell_center(ij: vec2<i32>) -> vec2<f32> {
     return vec2<f32>((f32(ij.x) + 0.5) * cell - half, (f32(ij.y) + 0.5) * cell - half);
 }
 
-// One pressed track. A shallow ribbon ties the lugs into the rut floor,
-// and each lug is a deeper void in that ribbon. Stored amplitude is unchanged.
+// The pressed track is the heightfield. A lug grid on a flat floor read as a
+// checkerboard card in the rut, so the print is not stamped on again here.
 fn tread_delta(xz: vec2<f32>) -> f32 {
-    let ij = vec2<i32>(round(world_to_ij(xz)));
-    let rec = imprint_at(ij);
-    if (rec.a < 0.5) {
-        return 0.0;
-    }
-    let amp = rec.r * 0.06;
-    let ang = rec.g * 6.2831853;
-    let fwd = vec2<f32>(sin(ang), cos(ang));
-    let right = vec2<f32>(fwd.y, -fwd.x);
-    let rel = xz - cell_center(ij);
-    let lat = dot(rel, right) + rec.b * 0.8 - 0.4;
-    let along = dot(xz, fwd);
-    let pitch = 0.19897;
-    let u = fract(along / pitch);
-    let row = select(0.0, 0.5, lat > 0.0);
-    let lug = abs(fract(u + row) - 0.5);
-    // Visual crown, not the wider physics lane. The edge fades into the rut.
-    // One groove the width of the crown. The lugs bite deeper into that floor
-    // so the print stays a track when the tire has moved on.
-    // The void is the lug. A deep flat floor was a sheet lying on the print.
-    let ribbon = 1.0 - smoothstep(0.09, 0.15, abs(lat));
-    let block = 1.0 - smoothstep(0.12, 0.34, lug);
-    let floor = ribbon * 0.12;
-    return -amp * max(floor, block * ribbon);
+    return (xz.x - xz.x) * 0.0;
 }
 
 // x = patch weight, y = carcass underside, z = hide the square stamp.
@@ -292,11 +269,11 @@ fn tire_contact(xz: vec2<f32>, a: vec4<f32>, b: vec4<f32>) -> vec3<f32> {
             weight = (1.0 - smoothstep(0.78, 1.04, ell)) * buried;
         }
     }
-    // Hide the stamp and the berms beside the rubber. The rut further
-    // behind stays, so the pressed track is still there after the pass.
+    // Beside the rubber only. The open rut behind the tread stays, so the
+    // pad does not sit in the groove as a flat card.
     let ahead = 1.0 - smoothstep(0.22, 0.72, along);
-    let not_behind = 1.0 - smoothstep(0.10, 0.55, -along);
-    let across = 1.0 - smoothstep(0.12, 0.55, lat);
+    let not_behind = 1.0 - smoothstep(-0.02, 0.20, -along);
+    let across = 1.0 - smoothstep(0.12, 0.28, lat);
     let closure = ahead * not_behind * across * (1.0 - weight);
     return vec3<f32>(clamp(weight, 0.0, 1.0), underside, clamp(closure, 0.0, 1.0));
 }
@@ -416,8 +393,9 @@ fn stamp_bilinear(xz: vec2<f32>) -> f32 {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
-// The sill sits between the hubs. Per-tire closure never reached it, so the
-// cut and the berms stayed as blocks and a hole under the body.
+// The sill between the hubs. Per-tire closure never reached it, so the
+// cut under the body stayed a hole. The box stays inside the tires: a
+// pad behind the tread was an orange card lying in the rut.
 fn body_cover(xz: vec2<f32>) -> f32 {
     let live = frame.tires[1].w + frame.tires[3].w + frame.tires[5].w + frame.tires[7].w;
     if (live < 0.5) {
@@ -451,9 +429,9 @@ fn body_cover(xz: vec2<f32>) -> f32 {
         minz = min(minz, frame.tires[6].z);
         maxz = max(maxz, frame.tires[6].z);
     }
-    let dx = max(minx - 1.35 - xz.x, xz.x - (maxx + 1.35));
-    let dz = max(minz - 0.88 - xz.y, xz.y - (maxz + 0.88));
-    return 1.0 - smoothstep(0.0, 0.22, max(dx, dz));
+    let dx = max((minx + 0.28) - xz.x, xz.x - (maxx - 0.28));
+    let dz = max((minz + 0.35) - xz.y, xz.y - (maxz - 0.35));
+    return 1.0 - smoothstep(0.0, 0.16, max(dx, dz));
 }
 
 // Put the pad back under the carcass. The stamp stays in the field.
@@ -666,14 +644,9 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     var n = terrain_normal(xz);
-    // The square stamp beside a live tire is filled back to the lip. Paint a
-    // clay card as the pad. Gravel is not a stamp product, so it stays gravel
-    // under the tire instead of being covered with the mud map.
-    let seat = apply_seat(xz, terrain_height(xz));
-    var kind = kind_nearest(xz);
-    if (seat.z > 0.22 && kind != 2u) {
-        kind = 4u;
-    }
+    // The rut keeps the kind the solver wrote. A wet-mud pad on the cover
+    // was a flat card in the groove behind the tire.
+    let kind = kind_nearest(xz);
 
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
@@ -686,7 +659,12 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let uv2 = xz / 3.5;
     let uv3 = xz / 2.3;
     let uv4 = xz / 3.3;
-    let layer = layer_of(kind);
+    // Packed clay is the clay map, one salmon tone. In the rut that sheet
+    // was a flat card. Draw it as the mud around it.
+    var layer = layer_of(kind);
+    if (kind == 9u) {
+        layer = 0;
+    }
     let diff = pick5(
         layer,
         textureSample(ground_diff, ground_samp, uv0, 0),
@@ -733,13 +711,6 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     albedo = mix(albedo, albedo * vec3<f32>(0.66, 0.58, 0.48), smoothstep(0.18, 0.92, wet) * wet_amt);
     if (kind == 9u) {
         albedo *= mix(1.0, 0.8, smoothstep(0.35, 0.9, darken));
-        // The clay color is almost one tone. In the cut, the mud under it shows.
-        // The printed rut stays the soil it was pressed into. The clay
-        // multiply was a pale sheet over the lugs.
-        if (-stamp_bilinear(xz) > 0.012 && !track_near(xz)) {
-            let mud = textureSampleLevel(ground_diff, ground_samp, uv0, 0, 0.0).rgb;
-            albedo = mud * vec3<f32>(1.08, 0.78, 0.52);
-        }
     } else if (kind == 7u) {
         // Placed spoil reads drier and lighter than the torn lip beside it.
         albedo = mix(albedo, albedo * vec3<f32>(1.14, 1.05, 0.86), 0.62);
