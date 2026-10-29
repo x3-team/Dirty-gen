@@ -530,6 +530,8 @@ struct CaptureArgs {
     slurry_tear_out_proof: PathBuf,
     slurry_plow: bool,
     slurry_plow_proof: PathBuf,
+    slurry_second_pass: bool,
+    slurry_second_pass_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -626,6 +628,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_plow {
         capture_slurry_plow(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_second_pass {
+        capture_slurry_second_pass(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -819,6 +825,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         PathBuf::from(format!("{MEDIA}/slurry-tear-out-proof.png"));
     let mut slurry_plow = false;
     let mut slurry_plow_proof = PathBuf::from(format!("{MEDIA}/slurry-plow-proof.png"));
+    let mut slurry_second_pass = false;
+    let mut slurry_second_pass_proof =
+        PathBuf::from(format!("{MEDIA}/slurry-second-pass-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -907,6 +916,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_plow = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_plow_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-second-pass-proof" => {
+                slurry_second_pass = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_second_pass_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -1002,6 +1017,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_tear_out_proof,
         slurry_plow,
         slurry_plow_proof,
+        slurry_second_pass,
+        slurry_second_pass_proof,
     }
 }
 
@@ -1815,6 +1832,79 @@ fn capture_slurry_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
     println!(
         "cc0 slurry-roll {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
         parsed.slurry_roll_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+/// The Niva on its second pass through the same slurry pool. The rut is deeper
+/// than after the first pass. Overlay numbers match the PR body.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_second_pass(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.second_pass_through_deep_slurry(3.6);
+    silence_soil_clods(&mut world);
+    println!(
+        "slurry-second-pass pool {:.4} berm {:.4} slurry {:.4} bow {:.4} wake {:.4} groove {:.4} \
+         sum {:.4} rut {:.4}->{:.4}->{:.4} ribbons {:.4} spray {:.4} clay {:.0} silt {:.0} sand {:.0}",
+        out.pool,
+        out.berm,
+        out.slurry,
+        out.bow_m3,
+        out.wake_m3,
+        out.groove,
+        out.sum,
+        out.rut0,
+        out.rut_pass1,
+        out.rut_pass2,
+        out.ribbons,
+        out.spray,
+        out.drag_clay,
+        out.drag_silt,
+        out.drag_sand,
+    );
+    let lines = [
+        format!("pool {:.4} m3", out.pool),
+        format!("berm {:.4} m3", out.berm),
+        format!("slurry {:.4} m3", out.slurry),
+        format!("bow {:.4} m3", out.bow_m3),
+        format!("wake {:.4} m3", out.wake_m3),
+        format!("groove {:.4} m3", out.groove),
+        format!("sum {:.4} m3", out.sum),
+        format!("rut1 {:.4} m", out.rut_pass1),
+        format!("rut2 {:.4} m", out.rut_pass2),
+        format!("ribbons {:.4} m3", out.ribbons),
+        format!("spray {:.4} m3", out.spray),
+        format!("clay {:.0} N", out.drag_clay),
+        format!("silt {:.0} N", out.drag_silt),
+        format!("sand {:.0} N", out.drag_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = slurry_plow_camera(&world);
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_second_pass_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_second_pass_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry second pass still");
+    println!(
+        "cc0 slurry-second-pass {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_second_pass_proof.display(),
         pose.eye.x,
         pose.eye.y,
         pose.eye.z,
