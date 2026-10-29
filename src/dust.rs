@@ -39,7 +39,9 @@ pub const AIR_DY_M: f32 = (AIR_Y1_M - AIR_Y0_M) / AIR_LAYERS as f32;
 
 const CELL_VOL_M3: f32 = AIR_DX_M * AIR_DY_M * AIR_DZ_M;
 /// Ground cells for dust that has left the air window, metres.
-const SETTLED_CELL_M: f32 = 0.5;
+/// The render contract splats settled volume onto the 40 m window with this cell.
+/// Changing it changes `dust_settled` and requires a render-contract version bump.
+pub const SETTLED_CELL_M: f32 = 0.5;
 
 const THROW_AFT_0: f32 = 0.12;
 const THROW_AFT_1: f32 = 1.85;

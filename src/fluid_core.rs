@@ -191,6 +191,20 @@ pub struct GroundSample {
     pub bed_m: f32,
 }
 
+/// One coarse-window cell. Heights are metres. `u` and `v` are metres per second.
+#[derive(Clone, Copy, Debug)]
+pub struct CoarseCell {
+    pub x: f32,
+    pub z: f32,
+    pub bed_m: f32,
+    pub water_m: f32,
+    pub slurry_m: f32,
+    pub moisture: f32,
+    pub u: f32,
+    pub v: f32,
+    pub settled_dust_m: f32,
+}
+
 /// Maps a beauty pass can read. Coarse window, after the fine patch is put back.
 #[derive(Clone, Debug)]
 pub struct SurfaceMaps {
@@ -1258,6 +1272,66 @@ impl FluidCore {
     pub fn window_bounds(&self) -> (f32, f32, f32) {
         let extent = WINDOW_RES as f32 * COARSE_CELL_M;
         (self.origin[0], self.origin[1], extent)
+    }
+
+    /// Minimum corner of the coarse window around `center`. Same snap as [`Self::new`].
+    ///
+    /// The render contract uses this corner. Change it only by bumping
+    /// `render_contract::RENDER_CONTRACT_VERSION` and recording the change
+    /// in `docs/RENDER_CONTRACT.md`.
+    pub fn window_origin(center: [f32; 2]) -> [f32; 2] {
+        let extent = WINDOW_RES as f32 * COARSE_CELL_M;
+        snap_origin(center, extent, COARSE_CELL_M)
+    }
+
+    /// One coarse cell after the fine patch has been restricted back.
+    ///
+    /// `u` and `v` are the thickness-weighted water and slurry velocity.
+    /// A dry cell reports zero. This is the flow the render contract publishes.
+    /// Change the blend only with a render-contract version bump.
+    pub fn coarse_cell(&self, i: usize, j: usize) -> Option<CoarseCell> {
+        if i >= WINDOW_RES || j >= WINDOW_RES {
+            return None;
+        }
+        let idx = j * WINDOW_RES + i;
+        let water_m = self.water[idx];
+        let slurry_m = self.slurry[idx];
+        let film = water_m + slurry_m;
+        let (u, v) = if film < 1.0e-5 {
+            (0.0, 0.0)
+        } else {
+            (
+                (self.uw[idx] * water_m + self.us[idx] * slurry_m) / film,
+                (self.vw[idx] * water_m + self.vs[idx] * slurry_m) / film,
+            )
+        };
+        Some(CoarseCell {
+            x: self.origin[0] + (i as f32 + 0.5) * COARSE_CELL_M,
+            z: self.origin[1] + (j as f32 + 0.5) * COARSE_CELL_M,
+            bed_m: self.bed[idx],
+            water_m,
+            slurry_m,
+            moisture: self.moisture[idx],
+            u,
+            v,
+            settled_dust_m: self.settled[idx],
+        })
+    }
+
+    /// Air-grid corner and horizontal cell, metres. Corner of texel (0, 0), not the centre.
+    pub fn air_window(&self) -> ([f32; 2], f32) {
+        (self.air_origin, self.air_cell())
+    }
+
+    /// Dust depth in one air slab, metres of equivalent column in that layer.
+    /// Index is `ix + layer * AIR_RES * AIR_RES + iz * AIR_RES` in solver storage.
+    /// The render contract republishes this as a volume fraction.
+    pub fn air_depth(&self, ix: usize, layer: usize, iz: usize) -> f32 {
+        if ix >= AIR_RES || iz >= AIR_RES || layer >= AIR_LAYERS {
+            return 0.0;
+        }
+        let idx = (layer * AIR_RES + iz) * AIR_RES + ix;
+        self.dust[idx]
     }
 
     /// Loudest airborne columns, then the settled film, up to `limit` marks.
