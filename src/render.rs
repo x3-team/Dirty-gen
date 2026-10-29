@@ -131,6 +131,8 @@ pub struct Renderer {
     pub niva_picture: bool,
     /// Draw the solved water column, including a bow above the film range.
     pub water_column: bool,
+    /// Paint the snow layer. Compaction in the darken channel tints the blanket.
+    pub snow: bool,
     niva_body: GpuMesh,
     niva_glass: GpuMesh,
     niva_wheels: [GpuMesh; 4],
@@ -1027,6 +1029,7 @@ impl Renderer {
             show_bike: true,
             niva_picture: false,
             water_column: false,
+            snow: false,
             niva_body,
             niva_glass,
             niva_wheels,
@@ -1160,7 +1163,7 @@ impl Renderer {
             light_vp: light_vp.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
-            sun_dir: vec4(sun, 0.0),
+            sun_dir: vec4(sun, if self.snow { 1.0 } else { 0.0 }),
             sun_color,
             sky_zenith,
             sky_horizon,

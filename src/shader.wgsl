@@ -707,6 +707,19 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let crust_rg = crust_bilinear(xz);
     let thickness = crust_rg.x * 0.04;
 
+    // Snow is its own layer. sun_dir.w selects it. Compaction is mat.b.
+    // The ground albedo stays off so the blanket, the rut, and the berm are the field.
+    if (frame.sun_dir.w > 0.5) {
+        let fresh = vec3<f32>(0.79, 0.83, 0.87);
+        let packed = vec3<f32>(0.47, 0.53, 0.60);
+        var albedo = mix(fresh, packed, darken);
+        let grain = noise(xz * 6.5);
+        albedo *= mix(0.93, 1.05, grain);
+        let rough_out = mix(0.96, 0.86, darken);
+        let lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+        return present(lit);
+    }
+
     let uv0 = xz / 3.2;
     let uv1 = xz / 2.7;
     let uv2 = xz / 3.5;
