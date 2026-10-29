@@ -1078,31 +1078,78 @@ fn spin_ribbon(vel: Vec3) -> bool {
     vel.length() > 6.0
 }
 
-/// Existing glass tint. Spray drops use it so they read as water, not mud boards.
+/// Existing glass tint. Spray ribbons use it so they read as water, not mud.
 const PANEL_WATER_DROP: f32 = 65.0;
 
-/// Ford exit. Drain and spray are drops of water, not a camera-facing card.
+/// A short ribbon thrown off the tread. Pinched at the ends, a few centimetres
+/// long. Not a sphere, a teardrop, or a board.
+fn add_spray_ribbon(mesh: &mut CpuMesh, origin: Vec3, dir: Vec3, slot: u32) {
+    let dir = if dir.length_squared() < 1.0e-8 {
+        Vec3::new(-0.1, 0.4, -0.9)
+    } else {
+        dir
+    }
+    .normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = 0.11 + (slot % 3) as f32 * 0.012;
+    let width = 0.016;
+    let thick = 0.006;
+    let segs = 5usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (t * (1.0 - t) * 4.0).powf(0.65).clamp(0.18, 1.0);
+        let bow = (t * std::f32::consts::PI).sin();
+        let c = origin + dir * (length * t) + up * (bow * 0.008);
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * (0.5 + 0.5 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_WATER_DROP);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_WATER_DROP);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_WATER_DROP);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_WATER_DROP);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_WATER_DROP);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_WATER_DROP);
+}
+
+/// Ford exit. Drain is the pool surface, not a mesh. Spray is several short
+/// ribbons off one ledger piece.
 fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    if p.kind != silt::particles::KIND_WATER_SPRAY && p.kind != silt::particles::KIND_WATER_DRAIN {
+    if p.kind == silt::particles::KIND_WATER_DRAIN {
         return;
     }
-    // One drop per ledger piece. A run of them is the stream; a clump read as foam.
-    let radius = if p.kind == silt::particles::KIND_WATER_DRAIN {
-        0.062
-    } else {
-        0.070
-    };
-    add_lump(
-        mesh,
-        p.pos,
-        Quat::IDENTITY,
-        radius,
-        p.seed.wrapping_add(3),
-        3,
-        5,
-        false,
-        PANEL_WATER_DROP,
-    );
+    if p.kind != silt::particles::KIND_WATER_SPRAY {
+        return;
+    }
+    let mut dir = p.vel;
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::new(-0.12, 0.5, -0.85);
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    for k in 0..3u32 {
+        let ang = (k as f32 - 1.0) * 0.42;
+        let d = (dir * ang.cos() + side * ang.sin()).normalize();
+        let origin = p.pos + side * (k as f32 - 1.0) * 0.034 + up * ((k as f32) - 1.0) * 0.016;
+        add_spray_ribbon(mesh, origin, d, p.seed.wrapping_add(k));
+    }
 }
 
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
@@ -1446,23 +1493,10 @@ mod slurry_shapes {
         let mut mesh = CpuMesh::new();
         add_water_film(&mut mesh, &drain);
         assert!(
-            mesh.vertices.len() > 40,
-            "drain is not drops, verts {}",
+            mesh.vertices.is_empty(),
+            "drain is a mesh, verts {}",
             mesh.vertices.len()
         );
-        let mut dmin = Vec3::splat(f32::MAX);
-        let mut dmax = Vec3::splat(-f32::MAX);
-        for v in &mesh.vertices {
-            let q = Vec3::from_array(v.pos);
-            dmin = dmin.min(q);
-            dmax = dmax.max(q);
-            assert!((v.panel - 47.0).abs() > 0.5, "drain uses the brown film panel");
-        }
-        let dext = dmax - dmin;
-        let mut daxes = [dext.x, dext.y, dext.z];
-        daxes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert!(daxes[0] > 0.05, "drain is a flat card {daxes:?}");
-        assert!(daxes[2] < 0.40, "drain is a long board {daxes:?}");
 
         let spray = Particle {
             pos: Vec3::new(0.2, 0.4, 0.1),
@@ -1480,8 +1514,8 @@ mod slurry_shapes {
         };
         add_water_film(&mut mesh, &spray);
         assert!(
-            mesh.vertices.len() > 40,
-            "spray is not a cloud of particles, verts {}",
+            mesh.vertices.len() > 250,
+            "spray is not many ribbons, verts {}",
             mesh.vertices.len()
         );
         let mut min = Vec3::splat(f32::MAX);
@@ -1494,18 +1528,20 @@ mod slurry_shapes {
                 (v.panel - 47.0).abs() > 0.5,
                 "spray uses the brown film panel"
             );
+            assert!(
+                (v.panel - 65.0).abs() < 0.5,
+                "spray is not the water tint"
+            );
         }
         let ext = max - min;
         let mut axes = [ext.x, ext.y, ext.z];
         axes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(axes[0] > 0.004, "spray is a flat card {axes:?}");
         assert!(
-            axes[0] > 0.05,
-            "spray is a flat card {axes:?}"
+            axes[2] > axes[0] * 1.7,
+            "spray is a sphere or a cube {axes:?}"
         );
-        assert!(
-            axes[2] < 0.40,
-            "spray is a long board {axes:?}"
-        );
+        assert!(axes[2] < 0.40, "spray is a long board {axes:?}");
     }
 
     #[test]

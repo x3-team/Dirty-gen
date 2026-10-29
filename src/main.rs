@@ -2607,21 +2607,21 @@ fn sculpt_ford_exit_still(world: &mut World) {
                 if !(-0.05..1.85).contains(&ahead) {
                     continue;
                 }
-                let along = smooth(-0.05, 0.10, ahead) * (1.0 - smooth(1.20, 1.85, ahead));
+                let along = smooth(-0.02, 0.12, ahead) * (1.0 - smooth(1.45, 2.15, ahead));
                 let outward = if hub.x < 0.0 { -dx } else { dx };
                 let across = if outward >= 0.0 {
-                    1.0 - smooth(0.04, 0.95, outward)
+                    1.0 - smooth(0.02, 1.35, outward)
                 } else {
-                    1.0 - smooth(0.02, 0.26, -outward)
+                    1.0 - smooth(0.02, 0.32, -outward)
                 };
                 let mask = along * across;
-                if mask < 0.05 {
+                if mask < 0.04 {
                     continue;
                 }
                 soil.wetness[idx] = 1.0;
-                if mask > 0.20 {
+                if mask > 0.10 {
                     soil.kind[idx] = SurfaceKind::Silt as u8;
-                } else if mask > 0.08 {
+                } else if mask > 0.05 {
                     soil.kind[idx] = SurfaceKind::FreshCut as u8;
                 }
             }
@@ -2633,9 +2633,9 @@ fn sculpt_ford_exit_still(world: &mut World) {
     for &wi in &[0usize, 1] {
         let hub = hubs[wi];
         let out = if hub.x < 0.0 { -1.0 } else { 1.0 };
-        for s in 0..12 {
-            let ahead = 0.06 + s as f32 * 0.13;
-            for side in [0.06_f32, 0.24, 0.42, 0.62] {
+        for s in 0..16 {
+            let ahead = 0.04 + s as f32 * 0.11;
+            for side in [0.05_f32, 0.22, 0.40, 0.60, 0.82, 1.05] {
                 let center = hub + fwd * ahead + right * (out * side) + Vec3::Y * 0.2;
                 world
                     .soil
@@ -2644,6 +2644,19 @@ fn sculpt_ford_exit_still(world: &mut World) {
         }
     }
     world.soil.rebuild_height();
+    // The bank is above the field the stamp was measured from, so the
+    // tread displacement was skipped. Match the baseline on the print
+    // ahead of the front tires and the lugs draw. After the ledger.
+    for idx in 0..world.soil.tread_amp.len() {
+        if world.soil.tread_amp[idx] < 0.02 {
+            continue;
+        }
+        let j = idx / res;
+        let z = (j as f32 + 0.5) * cell - half;
+        if z > front_z - 0.1 {
+            world.soil.initial_height[idx] = world.soil.height[idx];
+        }
+    }
 
     // Standing water in the low ford. The column rides the solved bed, so
     // the surface climbs the slope and thins out before the front tires.
@@ -2660,7 +2673,20 @@ fn sculpt_ford_exit_still(world: &mut World) {
                 + (x * 1.15).sin() * 0.07
                 + (x * 0.37 + 0.6).sin() * 0.05;
             let up = smooth(-0.02, shore, climb);
-            let column = 0.32 * (1.0 - up) * side;
+            let mut column = 0.32 * (1.0 - up) * side;
+            // Same pool water, one cell wide, from the rear arch lip back
+            // into the standing surface. A wider column was a wedge on the tire.
+            // A shallow reach of the same pool, one cell wide, toward the
+            // rear arch. Taller than this stood up as a wedge on the tire.
+            let pour_x = -1.1458;
+            if (x - pour_x).abs() < cell * 0.45 && (0.78..0.98).contains(&z) {
+                let bed = world.soil.height[idx];
+                let u = ((z - 0.78) / (0.96 - 0.78)).clamp(0.0, 1.0);
+                let y_pool = bed + 0.32;
+                let y_lip = bed + 0.46;
+                let want = (y_pool + (y_lip - y_pool) * u - bed).clamp(0.05, 0.48);
+                column = column.max(want);
+            }
             // Below ~0.05 the packed column leaves the free surface and the
             // old sheet path draws a card.
             world.soil.water[idx] = if column >= 0.05 { column } else { 0.0 };
@@ -2704,22 +2730,23 @@ fn sculpt_ford_exit_still(world: &mut World) {
             Vec3::new(-0.10, -0.35, -0.75),
         ),
     ];
+    // In the air just behind the rear tread. Not on the bumper.
     let sprays = [
         (
-            Vec3::new(-1.08, -0.28, 1.32),
-            Vec3::new(-0.40, 0.30, -0.50),
+            Vec3::new(-1.02, 0.16, 0.98),
+            Vec3::new(-0.12, 0.55, -0.90),
         ),
         (
-            Vec3::new(-1.22, -0.06, 1.26),
-            Vec3::new(-0.20, 0.75, -0.35),
+            Vec3::new(-0.97, 0.06, 0.94),
+            Vec3::new(-0.08, 0.42, -0.88),
         ),
         (
-            Vec3::new(-1.16, -0.36, 1.14),
-            Vec3::new(-0.45, 0.10, -0.60),
+            Vec3::new(-1.05, 0.12, 0.90),
+            Vec3::new(-0.16, 0.62, -0.74),
         ),
         (
-            Vec3::new(-1.34, 0.04, 1.16),
-            Vec3::new(-0.15, 0.80, -0.40),
+            Vec3::new(-0.99, 0.02, 1.00),
+            Vec3::new(-0.10, 0.36, -0.95),
         ),
     ];
     for (n, pi) in drain_i.iter().enumerate() {
