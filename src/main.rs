@@ -526,6 +526,8 @@ struct CaptureArgs {
     slurry_groove_proof: PathBuf,
     slurry_roll: bool,
     slurry_roll_proof: PathBuf,
+    slurry_tear_out: bool,
+    slurry_tear_out_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -614,6 +616,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_roll {
         capture_slurry_roll(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_tear_out {
+        capture_slurry_tear_out(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -802,6 +808,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_groove_proof = PathBuf::from(format!("{MEDIA}/slurry-groove-proof.png"));
     let mut slurry_roll = false;
     let mut slurry_roll_proof = PathBuf::from(format!("{MEDIA}/slurry-roll-proof.png"));
+    let mut slurry_tear_out = false;
+    let mut slurry_tear_out_proof =
+        PathBuf::from(format!("{MEDIA}/slurry-tear-out-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -878,6 +887,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_roll = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_roll_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-tear-out-proof" => {
+                slurry_tear_out = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_tear_out_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -969,6 +984,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_groove_proof,
         slurry_roll,
         slurry_roll_proof,
+        slurry_tear_out,
+        slurry_tear_out_proof,
     }
 }
 
@@ -1776,6 +1793,96 @@ fn capture_slurry_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose.target.y,
         pose.target.z
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The Niva climbing out of a deep pool. Ribbons, sheets, and fine spray
+/// hang beside the rut. The numbers are the rut tear-out, the groove hold,
+/// and the debris split.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_tear_out(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.tear_out_from_deep_slurry();
+    println!(
+        "slurry-tear-out pool {:.4} m3  rut {:.4} m3  groove {:.4} m3  shed {:.4} m3  \
+         ribbons {:.4} m3  sheets {:.4} m3  spray {:.4} m3  slurry {:.4} m3  airborne {:.4} m3  \
+         clay drag {:.0} N  silt {:.0} N  sand {:.0} N  clay torque {:.0} N·m  silt {:.0}  sand {:.0}",
+        out.pool,
+        out.rut_tear,
+        out.groove,
+        out.groove_shed,
+        out.ribbons,
+        out.sheets,
+        out.spray,
+        out.slurry,
+        out.airborne,
+        out.drag_clay,
+        out.drag_silt,
+        out.drag_sand,
+        out.torque_clay,
+        out.torque_silt,
+        out.torque_sand,
+    );
+    let lines = [
+        format!("rut {:.4}", out.rut_tear),
+        format!("groove {:.4}", out.groove),
+        format!("ribbons {:.4}", out.ribbons),
+        format!("sheets {:.4}", out.sheets),
+        format!("spray {:.4}", out.spray),
+        format!("slurry {:.4}", out.slurry),
+        format!("clay {:.0} N", out.drag_clay),
+        format!("silt {:.0} N", out.drag_silt),
+        format!("sand {:.0} N", out.drag_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = lift_camera(&world, slurry_tear_out_camera(&world));
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_tear_out_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_tear_out_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry tear-out still");
+    println!(
+        "cc0 slurry-tear-out {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_tear_out_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_tear_out_camera(world: &World) -> CameraPose {
+    let p = world.vehicle.pos;
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let pool_z = -1.35_f32;
+    let look = Vec3::new(
+        p.x * 0.35 + right.x * 0.15,
+        world.soil.sample(p.x, pool_z).height + 0.06,
+        pool_z * 0.55 + p.z * 0.45,
+    );
+    let eye = p + right * 2.05 - fwd * 0.35 + Vec3::Y * 0.55;
+    let ortho = 5.6;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
