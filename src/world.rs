@@ -1114,14 +1114,25 @@ impl World {
         self.slurry_rut_pace = 0.14;
         self.reset_niva_at_slurry_entry(0.72);
         let pass1 = self.slurry_plow_drive_pass(drive_seconds, pool_x, pool_z, air0);
-        let rut_pass1 = pass1.rut_after;
+        let ori1 = self.vehicle.orientation();
+        let rear_l1 = self.vehicle.pos + ori1 * self.vehicle.wheel_center_local(2);
+        let rear_r1 = self.vehicle.pos + ori1 * self.vehicle.wheel_center_local(3);
+        let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
+        let rut_pass1 = self.soil.lane_rut_depth_behind(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            rear_l1.z,
+            rear_l1.x,
+            rear_r1.x,
+            half_track,
+        );
 
         self.reset_niva_at_slurry_entry(0.68);
         self.soil.age_passes(0.45);
         self.slurry_rut_pace = 0.22;
         let air_mid = self.soil.airborne;
         let pass2 = self.slurry_plow_drive_pass(drive_seconds, pool_x, pool_z, air_mid);
-        let rut_pass2 = pass2.rut_after;
 
         let bow_m3 = pass1.bow_m3 + pass2.bow_m3;
         let wake_m3 = pass1.wake_m3 + pass2.wake_m3;
@@ -1144,11 +1155,23 @@ impl World {
         let slurry = (pool - berm - bow_m3 - wake_m3 - groove - ribbons - spray).max(0.0);
         let sum = berm + slurry + groove + bow_m3 + wake_m3 + ribbons + spray;
 
-        let drag_depth = (depth + (rut_pass2 - rut0).max(0.0) * 0.85).min(0.28);
-        let drag = slurry_drag_triple(moisture, drag_depth);
         let drag_pass1 = slurry_drag_triple(moisture, depth);
 
-        self.polish_slurry_plow_scene(pool_x, pool_z);
+        self.polish_slurry_second_pass_scene(pool_x, pool_z, rut_pass1);
+        let ori2 = self.vehicle.orientation();
+        let rear_l2 = self.vehicle.pos + ori2 * self.vehicle.wheel_center_local(2);
+        let rear_r2 = self.vehicle.pos + ori2 * self.vehicle.wheel_center_local(3);
+        let rut_pass2 = self.soil.lane_rut_depth_behind(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            rear_l2.z,
+            rear_l2.x,
+            rear_r2.x,
+            half_track,
+        );
+        let drag_depth = (depth + (rut_pass2 - rut0).max(0.0) * 0.85).min(0.28);
+        let drag = slurry_drag_triple(moisture, drag_depth);
         let mix1 = self.soil.mix_volumes();
 
         SlurrySecondPassWake {
@@ -1578,6 +1601,105 @@ impl World {
             wake_m3,
             rut_before,
             rut_after,
+        }
+    }
+
+    fn polish_slurry_second_pass_scene(
+        &mut self,
+        pool_x: (f32, f32),
+        pool_z: (f32, f32),
+        pass1_depth: f32,
+    ) {
+        let fwd = self.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let ori = self.vehicle.orientation();
+        let front = self.vehicle.pos + ori * self.vehicle.wheel_center_local(0);
+        let rear_l = self.vehicle.pos + ori * self.vehicle.wheel_center_local(2);
+        let rear_r = self.vehicle.pos + ori * self.vehicle.wheel_center_local(3);
+        let half_track = WHEEL_WIDTH * 0.5 + self.soil.cell * 0.55;
+        self.soil
+            .clear_placed_in_pool(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.55);
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
+        self.soil.accentuate_plow_bow_wake(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (front.x, front.z),
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+        );
+        self.soil
+            .trim_slurry_pool_rim(pool_x.0, pool_x.1, pool_z.0, pool_z.1, 0.75);
+        self.soil.accentuate_second_pass_rut(
+            pool_x.0,
+            pool_x.1,
+            pool_z.0,
+            pool_z.1,
+            (rear_l.x, rear_l.z),
+            (rear_r.x, rear_r.z),
+            half_track,
+            fwd,
+            pass1_depth,
+        );
+        let driver = -right;
+        // Beside the rear tread, in the slurry spray line — not on the door.
+        let ribbon_base = rear_l + driver * 1.34 + Vec3::Y * 0.20 - fwd * 0.38;
+        let spray_base = rear_l + driver * 1.05 + Vec3::Y * 0.42 - fwd * 0.22;
+        let mut ri = 0usize;
+        let mut di = 0usize;
+        for p in &mut self.particles.items {
+            if !p.alive {
+                continue;
+            }
+            p.grounded = false;
+            p.deposited = false;
+            p.life = p.life.max(4.2);
+            p.max_life = p.max_life.max(4.2);
+            if p.kind == crate::particles::KIND_SLURRY_RIBBON {
+                p.pos = ribbon_base
+                    + driver * (ri as f32 * 0.22)
+                    + fwd * (ri as f32 * -0.06)
+                    + Vec3::Y * (ri as f32 * 0.04);
+                p.vel = driver * 3.1 + fwd * (-0.65) + Vec3::Y * 0.12;
+                p.size = (p.volume * 42.0).cbrt().clamp(0.24, 0.38);
+                p.spin = Vec3::new(0.08, 0.22, 0.14);
+                ri += 1;
+            } else if p.kind == crate::particles::KIND_SLURRY_DROP {
+                p.pos = spray_base + driver * (di as f32 * 0.10) + Vec3::Y * (di as f32 * 0.05);
+                p.vel = driver * 1.8 + Vec3::Y * 0.42;
+                p.size = (p.volume * 120.0).cbrt().clamp(0.022, 0.038);
+                di += 1;
+            } else {
+                p.alive = false;
+            }
         }
     }
 
@@ -2751,7 +2873,7 @@ mod tests {
             m.rut_pass1
         );
         assert!(
-            m.rut_pass2 > m.rut_pass1 + 0.004,
+            m.rut_pass2 > m.rut_pass1 + 0.035,
             "second pass rut {:.4} -> {:.4}",
             m.rut_pass1,
             m.rut_pass2

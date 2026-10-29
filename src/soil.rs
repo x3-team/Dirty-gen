@@ -3120,7 +3120,7 @@ impl SoilField {
         if pace <= 1.0e-8 || dt <= 1.0e-8 {
             return 0.0;
         }
-        let carve = (pace * dt).min(0.0035);
+        let carve = (pace * dt).min(if pace > 0.28 { 0.0068 } else { 0.0035 });
         if carve <= 1.0e-8 {
             return 0.0;
         }
@@ -3272,6 +3272,137 @@ impl SoilField {
                 self.sync(idx);
             }
         }
+    }
+
+    /// Lower the rut floor on a second pass so the first lip stays visible in
+    /// profile. Spoil lands on the berm beside the cut. Slurry column volume
+    /// in the pool is unchanged; this only moves bed and placed soil.
+    pub fn accentuate_second_pass_rut(
+        &mut self,
+        pool_x0: f32,
+        pool_x1: f32,
+        pool_z0: f32,
+        pool_z1: f32,
+        rear_left: (f32, f32),
+        rear_right: (f32, f32),
+        track_half: f32,
+        forward: Vec3,
+        pass1_depth: f32,
+    ) {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let cell = self.cell;
+        let area = cell * cell;
+        let half = self.size * 0.5;
+        let rear_z = rear_left.1.min(rear_right.1);
+        let wake_floor = pool_z0 + cell * 1.2;
+        let wake_top = if rear_z > wake_floor + cell * 2.0 {
+            rear_z - 0.08
+        } else {
+            pool_z1 - cell * 1.4
+        };
+        if wake_top <= wake_floor + cell {
+            return;
+        }
+        let on_rut = |cx: f32| {
+            (cx - rear_left.0).abs() <= track_half + cell * 0.15
+                || (cx - rear_right.0).abs() <= track_half + cell * 0.15
+        };
+        let step = (0.078_f32).max(pass1_depth * 0.32);
+        let mut spoil = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz >= pool_z1 {
+                    continue;
+                }
+                if cz > wake_top || cz < wake_floor || !on_rut(cx) {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let cut = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                if cut + 0.002 < pass1_depth * 0.92 {
+                    continue;
+                }
+                let along = ((cz - wake_floor) / (wake_top - wake_floor)).clamp(0.0, 1.0);
+                let bite = step * (0.55 + 0.45 * along);
+                let removed = self.excavate(idx, bite);
+                if removed <= 1.0e-6 {
+                    continue;
+                }
+                spoil += removed * area;
+                self.loose[idx] = (self.loose[idx] + removed * 0.35).min(0.16);
+                self.sync(idx);
+            }
+        }
+        if spoil <= 1.0e-6 {
+            return;
+        }
+        let mut berms: Vec<usize> = Vec::new();
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz > wake_top + cell {
+                    continue;
+                }
+                if on_rut(cx) {
+                    continue;
+                }
+                let rel_x = cx - rear_left.0;
+                let rel_z = cz - rear_z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                if lat.abs() > track_half + cell * 2.8 || lat.abs() < track_half + cell * 0.35 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                berms.push(idx);
+            }
+        }
+        if berms.is_empty() {
+            return;
+        }
+        let share = spoil / berms.len() as f32 / area;
+        for idx in berms {
+            self.placed[idx] = (self.placed[idx] + share).min(0.28);
+            self.kind[idx] = SurfaceKind::Berm as u8;
+            self.sync(idx);
+        }
+    }
+
+    /// Max bed cut under the rear lane behind the vehicle, metres.
+    pub fn lane_rut_depth_behind(
+        &self,
+        pool_x0: f32,
+        pool_x1: f32,
+        pool_z0: f32,
+        rear_z: f32,
+        rear_left_x: f32,
+        rear_right_x: f32,
+        track_half: f32,
+    ) -> f32 {
+        let half = self.size * 0.5;
+        let cell = self.cell;
+        let wake_top = rear_z - 0.05;
+        let mut best = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * cell - half;
+                let cz = (j as f32 + 0.5) * cell - half;
+                if cx < pool_x0 || cx >= pool_x1 || cz < pool_z0 || cz > wake_top {
+                    continue;
+                }
+                let on_rut = (cx - rear_left_x).abs() <= track_half + cell * 0.12
+                    || (cx - rear_right_x).abs() <= track_half + cell * 0.12;
+                if !on_rut {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                best = best.max((self.initial_height[idx] - self.bed[idx]).max(0.0));
+            }
+        }
+        best
     }
 
     /// Move slurry on the heightfield so a wide still reads a crest ahead of
