@@ -1119,34 +1119,37 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     let up = side.cross(dir).normalize();
     let speed = p.vel.length();
     let length = if roll_sheet {
-        (0.52 + speed * 0.03).clamp(0.58, 0.96)
+        (0.44 + speed * 0.022).clamp(0.48, 0.68)
     } else if p.size > 0.14 {
-        (0.78 + speed * 0.04).clamp(0.82, 1.18)
+        (0.62 + speed * 0.03).clamp(0.66, 0.88)
     } else {
-        (0.52 + speed * 0.05).clamp(0.58, 0.92)
+        (0.44 + speed * 0.035).clamp(0.48, 0.72)
     };
     let width = (p.volume / length).sqrt();
     let width = if roll_sheet {
-        width.clamp(0.15, 0.24)
+        width.clamp(0.09, 0.17)
     } else if p.size > 0.14 {
         width.clamp(0.028, 0.062)
     } else {
         width.clamp(0.012, 0.048)
     };
     let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.028);
+    let length = length.min(width * 7.2);
     let segs = 8usize;
+    let side_sweep = if roll_sheet { 0.10 } else { 0.35 };
+    let twist_scale = if roll_sheet { 0.42 } else { 0.7 };
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
         let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0);
         let arc = (t * std::f32::consts::PI).sin();
-        let twist = (t - 0.5) * 0.7;
+        let twist = (t - 0.5) * twist_scale;
         let side_t = side * twist.cos() + up * twist.sin();
         let up_t = -side * twist.sin() + up * twist.cos();
         let c = p.pos
             + dir * (length * (t - 0.5))
             + up * (arc - 0.55) * length * 0.16
-            + side * (t - 0.5) * width * 0.35;
+            + side * (t - 0.5) * width * side_sweep;
         let w = side_t * width * 0.5 * taper;
         let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
         ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
@@ -1378,7 +1381,7 @@ mod slurry_shapes {
             assert!(e[0] / e[2] > 4.0, "shed is a sphere or a chunk {e:?}");
             if p.kind == KIND_SLURRY_SHEET {
                 assert!(
-                    e[1] > 0.12 && e[1] > e[2] * 1.2 && e[0] > e[1] * 1.8,
+                    e[1] > 0.085 && e[1] > e[2] * 1.2 && e[0] > e[1] * 1.8,
                     "roll sheet is a hair or a tablet {e:?}"
                 );
             }

@@ -1889,20 +1889,28 @@ impl World {
             half_track,
             fwd,
         );
+        self.soil.clear_tread_in(pool_x.0, pool_x.1, pool_z.0, pool_z.1);
+        self.soil
+            .spread_placed_lumps(self.vehicle.pos.x, self.vehicle.pos.z, 1.35, 0.045);
         let driver = -right;
+        let across = driver;
+        let lane = fwd;
         let mud_h = self.soil.sample(rear_l.x, rear_l.z).height;
-        let ribbon_base = Vec3::new(
-            rear_l.x + driver.x * 1.22,
-            mud_h + 0.38,
-            rear_l.z + driver.z * 1.22 - fwd.z * 0.32,
-        );
-        let sheet_base = Vec3::new(
-            rear_l.x + driver.x * 0.88,
-            mud_h + 0.52,
-            rear_l.z + driver.z * 0.88 - fwd.z * 0.18,
-        );
-        let mut ri = 0usize;
+        let shed_origin = rear_l + driver * 1.52 + Vec3::Y * 0.36 - fwd * 0.38;
+        let sheet_stations = [
+            (-0.42_f32, -0.18, 0.52),
+            (0.22, 0.38, 0.34),
+            (0.55, -0.12, 0.18),
+            (-0.08, 0.28, 0.44),
+        ];
+        let ribbon_stations = [
+            (0.32_f32, 0.42, 0.58),
+            (-0.55, -0.12, 0.38),
+            (-0.28, 0.48, 0.22),
+        ];
+        let inv = self.vehicle.orientation().conjugate();
         let mut si = 0usize;
+        let mut ri = 0usize;
         for p in &mut self.particles.items {
             if !p.alive {
                 continue;
@@ -1911,28 +1919,32 @@ impl World {
             p.deposited = false;
             p.life = p.life.max(4.4);
             p.max_life = p.max_life.max(4.4);
-            if p.kind == crate::particles::KIND_SLURRY_RIBBON {
-                p.pos = ribbon_base
-                    + driver * (ri as f32 * 0.20)
-                    + fwd * (ri as f32 * -0.05)
-                    + Vec3::Y * (ri as f32 * 0.05);
-                p.vel = driver * 2.6 + fwd * (-0.48) + Vec3::Y * 0.18;
-                p.size = (p.volume * 42.0).cbrt().clamp(0.22, 0.36);
-                p.spin = Vec3::new(0.10, 0.24, 0.12);
-                ri += 1;
-            } else if p.kind == crate::particles::KIND_SLURRY_SHEET {
-                p.pos = sheet_base
-                    + driver * (si as f32 * 0.26)
-                    + fwd * (si as f32 * 0.04)
-                    + Vec3::Y * (si as f32 * 0.06);
-                p.vel = driver * 1.9 + fwd * 0.22 + Vec3::Y * 0.28;
-                p.size = (p.volume * 18.0).cbrt().clamp(0.28, 0.44);
-                p.spin = Vec3::new(0.06, 0.14, 0.20);
+            p.size = (p.volume * 12.0).cbrt().clamp(0.04, 0.11);
+            if p.kind == crate::particles::KIND_SLURRY_SHEET {
+                let (along, out, up) = sheet_stations[si % sheet_stations.len()];
+                p.pos = shed_origin + lane * along + across * out + Vec3::Y * (up + 0.42);
+                let t = si as f32;
+                p.vel = across * (2.4 + t * 0.15) + lane * 0.35 + Vec3::Y * 0.55;
+                p.spin = Vec3::new(0.06, 0.12, 0.14);
                 si += 1;
-            } else if p.kind == crate::particles::KIND_SLURRY_DROP {
+            } else if p.kind == crate::particles::KIND_SLURRY_RIBBON {
+                let (along, out, up) = ribbon_stations[ri % ribbon_stations.len()];
+                p.pos = shed_origin + lane * along + across * out + Vec3::Y * (up + 0.38);
+                let t = ri as f32;
+                p.vel = across * (2.6 + t * 0.18) + Vec3::Y * (1.0 + t * 0.12) + lane * 0.35;
+                p.spin = Vec3::new(0.08, 0.18, 0.10);
+                ri += 1;
+            } else {
                 p.alive = false;
-            } else if p.kind == 0 || p.kind == 1 {
-                p.alive = false;
+                continue;
+            }
+            if p.pos.y < mud_h + 0.48 {
+                p.pos.y = mud_h + 0.52;
+            }
+            let local = inv * (p.pos - self.vehicle.pos);
+            if local.x.abs() < 1.05 && local.y > -0.30 && local.y < 1.05 && local.z.abs() < 1.95 {
+                let n = (si + ri) as f32;
+                p.pos = shed_origin + across * (0.42 + n * 0.11) + Vec3::Y * (0.55 + n * 0.06);
             }
         }
     }
@@ -2166,7 +2178,6 @@ impl World {
         let mut dir_acc = Vec3::ZERO;
         let mut fling = 0.0_f32;
         for i in 0..4 {
-            let center = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
             let bottom = tire_bottom(&self.vehicle, i);
             let h = self.soil.sample(bottom.x, bottom.z).height;
             let pen = h - bottom.y;
@@ -2185,16 +2196,6 @@ impl World {
                 throw_frac,
             );
             credit_bed(cut, false, &mut pose);
-            if pen > 0.008 {
-                self.soil.imprint_tread(
-                    center,
-                    fwd,
-                    right,
-                    WHEEL_RADIUS,
-                    WHEEL_WIDTH,
-                    pen.min(0.09),
-                );
-            }
             if cut.thrown > 1.0e-6 {
                 origin += bottom * cut.thrown;
                 dir_acc += throw_dir * cut.thrown;
