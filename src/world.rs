@@ -6,7 +6,8 @@ use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
 use crate::patch::{
     contact_patch, groove_slurry_capacity, moisture_sinkage_row, moisture_traction_row,
-    release_groove_slurry, sinkage_at_normal, TreadCoat, TreadStep, MOISTURE_SINKAGE_NORMAL,
+    release_groove_slurry, sinkage_at_normal, stuck_rock_compact_pace, stuck_saturation_hold,
+    TreadCoat, TreadStep, MOISTURE_SINKAGE_NORMAL,
     MOISTURE_TRACTION_NORMAL, MOISTURE_TRACTION_SINK, MOISTURE_TRACTION_SLIP, SIDEWALL_VOLUME,
 };
 use crate::soil::{
@@ -549,11 +550,21 @@ impl World {
         // At speed the visible cut is the lane ribbon. The per-tire slip dig
         // is for a tire that is spinning in place, not a second slot per wheel.
         let crawling = self.vehicle.speed() < 1.1;
+        let speed = self.vehicle.speed();
         for c in &contacts {
             if !c.active {
                 continue;
             }
-            let slip_stamp = if crawling { c.slip } else { 0.0 };
+            let slip_stamp = if crawling {
+                if speed < 0.12 {
+                    let spin = self.vehicle.wheels[c.index].omega.abs() * WHEEL_RADIUS;
+                    c.slip.abs().max(if spin > 0.32 { 0.82 } else { 0.0 })
+                } else {
+                    c.slip
+                }
+            } else {
+                0.0
+            };
             self.soil.stamp_wheel(
                 c.wheel_center,
                 WHEEL_RADIUS,
@@ -650,6 +661,25 @@ impl World {
             side.stamp(&mut self.soil, WHEEL_RADIUS, width, dt);
         }
 
+        if speed < 0.22 && input.throttle.abs() > 0.35 {
+            for c in &contacts {
+                if !c.active {
+                    continue;
+                }
+                let pace = stuck_rock_compact_pace(c.sample.kind())
+                    * (0.45 + 0.55 * c.sample.wetness.clamp(0.0, 1.0));
+                self.soil.compact_rut_under_patch(
+                    c.wheel_center,
+                    c.forward,
+                    c.right,
+                    WHEEL_RADIUS,
+                    width,
+                    pace,
+                    dt,
+                );
+            }
+        }
+
         let planted = contacts.iter().filter(|c| c.active).count();
         self.note_flight(planted, dt);
         self.vehicle.integrate(&contacts, &self.soil, dt);
@@ -696,7 +726,6 @@ impl World {
             }
         }
 
-        let speed = self.vehicle.speed();
         for c in &contacts {
             if !c.active {
                 continue;
@@ -1411,6 +1440,168 @@ impl World {
             cut,
             placed,
         }
+    }
+
+    /// Niva stuck in saturated clay: spin digs deeper, rocking compacts the rut,
+    /// then it drives out. Clay holds hardest; sand releases sooner.
+    pub fn stuck_recovery_in_saturated_clay(&mut self) -> StuckRecoveryWake {
+        self.soil = SoilField::mud_pad();
+        for i in 0..self.soil.kind.len() {
+            self.soil.wetness[i] = 0.96;
+            self.soil.base_wetness[i] = 0.94;
+            self.soil.water[i] = self.soil.water[i].max(0.018);
+            self.soil.loose[i] = self.soil.loose[i].max(0.05);
+        }
+        self.soil.roll_lane(
+            Vec3::new(0.0, 0.0, -1.35),
+            Vec3::new(0.0, 0.0, 1.35),
+            0.11,
+            0.0,
+        );
+        for loose in &mut self.soil.loose {
+            *loose = loose.max(0.07);
+        }
+
+        self.bike.pos = Vec3::new(14.0, 0.5, 14.0);
+        self.vehicle.pos = Vec3::new(0.0, 0.72, -0.15);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        for w in &mut self.vehicle.wheels {
+            w.compression = 0.24;
+            w.omega = 0.0;
+            w.mud = 0.0;
+            w.groove = 0.0;
+            w.smear = 0.0;
+            w.sidewall = 0.0;
+        }
+        self.seat_in_slurry(0.26);
+        self.vehicle.pitch = 0.14;
+        for w in &mut self.vehicle.wheels {
+            w.compression = 0.28;
+        }
+        for _ in 0..28 {
+            if self.vehicle.belly_penetration(&self.soil) > 0.012 {
+                break;
+            }
+            self.vehicle.pos.y -= 0.014;
+        }
+        let res = self.soil.res;
+        let half = self.soil.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * self.soil.cell - half;
+                let z = (j as f32 + 0.5) * self.soil.cell - half;
+                if x.abs() > 0.52 || z.abs() > 1.05 {
+                    continue;
+                }
+                let idx = j * res + i;
+                let dug = (self.soil.initial_height[idx] - self.soil.bed[idx]).max(0.0);
+                if dug > 0.02 {
+                    self.soil.loose[idx] = self.soil.loose[idx].max(0.09);
+                }
+            }
+        }
+
+        let cut0 = self.soil.cut_volume();
+        let placed0 = self.soil.placed_volume();
+
+        let rut_before = self.rut_depth_under_niva();
+        let belly_before = self.vehicle.belly_penetration(&self.soil);
+        let drag_before = self.vehicle.belly_drag_n(&self.soil);
+        let (grip_before, speed_before) = self.stuck_snapshot();
+
+        let dt = 1.0_f32 / 60.0;
+        let spin_steps = (2.4_f32 / dt).round() as u32;
+        for _ in 0..spin_steps {
+            self.step(
+                dt,
+                &Input {
+                    throttle: 1.0,
+                    brake: 0.0,
+                    steer: 0.0,
+                },
+            );
+        }
+        let rut_after_spin = self.rut_depth_under_niva();
+        let belly_spin = self.vehicle.belly_penetration(&self.soil);
+
+        let rock_steps = (3.6_f32 / dt).round() as u32;
+        for n in 0..rock_steps {
+            let fwd = n % 2 == 0;
+            self.step(
+                dt,
+                &Input {
+                    throttle: if fwd { 0.95 } else { -0.88 },
+                    brake: 0.0,
+                    steer: 0.0,
+                },
+            );
+        }
+        let rut_after_rock = self.rut_depth_under_niva();
+        let (grip_after_rock, speed_after_rock) = self.stuck_snapshot();
+        let belly_rock = self.vehicle.belly_penetration(&self.soil);
+        let drag_rock = self.vehicle.belly_drag_n(&self.soil);
+
+        let exit_steps = (5.2_f32 / dt).round() as u32;
+        for _ in 0..exit_steps {
+            self.step(
+                dt,
+                &Input {
+                    throttle: 1.0,
+                    brake: 0.0,
+                    steer: 0.0,
+                },
+            );
+        }
+        let rut_after_exit = self.rut_depth_under_niva();
+        let (_, speed_after_exit) = self.stuck_snapshot();
+
+        let cut = self.soil.cut_volume() - cut0;
+        let placed = self.soil.placed_volume() - placed0;
+        let vol1 = self.soil.volumes();
+        let sum = vol1.cut + vol1.berm;
+
+        StuckRecoveryWake {
+            rut_before,
+            rut_after_spin,
+            rut_after_rock,
+            rut_after_exit,
+            belly_before,
+            belly_spin,
+            belly_rock,
+            belly_drag_before: drag_before,
+            belly_drag_rock: drag_rock,
+            grip_before,
+            grip_after_rock,
+            speed_before,
+            speed_after_rock,
+            speed_after_exit,
+            hold_clay: stuck_saturation_hold(SurfaceKind::WetMud),
+            hold_silt: stuck_saturation_hold(SurfaceKind::Silt),
+            hold_sand: stuck_saturation_hold(SurfaceKind::Sand),
+            cut,
+            placed,
+            sum,
+        }
+    }
+
+    fn rut_depth_under_niva(&self) -> f32 {
+        self.soil.max_bed_cut_in(-0.55, 0.55, -1.05, 1.05)
+    }
+
+    fn stuck_snapshot(&mut self) -> (f32, f32) {
+        let contacts = self
+            .vehicle
+            .compute_contacts(&self.soil, 0.0, 0.0, 1.0 / 60.0);
+        let grip = contacts
+            .iter()
+            .filter(|c| c.active)
+            .map(|c| c.grip)
+            .sum::<f32>()
+            / contacts.iter().filter(|c| c.active).count().max(1) as f32;
+        (grip, self.vehicle.speed())
     }
 
     /// After a second pass through the pool, let the bow wave and berm creep
@@ -2856,6 +3047,32 @@ pub struct MoistureSinkageCell {
     pub water_m: f32,
     pub buoy_n: f32,
     pub suction_n: f32,
+}
+
+/// Stuck Niva in saturated clay: rut depth, belly drag, traction, and speed
+/// before and after rocking forward and back.
+#[derive(Clone, Copy, Debug)]
+pub struct StuckRecoveryWake {
+    pub rut_before: f32,
+    pub rut_after_spin: f32,
+    pub rut_after_rock: f32,
+    pub rut_after_exit: f32,
+    pub belly_before: f32,
+    pub belly_spin: f32,
+    pub belly_rock: f32,
+    pub belly_drag_before: f32,
+    pub belly_drag_rock: f32,
+    pub grip_before: f32,
+    pub grip_after_rock: f32,
+    pub speed_before: f32,
+    pub speed_after_rock: f32,
+    pub speed_after_exit: f32,
+    pub hold_clay: f32,
+    pub hold_silt: f32,
+    pub hold_sand: f32,
+    pub cut: f32,
+    pub placed: f32,
+    pub sum: f32,
 }
 
 /// Sink and contact table per soil and moisture, plus clay dry-band pass.
@@ -4305,6 +4522,92 @@ mod tests {
             }
         }
         assert!(sheets >= 2 && ribbons >= 4 && spray >= 2);
+    }
+
+    #[test]
+    fn stuck_recovery_rock_escapes_saturated_clay_and_conserves_volume() {
+        let mut world = World::wet_clay();
+        let m = world.stuck_recovery_in_saturated_clay();
+        eprintln!(
+            "stuck rut {:.4}->{:.4}->{:.4}->{:.4} belly {:.4}->{:.4} drag {:.0}->{:.0} \
+             grip {:.0}->{:.0} speed {:.3}->{:.3}->{:.3} cut {:.4} placed {:.4} sum {:.4}",
+            m.rut_before,
+            m.rut_after_spin,
+            m.rut_after_rock,
+            m.rut_after_exit,
+            m.belly_before,
+            m.belly_rock,
+            m.belly_drag_before,
+            m.belly_drag_rock,
+            m.grip_before,
+            m.grip_after_rock,
+            m.speed_before,
+            m.speed_after_rock,
+            m.speed_after_exit,
+            m.cut,
+            m.placed,
+            m.sum
+        );
+        assert!(
+            m.rut_after_spin > m.rut_before + 0.012,
+            "spin should dig deeper {:.4} -> {:.4}",
+            m.rut_before,
+            m.rut_after_spin
+        );
+        assert!(
+            m.belly_before > 0.004
+                || m.belly_spin > 0.004
+                || m.belly_rock > 0.004
+                || m.belly_drag_before > 200.0,
+            "belly or axle contact {:.4} {:.4} drag {:.0}",
+            m.belly_spin,
+            m.belly_rock,
+            m.belly_drag_before
+        );
+        assert!(
+            m.belly_drag_before > 90.0,
+            "belly drag {:.0} N",
+            m.belly_drag_before
+        );
+        assert!(
+            m.grip_after_rock > m.grip_before + 40.0,
+            "rock should raise traction {:.0} -> {:.0} N",
+            m.grip_before,
+            m.grip_after_rock
+        );
+        assert!(
+            m.speed_after_rock > m.speed_before + 0.04,
+            "rock should build exit speed {:.3} -> {:.3}",
+            m.speed_before,
+            m.speed_after_rock
+        );
+        assert!(
+            m.speed_after_exit > 0.22,
+            "should drive out {:.3} m/s",
+            m.speed_after_exit
+        );
+        assert!(
+            m.hold_clay > m.hold_silt && m.hold_silt > m.hold_sand,
+            "hold clay {:.2} silt {:.2} sand {:.2}",
+            m.hold_clay,
+            m.hold_silt,
+            m.hold_sand
+        );
+        assert!(m.cut > 1.0e-4, "pass did not cut");
+        let vol = world.soil.volumes();
+        assert!(
+            (m.sum - (vol.cut + vol.berm)).abs() < 1.0e-3,
+            "sum {:.4} != cut {:.4} + berm {:.4}",
+            m.sum,
+            vol.cut,
+            vol.berm
+        );
+        assert!(
+            m.placed > 0.08 && m.cut > 0.08,
+            "cut {:.4} placed {:.4}",
+            m.cut,
+            m.placed
+        );
     }
 }
 

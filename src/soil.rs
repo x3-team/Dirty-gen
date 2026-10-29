@@ -1848,6 +1848,69 @@ impl SoilField {
         self.sync(idx);
     }
 
+    /// Rocking forward and back packs loose spoil into the rut floor. Volume
+    /// stays on the heightfield: loose drops and the bed rises in place.
+    pub fn compact_rut_under_patch(
+        &mut self,
+        center: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        radius: f32,
+        width: f32,
+        pace: f32,
+        dt: f32,
+    ) {
+        if pace <= 0.0 || dt <= 0.0 {
+            return;
+        }
+        let half_l = radius.max(0.05) * 0.95;
+        let half_w = (width.max(0.02) * 0.5).max(self.cell * 0.45);
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let fwd = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let rgt = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+        if fwd.length_squared() < 1.0e-6 {
+            return;
+        }
+        let i0 = (((center.x - half_l - half) / self.cell).floor() as isize).clamp(0, self.res as isize - 1);
+        let i1 = (((center.x + half_l - half) / self.cell).ceil() as isize).clamp(0, self.res as isize - 1);
+        let j0 = (((center.z - half_l - half) / self.cell).floor() as isize).clamp(0, self.res as isize - 1);
+        let j1 = (((center.z + half_l - half) / self.cell).ceil() as isize).clamp(0, self.res as isize - 1);
+        let blend = (1.0 - (-pace * dt).exp()).min(0.35);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                let lx = (x - center.x) * rgt.x + (z - center.z) * rgt.z;
+                let lz = (x - center.x) * fwd.x + (z - center.z) * fwd.z;
+                if lx.abs() > half_w || lz.abs() > half_l {
+                    continue;
+                }
+                let along = (1.0 - (lz.abs() / half_l).powi(2)).max(0.0);
+                let across = (1.0 - (lx.abs() / half_w).powi(2)).max(0.0);
+                let w = along * across;
+                if w < 0.08 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                let loose = self.loose[idx];
+                if loose < 1.0e-4 {
+                    continue;
+                }
+                let pack = loose * blend * w;
+                self.loose[idx] = (loose - pack).max(0.0);
+                self.bed[idx] += pack;
+                self.height[idx] += pack;
+                let wet = self.wetness[idx];
+                self.darken[idx] =
+                    (self.darken[idx] + 18.0 * w * dt * (0.40 + wet)).min(1.0);
+                self.roughness[idx] = lerp(self.roughness[idx], 0.22, 0.08 * w * blend);
+                let _ = area;
+                self.sync(idx);
+            }
+        }
+    }
+
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {
         let half = self.size * 0.5;
         if x < -half || z < -half || x >= half || z >= half {

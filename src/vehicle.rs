@@ -3,7 +3,7 @@
 
 use glam::{EulerRot, Quat, Vec3};
 
-use crate::patch::{contact_patch, step_tread, TreadCoat, TreadStep};
+use crate::patch::{contact_patch, step_tread, stuck_compact_breakaway, TreadCoat, TreadStep};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
     slurry_motion_drag, slurry_suction_force, stick_scale, terramech_for, wheel_buoyancy, SoilField,
@@ -226,6 +226,42 @@ impl Vehicle {
         Vec3::new(hp.x, hp.y - REST_LEN + c, hp.z)
     }
 
+    /// Deepest belly, axle skid, or differential contact below the chassis.
+    pub fn belly_penetration(&self, soil: &SoilField) -> f32 {
+        let ori = self.orientation();
+        let mut pen_max = 0.0_f32;
+        let belly = [
+            Vec3::new(-0.30, -0.18, 0.9),
+            Vec3::new(0.30, -0.18, 0.9),
+            Vec3::new(-0.30, -0.18, -0.8),
+            Vec3::new(0.30, -0.18, -0.8),
+            Vec3::new(0.0, -0.22, 0.0),
+            Vec3::new(0.0, -0.20, 0.45),
+        ];
+        for p in belly {
+            let w = self.pos + ori * p;
+            let h = soil.sample(w.x, w.z).height;
+            pen_max = pen_max.max(h + 0.01 - w.y);
+        }
+        for hp in hardpoints() {
+            let arm = self.pos + ori * Vec3::new(hp.x, hp.y - REST_LEN + 0.04, hp.z);
+            let h = soil.sample(arm.x, arm.z).height;
+            pen_max = pen_max.max(h + 0.06 - arm.y);
+        }
+        pen_max.max(0.0)
+    }
+
+    /// Horizontal drag from belly or axle high-centering, newtons.
+    pub fn belly_drag_n(&self, soil: &SoilField) -> f32 {
+        let pen = self.belly_penetration(soil);
+        if pen <= 0.0 {
+            return 0.0;
+        }
+        let s = soil.sample(self.pos.x, self.pos.z);
+        let wet = s.wetness.clamp(0.0, 1.0);
+        (pen * (2_200.0 + 3_800.0 * wet)).min(6_500.0)
+    }
+
     pub fn update_steer(&mut self, steer: f32, dt: f32) {
         let target = steer.clamp(-1.0, 1.0) * MAX_STEER;
         let blend = 1.0 - (-dt * 6.0).exp();
@@ -406,7 +442,9 @@ impl Vehicle {
                 // At speed the full yield bogs the buggy. From rest only the
                 // breakaway fraction has to be beaten, unless the rut is deep.
                 let speed_gate = smoothstep(0.25, 1.2, speed_h);
-                let breakaway = f_yield * (0.50 + 0.50 * speed_gate);
+                let compact = (sample.darken * (sample.rut / 0.06).clamp(0.0, 1.2)).clamp(0.0, 1.0);
+                let breakaway =
+                    f_yield * (0.50 + 0.50 * speed_gate) * stuck_compact_breakaway(sample.kind(), compact);
 
                 if speed_h < 0.12 {
                     if prop_mag <= breakaway {
@@ -661,7 +699,9 @@ impl Vehicle {
             if self.vel.y < 0.0 {
                 self.vel.y *= 0.5;
             }
-            let decel = (pen_max * 16.0).min(4.0);
+            let sample = soil.sample(self.pos.x, self.pos.z);
+            let wet = sample.wetness.clamp(0.0, 1.0);
+            let decel = (pen_max * (16.0 + 26.0 * wet)).min(8.0);
             let hv = Vec3::new(self.vel.x, 0.0, self.vel.z);
             let speed = hv.length();
             if speed > 0.05 {
