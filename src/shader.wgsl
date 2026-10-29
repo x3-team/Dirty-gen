@@ -666,14 +666,7 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     var n = terrain_normal(xz);
-    // The square stamp beside a live tire is filled back to the lip. Paint a
-    // clay card as the pad. Gravel is not a stamp product, so it stays gravel
-    // under the tire instead of being covered with the mud map.
-    let seat = apply_seat(xz, terrain_height(xz));
     var kind = kind_nearest(xz);
-    if (seat.z > 0.22 && kind != 2u) {
-        kind = 4u;
-    }
 
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
@@ -1198,6 +1191,10 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        let g = noise(world.xz * 2.2 + vec2<f32>(world.y * 1.4, 0.3));
+        let col = mix(vec3<f32>(0.46, 0.38, 0.26), vec3<f32>(0.68, 0.58, 0.40), g);
+        return vec4<f32>(col, 0.72);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
