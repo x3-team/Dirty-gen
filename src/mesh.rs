@@ -902,6 +902,7 @@ fn add_lump(
     stacks: usize,
     slices: usize,
     slump: bool,
+    panel: f32,
 ) {
     let axis = Vec3::new(
         0.88 + chunk_hash(seed, 1) * 0.22,
@@ -964,7 +965,7 @@ fn add_lump(
             nrm[a],
             pts[b],
             nrm[b],
-            PANEL_CLOD,
+            panel,
             center,
         );
     }
@@ -982,7 +983,7 @@ fn add_lump(
                 nrm[c],
                 pts[b],
                 nrm[b],
-                PANEL_CLOD,
+                panel,
                 center,
             );
             add_tri_smooth(
@@ -993,7 +994,7 @@ fn add_lump(
                 nrm[c],
                 pts[d],
                 nrm[d],
-                PANEL_CLOD,
+                panel,
                 center,
             );
         }
@@ -1011,7 +1012,7 @@ fn add_lump(
             nrm[a],
             pts[b],
             nrm[b],
-            PANEL_CLOD,
+            panel,
             center,
         );
     }
@@ -1027,6 +1028,7 @@ fn add_piece(mesh: &mut CpuMesh, p: &silt::particles::Particle, stacks: usize, s
         stacks,
         slices,
         p.grounded,
+        PANEL_CLOD,
     );
 }
 
@@ -1076,95 +1078,31 @@ fn spin_ribbon(vel: Vec3) -> bool {
     vel.length() > 6.0
 }
 
-/// Look axis of the ford-exit still. Width is built across this view so the
-/// sheet faces that camera. A horizontal width turned the same film edge-on.
-fn ford_exit_view() -> Vec3 {
-    Vec3::new(0.827, -0.374, 0.420)
-}
+/// Existing glass tint. Spray drops use it so they read as water, not mud boards.
+const PANEL_WATER_DROP: f32 = 65.0;
 
-/// Arch film. The long axis is the fall out of the opening. The sheet faces
-/// the still, so it reads as a film instead of a post or an edge-on sliver.
-fn arch_film_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
-    let dir = if vel.length_squared() < 1.0e-6 {
-        Vec3::new(0.0, -1.0, -0.2)
-    } else {
-        vel.normalize()
-    };
-    let mut side = dir.cross(ford_exit_view());
-    if side.length_squared() < 1.0e-4 {
-        side = dir.cross(Vec3::Y);
-    }
-    side = side.normalize();
-    let thin = side.cross(dir).normalize();
-    (dir, side, thin)
-}
-
-/// Tread ribbon. Long axis is the throw off the carcass. Same facing sheet
-/// as the arch film, so the ribbon stays in frame.
-fn tread_ribbon_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
-    arch_film_axes(vel)
-}
-
-/// Two faces only. No rim, so the mark has no box edge.
-fn add_open_sheet(
-    mesh: &mut CpuMesh,
-    p: &silt::particles::Particle,
-    length: f32,
-    width: f32,
-    thick: f32,
-    panel: f32,
-    axes: (Vec3, Vec3, Vec3),
-    tip: f32,
-) {
-    let (dir, side, up) = axes;
-    let segs = 10usize;
-    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
-    for s in 0..=segs {
-        let t = s as f32 / segs as f32;
-        let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
-        // Narrows toward both ends. A flat clamp reads as a sawn board.
-        let taper = edge.powf(0.75).clamp(tip, 1.0);
-        let c = p.pos + dir * (length * (t - 0.5));
-        let w = side * width * 0.5 * taper;
-        let h = up * thick * 0.5;
-        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
-    }
-    for s in 0..segs {
-        let a = ring[s];
-        let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], panel);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], panel);
-    }
-}
-
-/// Ford water. Drain is a film in the arch. Spray is a fine ribbon off the tread.
-/// Straight centerline, so neither is a crescent. No rim, so neither is a slab.
-pub const PANEL_WATER_FILM: f32 = 47.0;
-
+/// Ford exit. Drain and spray are drops of water, not a camera-facing card.
 fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    if p.kind == silt::particles::KIND_WATER_SPRAY {
-        add_open_sheet(
-            mesh,
-            p,
-            0.64,
-            0.060,
-            0.0024,
-            PANEL_WATER_FILM,
-            tread_ribbon_axes(p.vel),
-            0.36,
-        );
-    } else {
-        add_open_sheet(
-            mesh,
-            p,
-            0.72,
-            0.093,
-            0.0040,
-            PANEL_WATER_FILM,
-            arch_film_axes(p.vel),
-            0.36,
-        );
+    if p.kind != silt::particles::KIND_WATER_SPRAY && p.kind != silt::particles::KIND_WATER_DRAIN {
+        return;
     }
+    // One drop per ledger piece. A run of them is the stream; a clump read as foam.
+    let radius = if p.kind == silt::particles::KIND_WATER_DRAIN {
+        0.062
+    } else {
+        0.070
+    };
+    add_lump(
+        mesh,
+        p.pos,
+        Quat::IDENTITY,
+        radius,
+        p.seed.wrapping_add(3),
+        3,
+        5,
+        false,
+        PANEL_WATER_DROP,
+    );
 }
 
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
@@ -1490,91 +1428,84 @@ mod slurry_shapes {
     }
 
     #[test]
-    fn ford_exit_water_is_a_flat_film() {
+    fn ford_exit_spray_is_particles_and_drain_is_not_a_card() {
         use silt::particles::{Particle, KIND_WATER_DRAIN, KIND_WATER_SPRAY};
-        for kind in [KIND_WATER_DRAIN, KIND_WATER_SPRAY] {
-            let p = Particle {
-                pos: Vec3::new(0.2, 0.4, 0.1),
-                vel: Vec3::new(0.05, -0.35, -1.6),
-                life: 2.0,
-                max_life: 2.0,
-                size: 0.08,
-                kind,
-                alive: true,
-                volume: 0.0012,
-                ledger: true,
-                water: true,
-                ..Particle::default()
-            };
-            let mut mesh = CpuMesh::new();
-            add_water_film(&mut mesh, &p);
-            let (dir, side, up) = if kind == KIND_WATER_SPRAY {
-                tread_ribbon_axes(p.vel)
-            } else {
-                arch_film_axes(p.vel)
-            };
-            let mut min = Vec3::splat(f32::MAX);
-            let mut max = Vec3::splat(-f32::MAX);
-            for v in &mesh.vertices {
-                let q = Vec3::from_array(v.pos);
-                let frame = Vec3::new(q.dot(dir), q.dot(side), q.dot(up));
-                min = min.min(frame);
-                max = max.max(frame);
-            }
-            let span = max - min;
-            let length = span.x;
-            let width = span.y;
-            let thick = span.z;
-            if kind == KIND_WATER_SPRAY {
-                assert!(
-                    length > width * 8.0 && length < width * 14.0,
-                    "spray is a slab or a hair {length:.3} {width:.3} kind {kind}"
-                );
-            } else {
-                assert!(
-                    length > width * 4.2 && length < width * 8.0,
-                    "drain film is a slab or a hair {length:.3} {width:.3}"
-                );
-            }
+        let drain = Particle {
+            pos: Vec3::new(0.2, 0.4, 0.1),
+            vel: Vec3::new(0.05, -0.35, -1.6),
+            life: 2.0,
+            max_life: 2.0,
+            size: 0.08,
+            kind: KIND_WATER_DRAIN,
+            alive: true,
+            volume: 0.0012,
+            ledger: true,
+            water: true,
+            ..Particle::default()
+        };
+        let mut mesh = CpuMesh::new();
+        add_water_film(&mut mesh, &drain);
+        assert!(
+            mesh.vertices.len() > 40,
+            "drain is not drops, verts {}",
+            mesh.vertices.len()
+        );
+        let mut dmin = Vec3::splat(f32::MAX);
+        let mut dmax = Vec3::splat(-f32::MAX);
+        for v in &mesh.vertices {
+            let q = Vec3::from_array(v.pos);
+            dmin = dmin.min(q);
+            dmax = dmax.max(q);
+            assert!((v.panel - 47.0).abs() > 0.5, "drain uses the brown film panel");
+        }
+        let dext = dmax - dmin;
+        let mut daxes = [dext.x, dext.y, dext.z];
+        daxes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(daxes[0] > 0.05, "drain is a flat card {daxes:?}");
+        assert!(daxes[2] < 0.40, "drain is a long board {daxes:?}");
+
+        let spray = Particle {
+            pos: Vec3::new(0.2, 0.4, 0.1),
+            vel: Vec3::new(-0.2, 0.7, -0.6),
+            life: 2.0,
+            max_life: 2.0,
+            size: 0.08,
+            kind: KIND_WATER_SPRAY,
+            alive: true,
+            seed: 7,
+            volume: 0.0012,
+            ledger: true,
+            water: true,
+            ..Particle::default()
+        };
+        add_water_film(&mut mesh, &spray);
+        assert!(
+            mesh.vertices.len() > 40,
+            "spray is not a cloud of particles, verts {}",
+            mesh.vertices.len()
+        );
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(-f32::MAX);
+        for v in &mesh.vertices {
+            let q = Vec3::from_array(v.pos);
+            min = min.min(q);
+            max = max.max(q);
             assert!(
-                width > thick * 18.0,
-                "water mark is a bar or a rod {width:.3} {thick:.3}"
-            );
-            // Centerline bow. A crescent leaves the middle off the end chord.
-            let mut bins = [Vec3::ZERO; 6];
-            let mut counts = [0.0_f32; 6];
-            let span_l = (max.x - min.x).max(1.0e-4);
-            for v in &mesh.vertices {
-                let q = Vec3::from_array(v.pos);
-                let along = q.dot(dir);
-                let lateral = q.dot(side);
-                let t = ((along - min.x) / span_l).clamp(0.0, 0.999);
-                let b = (t * 6.0) as usize;
-                bins[b] += Vec3::new(along, lateral, 1.0);
-                counts[b] += 1.0;
-            }
-            let mut pts = Vec::new();
-            for i in 0..6 {
-                if counts[i] > 0.0 {
-                    pts.push(bins[i] / counts[i]);
-                }
-            }
-            assert!(pts.len() >= 4, "film centerline is short");
-            let a = pts[0];
-            let c = pts[pts.len() - 1];
-            let chord = c.x - a.x;
-            let mut bow = 0.0_f32;
-            for p in &pts[1..pts.len() - 1] {
-                let u = (p.x - a.x) / chord.max(1.0e-4);
-                let line = a.y + (c.y - a.y) * u;
-                bow = bow.max((p.y - line).abs());
-            }
-            assert!(
-                bow < span.x * 0.04,
-                "water film bows like a crescent {bow:.4} length {:.3}",
-                span.x
+                (v.panel - 47.0).abs() > 0.5,
+                "spray uses the brown film panel"
             );
         }
+        let ext = max - min;
+        let mut axes = [ext.x, ext.y, ext.z];
+        axes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(
+            axes[0] > 0.05,
+            "spray is a flat card {axes:?}"
+        );
+        assert!(
+            axes[2] < 0.40,
+            "spray is a long board {axes:?}"
+        );
     }
 
     #[test]

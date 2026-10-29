@@ -2672,7 +2672,7 @@ fn sculpt_ford_exit_still(world: &mut World) {
     }
 
     // Films were spawned on the unpitched pose. Drain falls out of the
-    // camera-side arches. Spray rises off the rear tread. Volumes stay.
+    // rear arch into the pool. Spray leaves the rear tread. Volumes stay.
     let mut drain_i = Vec::new();
     let mut spray_i = Vec::new();
     for (i, p) in world.particles.items.iter().enumerate() {
@@ -2685,55 +2685,49 @@ fn sculpt_ford_exit_still(world: &mut World) {
             spray_i.push(i);
         }
     }
-    // Drain falls out of the camera-side arches into the pool and onto the
-    // bank. The long axis is the velocity. Volumes stay.
-    // Two collinear sheets per arch. The rear pair sits in front of the
-    // fender, from the lip of that arch down the sidewall into the pool.
-    // The front pair is the strip that leaves the front arch onto the bank.
+    // From the rear lip down into the standing water. Not a straight bead.
     let drains = [
         (
-            Vec3::new(-1.280, 0.190, 1.435),
-            Vec3::new(0.0, -0.728, 0.685),
+            Vec3::new(-1.12, 0.30, 1.18),
+            Vec3::new(-0.20, -0.90, -0.50),
         ),
         (
-            Vec3::new(-1.420, -0.057, 1.656),
-            Vec3::new(0.0, -0.728, 0.685),
+            Vec3::new(-1.20, 0.08, 0.96),
+            Vec3::new(-0.16, -0.75, -0.55),
         ),
         (
-            Vec3::new(-0.793, 0.666, 4.018),
-            Vec3::new(-0.676, -0.624, 0.392),
+            Vec3::new(-1.26, -0.08, 0.80),
+            Vec3::new(-0.18, -0.55, -0.65),
         ),
         (
-            Vec3::new(-1.177, 0.312, 4.240),
-            Vec3::new(-0.676, -0.624, 0.392),
+            Vec3::new(-1.32, -0.18, 0.66),
+            Vec3::new(-0.10, -0.35, -0.75),
+        ),
+    ];
+    let sprays = [
+        (
+            Vec3::new(-1.08, -0.28, 1.32),
+            Vec3::new(-0.40, 0.30, -0.50),
+        ),
+        (
+            Vec3::new(-1.22, -0.06, 1.26),
+            Vec3::new(-0.20, 0.75, -0.35),
+        ),
+        (
+            Vec3::new(-1.16, -0.36, 1.14),
+            Vec3::new(-0.45, 0.10, -0.60),
+        ),
+        (
+            Vec3::new(-1.34, 0.04, 1.16),
+            Vec3::new(-0.15, 0.80, -0.40),
         ),
     ];
     for (n, pi) in drain_i.iter().enumerate() {
-        let p = &mut world.particles.items[*pi];
         let (pos, vel) = drains[n % drains.len()];
+        let p = &mut world.particles.items[*pi];
         p.pos = pos;
         p.vel = vel;
     }
-    // One ribbon on the rear tread. It runs down the camera-side
-    // sidewall and off the rubber into the pool, clear of the arch drain.
-    let sprays = [
-        (
-            Vec3::new(-1.360, 0.096, 0.755),
-            Vec3::new(0.0, -0.807, -0.591),
-        ),
-        (
-            Vec3::new(-1.420, 0.123, 0.725),
-            Vec3::new(0.0, -0.807, -0.591),
-        ),
-        (
-            Vec3::new(-1.500, 0.159, 0.684),
-            Vec3::new(0.0, -0.807, -0.591),
-        ),
-        (
-            Vec3::new(-1.560, 0.186, 0.654),
-            Vec3::new(0.0, -0.807, -0.591),
-        ),
-    ];
     for (n, pi) in spray_i.iter().enumerate() {
         let (pos, vel) = sprays[n % sprays.len()];
         let p = &mut world.particles.items[*pi];
