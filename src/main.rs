@@ -528,6 +528,8 @@ struct CaptureArgs {
     slurry_roll_proof: PathBuf,
     slurry_tear_out: bool,
     slurry_tear_out_proof: PathBuf,
+    slurry_plow: bool,
+    slurry_plow_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -620,6 +622,10 @@ fn capture(args: &[String]) {
     }
     if parsed.slurry_tear_out {
         capture_slurry_tear_out(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.slurry_plow {
+        capture_slurry_plow(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -811,6 +817,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut slurry_tear_out = false;
     let mut slurry_tear_out_proof =
         PathBuf::from(format!("{MEDIA}/slurry-tear-out-proof.png"));
+    let mut slurry_plow = false;
+    let mut slurry_plow_proof = PathBuf::from(format!("{MEDIA}/slurry-plow-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -893,6 +901,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                 slurry_tear_out = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     slurry_tear_out_proof = PathBuf::from(val(&mut i));
+                }
+            }
+            "--slurry-plow-proof" => {
+                slurry_plow = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    slurry_plow_proof = PathBuf::from(val(&mut i));
                 }
             }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
@@ -986,6 +1000,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         slurry_roll_proof,
         slurry_tear_out,
         slurry_tear_out_proof,
+        slurry_plow,
+        slurry_plow_proof,
     }
 }
 
@@ -1808,6 +1824,98 @@ fn capture_slurry_roll(renderer: &mut Renderer, parsed: &CaptureArgs) {
     );
 }
 
+/// The Niva mid-pass through deep slurry. The bow is ahead of the tread and
+/// the wake thins behind it. Overlay numbers match the PR body.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_slurry_plow(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    let out = world.plow_through_deep_slurry(2.15);
+    silence_soil_clods(&mut world);
+    println!(
+        "slurry-plow pool {:.4} m3  slurry0 {:.4}  slurry {:.4}  groove {:.4}  \
+         bow {:.4} m  wake {:.4} m  rut {:.4}->{:.4} m  ribbons {:.4}  spray {:.4}  \
+         clay drag {:.0} N  silt {:.0}  sand {:.0}",
+        out.pool,
+        out.slurry0,
+        out.slurry,
+        out.groove,
+        out.bow,
+        out.wake,
+        out.rut_before,
+        out.rut_after,
+        out.ribbons,
+        out.spray,
+        out.drag_clay,
+        out.drag_silt,
+        out.drag_sand,
+    );
+    let lines = [
+        format!("pool {:.4}", out.pool),
+        format!("slurry {:.4}", out.slurry),
+        format!("groove {:.4}", out.groove),
+        format!("bow {:.4}", out.bow),
+        format!("wake {:.4}", out.wake),
+        format!("rut {:.4}", out.rut_after),
+        format!("ribbons {:.4}", out.ribbons),
+        format!("spray {:.4}", out.spray),
+        format!("clay {:.0} N", out.drag_clay),
+        format!("silt {:.0} N", out.drag_silt),
+        format!("sand {:.0} N", out.drag_sand),
+    ];
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let pose = lift_camera(&world, slurry_plow_camera(&world));
+    let mut rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    stamp_proof_lines(&mut rgba, parsed.width, parsed.height, &line_refs);
+    if let Some(parent) = parsed.slurry_plow_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.slurry_plow_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("slurry plow still");
+    println!(
+        "cc0 slurry-plow {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.slurry_plow_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn slurry_plow_camera(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let p = world.vehicle.pos;
+    let wheel = p + fwd * 0.95 + right * 0.76;
+    let bow = wheel + fwd * 0.48;
+    let wake = wheel - fwd * 0.62;
+    let floor = world.soil.sample(bow.x, bow.z).height;
+    let look = Vec3::new(
+        wheel.x * 0.40 + bow.x * 0.35 + wake.x * 0.25,
+        floor - 0.02,
+        wheel.z * 0.35 + bow.z * 0.40 + wake.z * 0.25,
+    );
+    let eye = wheel + right * 1.65 + fwd * 0.12 + Vec3::Y * 0.32;
+    let ortho = 1.95;
+    CameraPose {
+        eye: clear_ortho_eye(world, eye, look, ortho),
+        target: look,
+        ortho_width: Some(ortho),
+    }
+}
+
 /// The Niva climbing out of a deep pool. Ribbons, sheets, and fine spray
 /// hang beside the rut. The numbers are the rut tear-out, the groove hold,
 /// and the debris split.
@@ -2152,12 +2260,15 @@ fn capture_slurry_flow(renderer: &mut Renderer, parsed: &CaptureArgs) {
         let x = world.vehicle.pos.x + local.x;
         let z = world.vehicle.pos.z + local.z;
         let depth = world.soil.sample(x, z).slurry;
-        let bow = world
+        let pass = world
             .soil
             .raise_bow_wave(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH);
         println!("wheel {i} slurry {depth:.4} m");
-        bow_max = bow_max.max(bow);
-        println!("bow wave wheel {i} {bow:.4} m at ({x:.2}, {z:.2})");
+        bow_max = bow_max.max(pass.bow);
+        println!(
+            "bow wave wheel {i} {:.4} m  wake {:.4} m at ({x:.2}, {z:.2})",
+            pass.bow, pass.wake
+        );
     }
     println!("bow wave height {bow_max:.4} m");
 
@@ -2302,13 +2413,13 @@ fn capture_slurry_drag(renderer: &mut Renderer, parsed: &CaptureArgs) {
         let x = world.vehicle.pos.x + local.x;
         let z = world.vehicle.pos.z + local.z;
         let sample = world.soil.sample(x, z);
-        let bow = world
+        let pass = world
             .soil
             .raise_bow_wave(x, z, Vec3::Z, WHEEL_RADIUS, WHEEL_WIDTH);
-        bow_max = bow_max.max(bow);
+        bow_max = bow_max.max(pass.bow);
         println!(
-            "wheel {i} slurry {:.4} m  bow {bow:.4} m  at ({x:.2}, {z:.2})",
-            sample.slurry
+            "wheel {i} slurry {:.4} m  bow {:.4} m  wake {:.4} m  at ({x:.2}, {z:.2})",
+            sample.slurry, pass.bow, pass.wake
         );
     }
     println!("bow wave height {bow_max:.4} m");

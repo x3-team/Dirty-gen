@@ -5,7 +5,8 @@
 //! crest clod, impact ring). Standing water in a rut or a hole mixes with the
 //! wet soil into one slurry. That slurry then flows downhill into the low rut
 //! and into holes. A berm beside it slowly creeps into the slurry. A tire in
-//! the slurry pushes a bow wave and leaves its track in the slurry thickness.
+//! the slurry pushes a bow wave, thins a wake behind the tread, and leaves its
+//! track in the slurry thickness.
 //! Deep slurry also drags. The viscosity is the mix — clay, silt, or sand —
 //! and it resists both the roll of the tread and the forward motion of the
 //! tire. Pulling the tire out holds a short suction, then the seal breaks and
@@ -2780,6 +2781,24 @@ impl SoilField {
         self.column_volume_in(x0, x1, z0, z1, &self.slurry)
     }
 
+    /// Deepest bed cut, metres, among cells whose centers lie in the rectangle.
+    pub fn max_bed_cut_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        let half = self.size * 0.5;
+        let mut best = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                best = best.max((self.initial_height[idx] - self.bed[idx]).max(0.0));
+            }
+        }
+        best
+    }
+
     /// Cubic metres of placed soil whose cell centers lie in the rectangle.
     pub fn placed_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
         self.column_volume_in(x0, x1, z0, z1, &self.placed)
@@ -2960,10 +2979,10 @@ impl SoilField {
         next[recv] += depth;
     }
 
-    /// A tire in slurry. Slurry leaves the contact and piles ahead as a bow.
-    /// The thinned column under the tire is the splash track. The bed is not
-    /// cut, nothing is sprayed, and nothing is pulled up out of the rut.
-    /// Returns the bow height in metres: the most slurry added on one cell.
+    /// A tire in slurry. Slurry leaves the contact and the wake behind and
+    /// piles ahead as a bow. The thinned column under the tire is the splash
+    /// track. The bed is not cut here, nothing is sprayed, and nothing is
+    /// pulled up out of the rut.
     pub fn raise_bow_wave(
         &mut self,
         x: f32,
@@ -2971,7 +2990,7 @@ impl SoilField {
         forward: Vec3,
         radius: f32,
         width: f32,
-    ) -> f32 {
+    ) -> BowWakePass {
         let forward = horizontal(forward);
         let right = Vec3::new(forward.z, 0.0, -forward.x);
         let radius = radius.max(0.15);
@@ -2986,12 +3005,15 @@ impl SoilField {
         let j1 = (((z + reach) + half) / self.cell).floor() as isize;
         let track_back = -radius * 0.55;
         let track_front = radius * 0.12;
+        let wake_far = -radius * 2.35;
+        let wake_near = -radius * 0.58;
         // Ahead of the rubber, so the wave is in front of the tread and not under it.
         let bow_near = radius * 0.95;
         let bow_far = radius * 2.2;
 
         let mut taken: Vec<(usize, f32)> = Vec::new();
         let mut weights: Vec<(usize, f32)> = Vec::new();
+        let mut wake_drop = 0.0_f32;
         for j in j0.max(0)..=j1.min(res - 1) {
             for i in i0.max(0)..=i1.min(res - 1) {
                 let cx = (i as f32 + 0.5) * self.cell - half;
@@ -3005,6 +3027,12 @@ impl SoilField {
                     let take = self.slurry[idx] * 0.64;
                     if take > 1.0e-6 {
                         taken.push((idx, take));
+                    }
+                } else if (wake_far..=wake_near).contains(&along) && lat.abs() <= half_track {
+                    let take = self.slurry[idx] * 0.40;
+                    if take > 1.0e-6 {
+                        taken.push((idx, take));
+                        wake_drop = wake_drop.max(take);
                     }
                 } else if (bow_near..=bow_far).contains(&along) && lat.abs() <= half_bow {
                     let span = (bow_far - bow_near).max(0.05);
@@ -3021,7 +3049,7 @@ impl SoilField {
         let removed: f32 = taken.iter().map(|(_, t)| *t).sum();
         let wsum: f32 = weights.iter().map(|(_, w)| *w).sum();
         if removed <= 1.0e-6 || wsum <= 1.0e-6 {
-            return 0.0;
+            return BowWakePass::default();
         }
         for (idx, take) in &taken {
             self.slurry[*idx] -= *take;
@@ -3035,7 +3063,67 @@ impl SoilField {
         for (idx, _) in taken.iter().chain(weights.iter()) {
             self.sync(*idx);
         }
-        bow
+        BowWakePass { bow, wake: wake_drop }
+    }
+
+    /// Lower the bed under a rolling tire in deep slurry. The slurry column
+    /// stays on the ledger; the rut gets deeper relative to the rim.
+    pub fn deepen_slurry_rut(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        radius: f32,
+        width: f32,
+        pace: f32,
+        dt: f32,
+    ) -> f32 {
+        let pace = pace.max(0.0);
+        let dt = dt.max(0.0);
+        if pace <= 1.0e-8 || dt <= 1.0e-8 {
+            return 0.0;
+        }
+        let carve = (pace * dt).min(0.0035);
+        if carve <= 1.0e-8 {
+            return 0.0;
+        }
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let radius = radius.max(0.15);
+        let half_track = width * 0.5 + self.cell * 0.55;
+        let track_back = -radius * 0.65;
+        let track_front = radius * 0.18;
+        let reach = radius + half_track + self.cell;
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let mut deepest = 0.0_f32;
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                if !(track_back..=track_front).contains(&along) || lat.abs() > half_track {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if self.slurry[idx] < 0.012 {
+                    continue;
+                }
+                let across = 1.0 - (lat.abs() / half_track).clamp(0.0, 1.0);
+                let depth = carve * (0.55 + 0.45 * across);
+                self.bed[idx] -= depth;
+                self.sync(idx);
+                deepest = deepest.max(depth);
+            }
+        }
+        deepest
     }
 
     /// Dig a bowl and fill it with one slurry. The free surface sits below the rim.
@@ -5135,6 +5223,15 @@ pub struct SlurryFlowBed {
     pub x1: f32,
 }
 
+/// Slurry moved on one tire pass through deep slurry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BowWakePass {
+    /// Metres added on the highest bow cell.
+    pub bow: f32,
+    /// Metres removed on the deepest wake cell.
+    pub wake: f32,
+}
+
 /// Water plus soil, split into the solid, the free column, and the slurry.
 #[derive(Clone, Copy, Debug)]
 pub struct MixVolumes {
@@ -6986,13 +7083,16 @@ mod tests {
         let track0 = soil.slurry[idx];
         let ahead = soil.idx_at(tire.1, tire.2 + 0.42).expect("ahead");
         let ahead0 = soil.slurry[ahead];
-        let bow = soil.raise_bow_wave(tire.1, tire.2, Vec3::Z, 0.38, 0.28);
+        let pass = soil.raise_bow_wave(tire.1, tire.2, Vec3::Z, 0.38, 0.28);
         let track1 = soil.slurry[idx];
         eprintln!(
-            "bow wave height {bow:.4} m   splash track {track0:.4} -> {track1:.4} m   ahead {ahead0:.4} -> {:.4} m",
+            "bow wave height {:.4} m  wake {:.4} m   splash track {track0:.4} -> {track1:.4} m   ahead {ahead0:.4} -> {:.4} m",
+            pass.bow,
+            pass.wake,
             soil.slurry[ahead]
         );
-        assert!(bow > 0.01, "the tire did not raise a bow wave, {bow:.4} m");
+        assert!(pass.bow > 0.01, "the tire did not raise a bow wave, {:.4} m", pass.bow);
+        assert!(pass.wake > 0.004, "the tire did not thin a wake, {:.4} m", pass.wake);
         assert!(
             track1 < track0 - 0.008,
             "the splash track is not in the slurry, {track0:.4} -> {track1:.4}"
