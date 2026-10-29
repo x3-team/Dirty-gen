@@ -141,6 +141,12 @@ pub struct Vehicle {
     pub water_drag_n: f32,
     /// Set once the free surface reaches the air intake. Engine torque stays zero.
     pub engine_stalled: bool,
+    /// Water still on the body, cubic metres. It is not mud.
+    pub body_water: f32,
+    /// Water still in the wheel arches, cubic metres.
+    pub arch_water: f32,
+    /// Water on each tire, cubic metres.
+    pub wheel_water: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -195,6 +201,9 @@ impl Vehicle {
             water_lift_n: 0.0,
             water_drag_n: 0.0,
             engine_stalled: false,
+            body_water: 0.0,
+            arch_water: 0.0,
+            wheel_water: [0.0; 4],
         }
     }
 

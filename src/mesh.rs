@@ -1077,15 +1077,41 @@ fn spin_ribbon(vel: Vec3) -> bool {
 }
 
 /// Straight band in the sheet frame. No bow, so the silhouette is not a crescent.
-fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32, width: f32, thick: f32) {
-    let (dir, side, up) = slurry_sheet_axes(p.vel);
+/// Long axis follows the throw, including the vertical. The thin axis stays
+/// lateral, so a side camera sees the face of the film rather than its edge.
+fn water_film_axes(vel: Vec3) -> (Vec3, Vec3, Vec3) {
+    let dir = if vel.length_squared() < 1.0e-6 {
+        Vec3::new(0.0, -1.0, -0.25)
+    } else {
+        vel.normalize()
+    };
+    let mut thin = Vec3::X - dir * dir.x;
+    if thin.length_squared() < 1.0e-4 {
+        thin = Vec3::Z - dir * dir.z;
+    }
+    let up = thin.normalize();
+    let side = up.cross(dir).normalize();
+    (dir, side, up)
+}
+
+fn add_flat_strip(
+    mesh: &mut CpuMesh,
+    p: &silt::particles::Particle,
+    length: f32,
+    width: f32,
+    thick: f32,
+    panel: f32,
+) {
+    let (dir, side, up) = water_film_axes(p.vel);
     let segs = 8usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
         // Tips narrow a little. The run of the strip stays full width.
+        // Tips narrow a little. A hard pinch reads as a pill; the run stays a film.
+        // The centerline is straight, so the film is not a crescent.
         let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
-        let taper = edge.powf(0.18).clamp(0.7, 1.0);
+        let taper = edge.powf(0.22).clamp(0.72, 1.0);
         let c = p.pos + dir * (length * (t - 0.5));
         let w = side * width * 0.5 * taper;
         let h = up * thick * 0.5;
@@ -1094,11 +1120,29 @@ fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32
     for s in 0..segs {
         let a = ring[s];
         let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], panel);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], panel);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], panel);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], panel);
     }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], panel);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
+}
+
+/// Ford water leaving the body, an arch, or a tread. A flat film.
+/// The long axis follows the throw. There is no bow, so it is not a crescent,
+/// and the proportions are a sheet: not a sphere, a tablet, or a stick.
+pub const PANEL_WATER_FILM: f32 = 47.0;
+
+fn add_water_film(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    let (length, width, thick) = if p.kind == silt::particles::KIND_WATER_SPRAY {
+        (0.64_f32, 0.145_f32, 0.007_f32)
+    } else {
+        (0.72_f32, 0.16_f32, 0.008_f32)
+    };
+    add_flat_strip(mesh, p, length, width, thick, PANEL_WATER_FILM);
 }
 
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
@@ -1206,9 +1250,44 @@ fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 /// The ledger volume stays on the particle; this mark does not swell into a
 /// teardrop blob, a sphere, or a tablet.
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let mut q = *p;
-    q.size = p.size.clamp(0.02, 0.05);
-    add_slurry_curl(mesh, &q, false);
+    // The ribbon curl floors length near half a metre. That mark is a teardrop
+    // blob. A drop is a short pinched fleck; the ledger volume stays on the particle.
+    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::X;
+    }
+    dir = dir.normalize();
+    let mut side = dir.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = dir.cross(Vec3::X);
+    }
+    side = side.normalize();
+    let up = side.cross(dir).normalize();
+    let length = 0.062_f32;
+    let width = 0.024_f32;
+    let thick = 0.010_f32;
+    let segs = 6usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.12, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * (0.45 + 0.55 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 #[cfg(test)]
@@ -1389,6 +1468,80 @@ mod slurry_shapes {
     }
 
     #[test]
+    fn ford_exit_water_is_a_flat_film() {
+        use silt::particles::{Particle, KIND_WATER_DRAIN, KIND_WATER_SPRAY};
+        for kind in [KIND_WATER_DRAIN, KIND_WATER_SPRAY] {
+            let p = Particle {
+                pos: Vec3::new(0.2, 0.4, 0.1),
+                vel: Vec3::new(0.05, -0.35, -1.6),
+                life: 2.0,
+                max_life: 2.0,
+                size: 0.08,
+                kind,
+                alive: true,
+                volume: 0.0012,
+                ledger: true,
+                water: true,
+                ..Particle::default()
+            };
+            let mut mesh = CpuMesh::new();
+            add_water_film(&mut mesh, &p);
+            let (dir, side, up) = water_film_axes(p.vel);
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(-f32::MAX);
+            for v in &mesh.vertices {
+                let q = Vec3::from_array(v.pos);
+                let frame = Vec3::new(q.dot(dir), q.dot(side), q.dot(up));
+                min = min.min(frame);
+                max = max.max(frame);
+            }
+            let span = max - min;
+            let mut e = [span.x, span.y, span.z];
+            e.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            assert!(
+                e[0] > e[1] * 2.4 && e[0] < e[1] * 5.5,
+                "water film is a stick or a tablet {e:?} kind {kind}"
+            );
+            assert!(e[1] > e[2] * 4.0, "water film is a bar or a sphere {e:?}");
+            assert!(e[0] > e[2] * 8.0, "water film is a blob {e:?}");
+            // Centerline bow. A crescent leaves the middle off the end chord.
+            let mut bins = [Vec3::ZERO; 6];
+            let mut counts = [0.0_f32; 6];
+            let span_l = (max.x - min.x).max(1.0e-4);
+            for v in &mesh.vertices {
+                let q = Vec3::from_array(v.pos);
+                let along = q.dot(dir);
+                let lateral = q.dot(side);
+                let t = ((along - min.x) / span_l).clamp(0.0, 0.999);
+                let b = (t * 6.0) as usize;
+                bins[b] += Vec3::new(along, lateral, 1.0);
+                counts[b] += 1.0;
+            }
+            let mut pts = Vec::new();
+            for i in 0..6 {
+                if counts[i] > 0.0 {
+                    pts.push(bins[i] / counts[i]);
+                }
+            }
+            assert!(pts.len() >= 4, "film centerline is short");
+            let a = pts[0];
+            let c = pts[pts.len() - 1];
+            let chord = c.x - a.x;
+            let mut bow = 0.0_f32;
+            for p in &pts[1..pts.len() - 1] {
+                let u = (p.x - a.x) / chord.max(1.0e-4);
+                let line = a.y + (c.y - a.y) * u;
+                bow = bow.max((p.y - line).abs());
+            }
+            assert!(
+                bow < span.x * 0.04,
+                "water film bows like a crescent {bow:.4} length {:.3}",
+                span.x
+            );
+        }
+    }
+
+    #[test]
     fn mud_chunks_includes_the_breakaway() {
         use silt::particles::Particles;
         let mut particles = Particles::new();
@@ -1410,15 +1563,20 @@ pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
     // Draw the big clumps first so a full splash cannot crowd them out.
-    // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
-    for kind in [7u8, 5, 6, 3, 1, 4, 0, 2] {
+    // 8 and 9 are ford-exit water films. 7 is a roll sheet. 5 and 6 are the
+    // slurry breakaway: ribbons, then drops.
+    for kind in [8u8, 9, 7, 5, 6, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
             if p.ledger {
                 if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
-                    if p.kind == silt::particles::KIND_SLURRY_DROP {
+                    if p.kind == silt::particles::KIND_WATER_DRAIN
+                        || p.kind == silt::particles::KIND_WATER_SPRAY
+                    {
+                        add_water_film(&mut mesh, p);
+                    } else if p.kind == silt::particles::KIND_SLURRY_DROP {
                         add_mud_drop(&mut mesh, p);
                     } else if p.kind == silt::particles::KIND_SLURRY_SHEET {
                         add_slurry_sheet(&mut mesh, p);

@@ -546,6 +546,8 @@ struct CaptureArgs {
     stuck_recovery_proof: PathBuf,
     water_crossing: bool,
     water_crossing_proof: PathBuf,
+    ford_exit: bool,
+    ford_exit_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -674,6 +676,10 @@ fn capture(args: &[String]) {
     }
     if parsed.water_crossing {
         capture_water_crossing(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.ford_exit {
+        capture_ford_exit(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -891,6 +897,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut water_crossing = false;
     let mut water_crossing_proof =
         PathBuf::from(format!("{MEDIA}/water-crossing-proof.png"));
+    let mut ford_exit = false;
+    let mut ford_exit_proof = PathBuf::from(format!("{MEDIA}/ford-exit-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1029,6 +1037,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     water_crossing_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--ford-exit-proof" => {
+                ford_exit = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    ford_exit_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1138,6 +1152,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         stuck_recovery_proof,
         water_crossing,
         water_crossing_proof,
+        ford_exit,
+        ford_exit_proof,
     }
 }
 
@@ -2496,6 +2512,107 @@ fn capture_water_crossing(renderer: &mut Renderer, parsed: &CaptureArgs) {
         pose.target.y,
         pose.target.z
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_ford_exit(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = true;
+
+    let mut world = World::wet_clay();
+    let out = world.exit_ford();
+    println!(
+        "ford-exit drain {:.4} air {:.4} spray {:.4} air {:.4} moist {:.3}->{:.3} \
+         mu {:.3}->{:.3} sink {:.4}->{:.4}",
+        out.drain,
+        out.drain_air,
+        out.spray,
+        out.spray_air,
+        out.moisture_before,
+        out.bank_moisture,
+        out.mu_before,
+        out.mu_after,
+        out.sink_before,
+        out.sink_after
+    );
+    println!(
+        "ford-exit soaked {:.4} film {:.4} water {:.4} sum {:.4} soil {:.4} sum {:.4} \
+         cut {:.4} placed {:.4} cloud {:.4} pool {:.4} body {:.4} arch {:.4} tires {:.4}",
+        out.soaked,
+        out.film,
+        out.water0,
+        out.water_sum,
+        out.soil0,
+        out.soil,
+        out.cut,
+        out.placed,
+        out.cloud,
+        out.pool,
+        out.body,
+        out.arches,
+        out.tires
+    );
+    println!(
+        "ford-exit soak clay {:.4} silt {:.4} sand {:.4} hold {:.3} {:.3} {:.3} \
+         sink {:.4} {:.4} {:.4} mu {:.3} {:.3} {:.3} film {:.4} {:.4} {:.4}",
+        out.soak_clay,
+        out.soak_silt,
+        out.soak_sand,
+        out.hold_clay,
+        out.hold_silt,
+        out.hold_sand,
+        out.sink_clay,
+        out.sink_silt,
+        out.sink_sand,
+        out.mu_clay,
+        out.mu_silt,
+        out.mu_sand,
+        out.film_clay,
+        out.film_silt,
+        out.film_sand
+    );
+    let pose = ford_exit_camera(&world);
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    if let Some(parent) = parsed.ford_exit_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.ford_exit_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("ford exit still");
+    println!(
+        "cc0 ford-exit {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.ford_exit_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ford_exit_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Low rear quarter, close. Water sits under the rear tires and the
+    // bank is ahead of the front wheels. Films stay large enough to read.
+    let look = vehicle.pos + fwd * 0.35 + Vec3::Y * 0.36;
+    let eye = vehicle.pos - right * 2.85 - fwd * 3.25 + Vec3::Y * 0.58;
+    CameraPose {
+        eye,
+        target: look,
+        ortho_width: Some(5.6),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

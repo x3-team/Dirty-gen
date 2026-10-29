@@ -960,6 +960,51 @@ pub fn water_cloud_pace(kind: SurfaceKind) -> f32 {
     water_scour_pace(kind) * (1.0 - water_stick(kind))
 }
 
+/// Metres per second a standing film enters the pores.
+/// Sand drinks it. Silt is slower. Clay holds the film.
+pub fn film_soak_pace(kind: SurfaceKind) -> f32 {
+    match water_grain(kind) {
+        Some(SurfaceKind::Sand) => 0.078,
+        Some(SurfaceKind::Silt) => 0.022,
+        Some(SurfaceKind::WetMud) => 0.0065,
+        _ => 0.0,
+    }
+}
+
+/// Seconds a film of `depth` metres lasts before the pores take it.
+/// Clay is the long end. Sand is gone first.
+pub fn film_hold_seconds(kind: SurfaceKind, depth: f32) -> f32 {
+    let pace = film_soak_pace(kind);
+    if pace <= 1.0e-8 {
+        return 1.0e6;
+    }
+    (depth.max(0.0) / pace).min(1.0e6)
+}
+
+/// Film left after `seconds` at [`film_soak_pace`].
+pub fn film_remaining(kind: SurfaceKind, depth: f32, seconds: f32) -> f32 {
+    (depth.max(0.0) - film_soak_pace(kind) * seconds.max(0.0)).max(0.0)
+}
+
+/// Friction coefficient on a bank the exit has wetted. `film` is standing water.
+pub fn exit_track_mu(kind: SurfaceKind, wetness: f32, film: f32) -> f32 {
+    grip_mu(kind, wetness, 0.012, film)
+}
+
+/// Sinkage under the reference wheel on that same wetted bank.
+/// Sand sinks less than silt and clay at the same film.
+pub fn exit_track_sink(kind: SurfaceKind, wetness: f32, film: f32) -> f32 {
+    sinkage_on(
+        SURFACE_WHEEL_LOAD,
+        kind,
+        wetness,
+        0.012,
+        film,
+        0.38,
+        0.28,
+    )
+}
+
 fn water_grain(kind: SurfaceKind) -> Option<SurfaceKind> {
     match kind {
         SurfaceKind::WetMud
@@ -4121,6 +4166,202 @@ impl SoilField {
     pub fn water_volume(&self) -> f32 {
         let area = self.cell * self.cell;
         self.water.iter().sum::<f32>() * area
+    }
+
+    /// Free water inside a rectangle, cubic metres.
+    pub fn water_volume_in(&self, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let mut vol = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                vol += self.water[j * self.res + i];
+            }
+        }
+        vol * area
+    }
+
+    /// Take up to `want` cubic metres from cells in the rectangle, leaving
+    /// `floor` metres in each. The bed is not touched.
+    pub fn take_water_region(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        want: f32,
+        floor: f32,
+    ) -> f32 {
+        let want = want.max(0.0);
+        if want <= 1.0e-8 {
+            return 0.0;
+        }
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let floor = floor.max(0.0);
+        let mut spare = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                spare += (self.water[j * self.res + i] - floor).max(0.0);
+            }
+        }
+        spare *= area;
+        let take = want.min(spare);
+        if take <= 1.0e-8 || spare <= 1.0e-8 {
+            return 0.0;
+        }
+        let frac = take / spare;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let surplus = (self.water[idx] - floor).max(0.0);
+                self.water[idx] -= surplus * frac;
+            }
+        }
+        take
+    }
+
+    /// Spread `volume` as a film. No cell is filled past `cap` metres.
+    /// Returns the cubic metres that landed. The rest is still the caller's.
+    pub fn give_film(&mut self, cells: &[usize], volume: f32, cap: f32) -> f32 {
+        let volume = volume.max(0.0);
+        let cap = cap.max(0.0);
+        if volume <= 1.0e-8 || cells.is_empty() || cap <= 0.0 {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let mut room = 0.0_f32;
+        for &idx in cells {
+            if idx < self.water.len() {
+                room += (cap - self.water[idx]).max(0.0);
+            }
+        }
+        room *= area;
+        let place = volume.min(room);
+        if place <= 1.0e-8 || room <= 1.0e-8 {
+            return 0.0;
+        }
+        let mut left = place;
+        for &idx in cells {
+            if idx >= self.water.len() || left <= 1.0e-8 {
+                continue;
+            }
+            let space = (cap - self.water[idx]).max(0.0) * area;
+            if space <= 1.0e-8 {
+                continue;
+            }
+            let add = (place * space / room).min(space).min(left);
+            self.water[idx] += add / area;
+            if add > 0.0 {
+                self.wetness[idx] = self.wetness[idx].max(0.92);
+            }
+            left -= add;
+        }
+        place - left.max(0.0)
+    }
+
+    /// Pour a water sheet onto the ground. Excess past `cap` spills to the
+    /// four neighbours. Returns the cubic metres that did not fit.
+    pub fn pour_film_at(&mut self, x: f32, z: f32, volume: f32, cap: f32) -> f32 {
+        let Some(idx) = self.idx_at(x, z) else {
+            return volume.max(0.0);
+        };
+        let res = self.res;
+        let i = idx % res;
+        let j = idx / res;
+        let mut cells = vec![idx];
+        if i > 0 {
+            cells.push(idx - 1);
+        }
+        if i + 1 < res {
+            cells.push(idx + 1);
+        }
+        if j > 0 {
+            cells.push(idx - res);
+        }
+        if j + 1 < res {
+            cells.push(idx + res);
+        }
+        let placed = self.give_film(&cells, volume.max(0.0), cap);
+        (volume.max(0.0) - placed).max(0.0)
+    }
+
+    /// Standing film, not the ford column, soaks into the pores.
+    /// `film_cap` is the deepest water this step will drink. Deeper water
+    /// is the ford and stays. Returns cubic metres that left the free column.
+    /// The bed is unchanged.
+    pub fn soak_exit_film(&mut self, dt: f32, film_cap: f32) -> f32 {
+        let dt = dt.max(0.0);
+        let film_cap = film_cap.max(0.0);
+        if dt <= 0.0 || film_cap <= 0.0 {
+            return 0.0;
+        }
+        let area = self.cell * self.cell;
+        let mut soaked = 0.0_f32;
+        for idx in 0..self.water.len() {
+            let depth = self.water[idx];
+            if depth <= 1.0e-5 || depth > film_cap {
+                continue;
+            }
+            let kind = SurfaceKind::from_u8(self.kind[idx]);
+            let pace = film_soak_pace(kind);
+            if pace <= 0.0 {
+                continue;
+            }
+            let take = (pace * dt).min(depth);
+            self.water[idx] -= take;
+            self.wetness[idx] = (self.wetness[idx] + take * 6.0).min(1.0);
+            soaked += take * area;
+        }
+        soaked
+    }
+
+    /// Mean wetness, mean standing water, and water volume where the film
+    /// is at least `min_water` metres inside the rectangle.
+    pub fn film_band(&self, x0: f32, x1: f32, z0: f32, z1: f32, min_water: f32) -> (f32, f32, f32) {
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let mut wet = 0.0_f32;
+        let mut water = 0.0_f32;
+        let mut n = 0.0_f32;
+        let mut vol = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.water[idx] < min_water {
+                    continue;
+                }
+                wet += self.wetness[idx];
+                water += self.water[idx];
+                vol += self.water[idx] * area;
+                n += 1.0;
+            }
+        }
+        if n < 1.0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            (wet / n, water / n, vol)
+        }
     }
 
     pub fn cloud_volume(&self) -> f32 {
