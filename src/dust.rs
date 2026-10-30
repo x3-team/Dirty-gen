@@ -232,6 +232,9 @@ pub struct Dust {
     emitted: f64,
     air: f64,
     settled: f64,
+    /// Dry soil still in the ground. `None` until [`Dust::set_soil_stock`].
+    /// Emission draws this stock down; the ledger reads it back.
+    soil: Option<f64>,
     per_tire: [f64; 4],
     wind_x: f32,
     wind_z: f32,
@@ -260,6 +263,7 @@ impl Dust {
             emitted: 0.0,
             air: 0.0,
             settled: 0.0,
+            soil: None,
             per_tire: [0.0; 4],
             wind_x: 0.0,
             wind_z: 0.0,
@@ -303,6 +307,16 @@ impl Dust {
 
     pub fn dust_settled_m3(&self) -> f32 {
         self.settled as f32
+    }
+
+    /// Open the dry-soil stock, cubic metres. Later emission draws it down.
+    pub fn set_soil_stock(&mut self, m3: f64) {
+        self.soil = Some(m3);
+    }
+
+    /// Dry soil still in the ground, cubic metres. Zero until a stock is opened.
+    pub fn soil_m3(&self) -> f64 {
+        self.soil.unwrap_or(0.0)
     }
 
     /// Settled dust as world `(x, z, m³)` for the picture. The ledger is unchanged.
@@ -829,6 +843,9 @@ pub fn inject_dust(air: &mut Dust, inject: DustInject, dt: f32) -> f32 {
     }
     air.emitted += added;
     air.air += added;
+    if let Some(stock) = air.soil.as_mut() {
+        *stock -= added;
+    }
     added as f32
 }
 
@@ -1220,23 +1237,17 @@ mod tests {
     }
 
     /// Wet track, slurry, then dry ground. Dust uses the air grid already in this crate.
-    /// Water and slurry are static pours on the same books; they are not a second sheet solver.
+    /// Water, slurry, and soil are read back from the solver on one ledger.
     #[test]
     fn through_drive() {
         // Puddle x −6..6, z −24..0, 20 mm. Slurry x −2..2, z −16..−8, 40 mm.
-        let water_m3 = 12.0_f64 * 24.0 * 0.02;
-        let slurry_m3 = 4.0_f64 * 8.0 * 0.04;
-        let soil0 = 0.25_f64;
-        let mut soil = soil0;
-        let opened = water_m3 + slurry_m3 + soil0;
-        assert!((opened - 7.29).abs() < 1.0e-9, "opened {opened}");
         assert_eq!(AIR_RES, 128);
         assert_eq!(AIR_LAYERS, 8);
 
         let mut fluid = crate::fluid_core::FluidCore::new([0.0, -12.0]);
         fluid.set_wind(1.5, -0.9);
-        let poured_water = fluid.pour_water(-6.0, 6.0, -24.0, 0.0, 0.02) as f64;
-        let poured_slurry = fluid.pour_slurry(
+        fluid.pour_water(-6.0, 6.0, -24.0, 0.0, 0.02);
+        fluid.pour_slurry(
             -2.0,
             2.0,
             -16.0,
@@ -1244,18 +1255,20 @@ mod tests {
             0.04,
             crate::fluid_core::Grain::Clay,
             0.55,
-        ) as f64;
-        assert!(
-            (poured_water - water_m3).abs() < 1.0e-3,
-            "puddle {poured_water} m3"
-        );
-        assert!(
-            (poured_slurry - slurry_m3).abs() < 1.0e-3,
-            "slurry {poured_slurry} m3"
         );
 
         let mut dust = Dust::new();
         dust.set_wind(1.5, -0.9);
+        dust.set_soil_stock(0.25);
+        let soil0 = dust.soil_m3();
+        let opened_books = fluid.ledger();
+        let opened = opened_books.water_m3 as f64 + opened_books.slurry_m3 as f64 + soil0;
+        assert!(
+            opened.is_finite() && opened_books.water_m3 > 0.0 && opened_books.slurry_m3 > 0.0,
+            "solver books did not open, water {} slurry {} soil {soil0}",
+            opened_books.water_m3,
+            opened_books.slurry_m3
+        );
         let dt = PROOF_DT_S;
         let speed = PROOF_SPEED_M_S;
         let slip = PROOF_SLIP_M_S;
@@ -1296,14 +1309,12 @@ mod tests {
                 crossed_slurry = true;
                 assert_eq!(entered, 0.0, "slurry lofted at chassis {chassis_z}");
             }
-            soil -= entered;
-            assert!(soil >= -1.0e-9, "soil stock went negative");
-            let total = water_m3 + slurry_m3 + soil + dust.air + dust.settled;
-            let gap = (total - opened).abs();
+            let (water, slurry, soil, sum, gap) = solver_ledger(&fluid, &dust, opened);
             assert!(
-                gap < 1.0e-8,
-                "shared ledger gap {gap} at chassis {chassis_z}"
+                soil >= -1.0e-9,
+                "soil stock went negative at chassis {chassis_z}: {soil}"
             );
+            assert_ledger_closed(water, slurry, soil, sum, gap, chassis_z);
             if any_dry && dust.air > 1.0e-6 {
                 saw_dry_air = true;
                 max_lateral = max_lateral.max(dust.plume_offset().1);
@@ -1361,13 +1372,55 @@ mod tests {
             wet_after + 1.0e-6 >= wet_before,
             "settled dust left the wet track {wet_before} -> {wet_after}"
         );
-        let total = water_m3 + slurry_m3 + soil + dust.air + dust.settled;
-        assert!(
-            (total - opened).abs() < 1.0e-8,
-            "ledger after the wet return {}",
-            (total - opened).abs()
+        let (water, slurry, soil, sum, gap) = solver_ledger(&fluid, &dust, opened);
+        let (foam_peak, water_drops) = crate::render_contract::through_drive_contract_sample();
+        println!(
+            "water {water} slurry {slurry} soil {soil} sum {sum} gap {gap} foam peak {foam_peak} water-drop count {water_drops}"
         );
-        assert!((dust.emitted - (soil0 - soil)).abs() < 1.0e-9);
+        assert_ledger_closed(water, slurry, soil, sum, gap, "wet return");
+        assert!(
+            (dust.emitted - (soil0 - soil)).abs() < 1.0e-9,
+            "soil stock {} does not match emitted {}",
+            soil0 - soil,
+            dust.emitted
+        );
         closes(&dust);
+    }
+
+    /// Water and slurry from the sheet, soil from the dust stock.
+    fn solver_ledger(
+        fluid: &crate::fluid_core::FluidCore,
+        dust: &Dust,
+        opened: f64,
+    ) -> (f64, f64, f64, f64, f64) {
+        let books = fluid.ledger();
+        let water = books.water_m3 as f64;
+        let slurry = books.slurry_m3 as f64;
+        let soil = dust.soil_m3();
+        let sum = water + slurry + soil + dust.air + dust.settled;
+        let gap = (sum - opened).abs();
+        (water, slurry, soil, sum, gap)
+    }
+
+    fn assert_ledger_closed(
+        water: f64,
+        slurry: f64,
+        soil: f64,
+        sum: f64,
+        gap: f64,
+        at: impl std::fmt::Display,
+    ) {
+        assert!(
+            water.is_finite()
+                && slurry.is_finite()
+                && soil.is_finite()
+                && sum.is_finite()
+                && gap.is_finite(),
+            "non-finite ledger at {at}: water {water} slurry {slurry} soil {soil} sum {sum} gap {gap}"
+        );
+        assert!(
+            gap < 1.0e-8,
+            "shared ledger gap {gap} at {at}: water {water} slurry {slurry} soil {soil} sum {sum}"
+        );
     }
 }

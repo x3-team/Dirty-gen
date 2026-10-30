@@ -932,6 +932,81 @@ fn write_map2(queue: &wgpu::Queue, map: &Map2, src: &[f32], res: u32) {
     );
 }
 
+/// Foam peak and water-drop count on the scripted Niva crossing.
+///
+/// The contract test prints these. The through-drive ledger prints them
+/// from this sample so both tests read the same render contract.
+#[cfg(test)]
+pub(crate) fn through_drive_contract_sample() -> (f32, u32) {
+    let mut drive = crate::world::ThroughDrive::new();
+    let dt = 1.0 / 30.0;
+    let mut frame = ContractFrame::new();
+    let mut foam_peak = 0.0f32;
+    let mut water_drops = 0u32;
+    // The ford is the puddle ending at z = -11.2. Keep going until the
+    // Niva is on the bank and the peeled drops are still in the air.
+    while drive.world.vehicle.pos.z < -4.0 {
+        drive.step(dt);
+        publish(
+            &mut frame,
+            &drive.world.soil,
+            &drive.world.particles.items,
+            [drive.world.vehicle.pos.x, drive.world.vehicle.pos.z],
+            drive.world.vehicle.pos.z,
+            0,
+            Some(&drive.fluid),
+            Some(drive.dust()),
+        );
+        assert!(
+            contract_frame_is_finite(&frame),
+            "non-finite contract sample at z {:.2}",
+            drive.world.vehicle.pos.z
+        );
+        for foam in frame.foam_crest.iter().step_by(2) {
+            foam_peak = foam_peak.max(*foam);
+        }
+        if drive.world.vehicle.pos.z > -11.2 {
+            water_drops = water_drops.max(contract_water_drops(&frame));
+        }
+    }
+    (foam_peak, water_drops)
+}
+
+#[cfg(test)]
+fn contract_water_drops(frame: &ContractFrame) -> u32 {
+    frame.spray[..frame.header.spray_count as usize]
+        .iter()
+        .filter(|slot| {
+            slot.alive == 1
+                && slot.material == 0
+                && slot.pos_mass[3] > 0.0
+                && slot.pos_mass.iter().all(|c| c.is_finite())
+                && slot.vel_age.iter().all(|c| c.is_finite())
+        })
+        .count() as u32
+}
+
+#[cfg(test)]
+fn contract_frame_is_finite(frame: &ContractFrame) -> bool {
+    let maps = [
+        frame.ground_rut.as_slice(),
+        frame.moisture.as_slice(),
+        frame.film.as_slice(),
+        frame.flow.as_slice(),
+        frame.dust_settled.as_slice(),
+        frame.crust.as_slice(),
+        frame.wet_edge.as_slice(),
+        frame.foam_crest.as_slice(),
+        frame.dust_fog.as_slice(),
+    ];
+    if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
+        return false;
+    }
+    frame.spray.iter().all(|slot| {
+        slot.pos_mass.iter().all(|c| c.is_finite()) && slot.vel_age.iter().all(|c| c.is_finite())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,74 +1154,9 @@ mod tests {
 
     #[test]
     fn through_drive_contract_is_finite_and_carries_foam_and_water() {
-        let mut drive = crate::world::ThroughDrive::new();
-        let dt = 1.0 / 30.0;
-        let mut frame = ContractFrame::new();
-        let mut foam_peak = 0.0f32;
-        let mut water_drops = 0u32;
-        // The ford is the puddle ending at z = -11.2. Keep going until the
-        // Niva is on the bank and the peeled drops are still in the air.
-        while drive.world.vehicle.pos.z < -4.0 {
-            drive.step(dt);
-            publish(
-                &mut frame,
-                &drive.world.soil,
-                &drive.world.particles.items,
-                [drive.world.vehicle.pos.x, drive.world.vehicle.pos.z],
-                drive.world.vehicle.pos.z,
-                0,
-                Some(&drive.fluid),
-                Some(drive.dust()),
-            );
-            assert!(
-                frame_is_finite(&frame),
-                "non-finite contract sample at z {:.2}",
-                drive.world.vehicle.pos.z
-            );
-            for foam in frame.foam_crest.iter().step_by(2) {
-                foam_peak = foam_peak.max(*foam);
-            }
-            if drive.world.vehicle.pos.z > -11.2 {
-                let drops = water_drop_count(&frame);
-                water_drops = water_drops.max(drops);
-            }
-        }
+        let (foam_peak, water_drops) = super::through_drive_contract_sample();
         println!("foam peak {foam_peak} water-drop count {water_drops}");
         assert!(foam_peak > 0.0, "foam peak {foam_peak}");
         assert!(water_drops > 0, "water-drop count {water_drops}");
-    }
-
-    fn water_drop_count(frame: &ContractFrame) -> u32 {
-        frame.spray[..frame.header.spray_count as usize]
-            .iter()
-            .filter(|slot| {
-                slot.alive == 1
-                    && slot.material == 0
-                    && slot.pos_mass[3] > 0.0
-                    && slot.pos_mass.iter().all(|c| c.is_finite())
-                    && slot.vel_age.iter().all(|c| c.is_finite())
-            })
-            .count() as u32
-    }
-
-    fn frame_is_finite(frame: &ContractFrame) -> bool {
-        let maps = [
-            frame.ground_rut.as_slice(),
-            frame.moisture.as_slice(),
-            frame.film.as_slice(),
-            frame.flow.as_slice(),
-            frame.dust_settled.as_slice(),
-            frame.crust.as_slice(),
-            frame.wet_edge.as_slice(),
-            frame.foam_crest.as_slice(),
-            frame.dust_fog.as_slice(),
-        ];
-        if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
-            return false;
-        }
-        frame.spray.iter().all(|slot| {
-            slot.pos_mass.iter().all(|c| c.is_finite())
-                && slot.vel_age.iter().all(|c| c.is_finite())
-        })
     }
 }
