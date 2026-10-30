@@ -23,6 +23,13 @@
 //! slurry. The visible height is bed + placed + the slurry that is still on
 //! the ground.
 //!
+//! Pore moisture falls on a dry spell. Clay, a fresh cut, and packed clay
+//! grow a crust thickness, and shrinkage opens cracks on a fixed network.
+//! A track that has rested on that crust hardens: the same tire sinks less
+//! and cuts less. Sand, silt, and gravel do not crust. The bed, the placed
+//! pile, and the cloud stay put. Thickness and crack opening are exported
+//! for a shader. They are not a second height. A fissure is the same mud, opened.
+//!
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
 //! wheel was instead of climbing the mesh.
@@ -558,6 +565,14 @@ pub struct SoilSample {
     pub placed: f32,
     /// Mixed water and soil, metres. Zero where the column has not joined.
     pub slurry: f32,
+    /// Dry skin thickness, metres. Not a height and not a volume.
+    pub crust: f32,
+    /// Shrinkage opening, metres. Not a cut.
+    pub crack: f32,
+    /// Lane visits already counted on this cell.
+    pub passes: u8,
+    /// Seconds since a tire last claimed this cell.
+    pub rest: f32,
 }
 
 impl SoilSample {
@@ -608,6 +623,10 @@ pub struct SoilField {
     /// It is not height and it is not a second water. The closed soil sum is
     /// bed plus placed plus this cloud.
     pub cloud: Vec<f32>,
+    /// Crust thickness, metres. A shader reads this. It is not height.
+    pub crust: Vec<f32>,
+    /// Crack opening, metres. A shader reads this. It does not move the bed.
+    pub crack: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -816,6 +835,10 @@ pub fn sinkage_on(
     width: f32,
 ) -> f32 {
     let tm = terramech_for(kind, softness_of(wetness, loose, water), water);
+    sinkage_with(load, radius, width, &tm)
+}
+
+fn sinkage_with(load: f32, radius: f32, width: f32, tm: &Terramech) -> f32 {
     let mut lo = 0.0;
     let mut hi = radius * 0.9;
     for _ in 0..18 {
@@ -828,6 +851,32 @@ pub fn sinkage_on(
         }
     }
     0.5 * (lo + hi)
+}
+
+/// Sinkage on a cell that may have baked. A fresh surface uses the kind alone.
+pub fn sinkage_on_track(
+    load: f32,
+    kind: SurfaceKind,
+    wetness: f32,
+    loose: f32,
+    water: f32,
+    radius: f32,
+    width: f32,
+    crust: f32,
+    crack: f32,
+    passes: u8,
+    rest: f32,
+) -> f32 {
+    let mut tm = terramech_for(kind, softness_of(wetness, loose, water), water);
+    tm.k_eq *= track_harden_mul(crust, crack, passes, rest);
+    sinkage_with(load, radius, width, &tm)
+}
+
+/// Tire constants at a sample. An old crusted track is stiffer than the kind alone.
+pub fn mech_for_sample(sample: &SoilSample) -> Terramech {
+    let mut tm = terramech_for(sample.kind(), sample.softness, sample.water);
+    tm.k_eq *= track_harden_mul(sample.crust, sample.crack, sample.passes, sample.rest);
+    tm
 }
 
 /// Plastic rut depth (m) for the force on one tire.
@@ -863,6 +912,39 @@ pub fn rut_depth_from_force(
         width.max(0.02),
     );
     depth.min(radius * 0.85)
+}
+
+/// Plastic rut depth on one sampled cell. An old crusted track cuts less
+/// than the same force on wet clay. A cell with no crust matches
+/// [`rut_depth_from_force`].
+pub fn rut_depth_on_sample(
+    normal: f32,
+    push: f32,
+    radius: f32,
+    width: f32,
+    sample: &SoilSample,
+) -> f32 {
+    let n = normal.max(0.0);
+    let p = push.max(0.0);
+    let load = (n * n + p * p).sqrt();
+    if load < 1.0 || !load.is_finite() {
+        return 0.0;
+    }
+    let radius = radius.max(0.05);
+    sinkage_on_track(
+        load,
+        sample.kind(),
+        sample.wetness,
+        sample.loose,
+        sample.water,
+        radius,
+        width.max(0.02),
+        sample.crust,
+        sample.crack,
+        sample.passes,
+        sample.rest,
+    )
+    .min(radius * 0.85)
 }
 
 /// Wetness alone makes the ground heavy. Standing water and loose spoil
@@ -1088,6 +1170,8 @@ impl SoilField {
             airborne: 0.0,
             slurry: vec![0.0; n],
             cloud: vec![0.0; n],
+            crust: vec![0.0; n],
+            crack: vec![0.0; n],
         }
     }
 
@@ -1358,6 +1442,10 @@ impl SoilField {
                 kind: SurfaceKind::Undisturbed as u8,
                 placed: 0.0,
                 slurry: 0.0,
+                crust: 0.0,
+                crack: 0.0,
+                passes: 0,
+                rest: 0.0,
             };
         }
         let i = u.floor() as usize;
@@ -1392,6 +1480,10 @@ impl SoilField {
             kind,
             placed,
             slurry: self.slurry[nidx],
+            crust: self.crust[nidx],
+            crack: self.crack[nidx],
+            passes: self.passes[nidx],
+            rest: self.rest[nidx],
         }
     }
 
@@ -1577,6 +1669,10 @@ impl SoilField {
             kind: mid.kind,
             placed: mid.placed,
             slurry: mid.slurry,
+            crust: mid.crust,
+            crack: mid.crack,
+            passes: mid.passes,
+            rest: mid.rest,
         }
     }
 
@@ -2170,17 +2266,9 @@ impl SoilField {
         let forced = if loaded {
             // Spoil on the flank is not a softer bed. The depth is the clay
             // under the tire, so a second rut does not run away to the cap.
+            // A rested crust on that clay is harder than the wet cut.
             let s = self.soil_for_force(center.x, center.z);
-            rut_depth_from_force(
-                normal,
-                push,
-                radius,
-                width,
-                s.kind(),
-                s.wetness,
-                s.loose,
-                s.water,
-            )
+            rut_depth_on_sample(normal, push, radius, width, &s)
         } else {
             0.0
         };
@@ -5733,7 +5821,65 @@ impl SoilField {
                 let blend = 1.0 - (-0.35 * dt).exp();
                 self.roughness[idx] = lerp(self.roughness[idx], goal, blend);
             }
+            self.bake_crust(idx, next, dt, rain);
         }
+    }
+
+    /// Grow or soak the skin on one cell. The bed and the placed pile stay.
+    fn bake_crust(&mut self, idx: usize, kind: SurfaceKind, dt: f32, rain: f32) {
+        let dt = dt.max(0.0);
+        if dt <= 0.0 {
+            return;
+        }
+        let pond = rain > 1.0e-6 || self.water[idx] > water_hold(kind) + 0.012;
+        if !crustable(kind) || pond {
+            let soak = if pond { CRUST_SOAK } else { CRUST_SOAK * 0.35 };
+            self.crust[idx] = (self.crust[idx] - soak * dt).max(0.0);
+            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * dt).max(0.0);
+            return;
+        }
+        if self.wetness[idx] <= REWET_AT {
+            let deficit = ((REWET_AT - self.wetness[idx]) / REWET_AT).clamp(0.0, 1.0);
+            let track = if self.passes[idx] > 0 { 1.35 } else { 1.0 };
+            let room = (CRUST_MAX_M - self.crust[idx]).max(0.0);
+            let grow = (CRUST_GROW * deficit * track * dt).min(room);
+            self.crust[idx] += grow;
+        } else {
+            self.crust[idx] = (self.crust[idx] - CRUST_SOAK * 0.15 * dt).max(0.0);
+        }
+        self.open_crack(idx, dt);
+    }
+
+    fn open_crack(&mut self, idx: usize, dt: f32) {
+        if self.crust[idx] <= CRACK_ONSET_M {
+            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * dt).max(0.0);
+            return;
+        }
+        let (x, z) = self.cell_xz(idx);
+        let mask = crack_mask(x, z);
+        if mask < 0.12 {
+            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * 0.25 * dt).max(0.0);
+            return;
+        }
+        let skin = ((self.crust[idx] - CRACK_ONSET_M) / (CRUST_MAX_M - CRACK_ONSET_M)).clamp(0.0, 1.0);
+        let plate = if self.passes[idx] > 0 {
+            let age = ((self.rest[idx] - 0.40) / 12.0).clamp(0.0, 1.0);
+            0.55 + 0.45 * age
+        } else {
+            0.40
+        };
+        let target = CRACK_MAX_M * skin * mask * plate;
+        let a = 1.0 - (-0.09 * dt).exp();
+        self.crack[idx] = lerp(self.crack[idx], target, a).clamp(0.0, CRACK_MAX_M);
+    }
+
+    fn cell_xz(&self, idx: usize) -> (f32, f32) {
+        let half = self.size * 0.5;
+        let i = idx % self.res;
+        let j = idx / self.res;
+        let x = (i as f32 + 0.5) * self.cell - half;
+        let z = (j as f32 + 0.5) * self.cell - half;
+        (x, z)
     }
 
     /// Body-sized crater. The displaced soil is piled on the rim. Returns the
@@ -5908,6 +6054,8 @@ impl SoilField {
         push_f32s(&mut out, &self.tread_ang);
         push_f32s(&mut out, &self.tread_lat);
         push_f32s(&mut out, &self.slurry);
+        push_f32s(&mut out, &self.crust);
+        push_f32s(&mut out, &self.crack);
         out
     }
 
@@ -5936,19 +6084,48 @@ impl SoilField {
         let kind = read_u8s(bytes, &mut i, n)?;
         let passes = read_u8s(bytes, &mut i, n)?;
         let remain = bytes.len() - i;
-        let (tread_amp, tread_ang, tread_lat, slurry) = if remain == 0 {
-            (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n])
+        let (tread_amp, tread_ang, tread_lat, slurry, crust, crack) = if remain == 0 {
+            (
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+            )
         } else if remain == n * 12 {
             let tread_amp = read_f32s(bytes, &mut i, n)?;
             let tread_ang = read_f32s(bytes, &mut i, n)?;
             let tread_lat = read_f32s(bytes, &mut i, n)?;
-            (tread_amp, tread_ang, tread_lat, vec![0.0; n])
+            (
+                tread_amp,
+                tread_ang,
+                tread_lat,
+                vec![0.0; n],
+                vec![0.0; n],
+                vec![0.0; n],
+            )
         } else if remain == n * 16 {
             let tread_amp = read_f32s(bytes, &mut i, n)?;
             let tread_ang = read_f32s(bytes, &mut i, n)?;
             let tread_lat = read_f32s(bytes, &mut i, n)?;
             let slurry = read_f32s(bytes, &mut i, n)?;
-            (tread_amp, tread_ang, tread_lat, slurry)
+            (
+                tread_amp,
+                tread_ang,
+                tread_lat,
+                slurry,
+                vec![0.0; n],
+                vec![0.0; n],
+            )
+        } else if remain == n * 24 {
+            let tread_amp = read_f32s(bytes, &mut i, n)?;
+            let tread_ang = read_f32s(bytes, &mut i, n)?;
+            let tread_lat = read_f32s(bytes, &mut i, n)?;
+            let slurry = read_f32s(bytes, &mut i, n)?;
+            let crust = read_f32s(bytes, &mut i, n)?;
+            let crack = read_f32s(bytes, &mut i, n)?;
+            (tread_amp, tread_ang, tread_lat, slurry, crust, crack)
         } else {
             return Err("soil snapshot has trailing bytes".into());
         };
@@ -5979,6 +6156,8 @@ impl SoilField {
             airborne: 0.0,
             slurry,
             cloud: vec![0.0; n],
+            crust,
+            crack,
         })
     }
 
@@ -6286,6 +6465,39 @@ impl SoilField {
             // The stamp drops the cut on a one-cell shoulder. A hard push
             // fills that cell into a tower. Spread the same volume into a ridge.
             self.shape_force_berm();
+        }
+    }
+
+    /// Same force stamp as [`roll_with_force`] without reshaping the whole bed.
+    /// The comparison of a second pass needs the groove the tire just cut.
+    fn roll_force_lane(
+        &mut self,
+        from: Vec3,
+        to: Vec3,
+        sink: f32,
+        slip: f32,
+        normal: f32,
+        push: f32,
+    ) {
+        let from = Vec3::new(from.x, 0.0, from.z);
+        let to = Vec3::new(to.x, 0.0, to.z);
+        let delta = to - from;
+        let len = delta.length();
+        if len < 1.0e-3 {
+            return;
+        }
+        let forward = delta / len;
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let n = (len / 0.1).round().max(1.0) as i32;
+        let radius = 0.38;
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let p = from.lerp(to, t);
+            let h = self.initial_at(p.x, p.z);
+            let hub = Vec3::new(p.x, h + radius - sink, p.z);
+            self.stamp_wheel(
+                hub, radius, 0.28, forward, right, sink, slip, 0.12, true, normal, push,
+            );
         }
     }
 
@@ -6733,6 +6945,264 @@ impl SoilField {
             field.darken[i] = 0.08;
         }
         field
+    }
+
+    /// Tracks on one pad. The dry spell bakes a crust and opens cracks. A
+    /// warped front leaves the same clay wet where it has not finished drying.
+    /// The bed and the placed pile stay the wet cut.
+    pub fn drying_pair() -> (Self, DryingCrust) {
+        let mut field = Self::mud_pad();
+        let paint = |field: &mut SoilField, x: f32, z: f32, kind: SurfaceKind, wet: f32| {
+            let half = field.size * 0.5;
+            for j in 0..field.res {
+                for i in 0..field.res {
+                    let cx = (i as f32 + 0.5) * field.cell - half;
+                    let cz = (j as f32 + 0.5) * field.cell - half;
+                    if (cx - x).abs() < 0.4 && (cz - z).abs() < 0.4 {
+                        let idx = j * field.res + i;
+                        field.kind[idx] = kind as u8;
+                        field.wetness[idx] = wet;
+                        field.base_wetness[idx] = wet;
+                        field.water[idx] = 0.0;
+                    }
+                }
+            }
+        };
+        paint(&mut field, 6.2, 6.0, SurfaceKind::Sand, 0.22);
+        paint(&mut field, 7.2, 6.0, SurfaceKind::Silt, 0.72);
+        let lanes = [-2.44_f32, -0.96, 0.96, 2.44];
+        for x in lanes {
+            field.roll_lane(
+                Vec3::new(x, 0.0, -2.6),
+                Vec3::new(x, 0.0, 2.6),
+                0.055,
+                0.25,
+            );
+        }
+        let wet_snap = (
+            field.wetness.clone(),
+            field.water.clone(),
+            field.kind.clone(),
+            field.roughness.clone(),
+            field.crust.clone(),
+            field.crack.clone(),
+        );
+        let bed0 = field.bed.clone();
+        let placed0 = field.placed.clone();
+        let cloud0 = field.cloud.clone();
+        let slurry0 = field.slurry.clone();
+        let wet_sample = field.floor_sample(0.96, 0.0);
+        let wet_sink = sinkage_on(
+            1_600.0,
+            wet_sample.kind(),
+            wet_sample.wetness,
+            wet_sample.loose,
+            wet_sample.water,
+            0.38,
+            0.28,
+        );
+        let wetness_before = field.lane_mean(0.4, |s| s.0);
+        let mut wet_again = field.clone();
+        field.advance_weather(DRYING_SPELL_S, 0.0);
+        let bed_gap = max_abs(&bed0, &field.bed);
+        let placed_gap = max_abs(&placed0, &field.placed);
+        let cloud_gap = max_abs(&cloud0, &field.cloud);
+        let slurry_gap = max_abs(&slurry0, &field.slurry);
+        let (wetness_after, crust_m, crack_m, crack_max, crack_cells, floor_cells) =
+            field.lane_crust(0.4);
+        let baked = field.floor_sample(0.96, 0.0);
+        let crust_sink = sinkage_on(
+            1_600.0,
+            baked.kind(),
+            baked.wetness,
+            baked.loose,
+            baked.water,
+            0.38,
+            0.28,
+        );
+        let old_sink = sinkage_on_track(
+            1_600.0,
+            baked.kind(),
+            baked.wetness,
+            baked.loose,
+            baked.water,
+            0.38,
+            0.28,
+            baked.crust,
+            baked.crack,
+            baked.passes,
+            baked.rest,
+        );
+        let harden = track_harden_mul(baked.crust, baked.crack, baked.passes, baked.rest);
+        let mut old_again = field.clone();
+        let from = Vec3::new(0.96, 0.0, -2.6);
+        let to = Vec3::new(0.96, 0.0, 2.6);
+        let wet_cut0 = wet_again.lane_cut(0.96);
+        let old_cut0 = old_again.lane_cut(0.96);
+        // A load just past the wet rut. The baked floor is already harder than that.
+        let again_n = 1_900.0;
+        let again_p = 180.0;
+        wet_again.roll_force_lane(from, to, 0.05, 0.15, again_n, again_p);
+        old_again.roll_force_lane(from, to, 0.05, 0.15, again_n, again_p);
+        let sand_crust = field.patch_max_crust(6.2, 6.0);
+        let silt_crust = field.patch_max_crust(7.2, 6.0);
+        let cut = field.volumes().cut;
+        let placed = field.volumes().placed;
+        // One pad, drying. Wet clay and the crust are the same soil. The
+        // front is wide and warped, so the picture is not two tiles split
+        // on x = 0. The bed and the placed pile stay the wet cut.
+        for idx in 0..field.bed.len() {
+            let (x, z) = field.cell_xz(idx);
+            let mut d = drying_front(x, z);
+            // The measured wet lane stays wet. The box is off the close frame.
+            if (x + 0.96).abs() < 0.48 && z.abs() < 0.48 {
+                d = 0.0;
+            }
+            if d >= 0.999 {
+                continue;
+            }
+            field.wetness[idx] = lerp(wet_snap.0[idx], field.wetness[idx], d);
+            field.water[idx] = lerp(wet_snap.1[idx], field.water[idx], d);
+            field.roughness[idx] = lerp(wet_snap.3[idx], field.roughness[idx], d);
+            field.crust[idx] *= d;
+            field.crack[idx] *= d;
+            if d < 0.82 {
+                field.kind[idx] = wet_snap.2[idx];
+            }
+        }
+        let west_floor = field.floor_sample(-0.96, 0.0);
+        let stats = DryingCrust {
+            wetness_before,
+            wetness_after,
+            crust_m,
+            crack_m,
+            crack_max,
+            crack_cells,
+            floor_cells,
+            wet_sink,
+            crust_sink,
+            old_sink,
+            harden,
+            wet_extra_cut: wet_again.lane_cut(0.96) - wet_cut0,
+            old_extra_cut: old_again.lane_cut(0.96) - old_cut0,
+            cut,
+            placed,
+            bed_gap,
+            placed_gap,
+            cloud_gap,
+            slurry_gap,
+            sand_crust,
+            silt_crust,
+            west_wetness: west_floor.wetness,
+            west_kind: west_floor.kind,
+            east_kind: baked.kind,
+            east_crust: baked.crust,
+            east_crack: baked.crack,
+        };
+        (field, stats)
+    }
+
+    fn lane_mean(&self, x_min: f32, pick: fn((f32, f32)) -> f32) -> f32 {
+        let mut acc = 0.0;
+        let mut n = 0.0;
+        for idx in 0..self.bed.len() {
+            let (x, z) = self.cell_xz(idx);
+            if x < x_min || z.abs() > 2.3 {
+                continue;
+            }
+            let rut = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+            if rut < 0.02 {
+                continue;
+            }
+            acc += pick((self.wetness[idx], self.crust[idx]));
+            n += 1.0;
+        }
+        if n <= 0.0 {
+            0.0
+        } else {
+            acc / n
+        }
+    }
+
+    fn lane_crust(&self, x_min: f32) -> (f32, f32, f32, f32, u32, u32) {
+        let mut wet = 0.0;
+        let mut crust = 0.0;
+        let mut crack = 0.0;
+        let mut crack_max = 0.0_f32;
+        let mut crack_cells = 0u32;
+        let mut floor = 0u32;
+        for idx in 0..self.bed.len() {
+            let (x, z) = self.cell_xz(idx);
+            if x < x_min || z.abs() > 2.3 {
+                continue;
+            }
+            let rut = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+            if rut < 0.02 {
+                continue;
+            }
+            floor += 1;
+            wet += self.wetness[idx];
+            crust += self.crust[idx];
+            crack += self.crack[idx];
+            crack_max = crack_max.max(self.crack[idx]);
+            if self.crack[idx] > 0.003 {
+                crack_cells += 1;
+            }
+        }
+        let n = floor.max(1) as f32;
+        (wet / n, crust / n, crack / n, crack_max, crack_cells, floor)
+    }
+
+    /// Cut volume in the groove, not the berm beside it.
+    fn lane_cut(&self, x: f32) -> f32 {
+        let area = self.cell * self.cell;
+        let mut v = 0.0_f32;
+        for idx in 0..self.bed.len() {
+            let (cx, cz) = self.cell_xz(idx);
+            if (cx - x).abs() > 0.30 || cz.abs() > 2.7 {
+                continue;
+            }
+            v += (self.initial_height[idx] - self.bed[idx]).max(0.0);
+        }
+        v * area
+    }
+
+    /// Deepest cut near a point. A shoulder sample would miss the floor.
+    fn floor_sample(&self, x: f32, z: f32) -> SoilSample {
+        let half = self.size * 0.5;
+        let mut best = self.sample(x, z);
+        let mut best_rut = best.rut;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                if (cx - x).abs() > 0.45 || (cz - z).abs() > 0.45 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                let rut = (self.initial_height[idx] - self.bed[idx]).max(0.0);
+                if rut > best_rut {
+                    best_rut = rut;
+                    best = self.sample(cx, cz);
+                }
+            }
+        }
+        best
+    }
+
+    fn patch_max_crust(&self, x: f32, z: f32) -> f32 {
+        let half = self.size * 0.5;
+        let mut m = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                if (cx - x).abs() < 0.4 && (cz - z).abs() < 0.4 {
+                    m = m.max(self.crust[j * self.res + i]);
+                }
+            }
+        }
+        m
     }
 
     /// Ramp along +X. The ends flatten so the height stays in the texture range.
@@ -7228,6 +7698,150 @@ fn film_evap(kind: SurfaceKind) -> f32 {
 const CRUST_AT: f32 = 0.34;
 /// A crust above this, or under standing water, is wet clay again.
 const REWET_AT: f32 = 0.44;
+/// Thickest dry skin, metres. The shader's red channel is this over [`CRUST_SHADER_METRES`].
+pub const CRUST_MAX_M: f32 = 0.036;
+/// Widest shrinkage opening, metres. The shader's green channel is this over [`CRACK_SHADER_METRES`].
+pub const CRACK_MAX_M: f32 = 0.016;
+/// Skin that has to form before a fissure opens.
+pub const CRACK_ONSET_M: f32 = 0.008;
+/// Metres encoded as 1.0 in the crust texture's red channel.
+pub const CRUST_SHADER_METRES: f32 = 0.04;
+/// Metres encoded as 1.0 in the crust texture's green channel.
+pub const CRACK_SHADER_METRES: f32 = 0.02;
+/// Seconds of dry weather used to bake a fresh track into a crust.
+pub const DRYING_SPELL_S: f32 = 180.0;
+
+fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .fold(0.0_f32, |m, (u, v)| m.max((u - v).abs()))
+}
+
+/// Numbers from one dry spell on a pair of tracks.
+#[derive(Clone, Copy, Debug)]
+pub struct DryingCrust {
+    pub wetness_before: f32,
+    pub wetness_after: f32,
+    pub crust_m: f32,
+    pub crack_m: f32,
+    pub crack_max: f32,
+    pub crack_cells: u32,
+    pub floor_cells: u32,
+    pub wet_sink: f32,
+    pub crust_sink: f32,
+    pub old_sink: f32,
+    pub harden: f32,
+    pub wet_extra_cut: f32,
+    pub old_extra_cut: f32,
+    pub cut: f32,
+    pub placed: f32,
+    pub bed_gap: f32,
+    pub placed_gap: f32,
+    pub cloud_gap: f32,
+    pub slurry_gap: f32,
+    pub sand_crust: f32,
+    pub silt_crust: f32,
+    pub west_wetness: f32,
+    pub west_kind: u8,
+    pub east_kind: u8,
+    pub east_crust: f32,
+    pub east_crack: f32,
+}
+/// How far a cell has dried for the still. 0 is the wet cut, 1 is the rested crust.
+/// The front wanders, so wet ground and crust are one pad rather than a straight cut.
+fn drying_front(x: f32, z: f32) -> f32 {
+    let n = noise2(x * 0.45 + 1.7, z * 0.38 + 0.4);
+    let n2 = noise2(x * 1.15 - 2.2, z * 0.72 + 3.1);
+    let across = (x + 0.15 + (n - 0.5) * 2.4) / 2.1;
+    let along = (z + 0.2) * 0.22 + (n2 - 0.5) * 0.85;
+    let t = (across + along).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Metres per second the skin grows at a full moisture deficit, before the track bonus.
+/// A twelve-second lap stays under the harden threshold. A dry spell does not.
+const CRUST_GROW: f32 = 0.00022;
+/// Metres per second a pond or rain soaks the skin back off.
+const CRUST_SOAK: f32 = 0.0055;
+/// Metres per second a fissure closes once the skin is gone.
+const CRACK_CLOSE: f32 = 0.012;
+
+/// Clay that can bake. Sand, silt, gravel, and grass do not.
+fn crustable(kind: SurfaceKind) -> bool {
+    matches!(
+        kind,
+        SurfaceKind::WetMud
+            | SurfaceKind::PackedClay
+            | SurfaceKind::FreshCut
+            | SurfaceKind::DryCrust
+            | SurfaceKind::CutLip
+            | SurfaceKind::Berm
+            | SurfaceKind::PlacedClod
+    )
+}
+
+/// Extra Bekker modulus on a track that has rested under a crust.
+/// A wet track, a tire still on the cell, and a surface with no pass stay at 1.
+pub fn track_harden_mul(crust: f32, crack: f32, passes: u8, rest: f32) -> f32 {
+    if passes == 0 || crust < 0.006 || rest <= 0.40 {
+        return 1.0;
+    }
+    let age = ((rest - 0.40) / 12.0).clamp(0.0, 1.0);
+    let skin = (crust / CRUST_MAX_M).clamp(0.0, 1.0);
+    let open = (crack / CRACK_MAX_M).clamp(0.0, 1.0);
+    1.0 + 1.8 * skin * age * (1.0 - 0.35 * open)
+}
+
+/// 1 on a shrinkage fissure, 0 inside the polygon. World metres.
+pub fn crack_mask(x: f32, z: f32) -> f32 {
+    let scale = 0.48_f32;
+    let fx = x / scale;
+    let fz = z / scale;
+    let ix = fx.floor() as i32;
+    let iz = fz.floor() as i32;
+    let mut best = f32::MAX;
+    let mut second = f32::MAX;
+    for dj in -1..=1 {
+        for di in -1..=1 {
+            let gx = (ix + di) as f32;
+            let gz = (iz + dj) as f32;
+            let jx = hash2(gx, gz) - 0.5;
+            let jz = hash2(gx + 4.2, gz + 1.7) - 0.5;
+            let cx = gx + 0.5 + jx * 0.8;
+            let cz = gz + 0.5 + jz * 0.8;
+            let d = (fx - cx).hypot(fz - cz);
+            if d < best {
+                second = best;
+                best = d;
+            } else if d < second {
+                second = d;
+            }
+        }
+    }
+    let gap = (second - best).max(0.0);
+    (1.0 - gap / 0.11).clamp(0.0, 1.0)
+}
+
+/// RGBA8 texel for a shader. R is crust thickness, G is crack opening.
+/// B is unused. A is opaque so a sampler can tell a written cell from empty.
+pub fn crust_shader_texel(thickness: f32, crack: f32) -> [u8; 4] {
+    let r = (thickness.max(0.0) / CRUST_SHADER_METRES).clamp(0.0, 1.0);
+    let g = (crack.max(0.0) / CRACK_SHADER_METRES).clamp(0.0, 1.0);
+    [
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        0,
+        255,
+    ]
+}
+
+/// Read the metres a shader texel is holding.
+pub fn crust_shader_metres(texel: [u8; 4]) -> (f32, f32) {
+    (
+        texel[0] as f32 / 255.0 * CRUST_SHADER_METRES,
+        texel[1] as f32 / 255.0 * CRACK_SHADER_METRES,
+    )
+}
 
 fn evolve_kind(kind: SurfaceKind, wetness: f32, water: f32) -> SurfaceKind {
     // Pore water the soil is allowed to hold is not a pond. A film thicker
@@ -8320,6 +8934,113 @@ mod tests {
     }
 
     #[test]
+    fn drying_crust_cracks_and_old_tracks_harden_with_a_closed_ledger() {
+        let (field, s) = SoilField::drying_pair();
+        eprintln!(
+            "drying wetness {:.3}->{:.3} crust {:.4} m crack mean {:.4} max {:.4} cells {}/{}",
+            s.wetness_before, s.wetness_after, s.crust_m, s.crack_m, s.crack_max, s.crack_cells, s.floor_cells
+        );
+        eprintln!(
+            "drying sink wet {:.4} crust {:.4} old {:.4} m harden {:.3} extra cut wet {:.4} old {:.4}",
+            s.wet_sink, s.crust_sink, s.old_sink, s.harden, s.wet_extra_cut, s.old_extra_cut
+        );
+        eprintln!(
+            "drying ledger cut {:.4} placed {:.4} bed gap {:.6} placed gap {:.6} cloud {:.6} slurry {:.6}",
+            s.cut, s.placed, s.bed_gap, s.placed_gap, s.cloud_gap, s.slurry_gap
+        );
+        eprintln!(
+            "drying sand crust {:.6} silt crust {:.6} west {:?} {:.3} east {:?} crust {:.4} crack {:.4}",
+            s.sand_crust,
+            s.silt_crust,
+            SurfaceKind::from_u8(s.west_kind),
+            s.west_wetness,
+            SurfaceKind::from_u8(s.east_kind),
+            s.east_crust,
+            s.east_crack
+        );
+        assert!(s.floor_cells > 20, "the east tracks did not cut, {}", s.floor_cells);
+        assert!(
+            s.wetness_after < s.wetness_before - 0.35,
+            "moisture did not fall, {:.3} -> {:.3}",
+            s.wetness_before,
+            s.wetness_after
+        );
+        assert!(s.crust_m > 0.015, "the skin stayed thin, {:.4} m", s.crust_m);
+        assert!(s.crack_max > 0.004, "the crust did not crack, max {:.4}", s.crack_max);
+        assert!(s.crack_cells > 8, "too few fissures, {}", s.crack_cells);
+        assert_eq!(
+            SurfaceKind::from_u8(s.east_kind),
+            SurfaceKind::DryCrust,
+            "the old track should bake"
+        );
+        assert!(s.east_crust > 0.015, "sample missed the skin, {:.4}", s.east_crust);
+        assert!(
+            s.old_sink < s.wet_sink * 0.8,
+            "the old track should sink less, {:.4} -> {:.4}",
+            s.wet_sink,
+            s.old_sink
+        );
+        assert!(
+            s.old_sink < s.crust_sink * 0.92,
+            "resting on the crust should harden past the kind alone, {:.4} vs {:.4}",
+            s.old_sink,
+            s.crust_sink
+        );
+        assert!(s.harden > 1.4, "harden mul {:.3}", s.harden);
+        assert!(
+            s.wet_extra_cut > 0.004,
+            "the wet track took no second cut, {:.4}",
+            s.wet_extra_cut
+        );
+        assert!(
+            s.old_extra_cut < s.wet_extra_cut * 0.34,
+            "the crusted track cut like wet clay, old {:.4} wet {:.4}",
+            s.old_extra_cut,
+            s.wet_extra_cut
+        );
+        assert!(s.bed_gap < 1.0e-5, "drying moved the bed, {}", s.bed_gap);
+        assert!(s.placed_gap < 1.0e-5, "drying moved the pile, {}", s.placed_gap);
+        assert!(s.cloud_gap < 1.0e-5, "drying moved the cloud, {}", s.cloud_gap);
+        assert!(s.slurry_gap < 1.0e-5, "drying moved the slurry, {}", s.slurry_gap);
+        assert!(
+            (field.volumes().cut - s.cut).abs() < 1.0e-4,
+            "restore changed the cut"
+        );
+        assert!(
+            (field.volumes().placed - s.placed).abs() < 1.0e-4,
+            "restore changed the pile"
+        );
+        assert!(s.sand_crust < 1.0e-5, "sand crusted, {}", s.sand_crust);
+        assert!(s.silt_crust < 1.0e-5, "silt crusted, {}", s.silt_crust);
+        assert!(
+            matches!(
+                SurfaceKind::from_u8(s.west_kind),
+                SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay
+            ),
+            "the wet track left clay, {:?}",
+            SurfaceKind::from_u8(s.west_kind)
+        );
+        assert!(s.west_wetness > 0.6, "the wet track dried in the frame, {}", s.west_wetness);
+        let texel = crust_shader_texel(s.east_crust, s.east_crack);
+        let (back_c, back_k) = crust_shader_metres(texel);
+        assert!((back_c - s.east_crust).abs() < 0.001, "shader crust {back_c}");
+        assert!((back_k - s.east_crack).abs() < 0.001, "shader crack {back_k}");
+        let east = field.sample(0.96, 0.0);
+        assert_eq!(east.kind(), SurfaceKind::DryCrust);
+        assert!(east.crust > 0.015);
+        let west = field.floor_sample(-0.96, 0.0);
+        assert!(
+            matches!(
+                west.kind(),
+                SurfaceKind::WetMud | SurfaceKind::FreshCut | SurfaceKind::PackedClay
+            ),
+            "west floor {:?}",
+            west.kind()
+        );
+        assert!(west.crust < 1.0e-4, "the wet track kept a skin, {}", west.crust);
+    }
+
+    #[test]
     fn gravel_drains_and_sand_and_silt_keep_their_states() {
         let mut soil = SoilField::flat(0.2);
         let half = soil.size * 0.5;
@@ -8629,6 +9350,9 @@ mod tests {
             (soil.cut_volume() - before).abs() < 1.0e-6,
             "the tread negative cut the bed"
         );
+        let crust_cell = soil.idx_at(0.2, 0.2).expect("crust cell");
+        soil.crust[crust_cell] = 0.018;
+        soil.crack[crust_cell] = 0.007;
         let saved = soil.save_state();
         let loaded = SoilField::load_state(&saved).expect("reload");
         assert!(
@@ -8641,15 +9365,22 @@ mod tests {
         );
         assert!((loaded.tread_ang[idx] - soil.tread_ang[idx]).abs() < 1.0e-6);
         let cells = soil.res * soil.res;
-        let legacy_len = saved.len() - cells * 16;
+        let legacy_len = saved.len() - cells * 24;
         let legacy = SoilField::load_state(&saved[..legacy_len]).expect("old snapshot");
         assert_eq!(legacy.tread_amp[idx], 0.0);
         assert_eq!(legacy.slurry[idx], 0.0);
+        assert_eq!(legacy.crust[idx], 0.0);
         assert!((legacy.bed[idx] - soil.bed[idx]).abs() < 1.0e-6);
-        let prior = SoilField::load_state(&saved[..saved.len() - cells * 4]).expect("pre-slurry");
+        let prior = SoilField::load_state(&saved[..saved.len() - cells * 12]).expect("pre-slurry");
         assert_eq!(prior.slurry[idx], 0.0);
         assert!((prior.tread_amp[idx] - amp).abs() < 1.0e-6);
         assert!((loaded.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
+        assert!((loaded.crust[crust_cell] - 0.018).abs() < 1.0e-6);
+        assert!((loaded.crack[crust_cell] - 0.007).abs() < 1.0e-6);
+        let pre_crust = SoilField::load_state(&saved[..saved.len() - cells * 8]).expect("pre-crust");
+        assert_eq!(pre_crust.crust[crust_cell], 0.0);
+        assert_eq!(pre_crust.crack[crust_cell], 0.0);
+        assert!((pre_crust.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
     }
 
     #[test]

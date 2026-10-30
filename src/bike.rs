@@ -10,8 +10,8 @@ use glam::{EulerRot, Quat, Vec3};
 use crate::particles::Particles;
 use crate::patch::{contact_patch, step_tread, TreadCoat};
 use crate::soil::{
-    bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance, stick_scale,
-    terramech_for, wheel_buoyancy, SoilField, Terramech,
+    bekker_load, contact_length, janosi_hanamoto, mech_for_sample, on_launch_crest,
+    rolling_resistance, stick_scale, wheel_buoyancy, SoilField, Terramech,
 };
 use crate::vehicle::{
     PanelMud, Wheel, PANEL_BELLY, PANEL_COUNT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_SEAT,
@@ -144,7 +144,7 @@ impl Bike {
                     z0,
                     up_y,
                     self.wheels[i].slip,
-                    terramech_for(sample.kind(), sample.softness, sample.water),
+                    mech_for_sample(&sample),
                     sample.water,
                 )
             };
@@ -183,7 +183,7 @@ impl Bike {
             let mut long_f = 0.0;
             let mut lat_f = 0.0;
             if active {
-                let tm = terramech_for(sample.kind(), sample.softness, sample.water);
+                let tm = mech_for_sample(&sample);
                 let length = contact_length(BIKE_RADIUS, sinkage).max(0.05);
                 let area = (BIKE_WIDTH * length).max(0.008);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);

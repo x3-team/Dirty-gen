@@ -12,10 +12,11 @@ use crate::patch::{
     MOISTURE_TRACTION_NORMAL, MOISTURE_TRACTION_SINK, MOISTURE_TRACTION_SLIP, SIDEWALL_VOLUME,
 };
 use crate::soil::{
-    moisture_state_fields, on_launch_crest,     slurry_motion_drag, slurry_settle_pace, stick_scale, surface_moisture, track_offset,
-    water_body_buoyancy, water_body_drag, water_bow_height, water_cloud_pace, water_scour_pace,
-    water_stick, wet_berm_creep_under_load_rate, SlurrySeal, SoilField, SurfaceKind,
-    SurfaceMoisture, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN, TRACK_ZS,
+    moisture_state_fields, on_launch_crest, slurry_motion_drag, slurry_settle_pace, stick_scale,
+    surface_moisture, track_offset, water_body_buoyancy, water_body_drag, water_bow_height,
+    water_cloud_pace, water_scour_pace, water_stick, wet_berm_creep_under_load_rate, DryingCrust,
+    SlurrySeal, SoilField, SurfaceKind, SurfaceMoisture, SLURRY_COMPARE_MOISTURE, TRACK_R, TRACK_ZN,
+    TRACK_ZS,
 };
 use crate::vehicle::{
     hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
@@ -1117,6 +1118,21 @@ impl World {
             panel.drip = *cover;
             panel.streak = *cover;
         }
+    }
+
+    /// One pad drying. The Niva sits on the rested, cracked tracks.
+    /// The dry spell does not move the cut or the pile.
+    pub fn drying_crust_frame(&mut self) -> DryingCrust {
+        let (soil, stats) = SoilField::drying_pair();
+        self.soil = soil;
+        self.vehicle.pos = Vec3::new(1.70, 0.7, -0.35);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        self.place_on_soil();
+        self.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+        stats
     }
 
     /// Roll the Niva onto its side while it yaws in the clay, then settle it
