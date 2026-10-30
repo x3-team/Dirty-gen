@@ -6,7 +6,7 @@
 // Change this contract only by bumping RENDER_CONTRACT_VERSION and
 // recording the change in docs/RENDER_CONTRACT.md.
 
-const RENDER_CONTRACT_VERSION: u32 = 1u;
+const RENDER_CONTRACT_VERSION: u32 = 2u;
 
 struct ContractHeader {
     version: u32,
@@ -55,6 +55,7 @@ struct SprayParticle {
 @group(0) @binding(8) var wet_edge_tex: texture_2d<f32>;
 @group(0) @binding(9) var foam_crest_tex: texture_2d<f32>;
 @group(0) @binding(10) var<storage, read> spray: array<SprayParticle>;
+@group(0) @binding(11) var air_velocity: texture_3d<f32>;
 
 struct DebugOut {
     @builtin(position) clip: vec4<f32>,
@@ -90,6 +91,21 @@ fn fog_at(world_x: f32, world_z: f32) -> f32 {
     return textureLoad(dust_fog, i, 0).r;
 }
 
+fn air_speed_at(world_x: f32, world_z: f32) -> f32 {
+    let cell = vec3<f32>(header.air_cell_x, header.air_cell_y, header.air_cell_z);
+    if (cell.x <= 0.0 || cell.y <= 0.0 || cell.z <= 0.0) {
+        return 0.0;
+    }
+    let p = vec3<f32>(world_x, header.air_origin_y + cell.y * 1.5, world_z);
+    let origin = vec3<f32>(header.air_origin_x, header.air_origin_y, header.air_origin_z);
+    let i = vec3<i32>(floor((p - origin) / cell));
+    let dims = vec3<i32>(textureDimensions(air_velocity, 0));
+    if (any(i < vec3<i32>(0)) || any(i >= dims)) {
+        return 0.0;
+    }
+    return length(textureLoad(air_velocity, i, 0).rgb);
+}
+
 fn field_color(ij: vec2<i32>, world_xz: vec2<f32>) -> vec3<f32> {
     let mode = header.debug_mode;
     let ground = textureLoad(ground_rut, ij, 0);
@@ -109,6 +125,7 @@ fn field_color(ij: vec2<i32>, world_xz: vec2<f32>) -> vec3<f32> {
     if (mode == 10u) { return ramp(foam.r, 0.0, 1.0); }
     if (mode == 11u) { return ramp(foam.g, 0.0, 0.08); }
     if (mode == 13u) { return ramp(fog_at(world_xz.x, world_xz.y), 0.0, 0.02); }
+    if (mode == 14u) { return ramp(air_speed_at(world_xz.x, world_xz.y), 0.0, 12.0); }
     return ramp(ground.r, -0.4, 0.8);
 }
 

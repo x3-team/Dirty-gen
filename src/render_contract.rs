@@ -1,4 +1,4 @@
-//! Physics → render contract, version 1.
+//! Physics → render contract, version 2.
 //!
 //! The solver publishes these maps at the end of a frame. The debug view
 //! reads only this contract. Picture shading (materials, light, HDRI, fog,
@@ -15,7 +15,7 @@ use crate::particles::Particle;
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 1;
+pub const RENDER_CONTRACT_VERSION: u32 = 2;
 
 /// Coarse ground window. 200 × 0.20 m = 40 m. The 2 cm tire patch is restricted
 /// back into this window before publish. It is not a second map.
@@ -65,6 +65,7 @@ pub const VALID_CRUST: u32 = 1 << 6;
 pub const VALID_WET_EDGE: u32 = 1 << 7;
 pub const VALID_FOAM: u32 = 1 << 8;
 pub const VALID_SPRAY: u32 = 1 << 9;
+pub const VALID_AIR: u32 = 1 << 10;
 
 pub const BIND_HEADER: u32 = 0;
 pub const BIND_GROUND: u32 = 1;
@@ -77,6 +78,7 @@ pub const BIND_CRUST: u32 = 7;
 pub const BIND_WET_EDGE: u32 = 8;
 pub const BIND_FOAM: u32 = 9;
 pub const BIND_SPRAY: u32 = 10;
+pub const BIND_AIR: u32 = 11;
 
 /// Uniform header. 96 bytes. Layout matches `ContractHeader` in the WGSL.
 ///
@@ -134,6 +136,8 @@ pub struct ContractFrame {
     pub wet_edge: Vec<f32>,
     pub foam_crest: Vec<f32>,
     pub dust_fog: Vec<f32>,
+    /// World air velocity, rgba, same index as `dust_fog` times 4.
+    pub air_velocity: Vec<f32>,
     pub spray: Vec<SprayGpu>,
 }
 
@@ -152,6 +156,7 @@ impl ContractFrame {
             wet_edge: vec![0.0; n],
             foam_crest: vec![0.0; n * 2],
             dust_fog: vec![0.0; air],
+            air_velocity: vec![0.0; air * 4],
             spray: vec![SprayGpu::zeroed(); SPRAY_CAPACITY as usize],
         }
     }
@@ -263,6 +268,7 @@ pub fn publish(
     out.wet_edge.fill(0.0);
     out.foam_crest.fill(0.0);
     out.dust_fog.fill(0.0);
+    out.air_velocity.fill(0.0);
     for slot in &mut out.spray {
         *slot = SprayGpu::zeroed();
     }
@@ -455,6 +461,11 @@ pub fn publish(
     } else {
         (DUST_NONE, [0.0; 3], [0.0; 3])
     };
+    if let Some(dust) = dust {
+        dust.write_air_velocity(&mut out.air_velocity);
+    } else if let Some(fluid) = fluid {
+        fluid.write_air_velocity(&mut out.air_velocity);
+    }
 
     let mut spray_count = 0u32;
     for piece in particles {
@@ -536,7 +547,7 @@ pub fn publish(
         valid |= VALID_FLOW;
     }
     if dust_source != DUST_NONE {
-        valid |= VALID_DUST_SETTLED | VALID_DUST_FOG;
+        valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR;
     }
 
     scrub(&mut out.ground_rut);
@@ -548,6 +559,7 @@ pub fn publish(
     scrub(&mut out.wet_edge);
     scrub(&mut out.foam_crest);
     scrub(&mut out.dust_fog);
+    scrub(&mut out.air_velocity);
     for slot in &mut out.spray {
         scrub(&mut slot.pos_mass);
         scrub(&mut slot.vel_age);
@@ -655,6 +667,7 @@ pub fn contract_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
                 },
                 count: None,
             },
+            float_entry(BIND_AIR, wgpu::TextureViewDimension::D3),
         ],
     })
 }
@@ -668,6 +681,7 @@ struct Map2 {
 struct Map3 {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    channels: usize,
 }
 
 /// GPU copy of the contract. Absent when the device cannot store the float maps.
@@ -682,6 +696,7 @@ pub struct ContractGpu {
     flow: Map2,
     dust_settled: Map2,
     dust_fog: Map3,
+    air_velocity: Map3,
     crust: Map2,
     wet_edge: Map2,
     foam: Map2,
@@ -760,7 +775,18 @@ impl ContractGpu {
             wgpu::TextureFormat::R32Float,
             1,
         )?;
-        let dust_fog = map3(device, "contract-dust-fog")?;
+        let dust_fog = map3(
+            device,
+            "contract-dust-fog",
+            wgpu::TextureFormat::R32Float,
+            1,
+        )?;
+        let air_velocity = map3(
+            device,
+            "contract-air-velocity",
+            wgpu::TextureFormat::Rgba32Float,
+            4,
+        )?;
         let crust = map2(
             device,
             "contract-crust",
@@ -797,6 +823,7 @@ impl ContractGpu {
                 bind_tex(BIND_WET_EDGE, &wet_edge.view),
                 bind_tex(BIND_FOAM, &foam.view),
                 bind_buf(BIND_SPRAY, spray.as_entire_binding()),
+                bind_tex(BIND_AIR, &air_velocity.view),
             ],
         });
         Some(Self {
@@ -810,6 +837,7 @@ impl ContractGpu {
             flow,
             dust_settled,
             dust_fog,
+            air_velocity,
             crust,
             wet_edge,
             foam,
@@ -827,26 +855,8 @@ impl ContractGpu {
         write_map2(queue, &self.crust, &frame.crust, WINDOW_CELLS);
         write_map2(queue, &self.wet_edge, &frame.wet_edge, WINDOW_CELLS);
         write_map2(queue, &self.foam, &frame.foam_crest, WINDOW_CELLS);
-        let (bytes, padded) = pack_f32_rows(&frame.dust_fog, AIR_CELLS as usize, 1);
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.dust_fog.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &bytes,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(AIR_SLABS),
-            },
-            wgpu::Extent3d {
-                width: AIR_CELLS,
-                height: AIR_SLABS,
-                depth_or_array_layers: AIR_CELLS,
-            },
-        );
+        write_map3(queue, &self.dust_fog, &frame.dust_fog);
+        write_map3(queue, &self.air_velocity, &frame.air_velocity);
     }
 }
 
@@ -879,7 +889,12 @@ fn map2(
     })
 }
 
-fn map3(device: &wgpu::Device, label: &str) -> Option<Map3> {
+fn map3(
+    device: &wgpu::Device,
+    label: &str,
+    format: wgpu::TextureFormat,
+    channels: usize,
+) -> Option<Map3> {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -890,12 +905,39 @@ fn map3(device: &wgpu::Device, label: &str) -> Option<Map3> {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
-        format: wgpu::TextureFormat::R32Float,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
-    Some(Map3 { texture, view })
+    Some(Map3 {
+        texture,
+        view,
+        channels,
+    })
+}
+
+fn write_map3(queue: &wgpu::Queue, map: &Map3, src: &[f32]) {
+    let (bytes, padded) = pack_f32_rows(src, AIR_CELLS as usize, map.channels);
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &map.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(padded),
+            rows_per_image: Some(AIR_SLABS),
+        },
+        wgpu::Extent3d {
+            width: AIR_CELLS,
+            height: AIR_SLABS,
+            depth_or_array_layers: AIR_CELLS,
+        },
+    );
 }
 
 fn bind_buf(binding: u32, resource: wgpu::BindingResource<'_>) -> wgpu::BindGroupEntry<'_> {
@@ -953,6 +995,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<SprayGpu>(), 48);
         assert!(wgsl.contains("@group(0) @binding(0)"));
         assert!(wgsl.contains("@group(0) @binding(10)"));
+        assert!(wgsl.contains("@group(0) @binding(11)"));
+        assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
+        let air_row = padded_row_bytes(AIR_CELLS, 4);
+        assert_eq!(air_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
         assert!(!wgsl.contains("height_tex"));
         assert!(!wgsl.contains("sun_dir"));
         assert!(!wgsl.contains("ground_diff"));
@@ -1078,6 +1124,63 @@ mod tests {
     }
 
     #[test]
+    fn air_velocity_is_published_with_the_dust_ledger() {
+        let mut dust = Dust::new();
+        dust.set_wind(1.5, -0.9);
+        dust.step(&crate::dust::tires_at(0.0, 8.0, 1.6), 0.04, 0.0, 1.0 / 60.0);
+        let soil = SoilField::flat(0.2);
+        let mut frame = ContractFrame::new();
+        publish(
+            &mut frame,
+            &soil,
+            &[],
+            [0.0, 0.0],
+            0.0,
+            14,
+            None,
+            Some(&dust),
+        );
+        assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
+        assert_eq!(frame.header.dust_source, DUST_LEDGER);
+        assert_eq!(frame.header.valid & VALID_AIR, VALID_AIR);
+        assert_eq!(frame.air_velocity.len(), frame.dust_fog.len() * 4);
+        assert!(frame_is_finite(&frame));
+        assert!(
+            frame.air_velocity.chunks(4).any(|texel| {
+                texel[3] == 0.0 && texel[0].abs() + texel[1].abs() + texel[2].abs() > 0.2
+            }),
+            "air velocity stayed at rest"
+        );
+        assert!(frame.air_velocity.chunks(4).all(|texel| texel[3] == 0.0));
+
+        let mut sheet = FluidCore::new([0.0, 0.0]);
+        let _ = sheet.step(1.0 / 60.0);
+        let mut fluid_frame = ContractFrame::new();
+        publish(
+            &mut fluid_frame,
+            &soil,
+            &[],
+            [0.0, 0.0],
+            0.0,
+            0,
+            Some(&sheet),
+            None,
+        );
+        assert_eq!(fluid_frame.header.dust_source, DUST_FLUID_AIR);
+        assert_eq!(fluid_frame.header.valid & VALID_AIR, VALID_AIR);
+        assert!(fluid_frame
+            .air_velocity
+            .chunks(4)
+            .all(|texel| texel[1] == 0.0 && texel[3] == 0.0));
+        assert!(frame_is_finite(&fluid_frame));
+
+        let mut bare = ContractFrame::new();
+        publish(&mut bare, &soil, &[], [0.0, 0.0], 0.0, 0, None, None);
+        assert_eq!(bare.header.valid & VALID_AIR, 0);
+        assert!(bare.air_velocity.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
     fn through_drive_contract_is_finite_and_carries_foam_and_water() {
         let mut drive = crate::world::ThroughDrive::new();
         let dt = 1.0 / 30.0;
@@ -1140,6 +1243,7 @@ mod tests {
             frame.wet_edge.as_slice(),
             frame.foam_crest.as_slice(),
             frame.dust_fog.as_slice(),
+            frame.air_velocity.as_slice(),
         ];
         if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
             return false;
