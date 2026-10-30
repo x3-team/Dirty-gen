@@ -548,6 +548,8 @@ struct CaptureArgs {
     water_crossing_proof: PathBuf,
     solver_lod: bool,
     solver_lod_proof: PathBuf,
+    mud_adhesion: bool,
+    mud_adhesion_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -560,11 +562,17 @@ fn capture(args: &[String]) {
     let formats = render::gpu_formats(&adapter);
     eprintln!("loading cc0 ground and the dune buggy");
     let scene = cc0::load();
+    // Two Nivas share the still. Each draw is one half so the wheels stay round.
+    let render_w = if parsed.mud_adhesion {
+        (parsed.width / 2).max(2)
+    } else {
+        parsed.width
+    };
     let mut renderer = Renderer::new(
         device,
         queue,
         adapter.get_info().name,
-        parsed.width,
+        render_w,
         parsed.height,
         formats,
         scene,
@@ -680,6 +688,10 @@ fn capture(args: &[String]) {
     }
     if parsed.solver_lod {
         capture_solver_lod(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.mud_adhesion {
+        capture_mud_adhesion(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -900,6 +912,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         PathBuf::from("/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/solver-lod-proof.png");
     let mut water_crossing_proof =
         PathBuf::from(format!("{MEDIA}/water-crossing-proof.png"));
+    let mut mud_adhesion = false;
+    let mut mud_adhesion_proof = PathBuf::from(format!("{MEDIA}/mud-adhesion-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1044,6 +1058,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     solver_lod_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--mud-adhesion-proof" => {
+                mud_adhesion = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    mud_adhesion_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1155,6 +1175,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         water_crossing_proof,
         solver_lod,
         solver_lod_proof,
+        mud_adhesion,
+        mud_adhesion_proof,
     }
 }
 
@@ -2567,6 +2589,117 @@ fn solver_lod_camera(world: &World) -> CameraPose {
         target: look,
         ortho_width: Some(9.5),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_mud_adhesion(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+
+    let mut world = World::wet_clay();
+    world.seat_mid_clay();
+    silence_chunks(&mut world);
+    let before_pose = adhesion_camera(&world);
+    let before = renderer
+        .draw(&world, before_pose, None, true)
+        .expect("before");
+
+    let report = world.run_clay_adhesion();
+    // The pass rolls toward the edge of the pad. Park on the same ground as
+    // the clean frame and leave the coat where it stuck.
+    let z = -2.4_f32;
+    let h = world.soil.sample(0.0, z).height;
+    world.vehicle.pos = Vec3::new(0.0, h + 0.58, z);
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    world.vehicle.vel = Vec3::ZERO;
+    silence_chunks(&mut world);
+    let after_pose = adhesion_camera(&world);
+    let after = renderer
+        .draw(&world, after_pose, None, true)
+        .expect("after");
+
+    use silt::adhesion::ZONE_NAMES;
+    println!(
+        "mud-adhesion stuck {:.2} kg {:.4} m3 removed {:.4} shed {:.4} ribbon {:.4} clod {:.4}",
+        report.stuck_kg,
+        report.stuck_m3,
+        report.removed_m3,
+        report.shed_m3,
+        report.shed_ribbon_m3,
+        report.shed_clod_m3
+    );
+    println!(
+        "mud-adhesion mu clean {:.3} packed {:.3} now {:.3} pack {:.2} arch {:.1} Nm imbalance {:.1} N",
+        report.mu_clean,
+        report.mu_packed,
+        report.mu_now,
+        report.tire_pack,
+        report.arch_brake_nm,
+        report.imbalance_n
+    );
+    for (i, zone) in report.zones.iter().enumerate() {
+        println!(
+            "mud-adhesion {} {:.2} mm clay {:.2} silt {:.2} sand {:.2} water {:.2} {:.1} kg",
+            ZONE_NAMES[i],
+            zone.thickness_m * 1000.0,
+            zone.clay,
+            zone.silt,
+            zone.sand,
+            zone.water,
+            zone.mass_kg
+        );
+    }
+
+    let half_w = (parsed.width / 2).max(2);
+    let rgba = stitch_side_by_side(&before, &after, half_w, parsed.height);
+    if let Some(parent) = parsed.mud_adhesion_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.mud_adhesion_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("mud adhesion still");
+    println!("mud-adhesion {}", parsed.mud_adhesion_proof.display());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn adhesion_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Steep enough that a portrait half stays on the pad instead of the sky.
+    let look = vehicle.pos + Vec3::Y * 0.42 + fwd * 0.05;
+    let eye = vehicle.pos - fwd * 2.15 + right * 2.05 + Vec3::Y * 4.6;
+    CameraPose {
+        eye,
+        target: look,
+        ortho_width: Some(4.4),
+    }
+}
+
+/// Left half is the clean Niva, right half is the same car after the clay pass.
+#[cfg(not(target_arch = "wasm32"))]
+fn stitch_side_by_side(left: &[u8], right: &[u8], half_w: u32, height: u32) -> Vec<u8> {
+    let half_w = half_w.max(1);
+    let full_w = half_w * 2;
+    let row_bytes = (half_w * 4) as usize;
+    let mut out = vec![0u8; (full_w * height * 4) as usize];
+    for y in 0..height {
+        let src = (y * half_w * 4) as usize;
+        let dst_l = (y * full_w * 4) as usize;
+        let dst_r = dst_l + row_bytes;
+        out[dst_l..dst_l + row_bytes].copy_from_slice(&left[src..src + row_bytes]);
+        out[dst_r..dst_r + row_bytes].copy_from_slice(&right[src..src + row_bytes]);
+    }
+    out
 }
 
 #[cfg(not(target_arch = "wasm32"))]

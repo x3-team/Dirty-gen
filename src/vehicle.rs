@@ -3,6 +3,7 @@
 
 use glam::{EulerRot, Quat, Vec3};
 
+use crate::adhesion::{self, Adhesion};
 use crate::patch::{contact_patch, step_tread, stuck_compact_breakaway, TreadCoat, TreadStep};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, on_launch_crest, rolling_resistance,
@@ -141,6 +142,8 @@ pub struct Vehicle {
     pub water_drag_n: f32,
     /// Set once the free surface reaches the air intake. Engine torque stays zero.
     pub engine_stalled: bool,
+    /// Stuck mud: mass, packed tread, arch brake, shader thickness.
+    pub adhesion: Adhesion,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -195,7 +198,13 @@ impl Vehicle {
             water_lift_n: 0.0,
             water_drag_n: 0.0,
             engine_stalled: false,
+            adhesion: Adhesion::default(),
         }
+    }
+
+    /// Sprung mass plus the mud still stuck to the chassis and the tires.
+    pub fn total_mass(&self) -> f32 {
+        MASS + self.adhesion.mass_kg()
     }
 
     /// Air intake on the right of the bay, above the belly. Local space.
@@ -250,7 +259,10 @@ impl Vehicle {
         best
     }
 
-    /// How far the free surface stands above the belly, metres.
+    /// How far the free water surface stands above the belly, metres.
+    ///
+    /// A berm or rut wall is soil. Counting that height as water lifts the
+    /// hull off the clay it is trying to climb.
     pub fn body_draft(&self, soil: &SoilField) -> f32 {
         let ori = self.orientation();
         let pts = [
@@ -264,8 +276,13 @@ impl Vehicle {
         for p in pts {
             let w = self.pos + ori * p;
             let s = soil.sample(w.x, w.z);
-            let surface = s.height + s.water;
-            draft = draft.max(surface - w.y);
+            let above_bed = w.y - s.height;
+            let water_draft = if above_bed >= 0.0 {
+                s.water - above_bed
+            } else {
+                s.water
+            };
+            draft = draft.max(water_draft);
         }
         draft.max(0.0)
     }
@@ -299,6 +316,7 @@ impl Vehicle {
             w.sidewall = 0.0;
         }
         self.panels = [PanelMud::default(); PANEL_COUNT];
+        self.adhesion = Adhesion::default();
     }
 
     pub fn wheel_center_local(&self, index: usize) -> Vec3 {
@@ -526,7 +544,11 @@ impl Vehicle {
                 let patch_scale = lerp(1.0, patch.scale, patch_mix);
                 blended_long *= patch_scale;
                 blended_lat *= patch_scale;
-                grip = patch.grip * soil_w + pace_long.abs() * (1.0 - soil_w);
+                // Packed voids shear mud on mud. A clean tread stays on the soil μ.
+                let pack_scale = adhesion::tread_mu_scale(self.adhesion.tire_pack(i));
+                blended_long *= pack_scale;
+                blended_lat *= pack_scale;
+                grip = (patch.grip * soil_w + pace_long.abs() * (1.0 - soil_w)) * pack_scale;
                 squeeze = patch.squeeze;
                 pull = patch.pull;
                 patch_length = patch.length;
@@ -644,7 +666,8 @@ impl Vehicle {
 
     pub fn integrate(&mut self, contacts: &[Contact; 4], soil: &SoilField, dt: f32) {
         let ori = self.orientation();
-        let mut force = Vec3::new(0.0, -MASS * 9.81 + self.water_lift_n, 0.0);
+        let mass = self.total_mass();
+        let mut force = Vec3::new(0.0, -mass * 9.81 + self.water_lift_n, 0.0);
         if self.water_drag_n > 1.0 {
             let hv = Vec3::new(self.vel.x, 0.0, self.vel.z);
             let spd = hv.length();
@@ -674,9 +697,25 @@ impl Vehicle {
                 let r = c.contact_point - self.pos;
                 torque_local += ori.inverse() * r.cross(f_world);
             }
-            let alpha = c.wheel_torque / WHEEL_INERTIA;
+            let inertia = self.wheel_inertia(c.index);
+            let alpha = c.wheel_torque / inertia;
+            let brake = self.adhesion.arch_brake_nm(c.index);
+            let mut omega = (self.wheels[c.index].omega + alpha * dt).clamp(-MAX_OMEGA, MAX_OMEGA);
+            if brake > 0.0 && omega.abs() > 1.0e-3 {
+                let kick = brake / inertia * dt;
+                if kick >= omega.abs() {
+                    omega = 0.0;
+                } else {
+                    omega -= omega.signum() * kick;
+                }
+            }
+            let wobble = self.adhesion.imbalance_n(c.index, omega);
+            let phase = self.wheels[c.index].spin;
+            if wobble > 0.5 {
+                force.y += wobble * phase.sin();
+            }
             let w = &mut self.wheels[c.index];
-            w.omega = (w.omega + alpha * dt).clamp(-MAX_OMEGA, MAX_OMEGA);
+            w.omega = omega;
             w.spin += w.omega * dt;
             w.compression = c.compression;
             w.slip = c.slip;
@@ -743,7 +782,7 @@ impl Vehicle {
         }
         torque_local.y -= 180.0 * self.yaw_rate;
 
-        self.vel += (force / MASS) * dt;
+        self.vel += (force / mass) * dt;
         if airborne || climbing {
             self.vel.y = self.vel.y.clamp(-14.0, 9.0);
         } else {
@@ -1016,6 +1055,13 @@ fn solve_suspension(
     }
     let c = 0.5 * (lo + hi);
     (c, z_of(c), spring(c).min(22_000.0))
+}
+
+impl Vehicle {
+    fn wheel_inertia(&self, index: usize) -> f32 {
+        let mud = self.adhesion.tire_mass_kg(index);
+        WHEEL_INERTIA + mud * WHEEL_RADIUS * WHEEL_RADIUS * 0.55
+    }
 }
 
 fn engine_torque(throttle: f32, omega: f32) -> f32 {

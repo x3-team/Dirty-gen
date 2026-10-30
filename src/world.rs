@@ -2,6 +2,7 @@
 
 use glam::Vec3;
 
+use crate::adhesion::{AdhereContact, AdhesionReport, PASS_OFFER_M3_S};
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::particles::Particles;
 use crate::patch::{
@@ -274,6 +275,7 @@ impl World {
             world.step(1.0 / 60.0, &Input::default());
         }
         world.restore_sidewall_skim();
+        world.refund_spawn_coat();
         world.vehicle.clear_loose_mud();
         world.particles.clear();
         world.time = 0.0;
@@ -333,6 +335,7 @@ impl World {
             world.step(1.0 / 60.0, &Input::default());
         }
         world.restore_sidewall_skim();
+        world.refund_spawn_coat();
         world.vehicle.clear_loose_mud();
         world.particles.clear();
         world.coat_in_rut = 0.0;
@@ -747,6 +750,7 @@ impl World {
                 self.coat_in_rut += land.in_rut;
             }
         }
+        self.step_mud_adhesion(&contacts, dt);
         for c in &contacts {
             if c.active && c.squeeze > 0.02 {
                 // Loose smear only. The cut still lands on the berm.
@@ -969,6 +973,150 @@ impl World {
         world.vehicle.yaw = 0.0;
         world.vehicle.roll = 0.0;
         world
+    }
+
+    /// Spawn settle is not a clay pass. Put that coat back on the loose film.
+    fn refund_spawn_coat(&mut self) {
+        let vol = self.vehicle.adhesion.take_all();
+        if vol > 1.0e-6 {
+            self.soil.give_loose(self.vehicle.pos, vol);
+        }
+    }
+
+    fn step_mud_adhesion(&mut self, contacts: &[Contact; 4], dt: f32) {
+        let inputs = adhere_contacts(contacts);
+        let paint = crate::adhesion::step(
+            &mut self.vehicle.adhesion,
+            &mut self.soil,
+            &inputs,
+            crate::adhesion::LIVE_OFFER_M3_S,
+            dt,
+        );
+        for i in 0..4 {
+            let groove = paint.groove[i];
+            let w = &mut self.vehicle.wheels[i];
+            w.groove = w.groove.max(groove);
+        }
+        for (i, cover) in paint.panel.iter().enumerate() {
+            let mass = cover * PANEL_MUD_CAP;
+            let panel = &mut self.vehicle.panels[i];
+            if mass > panel.mass {
+                panel.mass = mass;
+                panel.wet = panel.wet.max(*cover);
+            }
+        }
+    }
+
+    /// Mid-moisture clay, loose film, Niva seated and clean. The before frame.
+    pub fn seat_mid_clay(&mut self) {
+        for i in 0..self.soil.kind.len() {
+            self.soil.kind[i] = SurfaceKind::WetMud as u8;
+            self.soil.wetness[i] = 0.46;
+            self.soil.base_wetness[i] = 0.46;
+            self.soil.water[i] = 0.0;
+            if self.soil.loose[i] < 0.07 {
+                self.soil.loose[i] = 0.07;
+            }
+        }
+        self.vehicle.vel = Vec3::ZERO;
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.yaw_rate = 0.0;
+        self.vehicle.pitch_rate = 0.0;
+        self.vehicle.roll_rate = 0.0;
+        self.vehicle.pos = Vec3::new(0.0, 0.0, -2.4);
+        let h = self.soil.sample(0.0, -2.4).height;
+        self.vehicle.pos.y = h + 0.58;
+        for w in &mut self.vehicle.wheels {
+            w.compression = 0.08;
+            w.omega = 0.0;
+            w.spin = 0.4 * (w.spin.signum().max(0.0) + 1.0);
+        }
+        self.refund_spawn_coat();
+        self.vehicle.clear_loose_mud();
+        self.bike.pos = Vec3::new(18.0, 0.5, 18.0);
+        self.bike.vel = Vec3::ZERO;
+        self.particles.clear();
+    }
+
+    /// Roll the seated Niva through mid-moisture clay and keep the coat.
+    /// The slurry surface is not stepped.
+    pub fn run_clay_adhesion(&mut self) -> AdhesionReport {
+        let dt = 1.0 / 60.0;
+        let seconds = 5.2_f32;
+        let steps = (seconds / dt).round() as u32;
+        let speed = 1.65_f32;
+        for _ in 0..steps {
+            self.vehicle.pos.z += speed * dt;
+            let h = self
+                .soil
+                .sample(self.vehicle.pos.x, self.vehicle.pos.z)
+                .height;
+            self.vehicle.pos.y = h + 0.58;
+            let travel = speed * dt;
+            for w in &mut self.vehicle.wheels {
+                w.omega = speed / WHEEL_RADIUS;
+                w.spin += travel / WHEEL_RADIUS;
+            }
+            let inputs = self.clay_contacts(0.10, speed);
+            crate::adhesion::step(
+                &mut self.vehicle.adhesion,
+                &mut self.soil,
+                &inputs,
+                PASS_OFFER_M3_S,
+                dt,
+            );
+        }
+        self.paint_adhesion_still();
+        self.vehicle
+            .adhesion
+            .report(crate::adhesion::mid_clay_mu())
+    }
+
+    fn clay_contacts(&self, slip: f32, speed: f32) -> [AdhereContact; 4] {
+        let mut out = [AdhereContact::default(); 4];
+        let ori = self.vehicle.orientation();
+        let forward = self.vehicle.forward();
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        for i in 0..4 {
+            let center = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
+            let sample = self.soil.sample(center.x, center.z);
+            out[i] = AdhereContact {
+                index: i,
+                active: true,
+                slip,
+                speed,
+                length: 0.22,
+                width: WHEEL_WIDTH,
+                center,
+                forward,
+                right,
+                kind: sample.kind(),
+                wetness: sample.wetness,
+                water: sample.water,
+                slurry: sample.slurry,
+            };
+        }
+        out
+    }
+
+    fn paint_adhesion_still(&mut self) {
+        let paint = self.vehicle.adhesion.paint();
+        for i in 0..4 {
+            let w = &mut self.vehicle.wheels[i];
+            w.groove = paint.groove[i];
+            w.sidewall = paint.sidewall[i];
+            w.smear = paint.smear[i];
+            w.mud = paint.groove[i] * 1.5;
+        }
+        for (i, cover) in paint.panel.iter().enumerate() {
+            let panel = &mut self.vehicle.panels[i];
+            panel.mass = cover * PANEL_MUD_CAP;
+            panel.wet = *cover;
+            panel.drip = *cover;
+            panel.streak = *cover;
+        }
     }
 
     /// Roll the Niva onto its side while it yaws in the clay, then settle it
@@ -3737,6 +3885,28 @@ fn stick_impact_mud(vehicle: &mut Vehicle, soil: &SoilField) {
     }
 }
 
+fn adhere_contacts(contacts: &[Contact; 4]) -> [AdhereContact; 4] {
+    let mut out = [AdhereContact::default(); 4];
+    for (i, c) in contacts.iter().enumerate() {
+        out[i] = AdhereContact {
+            index: c.index,
+            active: c.active,
+            slip: c.slip,
+            speed: c.speed,
+            length: c.patch_length.max(0.08),
+            width: WHEEL_WIDTH,
+            center: c.wheel_center,
+            forward: c.forward,
+            right: c.right,
+            kind: c.sample.kind(),
+            wetness: c.sample.wetness,
+            water: c.sample.water,
+            slurry: c.sample.slurry,
+        };
+    }
+    out
+}
+
 fn panel_drip_point(index: usize) -> Vec3 {
     match index {
         1 => Vec3::new(0.0, 0.15, 1.55),
@@ -3970,6 +4140,59 @@ mod tests {
         water_body_buoyancy, water_body_drag, water_bow_height, SoilField, SurfaceKind,
     };
     use crate::vehicle::{MASS, WHEEL_RADIUS};
+
+    #[test]
+    fn clay_adhesion_pass_coats_every_zone() {
+        use crate::adhesion::{ZONE_NAMES, ZONE_TIRE};
+        let mut world = World::wet_clay();
+        world.seat_mid_clay();
+        assert!(world.vehicle.adhesion.stuck_volume() < 1.0e-6);
+        let report = world.run_clay_adhesion();
+        eprintln!(
+            "adhesion stuck {:.2} kg  {:.4} m3  removed {:.4}  shed {:.4}  ribbon {:.4}  clod {:.4}",
+            report.stuck_kg,
+            report.stuck_m3,
+            report.removed_m3,
+            report.shed_m3,
+            report.shed_ribbon_m3,
+            report.shed_clod_m3
+        );
+        eprintln!(
+            "adhesion mu clean {:.3}  packed {:.3}  now {:.3}  pack {:.2}  arch brake {:.1} Nm  imbalance {:.1} N",
+            report.mu_clean,
+            report.mu_packed,
+            report.mu_now,
+            report.tire_pack,
+            report.arch_brake_nm,
+            report.imbalance_n
+        );
+        for (i, zone) in report.zones.iter().enumerate() {
+            eprintln!(
+                "adhesion {:>5}  {:.1} mm  clay {:.2}  silt {:.2}  sand {:.2}  water {:.2}  {:.1} kg",
+                ZONE_NAMES[i],
+                zone.thickness_m * 1000.0,
+                zone.clay,
+                zone.silt,
+                zone.sand,
+                zone.water,
+                zone.mass_kg
+            );
+            assert!(
+                zone.thickness_m > 0.002,
+                "{} stayed thin {}",
+                ZONE_NAMES[i],
+                zone.thickness_m
+            );
+        }
+        let gap = (report.removed_m3 - report.stuck_m3 - report.shed_m3).abs();
+        assert!(gap < 1.0e-3, "removed != stuck + shed, gap {gap}");
+        assert!(report.mu_packed < report.mu_clean * 0.62);
+        assert!(report.tire_pack > 0.55, "tread pack {}", report.tire_pack);
+        assert!(report.zones[ZONE_TIRE].clay > 0.45);
+        assert!(report.stuck_kg > 20.0, "stuck mass {}", report.stuck_kg);
+        assert!(report.arch_brake_nm > 40.0, "arch brake {}", report.arch_brake_nm);
+        assert!(report.imbalance_n > 15.0, "imbalance {}", report.imbalance_n);
+    }
 
     #[test]
     fn hubs_sit_on_the_solver_sink() {
