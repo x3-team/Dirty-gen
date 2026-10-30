@@ -36,6 +36,10 @@ struct FrameData {
     misc: [f32; 4],
     /// Four tires, two vec4s each: center.xyz + radius, then forward.xz, sink, active.
     tires: [[f32; 4]; 8],
+    /// Turn crest. snow_arc2[1] is the bin count; 0 leaves the heightfield alone.
+    snow_arc: [f32; 4],
+    snow_arc2: [f32; 4],
+    snow_profile: [[f32; 4]; 8],
 }
 
 #[repr(C)]
@@ -131,6 +135,11 @@ pub struct Renderer {
     pub niva_picture: bool,
     /// Draw the solved water column, including a bow above the film range.
     pub water_column: bool,
+    /// Paint the snow layer. Compaction in the darken channel tints the blanket.
+    pub snow: bool,
+    /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
+    pub snow_arc: Option<silt::snow::SnowArc>,
+    pub snow_bed: f32,
     niva_body: GpuMesh,
     niva_glass: GpuMesh,
     niva_wheels: [GpuMesh; 4],
@@ -1027,6 +1036,9 @@ impl Renderer {
             show_bike: true,
             niva_picture: false,
             water_column: false,
+            snow: false,
+            snow_arc: None,
+            snow_bed: 0.0,
             niva_body,
             niva_glass,
             niva_wheels,
@@ -1160,7 +1172,7 @@ impl Renderer {
             light_vp: light_vp.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             cam_pos: vec4(cam.eye, 1.0),
-            sun_dir: vec4(sun, 0.0),
+            sun_dir: vec4(sun, if self.snow { 1.0 } else { 0.0 }),
             sun_color,
             sky_zenith,
             sky_horizon,
@@ -1178,7 +1190,20 @@ impl Renderer {
                 if self.water_column { 1.0 } else { 0.0 },
             ],
             tires: tire_frame(&world.vehicle),
+            snow_arc: [0.0; 4],
+            snow_arc2: [1.0, 0.0, 0.0, 0.0],
+            snow_profile: [[0.0; 4]; 8],
         };
+        let mut frame = frame;
+        if self.snow {
+            if let Some(arc) = self.snow_arc {
+                frame.snow_arc = [arc.center.x, arc.center.y, arc.sweep, arc.r_lo];
+                frame.snow_arc2 = [arc.dr, silt::snow::ARC_BINS as f32, 0.08, arc.sweep - 0.06];
+                for i in 0..silt::snow::ARC_BINS {
+                    frame.snow_profile[i / 4][i % 4] = arc.depth[i] + self.snow_bed;
+                }
+            }
+        }
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
         self.write_models(&world.vehicle);

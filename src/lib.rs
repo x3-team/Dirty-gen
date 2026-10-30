@@ -9,6 +9,7 @@ pub mod bike;
 pub mod lod;
 pub mod particles;
 pub mod patch;
+pub mod snow;
 pub mod soil;
 pub mod vehicle;
 pub mod world;
