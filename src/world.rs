@@ -4261,6 +4261,11 @@ impl ThroughDrive {
         }
     }
 
+    /// Dust ledger attached to this pass. The render contract reads it.
+    pub fn dust(&self) -> &crate::dust::Dust {
+        &self.dust
+    }
+
     pub fn step(&mut self, dt: f32) {
         self.world
             .particles
