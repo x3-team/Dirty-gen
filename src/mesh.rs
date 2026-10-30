@@ -1206,9 +1206,43 @@ fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 /// The ledger volume stays on the particle; this mark does not swell into a
 /// teardrop blob, a sphere, or a tablet.
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    let mut q = *p;
-    q.size = p.size.clamp(0.02, 0.05);
-    add_slurry_curl(mesh, &q, false);
+    // The ribbon curl's length floor is 0.48 m, so routing a drop through it
+    // stretches the fleck into a ribbon. Keep the long axis horizontal and
+    // short: a side camera sees the fleck, not an edge-on hair.
+    let mut dir = Vec3::new(p.vel.x * 0.2, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-4 {
+        dir = Vec3::new(p.vel.x, 0.0, -1.0);
+    }
+    dir = dir.normalize();
+    let up = Vec3::Y;
+    let side = dir.cross(up).normalize();
+    let wobble = (p.seed % 5) as f32;
+    let length = 0.048 + wobble * 0.003;
+    let width = 0.016;
+    let thick = 0.0026;
+    let segs = 4usize;
+    let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let taper = (t * (1.0 - t) * 4.0).powf(0.7).clamp(0.16, 1.0);
+        let arc = (t * std::f32::consts::PI).sin();
+        let c = p.pos + dir * (length * (t - 0.5)) + up * (arc - 0.5) * length * 0.06;
+        let w = side * width * 0.5 * taper;
+        let h = up * thick * 0.5 * (0.55 + 0.45 * taper);
+        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+    }
+    for s in 0..segs {
+        let a = ring[s];
+        let b = ring[s + 1];
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+    }
+    let a = ring[0];
+    let b = ring[segs];
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
 }
 
 #[cfg(test)]
