@@ -65,7 +65,7 @@ Contract notes for the solver side: `flow` and `foam_crest` carry NaN in some dr
 cargo run --release -- capture --software --width 1280 --height 720 --beauty-drive /tmp/drive --beauty-video
 ```
 
-Stills `puddle-wave` (z −17.5), `slurry-spray` (z −6.5), `dust-exit` (z 9.0) and `through-drive-beauty.mp4` at 30 fps on the chase camera. `SILT_BEAUTY_STILLS=puddle-wave` renders just the named stills. The checked-in frames are `drive/*.jpg`.
+Stills `puddle-wave` (z −17.5), `slurry-spray` (z −6.5), `dust-exit` (z 9.0) and `through-drive-beauty.mp4` at 30 fps on the chase camera (checked in as `drive/through-drive.mp4`; the fog drive as `drive/through-fog.mp4` and `drive/fog-*.jpg`). `SILT_BEAUTY_STILLS=puddle-wave` renders just the named stills. The checked-in frames are `drive/*.jpg`.
 
 ## Proof stills
 
