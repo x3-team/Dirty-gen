@@ -559,6 +559,155 @@ struct CaptureArgs {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn through_chase(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // High enough to see the bow over the hood, close enough that the wake
+    // behind the car stays in frame instead of a corner.
+    let eye = world.vehicle.pos - fwd * 9.0 - right * 2.05 + Vec3::Y * 3.35;
+    let target = world.vehicle.pos - fwd * 1.15 + Vec3::Y * 0.32;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+fn belly_chase(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // Clear of the body. Low rear three-quarter along the shelf between the ruts.
+    let eye = world.vehicle.pos - fwd * 5.6 - right * 1.25 + Vec3::Y * 0.78;
+    let target = world.vehicle.pos + fwd * 0.2 - Vec3::Y * 0.28;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
+    let media = PathBuf::from(MEDIA);
+    std::fs::create_dir_all(&media).ok();
+    let video = media.join("through-drive-proof.mp4");
+    let still = media.join("through-drive-proof.png");
+    let slurry_still = media.join("slurry-surface-proof.png");
+    let mut drive = silt::ThroughDrive::new();
+    let dir = std::env::temp_dir().join("silt-through-frames");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("frame dir");
+    let fps = 10u32;
+    let dt = 1.0 / 30.0;
+    let steps_per_frame = 3u32;
+    let mut frame = 0u32;
+    let mut saved_still = false;
+    let mut saved_slurry = false;
+    let t0 = Instant::now();
+    while frame < 51 && drive.world.vehicle.pos.z < 19.6 {
+        let pose = through_chase(&drive.world);
+        let rgba = renderer
+            .draw(&drive.world, pose, None, true)
+            .expect("readback");
+        let path = dir.join(format!("frame_{frame:04}.png"));
+        write_png(&path, width, height, &rgba).expect("png");
+        let z = drive.world.vehicle.pos.z;
+        if !saved_slurry && z > -14.0 && z < -9.0 {
+            write_png(&slurry_still, width, height, &rgba).expect("slurry still");
+            saved_slurry = true;
+            println!("slurry still at z {z:.1}");
+        }
+        if !saved_still && z > 6.4 && z < 10.5 {
+            write_png(&still, width, height, &rgba).expect("still");
+            saved_still = true;
+            println!("through still at z {z:.1}");
+        }
+        for _ in 0..steps_per_frame {
+            drive.step(dt);
+        }
+        frame += 1;
+        if frame % 10 == 0 {
+            println!(
+                "frame {frame} z {z:.1} wall {:.0}s",
+                t0.elapsed().as_secs_f32()
+            );
+        }
+    }
+    if !saved_still || !saved_slurry {
+        let pose = through_chase(&drive.world);
+        let rgba = renderer
+            .draw(&drive.world, pose, None, true)
+            .expect("readback");
+        if !saved_slurry {
+            write_png(&slurry_still, width, height, &rgba).expect("slurry still");
+        }
+        if !saved_still {
+            write_png(&still, width, height, &rgba).expect("still");
+        }
+    }
+    let wall = t0.elapsed().as_secs_f32().max(0.001);
+    let report = drive.finish();
+    let sim_fps = (frame * steps_per_frame) as f32 / wall;
+    println!(
+        "through-drive frames {frame} sim-steps/s {sim_fps:.2} z {:.1} speed {:.2} spray {:.4} rut {:.3} removed {:.4} stuck {:.4} shed {:.4} dust {:.5} air {:.5} settled {:.5} gap {:.5}",
+        report.end_z,
+        report.speed_peak,
+        report.spray_m3,
+        report.rut_m,
+        report.removed_m3,
+        report.stuck_m3,
+        report.shed_m3,
+        report.dust_injected_m3,
+        report.dust_air_m3,
+        report.dust_settled_m3,
+        report.ledger_gap
+    );
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-framerate",
+            &fps.to_string(),
+            "-i",
+            &dir.join("frame_%04d.png").to_string_lossy(),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&video)
+        .status()
+        .expect("ffmpeg");
+    if !status.success() {
+        panic!("ffmpeg failed: {status}");
+    }
+    println!("video {}", video.display());
+}
+
+fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
+    let mut world = silt::World::flat(0.4);
+    let report = world.carve_belly_shelf();
+    println!(
+        "belly shelf drag {:.3} kN unload {:.3} kN shelf {:.3} m rut {:.3} m cut {:.4} placed {:.4} gap {:.5}",
+        report.drag_n / 1000.0,
+        report.unload_n / 1000.0,
+        report.shelf_y,
+        report.rut_y,
+        report.cut_m3,
+        report.placed_m3,
+        report.gap_m3
+    );
+    let pose = belly_chase(&world);
+    let rgba = renderer
+        .draw(&world, pose, None, true)
+        .expect("belly readback");
+    let path = PathBuf::from(MEDIA).join("slurry-belly-proof.png");
+    write_png(&path, width, height, &rgba).expect("belly still");
+    println!("belly {}", path.display());
+}
+
 fn capture(args: &[String]) {
     let parsed = parse_capture(args);
     if parsed.software {
@@ -583,6 +732,15 @@ fn capture(args: &[String]) {
         formats,
         scene,
     );
+    if args.iter().any(|s| s == "--through-drive") {
+        renderer.show_bike = false;
+        renderer.show_props = false;
+        renderer.show_hills = false;
+        renderer.niva_picture = true;
+        renderer.water_column = true;
+        capture_through_drive(&mut renderer, parsed.width, parsed.height);
+        return;
+    }
     if parsed.cc0 {
         capture_cc0(&mut renderer, &parsed);
         return;
@@ -950,6 +1108,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         };
         match flag {
             "--software" => software = true,
+            "--through-drive" => {}
             "--width" => width = val(&mut i).parse().expect("width"),
             "--height" => height = val(&mut i).parse().expect("height"),
             "--fps" => fps = val(&mut i).parse().expect("fps"),

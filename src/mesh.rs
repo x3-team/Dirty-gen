@@ -21,6 +21,10 @@ pub const PANEL_TREE: f32 = 44.0;
 pub const PANEL_TRUNK: f32 = 45.0;
 /// Wet mud clod. Not body paint, and not a camera-facing card.
 pub const PANEL_CLOD: f32 = 46.0;
+/// Dry dust lofted off the track. A pale film, not wet mud.
+pub const PANEL_DUST: f32 = 47.0;
+/// Water fleck. Not a clod and not body paint.
+pub const PANEL_SPRAY: f32 = 48.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -84,6 +88,28 @@ fn add_tri(mesh: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, panel: f32) {
 fn add_quad(mesh: &mut CpuMesh, p: [Vec3; 4], panel: f32) {
     add_tri(mesh, p[0], p[1], p[2], panel);
     add_tri(mesh, p[0], p[2], p[3], panel);
+}
+
+fn add_quad_uv(mesh: &mut CpuMesh, p: [Vec3; 4], uv: [[f32; 2]; 4], panel: f32) {
+    let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+    if n.length_squared() < 1.0e-8 {
+        return;
+    }
+    let push = |mesh: &mut CpuMesh, pos: Vec3, uv: [f32; 2]| {
+        mesh.vertices.push(MeshVertex {
+            pos: pos.to_array(),
+            nrm: n.to_array(),
+            uv,
+            panel,
+        });
+    };
+    let base = mesh.vertices.len() as u32;
+    push(mesh, p[0], uv[0]);
+    push(mesh, p[1], uv[1]);
+    push(mesh, p[2], uv[2]);
+    push(mesh, p[3], uv[3]);
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 fn add_box(mesh: &mut CpuMesh, c: Vec3, h: Vec3, panel: f32) {
@@ -791,54 +817,50 @@ fn add_horizon(mesh: &mut CpuMesh) {
 /// Horizon ring so the mud has somewhere to sit.
 pub fn environment_mesh() -> CpuMesh {
     let mut m = CpuMesh::new();
-    let y = -0.02;
-    // Skirt outside the 40 m heightfield so the world does not end in a void.
-    let far = 78.0;
-    let edge = 20.0;
-    add_quad(
+    let y = 0.0;
+    // Skirt outside the 40 m heightfield. Winding is +Y so it is a floor,
+    // not a back face, and the field does not end as a wall.
+    let far = 90.0;
+    let edge = 19.6;
+    let quad = |m: &mut CpuMesh, a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+        add_quad(m, [a, b, c, d], PANEL_SKIRT);
+    };
+    // +Y: a -> b -> c is counter-clockwise when looking down.
+    quad(
         &mut m,
-        [
-            Vec3::new(-far, y, edge),
-            Vec3::new(far, y, edge),
-            Vec3::new(far, y, far),
-            Vec3::new(-far, y, far),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(-far, y, edge),
+        Vec3::new(-far, y, far),
+        Vec3::new(far, y, far),
+        Vec3::new(far, y, edge),
     );
-    add_quad(
+    quad(
         &mut m,
-        [
-            Vec3::new(-far, y, -far),
-            Vec3::new(far, y, -far),
-            Vec3::new(far, y, -edge),
-            Vec3::new(-far, y, -edge),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(-far, y, -far),
+        Vec3::new(-far, y, -edge),
+        Vec3::new(far, y, -edge),
+        Vec3::new(far, y, -far),
     );
-    add_quad(
+    quad(
         &mut m,
-        [
-            Vec3::new(edge, y, -edge),
-            Vec3::new(far, y, -edge),
-            Vec3::new(far, y, edge),
-            Vec3::new(edge, y, edge),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(edge, y, -edge),
+        Vec3::new(edge, y, edge),
+        Vec3::new(far, y, edge),
+        Vec3::new(far, y, -edge),
     );
-    add_quad(
+    quad(
         &mut m,
-        [
-            Vec3::new(-far, y, -edge),
-            Vec3::new(-edge, y, -edge),
-            Vec3::new(-edge, y, edge),
-            Vec3::new(-far, y, edge),
-        ],
-        PANEL_SKIRT,
+        Vec3::new(-far, y, -edge),
+        Vec3::new(-far, y, edge),
+        Vec3::new(-edge, y, edge),
+        Vec3::new(-edge, y, -edge),
     );
 
-    // Low rolling silhouette. The inner ring is tucked into the skirt so it
-    // sits on the ground instead of floating as boxes. Trees, rocks and grass
-    // are the Gobkit meshes placed around the oval.
+    m
+}
+
+/// Faceted distance hills. Off for a proof that must not end in a wall.
+pub fn horizon_mesh() -> CpuMesh {
+    let mut m = CpuMesh::new();
     add_horizon(&mut m);
     m
 }
@@ -1104,8 +1126,11 @@ fn add_flat_strip(mesh: &mut CpuMesh, p: &silt::particles::Particle, length: f32
 /// Curled slurry in the air. Pinched at both ends so it reads as a ribbon or a
 /// roll sheet, not a flat tablet, a ground stamp, or a box.
 fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet: bool) {
-    // Long axis stays in the XZ plane so a side camera sees a ribbon, not a
-    // vertical sheet or a tablet on the tread.
+    // Long axis stays in the XZ plane. A roll sheet lies down. A ribbon stands
+    // up so a camera behind the car sees the face and not the thin edge.
+    // A non-ledger strip is the same curl, kept short so it leaves the tread
+    // instead of hanging off the body as a board.
+    let shed = !roll_sheet && !p.ledger;
     let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
     if dir.length_squared() < 1.0e-6 {
         dir = Vec3::new(p.vel.x.max(0.2), 0.0, -1.0);
@@ -1117,60 +1142,295 @@ fn add_slurry_curl(mesh: &mut CpuMesh, p: &silt::particles::Particle, roll_sheet
     }
     side = side.normalize();
     let up = side.cross(dir).normalize();
+    // A shed curl lies on the track so the chase camera sees the strip.
+    // A standing card from that camera is a flat shard.
+    let (dir, side, up) = if shed {
+        let side = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
+        let side = if side.length_squared() < 1.0e-6 {
+            Vec3::X
+        } else {
+            side
+        };
+        (dir, side, Vec3::Y)
+    } else if !roll_sheet {
+        let side = Vec3::Y;
+        let up = dir.cross(side).normalize();
+        (dir, side, up)
+    } else {
+        (dir, side, up)
+    };
     let speed = p.vel.length();
     let length = if roll_sheet {
         (0.44 + speed * 0.022).clamp(0.48, 0.68)
-    } else if p.size > 0.14 {
-        (0.62 + speed * 0.03).clamp(0.66, 0.88)
+    } else if shed {
+        (0.48 + speed * 0.02).clamp(0.52, 0.68)
     } else {
         (0.44 + speed * 0.035).clamp(0.48, 0.72)
     };
     let width = (p.volume / length).sqrt();
     let width = if roll_sheet {
         width.clamp(0.09, 0.17)
-    } else if p.size > 0.14 {
-        width.clamp(0.028, 0.062)
+    } else if shed {
+        width.clamp(0.07, 0.11)
     } else {
         width.clamp(0.012, 0.048)
     };
-    let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.028);
-    let length = length.min(width * 7.2);
-    let segs = 8usize;
-    let side_sweep = if roll_sheet { 0.10 } else { 0.35 };
-    let twist_scale = if roll_sheet { 0.42 } else { 0.7 };
+    let thick = (p.volume / (length * width * 0.55)).clamp(0.006, 0.022);
+    let length = if shed { length } else { length.min(width * 7.2) };
+    let segs = if shed { 12usize } else { 8usize };
+    let panel = if roll_sheet { PANEL_CLOD } else { 49.0 };
+    let side_sweep = if roll_sheet {
+        0.10
+    } else if shed {
+        0.62
+    } else {
+        0.55
+    };
+    let twist_scale = if roll_sheet {
+        0.42
+    } else if shed {
+        0.70
+    } else {
+        0.55
+    };
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
-        let taper = (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0);
-        let arc = (t * std::f32::consts::PI).sin();
-        let twist = (t - 0.5) * twist_scale;
-        let side_t = side * twist.cos() + up * twist.sin();
-        let up_t = -side * twist.sin() + up * twist.cos();
-        let c = p.pos
-            + dir * (length * (t - 0.5))
-            + up * (arc - 0.55) * length * 0.16
-            + side * (t - 0.5) * width * side_sweep;
-        let w = side_t * width * 0.5 * taper;
-        let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
-        ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+        let taper = if shed {
+            (0.82 + 0.18 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.78, 1.0)
+        } else {
+            (t * (1.0 - t) * 4.0).powf(0.55).clamp(0.08, 1.0)
+        };
+        if shed {
+            // A short strip down the rut. It twists and lifts along its
+            // length. The centerline does not bend into a crescent.
+            let roll = (t - 0.5) * 1.15;
+            let lift = (t * std::f32::consts::PI).sin();
+            let half_w = 0.058 * taper;
+            let skin = 0.012;
+            let side_t = (side * roll.cos() + up * roll.sin()).normalize();
+            let up_t = dir.cross(side_t).normalize();
+            let c = p.pos
+                + dir * (length * (t - 0.5))
+                + up * lift * 0.055
+                + side_t * lift * 0.012;
+            let w = side_t * half_w;
+            let h = up_t * skin;
+            ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+        } else {
+            let arc = (t * std::f32::consts::PI).sin();
+            let twist = (t - 0.5) * twist_scale;
+            let side_t = side * twist.cos() + up * twist.sin();
+            let up_t = -side * twist.sin() + up * twist.cos();
+            let c = p.pos
+                + dir * (length * (t - 0.5))
+                + up * (arc - 0.55) * length * 0.16
+                + side * (t - 0.5) * width * side_sweep;
+            let w = side_t * width * 0.5 * taper;
+            let h = up_t * thick * 0.5 * (0.45 + 0.55 * taper);
+            ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
+        }
     }
     for s in 0..segs {
         let a = ring[s];
         let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], panel);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], panel);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], panel);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], panel);
     }
     let a = ring[0];
     let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], panel);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
+}
+
+/// Jagged offset for a torn slurry edge. Corners stay sharp. About −1..1.
+fn torn_edge(z: f32, salt: f32) -> f32 {
+    let u = z * 2.15 + salt;
+    let i = u.floor();
+    let f = u - i;
+    let cell = |n: f32| -> f32 {
+        let h = (n * 12.9898 + salt * 78.233).sin() * 43758.5453;
+        let r = h - h.floor();
+        if r > 0.74 {
+            -1.0
+        } else if r > 0.58 {
+            0.95
+        } else if r < 0.16 {
+            -0.62
+        } else {
+            (r - 0.40) * 0.55
+        }
+    };
+    cell(i) + (cell(i + 1.0) - cell(i)) * f
+}
+
+fn slurry_hash(n: f32, salt: f32) -> f32 {
+    let h = (n * 12.9898 + salt * 78.233).sin() * 43758.5453;
+    h - h.floor()
+}
+
+fn ground_at(ground: Option<&silt::soil::SoilField>, x: f32, z: f32, fallback: f32) -> f32 {
+    let h = ground.map(|soil| soil.sample(x, z).height).unwrap_or(fallback);
+    if h < 0.05 { fallback } else { h }
+}
+
+/// A torn patch lying on the soil. Each station picks its own width, so the
+/// piece is not a rectangle or a band of one width.
+fn add_torn_patch(
+    mesh: &mut CpuMesh,
+    origin: Vec3,
+    dir: Vec3,
+    side: Vec3,
+    piece_len: f32,
+    half_w: f32,
+    thick: f32,
+    ground: Option<&silt::soil::SoilField>,
+    salt: f32,
+) {
+    let segs = 6usize;
+    let across = 4usize;
+    let panel = 49.0;
+    let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(segs + 1);
+    for s in 0..=segs {
+        let t = s as f32 / segs as f32;
+        let center = origin + dir * (t * piece_len);
+        let h = ground_at(ground, center.x, center.z, origin.y);
+        let along = slurry_hash(center.z * 0.37 + t * 0.55, salt);
+        let tear = torn_edge(center.z * 0.45, salt);
+        let left = half_w * (0.28 + along * 1.25 + tear * 0.5);
+        let right = half_w
+            * (0.28 + slurry_hash(center.z * 0.37 + t * 0.55, salt + 2.7) * 1.25 + torn_edge(center.z * 0.45, salt + 4.0) * 0.5);
+        let left = left.clamp(0.02, 0.70);
+        let right = right.clamp(0.02, 0.70);
+        let along_thick = (t * std::f32::consts::PI).sin();
+        let station = 0.25 + slurry_hash(center.z, salt + 5.0) * 0.9;
+        let mut row = Vec::with_capacity(across);
+        for a in 0..across {
+            let u = a as f32 / (across - 1) as f32;
+            let x = -left + (left + right) * u;
+            let from_mid = (u - 0.5).abs() * 2.0;
+            let lift = thick * along_thick * station * (1.0 - from_mid * from_mid);
+            row.push(Vec3::new(center.x, 0.0, center.z) + side * x + Vec3::Y * (h + 0.004 + lift));
+        }
+        rows.push(row);
+    }
+    for s in 0..segs {
+        for a in 0..across - 1 {
+            let a00 = rows[s][a];
+            let a10 = rows[s][a + 1];
+            let a01 = rows[s + 1][a];
+            let a11 = rows[s + 1][a + 1];
+            add_quad(mesh, [a00, a10, a11, a01], panel);
+            add_quad(mesh, [a00, a01, a11, a10], panel);
+        }
+    }
+}
+
+/// One tire line of slurry. Separate torn sheets, thin smears, and clods,
+/// with gaps. Not one band of constant width.
+fn add_rut_ribbon(
+    mesh: &mut CpuMesh,
+    p: &silt::particles::Particle,
+    ground: Option<&silt::soil::SoilField>,
+) {
+    let mut dir = Vec3::new(p.vel.x, 0.0, p.vel.z);
+    if dir.length_squared() < 1.0e-6 {
+        dir = Vec3::new(0.0, 0.0, -1.0);
+    }
+    dir = dir.normalize();
+    let mut side = Vec3::new(-dir.z, 0.0, dir.x);
+    if side.length_squared() < 1.0e-6 {
+        side = Vec3::X;
+    }
+    side = side.normalize();
+    let length = p.size.clamp(0.7, 12.0);
+    let lead = 0.16_f32;
+    let end = lead + (length - lead).max(0.5);
+    let mut dist = lead;
+    let mut i = 0i32;
+    while dist < end && i < 24 {
+        let origin = p.pos + dir * dist;
+        let hz = origin.z;
+        let gap_roll = slurry_hash(hz, 9.1);
+        // A break. The next piece does not continue the last edge.
+        if gap_roll < 0.22 {
+            dist += 0.55 + slurry_hash(hz, 1.2) * 1.05;
+            i += 1;
+            continue;
+        }
+        let yaw = (slurry_hash(hz, 11.0) - 0.5) * 0.55;
+        let (c, s) = (yaw.cos(), yaw.sin());
+        let dir_p = dir * c + side * s;
+        let side_p = side * c - dir * s;
+        let off = (slurry_hash(hz, 8.0) - 0.5) * 0.46;
+        let roll = slurry_hash(hz, 6.6);
+        let (piece_len, half_w, thick, advance) = if roll > 0.72 {
+            // A thin smear dragged along the rut. Wide, almost no height.
+            let len = 0.70 + slurry_hash(hz, 3.1) * 0.90;
+            (
+                len,
+                0.22 + slurry_hash(hz, 4.4) * 0.28,
+                0.0012 + slurry_hash(hz, 5.5) * 0.003,
+                len + 0.12 + slurry_hash(hz, 1.4) * 0.35,
+            )
+        } else if roll < 0.34 {
+            // A clod. Thicker than the sheet, still lying down in the rut.
+            let len = 0.16 + slurry_hash(hz, 3.1) * 0.18;
+            (
+                len,
+                0.07 + slurry_hash(hz, 4.4) * 0.08,
+                0.09 + slurry_hash(hz, 5.5) * 0.07,
+                len + 0.08 + slurry_hash(hz, 1.4) * 0.20,
+            )
+        } else {
+            let len = 0.16 + slurry_hash(hz, 3.1) * 0.48;
+            (
+                len,
+                0.045 + slurry_hash(hz, 4.4) * 0.16,
+                0.008 + slurry_hash(hz, 5.5) * 0.020,
+                len + 0.08 + slurry_hash(hz, 1.4) * 0.40,
+            )
+        };
+        add_torn_patch(
+            mesh,
+            origin + side * off,
+            dir_p,
+            side_p,
+            piece_len,
+            half_w,
+            thick,
+            ground,
+            1.7 + i as f32 * 3.1,
+        );
+        if slurry_hash(hz, 7.7) > 0.64 {
+            let side_off = if slurry_hash(hz, 8.8) > 0.5 { 1.0 } else { -1.0 }
+                * (0.12 + slurry_hash(hz, 0.4) * 0.24);
+            add_torn_patch(
+                mesh,
+                origin + side * (off + side_off) + dir * (piece_len * 0.3),
+                dir_p,
+                side_p,
+                0.10 + slurry_hash(hz, 1.9) * 0.12,
+                0.05 + slurry_hash(hz, 2.8) * 0.05,
+                0.07 + slurry_hash(hz, 3.7) * 0.06,
+                ground,
+                6.0 + i as f32,
+            );
+        }
+        dist += advance;
+        i += 1;
+    }
 }
 
 /// Liquid slurry torn off a tire. A curled sheet, pinched at both ends, so it
 /// is a ribbon rather than a box, a tablet, or a cube.
 fn add_slurry_ribbon(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
+    if !p.ledger {
+        add_rut_ribbon(mesh, p, None);
+        return;
+    }
     add_slurry_curl(mesh, p, false);
 }
 
@@ -1206,43 +1466,121 @@ fn add_slurry_sheet(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
 /// The ledger volume stays on the particle; this mark does not swell into a
 /// teardrop blob, a sphere, or a tablet.
 fn add_mud_drop(mesh: &mut CpuMesh, p: &silt::particles::Particle) {
-    // The ribbon curl's length floor is 0.48 m, so routing a drop through it
-    // stretches the fleck into a ribbon. Keep the long axis horizontal and
-    // short: a side camera sees the fleck, not an edge-on hair.
-    let mut dir = Vec3::new(p.vel.x * 0.2, 0.0, p.vel.z);
+    // A short fleck. The long axis follows the horizontal throw, and it stays
+    // under 7.5 cm so it is not a bar, a tablet, or a teardrop blob.
+    // Arch water falls, so its long axis is the fall and not a flat coin.
+    let falling = (p.kind == 9 && p.vel.y < -0.4) || (p.kind == 0 && p.vel.length() > 0.4);
+    let mut dir = if falling {
+        p.vel
+    } else {
+        Vec3::new(p.vel.x, 0.0, p.vel.z)
+    };
     if dir.length_squared() < 1.0e-4 {
         dir = Vec3::new(p.vel.x, 0.0, -1.0);
     }
     dir = dir.normalize();
-    let up = Vec3::Y;
-    let side = dir.cross(up).normalize();
-    let wobble = (p.seed % 5) as f32;
-    let length = 0.048 + wobble * 0.003;
-    let width = 0.016;
-    let thick = 0.0026;
-    let segs = 4usize;
+    let mut side = if falling {
+        Vec3::new(-dir.z, 0.0, dir.x)
+    } else {
+        dir.cross(Vec3::Y)
+    };
+    if side.length_squared() < 1.0e-6 {
+        side = Vec3::Z;
+    }
+    side = side.normalize();
+    let width_axis = if falling { side } else { Vec3::Y };
+    let thick_axis = dir.cross(width_axis).normalize_or_zero();
+    let thick_axis = if thick_axis.length_squared() < 1.0e-6 {
+        side
+    } else {
+        thick_axis
+    };
+    let scale = if p.kind == 9 {
+        (p.size / 0.05).clamp(0.7, 1.2)
+    } else if p.kind == 0 {
+        (p.size / 0.05).clamp(0.8, 1.7)
+    } else {
+        1.0
+    };
+    let panel = if p.kind == 0 || p.kind == 9 {
+        PANEL_SPRAY
+    } else {
+        PANEL_CLOD
+    };
+    let length = if p.kind == 9 {
+        0.14
+    } else if p.kind == 0 {
+        0.11
+    } else {
+        0.058
+    } * scale;
+    let width = if p.kind == 9 { 0.016 } else { 0.020 } * scale;
+    let thick = 0.010_f32 * scale;
+    let segs = 5usize;
     let mut ring: Vec<[Vec3; 4]> = Vec::with_capacity(segs + 1);
     for s in 0..=segs {
         let t = s as f32 / segs as f32;
-        let taper = (t * (1.0 - t) * 4.0).powf(0.7).clamp(0.16, 1.0);
-        let arc = (t * std::f32::consts::PI).sin();
-        let c = p.pos + dir * (length * (t - 0.5)) + up * (arc - 0.5) * length * 0.06;
-        let w = side * width * 0.5 * taper;
-        let h = up * thick * 0.5 * (0.55 + 0.45 * taper);
+        let taper = (0.28 + 0.72 * (t * (1.0 - t) * 4.0).sqrt()).clamp(0.28, 1.0);
+        let c = p.pos + dir * (length * (t - 0.5));
+        let w = width_axis * width * 0.5 * taper;
+        let h = thick_axis * thick * 0.5 * taper;
         ring.push([c - w - h, c + w - h, c + w + h, c - w + h]);
     }
     for s in 0..segs {
         let a = ring[s];
         let b = ring[s + 1];
-        add_quad(mesh, [a[3], b[3], b[2], a[2]], PANEL_CLOD);
-        add_quad(mesh, [a[0], a[1], b[1], b[0]], PANEL_CLOD);
-        add_quad(mesh, [a[1], a[2], b[2], b[1]], PANEL_CLOD);
-        add_quad(mesh, [b[0], a[0], a[3], b[3]], PANEL_CLOD);
+        add_quad(mesh, [a[3], b[3], b[2], a[2]], panel);
+        add_quad(mesh, [a[0], a[1], b[1], b[0]], panel);
+        add_quad(mesh, [a[1], a[2], b[2], b[1]], panel);
+        add_quad(mesh, [b[0], a[0], a[3], b[3]], panel);
     }
     let a = ring[0];
     let b = ring[segs];
-    add_quad(mesh, [a[0], a[3], a[2], a[1]], PANEL_CLOD);
-    add_quad(mesh, [b[0], b[1], b[2], b[3]], PANEL_CLOD);
+    add_quad(mesh, [a[0], a[3], a[2], a[1]], panel);
+    add_quad(mesh, [b[0], b[1], b[2], b[3]], panel);
+}
+
+fn puff_quad(mesh: &mut CpuMesh, center: Vec3, axis_u: Vec3, axis_v: Vec3, ru: f32, rv: f32, panel: f32) {
+    let u = axis_u * ru;
+    let v = axis_v * rv;
+    let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    add_quad_uv(
+        mesh,
+        [center - u - v, center + u - v, center + u + v, center - u + v],
+        uv,
+        panel,
+    );
+}
+
+/// Soft dust from the air grid. Crossed puffs with a radial fade, stretched
+/// a little along the wind. Ground film is one flat puff. Not a tube, a
+/// sphere, or a hard card.
+pub fn dust_cloud(items: &[silt::particles::Particle]) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    const MAX_VERTS: usize = 12000;
+    for p in items {
+        if !p.alive || p.life <= 0.0 || p.kind != 8 {
+            continue;
+        }
+        if mesh.vertices.len() + 48 > MAX_VERTS {
+            break;
+        }
+        if p.pos.y < 0.10 {
+            continue;
+        }
+        // One card. A second crossing card read as a second disc.
+        // Smaller marks sit further down the trail and use a fainter panel.
+        let panel = if p.size < 0.40 { 47.30 } else { PANEL_DUST };
+        let mut wind = Vec3::new(p.vel.x, 0.0, p.vel.z);
+        if wind.length_squared() < 1.0e-4 {
+            wind = Vec3::new(0.86, 0.0, -0.51);
+        }
+        wind = wind.normalize();
+        let up = Vec3::new(-0.10, 0.62, -0.22).normalize();
+        let r = p.size.clamp(0.16, 0.58);
+        puff_quad(&mut mesh, p.pos, wind, up, r * 1.35, r * 0.72, panel);
+    }
+    mesh
 }
 
 #[cfg(test)]
@@ -1441,26 +1779,62 @@ mod slurry_shapes {
 /// smaller lumps. Ledger soil is not in this mesh once it has landed: that
 /// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
+    mud_chunks_with_ground(items, None)
+}
+
+/// Same chunks, with picture ribbons laid on the heightfield instead of a flat y.
+pub fn mud_chunks_with_ground(
+    items: &[silt::particles::Particle],
+    ground: Option<&silt::soil::SoilField>,
+) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
+    // One continuous ribbon per tire line. Drawn before ledger flecks.
+    for p in items {
+        if !p.alive || p.life <= 0.0 || p.kind != silt::particles::KIND_SLURRY_RIBBON || p.ledger {
+            continue;
+        }
+        if mesh.vertices.len() + 6000 >= MAX_VERTS {
+            break;
+        }
+        add_rut_ribbon(&mut mesh, p, ground);
+    }
     // Draw the big clumps first so a full splash cannot crowd them out.
     // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
-    for kind in [7u8, 5, 6, 3, 1, 4, 0, 2] {
+    for kind in [7u8, 5, 6, 9, 3, 1, 4, 0, 2] {
         for p in items {
             if !p.alive || p.life <= 0.0 || p.kind != kind {
                 continue;
             }
+            if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 || p.kind == 9 {
+                if mesh.vertices.len() + 200 < MAX_VERTS {
+                    add_mud_drop(&mut mesh, p);
+                }
+                continue;
+            }
+            if p.kind == silt::particles::KIND_SLURRY_SHEET {
+                if mesh.vertices.len() + 400 < MAX_VERTS {
+                    add_slurry_sheet(&mut mesh, p);
+                }
+                continue;
+            }
+            if p.kind == silt::particles::KIND_SLURRY_RIBBON {
+                // Picture ribbons were drawn above. A tiny ledger piece is
+                // the volume in flight, not a sheet the camera should see.
+                if p.ledger && p.volume < 0.0015 {
+                    continue;
+                }
+                if !p.ledger {
+                    continue;
+                }
+                if mesh.vertices.len() + 400 < MAX_VERTS {
+                    add_slurry_ribbon(&mut mesh, p);
+                }
+                continue;
+            }
             if p.ledger {
                 if !p.deposited && p.volume > 1.0e-8 && mesh.vertices.len() + 400 < MAX_VERTS {
-                    if p.kind == silt::particles::KIND_SLURRY_DROP {
-                        add_mud_drop(&mut mesh, p);
-                    } else if p.kind == silt::particles::KIND_SLURRY_SHEET {
-                        add_slurry_sheet(&mut mesh, p);
-                    } else if p.kind == silt::particles::KIND_SLURRY_RIBBON {
-                        add_slurry_ribbon(&mut mesh, p);
-                    } else {
-                        add_soil_ribbon(&mut mesh, p);
-                    }
+                    add_soil_ribbon(&mut mesh, p);
                 }
                 continue;
             }

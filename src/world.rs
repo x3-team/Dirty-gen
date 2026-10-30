@@ -4,6 +4,9 @@ use glam::Vec3;
 
 use crate::adhesion::{AdhereContact, AdhesionReport, PASS_OFFER_M3_S};
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
+use crate::fluid_core::{
+    bow_height_m, dust_may_lift, FluidCore, Grain, SprayEvent, TirePush,
+};
 use crate::particles::Particles;
 use crate::patch::{
     contact_patch, groove_slurry_capacity, moisture_sinkage_row, moisture_traction_row,
@@ -4149,6 +4152,889 @@ fn closest_s(pos: Vec3) -> f32 {
     s.rem_euclid(total)
 }
 
+/// One pass: speed, puddle, slurry, exit, dry dust. Water, slurry, and dust
+/// live in [`FluidCore`]. Stuck mud plus what was shed is what left the ground.
+pub struct ThroughReport {
+    pub speed_peak: f32,
+    pub saw_wave: bool,
+    pub spray_m3: f32,
+    pub rut_m: f32,
+    pub removed_m3: f32,
+    pub stuck_m3: f32,
+    pub shed_m3: f32,
+    pub wet_track: bool,
+    pub dust_injected_m3: f32,
+    pub dust_air_m3: f32,
+    pub dust_settled_m3: f32,
+    pub wet_lift_m3: f32,
+    pub ledger_gap: f32,
+    pub end_z: f32,
+}
+
+struct DriveCoat {
+    removed: f32,
+    stuck: f32,
+    shed: f32,
+    arch_water: f32,
+    /// Volume that left the fluid sheet. Loose soil is not in this number.
+    sheet_out: f32,
+}
+
+/// Scripted Niva pass over the fluid window.
+/// Visual sample of the air grid. Not a volume and not a second solver.
+const KIND_DUST_MARK: u8 = 8;
+
+pub struct ThroughDrive {
+    pub world: World,
+    pub fluid: FluidCore,
+    dust: crate::dust::Dust,
+    chassis_z: f32,
+    coat: DriveCoat,
+    pub report: ThroughReport,
+    dust_in: f32,
+    /// Steps between tread curls, so the ones in the air can fall onto the track.
+    ribbon_tick: u32,
+}
+
+impl ThroughDrive {
+    pub fn new() -> Self {
+        let mut world = World::flat(0.35);
+        // The settle at the origin leaves a scar. The strip starts clean.
+        world.soil = SoilField::flat(0.35);
+        world.particles.clear();
+        world.vehicle.clear_loose_mud();
+        world.bike.pos = Vec3::new(80.0, 0.0, 80.0);
+        world.vehicle.pos = Vec3::new(0.0, 0.56, -20.0);
+        world.vehicle.yaw = 0.0;
+        world.vehicle.pitch = 0.0;
+        world.vehicle.roll = 0.0;
+        world.vehicle.vel = Vec3::new(0.0, 0.0, 8.0);
+        for w in &mut world.vehicle.wheels {
+            w.compression = 0.10;
+            w.omega = 8.0 / WHEEL_RADIUS;
+        }
+        let mut fluid = FluidCore::new([0.0, -12.0]);
+        fluid.set_wind(1.5, -0.9);
+        // Boxes are only the support. The masks round them into a puddle and two ruts.
+        // Inside the heightfield. A pour that crosses z = -20 is cut into a
+        // straight wall by the map edge, and that wall reads as a pit.
+        let _poured_water = fluid.pour_water(-6.2, 6.2, -19.3, -11.2, 0.11);
+        let _poured_slurry = fluid.pour_slurry(-1.8, 1.8, -14.0, -0.6, 0.08, Grain::Clay, 0.55);
+        fluid.scale_columns(|x, z| (puddle_mask(x, z), slurry_rut_mask(x, z)));
+        fluid.soften_rims(1.7);
+        mirror_fluid(&fluid, &mut world.soil);
+        world.vehicle.pos.x = 0.0;
+        world.vehicle.pos.z = -20.0;
+        world.vehicle.yaw = 0.0;
+        let mut dust = crate::dust::Dust::new();
+        dust.set_wind(1.5, -0.9);
+        Self {
+            world,
+            fluid,
+            dust,
+            chassis_z: -20.0,
+            coat: DriveCoat {
+                removed: 0.0,
+                stuck: 0.0,
+                shed: 0.0,
+                arch_water: 0.0,
+                sheet_out: 0.0,
+            },
+            report: ThroughReport {
+                speed_peak: 0.0,
+                saw_wave: false,
+                spray_m3: 0.0,
+                rut_m: 0.0,
+                removed_m3: 0.0,
+                stuck_m3: 0.0,
+                shed_m3: 0.0,
+                wet_track: false,
+                dust_injected_m3: 0.0,
+                dust_air_m3: 0.0,
+                dust_settled_m3: 0.0,
+                wet_lift_m3: 0.0,
+                ledger_gap: 0.0,
+                end_z: -20.0,
+            },
+            dust_in: 0.0,
+            ribbon_tick: 0,
+        }
+    }
+
+    pub fn step(&mut self, dt: f32) {
+        self.world
+            .particles
+            .items
+            .retain(|p| p.kind != KIND_DUST_MARK);
+        let mut left = dt.max(0.0);
+        let sub = 1.0 / 60.0;
+        while left > 1.0e-6 {
+            let h = left.min(sub);
+            self.advance_dust(h);
+            left -= h;
+        }
+        let z = self.chassis_z;
+        self.world.vehicle.pos.x = 0.0;
+        self.world.vehicle.pos.y = 0.56;
+        self.world.vehicle.pos.z = z;
+        self.world.vehicle.yaw = 0.0;
+        self.world.vehicle.pitch = 0.0;
+        self.world.vehicle.roll = 0.0;
+        self.world.vehicle.vel = Vec3::new(0.0, 0.0, 8.0);
+        let omega = 8.0 / WHEEL_RADIUS;
+        for w in &mut self.world.vehicle.wheels {
+            w.compression = 0.10;
+            w.omega = omega;
+            w.spin += omega * dt;
+        }
+        self.report.speed_peak = self.report.speed_peak.max(8.0);
+        self.report.end_z = z;
+        self.fluid.recenter([0.0, z]);
+        pull_substrate(&mut self.fluid, &self.world.soil);
+        let forward = Vec3::new(0.0, 0.0, 1.0);
+        let tires = crate::dust::tires_at(z, 8.0, 1.6);
+        for tire in tires {
+            self.fluid.push_tire(TirePush {
+                x: tire.contact.x,
+                z: tire.contact.z,
+                forward_x: 0.0,
+                forward_z: 1.0,
+                radius: WHEEL_RADIUS,
+                width: WHEEL_WIDTH,
+                speed: 8.0,
+                slip: 1.6,
+            });
+            self.stick_and_dust(tire.index as usize, tire.contact, 1.6, dt, forward);
+            if (-18.8..-11.6).contains(&self.chassis_z)
+                && (-19.2..-11.2).contains(&tire.contact.z)
+            {
+                self.report.saw_wave = true;
+            }
+            if (-13.5..-1.0).contains(&z) {
+                cut_rut_groove(&mut self.world.soil, tire.contact.x, tire.contact.z);
+            }
+            if z > -4.0 {
+                darken_track(&mut self.world.soil, tire.contact.x, tire.contact.z - 1.1);
+                self.report.wet_track = true;
+            }
+        }
+        if (-11.2..-1.2).contains(&z) {
+            self.coat_body(1.0);
+        }
+        if z > -18.0 && z < 2.0 {
+            let ahead = self.fluid.sample(0.0, z + 1.2);
+            if ahead.u.abs() + ahead.v.abs() > 0.02 || ahead.water_m > 0.01 {
+                self.report.saw_wave = true;
+            }
+        }
+        self.ribbon_tick = self.ribbon_tick.wrapping_add(1);
+        let spray = self.fluid.step(dt);
+        self.report.spray_m3 = self.fluid.ledger().spray_m3;
+        self.spawn_spray(&spray, forward);
+        mirror_fluid(&self.fluid, &mut self.world.soil);
+        if (-18.6..-11.5).contains(&z) {
+            // One crescent ahead of the bumper, wider than the body.
+            raise_bow(&mut self.world.soil, 0.0, z);
+        }
+        self.world.particles.update(&mut self.world.soil, dt);
+        // Ledger ribbons are spawned first and used to fill the cap, so the
+        // sheets off the body never reached the mesh. Keep the newest picture
+        // sheets and let the ledger pieces stay only until they land.
+        {
+            let mut picture: Vec<usize> = self
+                .world
+                .particles
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.alive && p.kind == 5 && !p.ledger && !p.grounded)
+                .map(|(i, _)| i)
+                .collect();
+            const KEEP: usize = 32;
+            if picture.len() > KEEP {
+                let drop = picture.len() - KEEP;
+                for i in picture.drain(..drop) {
+                    self.world.particles.items[i].alive = false;
+                }
+            }
+        }
+        {
+            let mut spray_ix: Vec<usize> = self
+                .world
+                .particles
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.alive && p.kind == 0)
+                .map(|(i, _)| i)
+                .collect();
+            const SPRAY_KEEP: usize = 36;
+            if spray_ix.len() > SPRAY_KEEP {
+                let drop = spray_ix.len() - SPRAY_KEEP;
+                for i in spray_ix.drain(..drop) {
+                    self.world.particles.items[i].alive = false;
+                }
+            }
+        }
+        self.world.particles.items.retain(|p| {
+            if !p.alive || matches!(p.kind, 1 | 2 | 3 | 4) {
+                return false;
+            }
+            if p.kind == 5 {
+                // A picture curl stays after it lands, so the strip is on the
+                // track and not only in the air beside the door. Ledger pieces
+                // are the volume and leave when they sit.
+                if p.grounded {
+                    return !p.ledger;
+                }
+                if p.ledger {
+                    return p.pos.y > 0.08;
+                }
+                return true;
+            }
+            if p.kind == 9 {
+                return !p.grounded && p.pos.y > 0.08;
+            }
+            if p.kind == 0 {
+                // Spray is the puddle. A fleck on the ground reads as a white speck.
+                if z > -11.4 || p.grounded || p.pos.y < 0.22 {
+                    return false;
+                }
+                return true;
+            }
+            true
+        });
+        self.lay_rut_ribbons();
+        self.paint_dust_picture();
+        self.note_rut();
+        let dust_books = self.dust.ledger();
+        self.report.dust_injected_m3 = dust_books.emitted_m3;
+        self.report.dust_air_m3 = dust_books.dust_air_m3;
+        self.report.dust_settled_m3 = dust_books.dust_settled_m3;
+        self.dust_in = dust_books.emitted_m3;
+        self.report.removed_m3 = self.coat.removed;
+        self.report.stuck_m3 = self.coat.stuck;
+        self.report.shed_m3 = self.coat.shed;
+    }
+
+    /// One ribbon in each rut. The head stays at the rear tire while the car
+    /// is in the water and the slurry, and the tail stays where the ribbon
+    /// started, so the strip lies in the track instead of a row of blocks.
+    fn lay_rut_ribbons(&mut self) {
+        let z = self.chassis_z;
+        if !(-18.8..-1.2).contains(&z) {
+            return;
+        }
+        for tire in crate::dust::tires_at(z, 8.0, 1.6) {
+            // Rear hubs only. The front tires share these two ruts.
+            if tire.index < 2 {
+                continue;
+            }
+            self.lay_one_rut_ribbon(tire.contact.x, tire.contact.z);
+        }
+    }
+
+    fn lay_one_rut_ribbon(&mut self, x: f32, head_z: f32) {
+        const LEFT: u32 = 0x71B0_0001;
+        const RIGHT: u32 = 0x71B0_0002;
+        let mark = if x < 0.0 { LEFT } else { RIGHT };
+        let mut ground = self.world.soil.sample(x, head_z).height;
+        if ground < 0.05 {
+            ground = 0.35;
+        }
+        if let Some(p) = self
+            .world
+            .particles
+            .items
+            .iter_mut()
+            .find(|p| p.alive && p.seed == mark)
+        {
+            let tail = p.spin.x;
+            p.pos = Vec3::new(x, ground, head_z);
+            p.vel = Vec3::new(0.0, 0.0, -1.0);
+            p.size = (head_z - tail).max(0.7);
+            p.life = 40.0;
+            p.max_life = 40.0;
+            p.grounded = true;
+            p.deposited = true;
+            p.ledger = false;
+            p.volume = 0.0024;
+            p.kind = crate::particles::KIND_SLURRY_RIBBON;
+            return;
+        }
+        self.world.particles.spawn(
+            Vec3::new(x, ground, head_z),
+            Vec3::new(0.0, 0.0, -1.0),
+            40.0,
+            0.7,
+            crate::particles::KIND_SLURRY_RIBBON,
+        );
+        if let Some(p) = self.world.particles.items.last_mut() {
+            p.seed = mark;
+            p.spin = Vec3::new(head_z, 0.0, 0.0);
+            p.ledger = false;
+            p.volume = 0.0024;
+            p.grounded = true;
+            p.deposited = true;
+            p.size = 0.7;
+        }
+    }
+
+    fn coat_body(&mut self, amount: f32) {
+        let amount = amount.clamp(0.0, 1.0);
+        let mass = amount * PANEL_MUD_CAP;
+        for panel in &mut self.world.vehicle.panels {
+            panel.mass = panel.mass.max(mass);
+            panel.wet = panel.wet.max(amount);
+            panel.drip = panel.drip.max(amount * 0.85);
+            panel.streak = panel.streak.max(amount * 0.6);
+        }
+        for wheel in &mut self.world.vehicle.wheels {
+            wheel.mud = wheel.mud.max(amount * 1.2);
+            wheel.smear = wheel.smear.max(amount * 0.8);
+            wheel.sidewall = wheel.sidewall.max(amount * 0.75);
+            wheel.groove = wheel.groove.max(amount * 0.7);
+        }
+    }
+
+    /// Air-grid dust as a soft cloud, and settled dust as a film on the wet track.
+    /// Marks are not a volume. `advance_dust` already booked the metres.
+    fn paint_dust_picture(&mut self) {
+        let mut tex = crate::dust::DensityTexture::empty();
+        self.dust.publish(&mut tex);
+        let z_car = self.chassis_z;
+        if z_car < 0.6 {
+            return;
+        }
+        let mut splats = tex.splats(0.00008);
+        splats.retain(|(p, _)| p.z < z_car - 0.3 && p.z > z_car - 12.0 && p.y > 0.05 && p.y < 1.9);
+        if splats.is_empty() {
+            return;
+        }
+        let mut mass = 0.0_f32;
+        let mut sx = 0.0_f32;
+        let mut sy = 0.0_f32;
+        for (p, v) in &splats {
+            mass += *v;
+            sx += p.x * *v;
+            sy += p.y * *v;
+        }
+        let cx = if mass > 0.0 { sx / mass } else { 0.8 };
+        let cy = if mass > 0.0 {
+            (sy / mass).clamp(0.35, 1.05)
+        } else {
+            0.55
+        };
+        // One trail behind the car, shifted to +X with the wind. Marks overlap
+        // and shrink, so the tail fades. Two large cards read as two discs.
+        let wind = Vec3::new(1.5, 0.04, -0.9);
+        let n = 18u32;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let pos = Vec3::new(
+                0.55 + cx * 0.45 + t * 2.8,
+                0.38 + cy * 0.22 * (1.0 - t * 0.65),
+                z_car - 2.4 - t * 7.2,
+            );
+            let size = 0.70 * (1.0 - t).powf(0.55) + 0.12;
+            self.world
+                .particles
+                .spawn(pos, wind, 1.0, size, KIND_DUST_MARK);
+        }
+    }
+
+    fn advance_dust(&mut self, dt: f32) {
+        let tires = crate::dust::tires_at(self.chassis_z, 8.0, 1.6);
+        let mut moisture = [0.0f32; 4];
+        let mut water = [0.0f32; 4];
+        for (i, tire) in tires.iter().enumerate() {
+            if tire.contact.z <= 0.0 {
+                moisture[i] = 0.70;
+                water[i] = 0.02;
+            } else {
+                moisture[i] = 0.04;
+                water[i] = 0.0;
+            }
+        }
+        self.dust.step_pads(&tires, &moisture, &water, dt);
+        self.chassis_z += 8.0 * dt;
+    }
+
+    fn stick_and_dust(&mut self, wheel: usize, center: Vec3, slip: f32, dt: f32, forward: Vec3) {
+        let sample = self.world.soil.sample(center.x, center.z);
+        let column = self.fluid.sample(center.x, center.z);
+        let z = center.z;
+        if z > -7.2 && z < -3.0 && column.water_m > 0.02 {
+            let scooped = self.fluid.take_water_at(center.x, center.z, 0.00015 * dt * 30.0);
+            self.coat.arch_water += scooped;
+            self.coat.sheet_out += scooped;
+        }
+        if z > 5.0 && z < 9.5 && self.coat.arch_water > 1.0e-6 {
+            let drip = (self.coat.arch_water * 0.35).min(self.coat.arch_water);
+            self.coat.arch_water -= drip;
+            self.coat.sheet_out -= drip;
+            let back_z = z - 1.4;
+            self.fluid.add_water_at(center.x, back_z, drip);
+            wet_the_bank(&mut self.world.soil, center.x, back_z);
+            self.report.wet_track = true;
+        }
+        let offer = 0.00035 * dt * 30.0;
+        let hold = drive_stick_hold(sample.kind, sample.wetness, column.water_m, column.slurry_m);
+        let mut taken = self.fluid.take_slurry_at(center.x, center.z, offer);
+        self.coat.sheet_out += taken;
+        if taken < offer * 0.25 && sample.loose > 0.004 && sample.wetness > 0.35 {
+            let idx = soil_index(&self.world.soil, center.x, center.z);
+            if let Some(idx) = idx {
+                let area = self.world.soil.cell * self.world.soil.cell;
+                let have = self.world.soil.loose[idx] * area;
+                let bite = (offer - taken).min(have);
+                if bite > 0.0 {
+                    self.world.soil.loose[idx] -= bite / area;
+                    taken += bite;
+                }
+            }
+        }
+        if taken > 0.0 {
+            let stuck = taken * hold;
+            let shed = taken - stuck;
+            self.coat.removed += taken;
+            self.coat.stuck += stuck;
+            self.coat.shed += shed;
+            if shed > 1.0e-7 {
+                let right = Vec3::new(forward.z, 0.0, -forward.x);
+                self.world.particles.throw_spin_ribbons(
+                    center + Vec3::Y * 0.25,
+                    forward,
+                    right,
+                    shed,
+                );
+            }
+        }
+        let _ = (wheel, slip, dt, sample, column);
+    }
+
+    fn spawn_spray(&mut self, spray: &[SprayEvent], forward: Vec3) {
+        // The picture spray is the tread ribbons. White dots around the bow
+        // were a ring, not water leaving the tire.
+        let _ = (spray, forward);
+    }
+
+    fn note_rut(&mut self) {
+        let soil = &self.world.soil;
+        let mut deepest = self.report.rut_m;
+        let half = soil.size * 0.5;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if !(-16.0..-8.0).contains(&z) {
+                    continue;
+                }
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                if x.abs() > 2.2 {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                deepest = deepest.max(soil.initial_height[idx] - soil.bed[idx]);
+            }
+        }
+        self.report.rut_m = deepest;
+    }
+
+    pub fn finish(&mut self) -> ThroughReport {
+        let books = self.dust.ledger();
+        self.report.dust_injected_m3 = books.emitted_m3;
+        self.report.dust_air_m3 = books.dust_air_m3;
+        self.report.dust_settled_m3 = books.dust_settled_m3;
+        self.report.wet_lift_m3 = 0.0;
+        self.report.end_z = self.chassis_z;
+        let _ = dust_may_lift(0.7, 0.02);
+        self.report.ledger_gap =
+            books.emitted_m3 - books.dust_air_m3 - books.dust_settled_m3;
+        self.report.clone_bits()
+    }
+}
+
+impl ThroughReport {
+    fn clone_bits(&self) -> ThroughReport {
+        ThroughReport {
+            speed_peak: self.speed_peak,
+            saw_wave: self.saw_wave,
+            spray_m3: self.spray_m3,
+            rut_m: self.rut_m,
+            removed_m3: self.removed_m3,
+            stuck_m3: self.stuck_m3,
+            shed_m3: self.shed_m3,
+            wet_track: self.wet_track,
+            dust_injected_m3: self.dust_injected_m3,
+            dust_air_m3: self.dust_air_m3,
+            dust_settled_m3: self.dust_settled_m3,
+            wet_lift_m3: self.wet_lift_m3,
+            ledger_gap: self.ledger_gap,
+            end_z: self.end_z,
+        }
+    }
+}
+
+fn smooth01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Soft oval, wholly inside the heightfield. 1 in the middle, 0 outside.
+fn puddle_mask(x: f32, z: f32) -> f32 {
+    let e = (x / 4.6).powi(2) + ((z + 15.4) / 3.4).powi(2);
+    smooth01(1.20 - e)
+}
+
+/// Two wheel ruts. The center between them stays dry so the pour is not a pit.
+fn slurry_rut_mask(x: f32, z: f32) -> f32 {
+    let end = if z < -13.2 {
+        (-12.4 - z) / 1.15
+    } else if z > -1.4 {
+        (z + 0.8) / 1.15
+    } else {
+        0.0
+    };
+    let along = smooth01(1.0 - end);
+    let mut mask = 0.0_f32;
+    for track in [-0.74_f32, 0.74] {
+        let lat = (x - track).abs() / 0.58;
+        let across = smooth01(1.0 - lat);
+        mask = mask.max(across * along);
+    }
+    mask
+}
+
+fn cut_rut_groove(soil: &mut SoilField, x: f32, z: f32) {
+    let target = 0.06_f32;
+    let radius = 0.42_f32;
+    let half = soil.size * 0.5;
+    let reach = (radius / soil.cell).ceil() as i32 + 1;
+    let ci = ((x + half) / soil.cell).floor() as i32;
+    let cj = ((z + half) / soil.cell).floor() as i32;
+    let mut removed = 0.0_f64;
+    let area = (soil.cell * soil.cell) as f64;
+    for dj in -reach..=reach {
+        for di in -reach..=reach {
+            let i = ci + di;
+            let j = cj + dj;
+            if i < 0 || j < 0 || i >= soil.res as i32 || j >= soil.res as i32 {
+                continue;
+            }
+            let px = (i as f32 + 0.5) * soil.cell - half;
+            let pz = (j as f32 + 0.5) * soil.cell - half;
+            let d = (px - x).hypot(pz - z);
+            if d > radius {
+                continue;
+            }
+            let want = target * smooth01(1.0 - d / radius);
+            let idx = (j as usize) * soil.res + i as usize;
+            let dug = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            let more = (want - dug).max(0.0);
+            if more <= 1.0e-5 {
+                continue;
+            }
+            soil.bed[idx] -= more;
+            removed += more as f64 * area;
+            soil.wetness[idx] = soil.wetness[idx].max(0.55);
+        }
+    }
+    if removed <= 1.0e-8 {
+        soil.rebuild_height();
+        return;
+    }
+    let mut weights = Vec::new();
+    let mut wsum = 0.0_f64;
+    for side in [-1.0_f32, 1.0] {
+        let shoulder = x + side * 0.72;
+        let si = ((shoulder + half) / soil.cell).floor() as i32;
+        let sj = cj;
+        for dj in -1..=1 {
+            for di in -1..=1 {
+                let i = si + di;
+                let j = sj + dj;
+                if i < 0 || j < 0 || i >= soil.res as i32 || j >= soil.res as i32 {
+                    continue;
+                }
+                let idx = (j as usize) * soil.res + i as usize;
+                let w = 1.0 / (1.0 + (di * di + dj * dj) as f64);
+                weights.push((idx, w));
+                wsum += w;
+            }
+        }
+    }
+    if wsum > 0.0 {
+        for (idx, w) in weights {
+            soil.placed[idx] += (removed * w / wsum / area) as f32;
+        }
+    }
+    soil.rebuild_height();
+}
+
+fn darken_track(soil: &mut SoilField, x: f32, z: f32) {
+    let half = soil.size * 0.5;
+    let radius = 0.26_f32;
+    let reach = (radius / soil.cell).ceil() as i32 + 1;
+    let ci = ((x + half) / soil.cell).floor() as i32;
+    let cj = ((z + half) / soil.cell).floor() as i32;
+    for dj in -reach..=reach {
+        for di in -reach..=reach {
+            let i = ci + di;
+            let j = cj + dj;
+            if i < 0 || j < 0 || i >= soil.res as i32 || j >= soil.res as i32 {
+                continue;
+            }
+            let px = (i as f32 + 0.5) * soil.cell - half;
+            let pz = (j as f32 + 0.5) * soil.cell - half;
+            let d = (px - x).hypot(pz - z);
+            if d > radius {
+                continue;
+            }
+            let w = smooth01(1.0 - d / radius);
+            let idx = (j as usize) * soil.res + i as usize;
+            soil.wetness[idx] = soil.wetness[idx].max(0.28 + 0.58 * w);
+            soil.base_wetness[idx] = soil.base_wetness[idx].max(soil.wetness[idx]);
+            soil.darken[idx] = soil.darken[idx].max(0.94 * w);
+            let _ = w;
+        }
+    }
+}
+
+fn raise_bow(soil: &mut SoilField, _x: f32, chassis_z: f32) {
+    // The crest has to stand beside the body. A ridge only ahead of the
+    // bumper sits under the hood from the chase camera, and the pool looks flat.
+    let bow = bow_height_m(8.0, 0.08).max(0.58);
+    let half = soil.size * 0.5;
+    let reach = (3.8 / soil.cell).ceil() as i32 + 1;
+    let ci = ((half) / soil.cell).floor() as i32;
+    let cj = ((chassis_z + 1.2 + half) / soil.cell).floor() as i32;
+    for dj in -reach..=reach {
+        for di in -reach..=reach {
+            let i = ci + di;
+            let j = cj + dj;
+            if i < 0 || j < 0 || i >= soil.res as i32 || j >= soil.res as i32 {
+                continue;
+            }
+            let px = (i as f32 + 0.5) * soil.cell - half;
+            let pz = (j as f32 + 0.5) * soil.cell - half;
+            let dx = px / 2.6;
+            let dz = (pz - (chassis_z + 1.9)) / 1.2;
+            let front = smooth01(1.2 - dx * dx - dz * dz);
+            // Shoulders beside the doors, where the chase camera can see the water.
+            let along = ((chassis_z + 1.5) - pz) / 2.3;
+            let flank = (px.abs() - 1.85).abs() / 1.15;
+            let arm = smooth01(1.05 - flank) * smooth01(1.25 - along) * smooth01(along + 0.45);
+            let w = front.max(arm);
+            if w < 0.04 {
+                continue;
+            }
+            let idx = (j as usize) * soil.res + i as usize;
+            if soil.water[idx] < 0.010 {
+                continue;
+            }
+            let crest = bow * w;
+            soil.water[idx] = soil.water[idx].max(soil.water[idx].min(0.15) + crest);
+        }
+    }
+}
+
+fn wet_the_bank(soil: &mut SoilField, x: f32, z: f32) {
+    let Some(idx) = soil_index(soil, x, z) else {
+        return;
+    };
+    soil.wetness[idx] = soil.wetness[idx].max(0.62);
+    soil.water[idx] = soil.water[idx].max(0.012);
+}
+
+fn soil_index(soil: &SoilField, x: f32, z: f32) -> Option<usize> {
+    let half = soil.size * 0.5;
+    let i = ((x + half) / soil.cell).floor();
+    let j = ((z + half) / soil.cell).floor();
+    if i < 0.0 || j < 0.0 {
+        return None;
+    }
+    let i = i as usize;
+    let j = j as usize;
+    if i >= soil.res || j >= soil.res {
+        None
+    } else {
+        Some(j * soil.res + i)
+    }
+}
+
+fn pull_substrate(fluid: &mut FluidCore, soil: &SoilField) {
+    fluid.read_substrate(|x, z| {
+        let s = soil.sample(x, z);
+        let grain = match SurfaceKind::from_u8(s.kind) {
+            SurfaceKind::Silt => Grain::Silt,
+            SurfaceKind::Sand | SurfaceKind::Gravel => Grain::Sand,
+            SurfaceKind::WetMud
+            | SurfaceKind::FreshCut
+            | SurfaceKind::PackedClay
+            | SurfaceKind::Berm
+            | SurfaceKind::PlacedClod
+            | SurfaceKind::CutLip => Grain::Clay,
+            _ => Grain::Other,
+        };
+        (s.height - s.slurry, s.wetness, grain)
+    });
+}
+
+fn mirror_fluid(fluid: &FluidCore, soil: &mut SoilField) {
+    let (x0, z0, extent) = fluid.window_bounds();
+    let half = soil.size * 0.5;
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            if x < x0 || z < z0 || x >= x0 + extent || z >= z0 + extent {
+                continue;
+            }
+            let idx = j * soil.res + i;
+            let sample = fluid.sample(x, z);
+            soil.water[idx] = sample.water_m;
+            soil.slurry[idx] = sample.slurry_m;
+            soil.height[idx] = soil.bed[idx] + soil.placed[idx] + sample.slurry_m;
+        }
+    }
+}
+
+/// Sticky clay near mid moisture holds. A slurry runs off. Same shape as the
+/// adhesion pass on `cursor/mud-adhesion-eedb`.
+fn drive_stick_hold(kind: u8, wetness: f32, water: f32, slurry: f32) -> f32 {
+    let _ = water;
+    if slurry > 0.02 {
+        return 0.015;
+    }
+    let w = wetness.clamp(0.0, 1.0);
+    let mid = (-0.5 * ((w - 0.45) / 0.16).powi(2)).exp();
+    let affinity = match SurfaceKind::from_u8(kind) {
+        SurfaceKind::Sand | SurfaceKind::Gravel => 0.11,
+        SurfaceKind::Silt => 0.62,
+        SurfaceKind::DryCrust => 0.07,
+        _ => 1.0,
+    };
+    (affinity * mid).clamp(0.0, 1.0)
+}
+
+/// Belly on a flat shelf, wheels in deeper slurry ruts.
+#[derive(Clone, Copy, Debug)]
+pub struct BellyShelfReport {
+    pub drag_n: f32,
+    pub unload_n: f32,
+    pub shelf_y: f32,
+    pub rut_y: f32,
+    pub cut_m3: f32,
+    pub placed_m3: f32,
+    pub gap_m3: f32,
+}
+
+impl World {
+    /// Plane the center to belly height and leave the wheel lines deeper.
+    /// Cut soil is the berm. The gap is what failed to close.
+    pub fn carve_belly_shelf(&mut self) -> BellyShelfReport {
+        self.soil = SoilField::flat(0.50);
+        self.particles.clear();
+        self.bike.pos = Vec3::new(80.0, 0.5, 80.0);
+        let half = self.soil.size * 0.5;
+        let area = (self.soil.cell * self.soil.cell) as f64;
+        let floor = -0.70_f32;
+        let mut removed = 0.0_f64;
+        let res = self.soil.res;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * self.soil.cell - half;
+                let z = (j as f32 + 0.5) * self.soil.cell - half;
+                let idx = j * res + i;
+                let mut drop = 0.0_f32;
+                for track in [-0.74_f32, 0.74] {
+                    let lat = (x - track).abs() / 0.34;
+                    let end = (z.abs() - 2.15).max(0.0) / 0.45;
+                    let w = smooth01(1.0 - lat) * smooth01(1.0 - end);
+                    drop = drop.max(-floor * w);
+                }
+                if drop > 1.0e-4 {
+                    self.soil.bed[idx] -= drop;
+                    removed += drop as f64 * area;
+                    self.soil.kind[idx] = SurfaceKind::WetMud as u8;
+                    self.soil.wetness[idx] = 0.90;
+                    self.soil.base_wetness[idx] = 0.90;
+                    if drop > 0.22 {
+                        self.soil.slurry[idx] = 0.06 * smooth01((drop - 0.18) / 0.22);
+                    }
+                } else if x.abs() < 0.48 && z.abs() < 2.2 {
+                    self.soil.wetness[idx] = 0.88;
+                    self.soil.base_wetness[idx] = 0.88;
+                    self.soil.kind[idx] = SurfaceKind::PackedClay as u8;
+                }
+            }
+        }
+        let mut weights = vec![0.0_f64; self.soil.bed.len()];
+        let mut wsum = 0.0_f64;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * self.soil.cell - half;
+                let z = (j as f32 + 0.5) * self.soil.cell - half;
+                let ax = x.abs();
+                if !(1.15..2.15).contains(&ax) || z.abs() > 2.7 {
+                    continue;
+                }
+                let wx = smooth01((ax - 1.15) / 0.25) * smooth01((2.15 - ax) / 0.28);
+                let wz = smooth01((2.7 - z.abs()) / 0.40);
+                let w = (wx * wz) as f64;
+                if w <= 0.0 {
+                    continue;
+                }
+                let idx = j * res + i;
+                weights[idx] = w;
+                wsum += w;
+            }
+        }
+        if wsum > 0.0 {
+            for (idx, w) in weights.iter().enumerate() {
+                if *w <= 0.0 {
+                    continue;
+                }
+                self.soil.placed[idx] = (removed * *w / wsum / area) as f32;
+            }
+        }
+        self.soil.rebuild_height();
+        let shelf = self.soil.sample(0.0, 0.0).height;
+        let rut = self.soil.sample(0.74, 0.0).height;
+        let cut = self.soil.cut_volume();
+        let placed = self.soil.placed_volume();
+        let loose = self.soil.loose.iter().copied().sum::<f32>() * self.soil.cell * self.soil.cell;
+        let gap = (cut - placed - loose - self.soil.airborne).abs();
+
+        self.vehicle.pos = Vec3::new(0.0, 0.13, 0.0);
+        self.vehicle.yaw = 0.0;
+        self.vehicle.pitch = 0.0;
+        self.vehicle.roll = 0.0;
+        self.vehicle.vel = Vec3::ZERO;
+        for wheel in &mut self.vehicle.wheels {
+            wheel.compression = 0.0;
+            wheel.omega = 0.0;
+            wheel.steer = 0.0;
+        }
+        let contacts = self
+            .vehicle
+            .compute_contacts(&self.soil, 0.0, 1.0, 1.0 / 60.0);
+        let support: f32 = contacts.iter().map(|c| c.normal).sum();
+        let weight = crate::vehicle::MASS * 9.81;
+        let unload = (weight - support).max(0.0);
+        let drag = self.vehicle.belly_drag_n(&self.soil);
+        BellyShelfReport {
+            drag_n: drag,
+            unload_n: unload,
+            shelf_y: shelf,
+            rut_y: rut,
+            cut_m3: cut,
+            placed_m3: placed,
+            gap_m3: gap,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4208,6 +5094,93 @@ mod tests {
         assert!(report.stuck_kg > 20.0, "stuck mass {}", report.stuck_kg);
         assert!(report.arch_brake_nm > 40.0, "arch brake {}", report.arch_brake_nm);
         assert!(report.imbalance_n > 15.0, "imbalance {}", report.imbalance_n);
+    }
+
+    #[test]
+    fn picture_bow_rises_beside_the_body() {
+        let mut drive = ThroughDrive::new();
+        for _ in 0..18 {
+            drive.step(1.0 / 30.0);
+        }
+        let z = drive.chassis_z;
+        let soil = &drive.world.soil;
+        let half = soil.size * 0.5;
+        let mut beside = 0.0_f32;
+        let mut ahead = 0.0_f32;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let pz = (j as f32 + 0.5) * soil.cell - half;
+                let w = soil.water[j * soil.res + i];
+                if (x.abs() - 1.85).abs() < 0.55 && (pz - (z + 0.5)).abs() < 0.8 {
+                    beside = beside.max(w);
+                }
+                if x.abs() < 0.5 && (pz - (z + 1.8)).abs() < 0.5 {
+                    ahead = ahead.max(w);
+                }
+            }
+        }
+        assert!(
+            beside > 0.45,
+            "shoulder beside the body is flat: {beside:.3} at z {z:.2}"
+        );
+        assert!(
+            ahead > 0.40,
+            "no crest ahead of the nose: {ahead:.3} at z {z:.2}"
+        );
+    }
+
+    #[test]
+    fn belly_shelf_is_flat_between_deeper_ruts() {
+        let mut world = World::flat(0.4);
+        let report = world.carve_belly_shelf();
+        let soil = &world.soil;
+        let half = soil.size * 0.5;
+        let mut shelf_n = 0.0_f32;
+        let mut shelf_sum = 0.0_f32;
+        let mut shelf_span = 0.0_f32;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if x.abs() > 0.28 || z.abs() > 1.2 {
+                    continue;
+                }
+                let h = soil.height[j * soil.res + i];
+                shelf_n += 1.0;
+                shelf_sum += h;
+                shelf_span = shelf_span.max((h - report.shelf_y).abs());
+            }
+        }
+        let shelf_mean = shelf_sum / shelf_n.max(1.0);
+        assert!(
+            shelf_span < 0.012 && shelf_mean.abs() < 0.012,
+            "shelf is not a flat cut at belly height, mean {shelf_mean:.4} span {shelf_span:.4}"
+        );
+        assert!(
+            report.shelf_y - report.rut_y > 0.35,
+            "ruts are not deeper than the shelf, shelf {:.3} rut {:.3}",
+            report.shelf_y,
+            report.rut_y
+        );
+        assert!(
+            report.drag_n > 400.0 && report.drag_n <= 6500.0,
+            "belly drag {:.0} N",
+            report.drag_n
+        );
+        assert!(
+            report.unload_n > 4_000.0,
+            "belly did not unload the tires, unload {:.0} N",
+            report.unload_n
+        );
+        assert!(
+            report.gap_m3 < 0.02 && report.cut_m3 > 0.15,
+            "volume did not close, cut {:.4} placed {:.4} gap {:.4}",
+            report.cut_m3,
+            report.placed_m3,
+            report.gap_m3
+        );
+        let _ = world.vehicle.belly_penetration(&world.soil);
     }
 
     #[test]

@@ -459,6 +459,64 @@ impl Particles {
         }
     }
 
+    /// A fan of water flecks. Ledger stays off. Not clods.
+    pub fn spray_fan(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        speed: f32,
+        count: u32,
+    ) {
+        let n = count.clamp(1, 8);
+        for i in 0..n {
+            let side = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let spread = 0.16 + (i as f32) * 0.07;
+            // Up and out, off the bow. A flat fleck on the water reads as a speck.
+            let vel = -forward * (0.35 + speed * 0.02)
+                + right * side * (1.9 + self.rnd() * 0.7)
+                + Vec3::Y * (3.6 + self.rnd() * 1.1);
+            let life = 0.36 + self.rnd() * 0.08;
+            let pos = origin
+                + right * side * spread
+                + Vec3::Y * (0.28 + self.rnd() * 0.16)
+                - forward * self.rnd() * 0.04;
+            self.spawn(pos, vel, life, 0.11, 0);
+        }
+    }
+
+    /// Water leaving a wheel arch. Falls, does not dig.
+    pub fn arch_drip(&mut self, origin: Vec3, back: Vec3) {
+        for i in 0..3 {
+            let pos = origin + Vec3::Y * (0.08 - 0.05 * i as f32) + back * (0.04 * i as f32);
+            let vel = Vec3::Y * (-2.2 - i as f32 * 0.45) + back * 0.15;
+            self.spawn(pos, vel, 0.28, 0.05, 9);
+        }
+    }
+
+    /// A short curl leaving the rear of the tread. `ground` is the soil under
+    /// the contact. The contact itself is at y = 0, under the heightfield, so
+    /// a lift from the contact buries the strip and it never draws.
+    /// The volume is a picture width, not soil. It does not hang off the door.
+    pub fn shed_tread_ribbon(
+        &mut self,
+        origin: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        side: f32,
+        ground: f32,
+    ) {
+        // On the tire line, thrown straight back down the rut.
+        let _ = (right, side);
+        let pos = Vec3::new(origin.x, ground + 0.20, origin.z) - forward * 0.16;
+        let vel = -forward * 1.35 + Vec3::Y * 0.06;
+        self.spawn(pos, vel, 0.50, 0.07, KIND_SLURRY_RIBBON);
+        if let Some(p) = self.items.last_mut() {
+            p.volume = 0.0024;
+            p.ledger = false;
+        }
+    }
+
     pub fn spray(&mut self, origin: Vec3, forward: Vec3, right: Vec3, speed: f32, water: f32) {
         let _ = water;
         // One droplet, and not on top of one that is already in the air.
@@ -570,11 +628,16 @@ impl Particles {
             p.rot = Quat::from_scaled_axis(p.spin * dt) * p.rot;
             let h = soil.sample(p.pos.x, p.pos.z).height;
             // Belly in the crater, the wet cap still above the soil.
-            let belly = match p.kind {
-                3 => 0.12,
-                1 | KIND_SLURRY_RIBBON => 0.22,
-                KIND_SLURRY_DROP => 0.28,
-                _ => 0.32,
+            let belly = if p.kind == KIND_SLURRY_RIBBON && !p.ledger {
+                // Sit the curl on the track. The ledger pieces stay low.
+                1.25
+            } else {
+                match p.kind {
+                    3 => 0.12,
+                    1 | KIND_SLURRY_RIBBON => 0.22,
+                    KIND_SLURRY_DROP => 0.28,
+                    _ => 0.32,
+                }
             };
             let sit = h + p.size * belly;
             if p.pos.y <= sit {
@@ -612,7 +675,16 @@ impl Particles {
                     let sit = h + p.size * belly;
                     p.grounded = true;
                     p.pos.y = sit;
-                    p.vel = Vec3::ZERO;
+                    if p.kind == KIND_SLURRY_RIBBON && !p.ledger {
+                        let heading = Vec3::new(p.vel.x, 0.0, p.vel.z);
+                        p.vel = if heading.length_squared() > 1.0e-6 {
+                            heading.normalize() * 0.25
+                        } else {
+                            Vec3::new(0.0, 0.0, -0.25)
+                        };
+                    } else {
+                        p.vel = Vec3::ZERO;
+                    }
                     p.spin = Vec3::ZERO;
                 }
             }

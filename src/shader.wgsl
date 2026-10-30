@@ -738,6 +738,9 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
             h = mix(base, seated.x, seated.y);
         }
     }
+    // The heightfield ends. Ease the map relief down so the rim is not a lip.
+    let rim = smoothstep(15.5, 19.2, max(abs(in.xz.x), abs(in.xz.y)));
+    h = mix(h, base, rim);
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -867,6 +870,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         dry_c = mix(dry_c, dry_c * vec3<f32>(1.22, 1.1, 0.9), 0.7);
         albedo = mix(wet_c, dry_c, skin);
     }
+    // The exit print. A fresh field sits under this ramp, so the lane goes dark
+    // without a new surface kind.
+    albedo *= mix(1.0, 0.36, smoothstep(0.20, 0.52, darken));
 
     let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
     let drowned = smoothstep(0.012, 0.05, water);
@@ -993,6 +999,34 @@ fn covered_depth(xz: vec2<f32>) -> f32 {
     return max(here, across);
 }
 
+// Metres above the bed. The solved column can be most of a metre; drawing
+// that is a mound. The pool stays a film. Only the tallest part of the bow
+// stands up, so the crest is a wave in the surface.
+fn shallow_water(column: f32) -> f32 {
+    // A film on the ground. The bow adds a low crest, not a mound.
+    // The solved column is left in the simulation; only a fraction is drawn.
+    let film = min(column, 0.11) * 0.10;
+    let extra = max(column - 0.11, 0.0);
+    let t = clamp(extra / 0.58, 0.0, 1.0);
+    let wave = t * 0.045;
+    return 0.003 + film + wave;
+}
+
+// Long swells on the free surface. A few centimetres, so the sheet stays
+// on the ground. A tight lattice would read as a checker.
+fn free_swell(xz: vec2<f32>, t: f32) -> f32 {
+    return 0.11 * sin(xz.x * 0.72 + xz.y * 1.05 + t * 0.7)
+        + 0.07 * sin(xz.y * 1.45 - xz.x * 0.28 - t * 0.45);
+}
+
+fn free_swell_grad(xz: vec2<f32>, t: f32) -> vec2<f32> {
+    let a = cos(xz.x * 0.72 + xz.y * 1.05 + t * 0.7);
+    let b = cos(xz.y * 1.45 - xz.x * 0.28 - t * 0.45);
+    let dx = 0.11 * a * 0.72 - 0.07 * b * 0.28;
+    let dz = 0.11 * a * 1.05 + 0.07 * b * 1.45;
+    return vec2<f32>(dx, dz);
+}
+
 fn water_bed(xz: vec2<f32>) -> f32 {
     // Blur a single-cell rut out of the sheet so the pool stays one surface.
     let e = 0.55;
@@ -1011,7 +1045,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
     let column = water_column(in.xz);
-    let free = frame.misc.w > 0.5 && column > 0.04;
+    let free = frame.misc.w > 0.5 && column > 0.004;
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
@@ -1024,7 +1058,10 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let fill = smoothstep(0.04, 0.12, depth) * min(dug * 0.5, 0.032);
     let in_rut = local + 0.01 + rip + fill;
     let y_sheet = select(pond, in_rut, dug > 0.018 && depth > 0.004);
-    let surface = water_bed(in.xz) + column;
+    // The column is the solved water. Drawing it at full height is a mound.
+    // The sheet sits on the ground. The bow is a crest in that sheet, plus a swell.
+    let swell = select(0.0, free_swell(in.xz, frame.misc.x), free);
+    let surface = water_bed(in.xz) + shallow_water(column) + rip * 0.45 + swell;
     let y = select(y_sheet, surface, free);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
@@ -1063,24 +1100,25 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz - e) > 0.02
         || -stamp_bilinear(xz + ez) > 0.02
         || -stamp_bilinear(xz - ez) > 0.02;
-    let free = frame.misc.w > 0.5 && in.depth > 0.04;
-    if (free) {
-        if (in.depth < 0.04) {
-            discard;
-        }
-    } else if (near_cut || own < 0.008 || in.depth < 0.008) {
+    let free = frame.misc.w > 0.5 && in.depth > 0.004;
+    if (!free && (near_cut || own < 0.008 || in.depth < 0.008)) {
         discard;
     }
     let n = ripple_normal(xz, frame.misc.x);
-    // Keep the pond facing up. A bowed normal is what made the gray metal disc.
-    // The crossing crest uses the solved slope so the ridge is a face, not a tint.
     let flat = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
-    let de = 0.22;
-    let h0 = water_bed(xz) + water_column(xz);
-    let hx = water_bed(xz + vec2<f32>(de, 0.0)) + water_column(xz + vec2<f32>(de, 0.0));
-    let hz = water_bed(xz + vec2<f32>(0.0, de)) + water_column(xz + vec2<f32>(0.0, de));
-    let slope = normalize(vec3<f32>(-(hx - h0) / de, 1.0, -(hz - h0) / de));
-    let nrm = select(flat, normalize(mix(vec3<f32>(0.0, 1.0, 0.0), slope, 0.7)), free);
+    // Slope of the low sheet, not of the full column. A full-column normal
+    // is a wall.
+    let de = 0.28;
+    let y0 = shallow_water(water_column(xz));
+    let yx = shallow_water(water_column(xz + vec2<f32>(de, 0.0)));
+    let yz = shallow_water(water_column(xz + vec2<f32>(0.0, de)));
+    let g = free_swell_grad(xz, frame.misc.x);
+    // The crest is only a few centimetres. Stretch its normal so the face
+    // of the wave reads, without standing the water up into a mound.
+    let dx = (yx - y0) / de;
+    let dz = (yz - y0) / de;
+    let slope = normalize(vec3<f32>(-(dx * 2.6 + g.x * 2.4), 1.0, -(dz * 2.6 + g.y * 2.4)));
+    let nrm = select(flat, slope, free);
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
@@ -1111,7 +1149,23 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let solved = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
     // A bowl is a cut, and the groove path opens that cut. The ford sheet is
     // the free surface, so the crest stays a surface instead of a tint.
-    let alpha = select(solved, max(solved, 0.90), free);
+    let shore_fade = smoothstep(0.003, 0.07, in.depth);
+    var alpha = select(solved, shore_fade, free);
+    if (free) {
+        // Turbid water. The bed shows through the troughs. Crests catch the
+        // sun so the swell reads as a wave, not a flat stain.
+        let soil = bed;
+        let column_here = water_column(xz);
+        let deep = smoothstep(0.02, 0.10, column_here);
+        let murk = soil * vec3<f32>(0.26, 0.17, 0.08);
+        let body = mix(murk, vec3<f32>(0.07, 0.045, 0.018), deep * 0.5);
+        let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
+        col = body * (0.10 + 2.8 * ndl);
+        let halfv = normalize(sun + view);
+        let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), 3.0);
+        col += vec3<f32>(0.62, 0.46, 0.24) * sheen * 1.5;
+        alpha = shore_fade * mix(0.46, 0.72, deep);
+    }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
@@ -1321,8 +1375,9 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
     } else if (panel < 17.5) {
         return vec4<f32>(0.7, 0.02, 0.015, 0.2);
     } else if (panel < 40.5) {
-        let g = noise(world.xz * 0.35);
-        return vec4<f32>(vec3<f32>(0.055, 0.030, 0.016) * (0.85 + g * 0.25), 0.96);
+        let g = noise(world.xz * 0.22);
+        let dirt = mix(vec3<f32>(0.20, 0.15, 0.09), vec3<f32>(0.30, 0.22, 0.13), g);
+        return vec4<f32>(dirt, 0.94);
     } else if (panel < 41.5) {
         let g = noise(world.xz * 0.07);
         return vec4<f32>(vec3<f32>(0.092, 0.048, 0.024) * (0.78 + g * 0.4), 0.97);
@@ -1343,6 +1398,12 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
         let g = noise(world.xz * 3.2 + vec2<f32>(world.y * 2.2, 0.4));
         let col = mix(vec3<f32>(0.018, 0.008, 0.004), vec3<f32>(0.032, 0.014, 0.006), g);
         return vec4<f32>(col, 0.06);
+    } else if (panel < 47.5) {
+        let g = noise(world.xz * 2.2 + vec2<f32>(world.y * 1.4, 0.3));
+        let col = mix(vec3<f32>(0.46, 0.38, 0.26), vec3<f32>(0.68, 0.58, 0.40), g);
+        return vec4<f32>(col, 0.72);
+    } else if (panel < 48.5) {
+        return vec4<f32>(vec3<f32>(0.72, 0.80, 0.84), 0.18);
     }
     return vec4<f32>(vec3<f32>(0.16, 0.10, 0.06), 0.9);
 }
@@ -1357,6 +1418,21 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
 
     var nrm = in.nrm;
     var alpha = 1.0;
+    // The floor outside the heightfield. Same gravel as the field, so the rim is not a wall.
+    if (in.panel > 39.5 && in.panel < 40.5) {
+        let xz = in.world.xz;
+        let uv = xz / 2.7;
+        let diff = textureSample(ground_diff, ground_samp, uv, 1).rgb;
+        let ntex = textureSample(ground_nor, ground_samp, uv, 1).rgb;
+        let pack = textureSample(ground_pack, ground_samp, uv, 1);
+        let ts = ntex * 2.0 - vec3<f32>(1.0);
+        let n = normalize(vec3<f32>(ts.x * 0.85, 1.0, ts.y * 0.85));
+        let ao = clamp(pack.g, 0.0, 1.0);
+        let skirt_albedo = diff * mix(1.0, ao, 0.75);
+        let skirt_rough = clamp(pack.r * (1.0 - pack.a * 0.2), 0.2, 1.0);
+        let lit_skirt = shade(in.world, n, skirt_albedo, skirt_rough, vec3<f32>(0.0));
+        return vec4<f32>(present(lit_skirt).rgb, 1.0);
+    }
     if (in.panel > 79.5 && in.panel < 88.5) {
         let layer = i32(in.panel + 0.5) - 80;
         let dims = vec2<f32>(textureDimensions(niva_base));
@@ -1401,10 +1477,11 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         } else if (layer != 7) {
             let mud = clamp(model.extra.y, 0.0, 1.2);
             let cover = max(mud, max(model.mud5.x, max(model.mud1.x, max(model.mud4.x, max(model.mud2.x, model.mud3.x)))));
-            let down = smoothstep(0.55, -0.2, nrm.y);
-            let mask = smoothstep(0.04, 0.42, cover) * (0.28 + 0.72 * down);
-            albedo = mix(albedo, vec3<f32>(0.045, 0.022, 0.011), mask * 0.9);
-            rough = mix(rough, mix(0.32, 0.08, cover), mask);
+            let roof = smoothstep(0.55, 0.92, nrm.y);
+            let clay = vec3<f32>(0.32, 0.12, 0.04);
+            let coat = cover * (1.0 - roof);
+            albedo = mix(albedo, clay, coat * 0.94);
+            rough = mix(rough, 0.18, coat);
         }
     } else if (in.panel > 69.5 && in.panel < 70.5) {
         let c = textureSampleLevel(prop_tex, paint_samp, in.uv, 0.0);
@@ -1542,6 +1619,37 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         lit += gloss * fres * 0.08;
         let belly = smoothstep(0.2, -0.45, n.y);
         lit = mix(lit, lit * vec3<f32>(0.42, 0.28, 0.18), belly * 0.75);
+    }
+    if (in.panel > 46.5 && in.panel < 47.5) {
+        let d = length(in.uv - vec2<f32>(0.5, 0.5));
+        // A gaussian, so overlapping marks are one cloud. A hard radial
+        // falloff read as a disc.
+        let soft = exp(-d * d * 7.0);
+        if (soft < 0.05) {
+            discard;
+        }
+        let g = noise(in.world.xz * 1.6 + vec2<f32>(in.world.y * 0.8, 0.3));
+        let col = mix(vec3<f32>(0.20, 0.15, 0.09), vec3<f32>(0.32, 0.24, 0.15), g);
+        let sun = normalize(frame.sun_dir.xyz);
+        let ndl = clamp(dot(normalize(in.nrm), sun), 0.0, 1.0);
+        let tail = smoothstep(47.08, 47.34, in.panel);
+        let strength = mix(0.46, 0.10, tail);
+        let mapped_dust = present(col * (0.72 + 0.28 * ndl));
+        return vec4<f32>(mapped_dust.rgb, soft * strength);
+    }
+    if (in.panel > 47.5 && in.panel < 48.5) {
+        let mapped_spray = present(vec3<f32>(0.72, 0.82, 0.88));
+        return vec4<f32>(mapped_spray.rgb, 0.92);
+    }
+    if (in.panel > 48.5 && in.panel < 49.5) {
+        let g = noise(in.world.xz * 7.5 + vec2<f32>(in.world.y * 2.0, 0.2));
+        let blot = noise(in.world.xz * 1.6 + vec2<f32>(2.0, 0.4));
+        let clay0 = mix(vec3<f32>(0.09, 0.045, 0.02), vec3<f32>(0.18, 0.09, 0.035), g);
+        let clay = mix(clay0, clay0 * 0.5, blot * blot);
+        let face = smoothstep(0.25, 0.9, abs(in.nrm.y));
+        let clay_s = mix(clay * 0.42, clay, face);
+        let lit_rib = shade(in.world, in.nrm, clay_s, 0.88, vec3<f32>(0.0));
+        return vec4<f32>(present(lit_rib).rgb, 1.0);
     }
     let mapped = present(lit);
     return vec4<f32>(mapped.rgb, alpha);
