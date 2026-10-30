@@ -49,6 +49,9 @@ struct FrameData {
     /// ground fog extinction (1/m, 0 off). 1: Niva position xyz, fog scale
     /// height (m). 2: Niva velocity xyz, yaw.
     air: [[f32; 4]; 3],
+    /// Near shadow cascade: a tight ortho round the Niva, drawn into the
+    /// right half of the shadow atlas. The far cascade is `light_vp`.
+    light_vp_near: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -75,6 +78,10 @@ pub struct Renderer {
     model_stride: u32,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
+    /// The frame with `light_vp` swapped for the near cascade, for its
+    /// shadow pass only.
+    frame_near_buf: wgpu::Buffer,
+    frame_near_bg: wgpu::BindGroup,
     env_tex: wgpu::Texture,
     env_sh: [[f32; 4]; 9],
     env_from_file: bool,
@@ -500,6 +507,30 @@ impl Renderer {
                 },
             ],
         });
+        let frame_near_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame-near"),
+            size: std::mem::size_of::<FrameData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_near_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame-near-bg"),
+            layout: &frame_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_near_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&env_samp),
+                },
+            ],
+        });
         let model_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model-bg"),
             layout: &model_bgl,
@@ -558,7 +589,7 @@ impl Renderer {
         let shadow = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow"),
             size: wgpu::Extent3d {
-                width: SHADOW,
+                width: SHADOW * 2,
                 height: SHADOW,
                 depth_or_array_layers: 1,
             },
@@ -573,7 +604,7 @@ impl Renderer {
         let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow-depth"),
             size: wgpu::Extent3d {
-                width: SHADOW,
+                width: SHADOW * 2,
                 height: SHADOW,
                 depth_or_array_layers: 1,
             },
@@ -1251,6 +1282,8 @@ impl Renderer {
             model_stride,
             frame_buf,
             frame_bg,
+            frame_near_buf,
+            frame_near_bg,
             env_tex,
             env_sh: [[0.0; 4]; 9],
             env_from_file: false,
@@ -1561,6 +1594,15 @@ impl Renderer {
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
         let light_proj = Mat4::orthographic_rh(-extent, extent, -extent, extent, 1.0, 130.0);
         let light_vp = light_proj * light_view;
+        // Near cascade: 7 m round the Niva at ~3 mm a texel, so the tires
+        // and sills print a sharp contact shadow where they meet the ground.
+        let near_target = Vec3::new(
+            world.vehicle.pos.x,
+            world.vehicle.pos.y - 0.4,
+            world.vehicle.pos.z,
+        );
+        let light_vp_near = Mat4::orthographic_rh(-3.5, 3.5, -3.5, 3.5, 1.0, 24.0)
+            * Mat4::look_at_rh(near_target + sun * 12.0, near_target, Vec3::Y);
         let (sun_color, sky_zenith, sky_horizon, amb) = if self.daylight {
             (
                 [1.70, 1.78, 1.90, 1.0],
@@ -1638,9 +1680,19 @@ impl Renderer {
                     world.vehicle.yaw,
                 ],
             ],
+            light_vp_near: if self.niva_picture {
+                light_vp_near.to_cols_array_2d()
+            } else {
+                // No near cascade: a matrix that maps everything off the map.
+                Mat4::from_translation(Vec3::new(9.0, 9.0, 0.0)).to_cols_array_2d()
+            },
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
+        let mut frame_near = frame;
+        frame_near.light_vp = frame.light_vp_near;
+        self.queue
+            .write_buffer(&self.frame_near_buf, 0, bytemuck::bytes_of(&frame_near));
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
@@ -1742,6 +1794,40 @@ impl Renderer {
             if chunk_count > 0 {
                 self.draw_chunks(&mut pass, chunk_count);
             }
+        }
+
+        if self.niva_picture {
+            // Near cascade, right half of the atlas: the ground under the
+            // Niva and the Niva itself.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow-near"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.shadow_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_viewport(SHADOW as f32, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
+            pass.set_bind_group(0, &self.frame_near_bg, &[]);
+            pass.set_bind_group(1, &self.height_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[0]);
+            pass.set_pipeline(&self.pipe_shadow_terrain);
+            draw_indexed(&mut pass, &self.terrain);
+            pass.set_pipeline(&self.pipe_shadow_mesh);
+            self.draw_vehicle(&mut pass);
         }
 
         {

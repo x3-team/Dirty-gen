@@ -25,6 +25,8 @@ struct Frame {
     // Air, picture only. 0: wind xyz m/s, ground fog 1/m. 1: Niva position,
     // fog scale height. 2: Niva velocity, yaw.
     air: array<vec4<f32>, 3>,
+    // Near shadow cascade round the Niva, right half of the shadow atlas.
+    light_vp_near: mat4x4<f32>,
 }
 
 struct Model {
@@ -299,50 +301,54 @@ fn interleaved_gradient_noise(px: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
 }
 
-fn shadow_depth_at(c: vec2<i32>, dims: vec2<i32>) -> f32 {
-    return decode_depth(textureLoad(shadow_tex, clamp(c, vec2<i32>(0), dims - vec2<i32>(1)), 0));
+// One cascade is a SHADOW x SHADOW tile of the atlas starting at column x0.
+fn shadow_depth_at(c: vec2<i32>, lo: vec2<i32>, hi: vec2<i32>) -> f32 {
+    return decode_depth(textureLoad(shadow_tex, clamp(c, lo, hi), 0));
 }
 
 // Lit fraction from a bilinear 2x2 compare, as a comparison sampler would.
-fn shadow_cmp_2x2(texel: vec2<f32>, z: f32, dims: vec2<i32>) -> f32 {
+fn shadow_cmp_2x2(texel: vec2<f32>, z: f32, lo: vec2<i32>, hi: vec2<i32>) -> f32 {
     let t = texel - 0.5;
     let b = vec2<i32>(floor(t));
     let f = t - floor(t);
-    let l00 = select(1.0, 0.0, z > shadow_depth_at(b, dims));
-    let l10 = select(1.0, 0.0, z > shadow_depth_at(b + vec2<i32>(1, 0), dims));
-    let l01 = select(1.0, 0.0, z > shadow_depth_at(b + vec2<i32>(0, 1), dims));
-    let l11 = select(1.0, 0.0, z > shadow_depth_at(b + vec2<i32>(1, 1), dims));
+    let l00 = select(1.0, 0.0, z > shadow_depth_at(b, lo, hi));
+    let l10 = select(1.0, 0.0, z > shadow_depth_at(b + vec2<i32>(1, 0), lo, hi));
+    let l01 = select(1.0, 0.0, z > shadow_depth_at(b + vec2<i32>(0, 1), lo, hi));
+    let l11 = select(1.0, 0.0, z > shadow_depth_at(b + vec2<i32>(1, 1), lo, hi));
     return mix(mix(l00, l10, f.x), mix(l01, l11, f.x), f.y);
 }
 
-fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
-    let lp = frame.light_vp * vec4<f32>(world, 1.0);
+// PCSS in one cascade. Returns -1 when the point is off that cascade.
+fn shadow_cascade(world: vec3<f32>, n: vec3<f32>, m: mat4x4<f32>, tile: i32, margin: f32) -> f32 {
+    let lp = m * vec4<f32>(world, 1.0);
     let ndc = lp.xyz / lp.w;
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
-        return 1.0;
+    if (any(uv < vec2<f32>(margin)) || any(uv > vec2<f32>(1.0 - margin)) || ndc.z < 0.0 || ndc.z > 1.0) {
+        return -1.0;
     }
-    let dims_i = vec2<i32>(textureDimensions(shadow_tex));
-    let dims = vec2<f32>(dims_i);
-    let texel = uv * dims;
+    let atlas = vec2<i32>(textureDimensions(shadow_tex));
+    let size = atlas.y;
+    let dims = vec2<f32>(f32(size));
+    let lo = vec2<i32>(tile * size, 0);
+    let hi = lo + vec2<i32>(size - 1);
+    let texel = uv * dims + vec2<f32>(f32(lo.x), 0.0);
     // Flat ground can shadow a few centimetres of rut. A wall keeps a larger bias.
     let slope = clamp(1.0 - n.y, 0.0, 1.0);
-    // A low sun spreads one shadow texel over a long run of ground; without
-    // more bias the field prints the shadow map's grid.
-    let low_sun = 1.0 - smoothstep(0.3, 0.7, normalize(frame.sun_dir.xyz).y);
-    let bias = 0.00015 + slope * 0.0014 + low_sun * 0.0009;
-    let z = ndc.z - bias;
     // Texel size and depth range in metres, read back from the ortho matrix.
-    let m = frame.light_vp;
     let texel_m = 2.0 / (length(vec3<f32>(m[0].x, m[1].x, m[2].x)) * dims.x);
     let depth_m = 1.0 / max(length(vec3<f32>(m[0].z, m[1].z, m[2].z)), 1e-6);
+    // Bias in metres, from the texel footprint: a low sun spreads one texel
+    // over a long run of ground and would print the map's grid.
+    let low_sun = 1.0 - smoothstep(0.3, 0.7, normalize(frame.sun_dir.xyz).y);
+    let bias_m = texel_m * (1.5 + slope * 6.0 + low_sun * 4.0) + 0.004;
+    let z = ndc.z - bias_m / depth_m;
     // The sun disc and the bright sky round it blur a shadow by ~2 cm per
     // metre of gap. Search as wide as the tallest gap the car can make.
     let light_size = 0.02;
-    let search = clamp(1.6 * light_size / max(texel_m, 1e-5), 2.0, 12.0);
+    let search = clamp(1.6 * light_size / max(texel_m, 1e-5), 2.0, 16.0);
     var blk = vec2<f32>(0.0);
     for (var k: i32 = 0; k < 8; k = k + 1) {
-        let s = shadow_depth_at(vec2<i32>(floor(texel + PCSS_D3D[k] * search)), dims_i);
+        let s = shadow_depth_at(vec2<i32>(floor(texel + PCSS_D3D[k] * search)), lo, hi);
         blk += select(vec2<f32>(0.0), vec2<f32>(s, 1.0), z > s);
     }
     if (blk.y == 0.0) {
@@ -360,11 +366,46 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let rot2 = mat2x2<f32>(0.7071, -0.7071, 0.7071, 0.7071) * rot;
     var lit = 0.0;
     for (var k: i32 = 0; k < 8; k = k + 1) {
-        lit += shadow_cmp_2x2(texel + rot * PCSS_SPIRAL[k] * blur, z, dims_i);
-        lit += shadow_cmp_2x2(texel + rot2 * PCSS_SPIRAL[k] * blur * 0.8, z, dims_i);
+        lit += shadow_cmp_2x2(texel + rot * PCSS_SPIRAL[k] * blur, z, lo, hi);
+        lit += shadow_cmp_2x2(texel + rot2 * PCSS_SPIRAL[k] * blur * 0.8, z, lo, hi);
+    }
+    return lit / 16.0;
+}
+
+fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
+    // Near cascade first, faded into the far one over its outer rim.
+    var lit = shadow_cascade(world, n, frame.light_vp, 0, 0.0);
+    let near = shadow_cascade(world, n, frame.light_vp_near, 1, 0.02);
+    if (near >= 0.0) {
+        let lp = frame.light_vp_near * vec4<f32>(world, 1.0);
+        let e = max(abs(lp.x), abs(lp.y)) / lp.w;
+        let w = 1.0 - smoothstep(0.8, 0.96, e);
+        lit = select(near, mix(lit, near, w), lit >= 0.0);
+    }
+    if (lit < 0.0) {
+        return 1.0;
     }
     // 0.92 so the airborne buggy and the clods throw a shadow you can see.
-    return 1.0 - (1.0 - lit / 16.0) * 0.92;
+    return 1.0 - (1.0 - lit) * 0.92;
+}
+
+// Does a ray from `o` along `d` hit the Niva's body box within `t_max`?
+// The water under the car mirrors its dark underside and sills, not the
+// sky, wherever the screen-space march misses them.
+fn niva_box_hit(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> bool {
+    let yaw = frame.air[2].w;
+    let fwd = vec2<f32>(sin(yaw), cos(yaw));
+    let rel = o - frame.air[1].xyz;
+    // Local frame: x across the car, y up, z along it.
+    let lo = vec3<f32>(rel.x * fwd.y - rel.z * fwd.x, rel.y, dot(rel.xz, fwd));
+    let ld = vec3<f32>(d.x * fwd.y - d.z * fwd.x, d.y, dot(d.xz, fwd));
+    let half_ext = vec3<f32>(0.85, 0.8, 1.9);
+    let inv = 1.0 / select(ld, vec3<f32>(1e-6), abs(ld) < vec3<f32>(1e-6));
+    let t0 = (-half_ext - lo) * inv;
+    let t1 = (half_ext - lo) * inv;
+    let tn = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let tf = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return tn <= tf && tf > 0.0 && tn < t_max;
 }
 
 // Sky occlusion on the ground under the vehicle: the body hides most of the
@@ -1901,6 +1942,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             break;
         }
     }
+    if (frame.lamps[1].w > 0.5 && niva_box_hit(in.world, refl_dir, 12.0)) {
+        // The underside and the sills in the reflection: dark, lit only by
+        // the sky bounced off the ground.
+        refl = sh_irradiance(vec3<f32>(0.0, -1.0, 0.0)) * frame.env.y * 0.12;
+    }
     let halfv = normalize(sun + view);
     let ndh = clamp(dot(nrm, halfv), 0.0, 1.0);
     let ndl_w = clamp(dot(nrm, sun), 0.0, 1.0);
@@ -1963,10 +2009,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Feather the shoreline so the edge is a wet margin, not a cut line.
     // The thinnest film is a clear sheet over the sand: it keeps its
     // reflection and glint and lets the grain through.
-    // The waterline wanders with the ground: a noise-shifted depth, so the
-    // shore is ragged, not the solver's round contour.
-    let ragged = depth - (noise(xz * 2.3) * 0.6 + noise(xz * 8.5) * 0.4 - 0.35) * 0.012;
-    alpha = max(alpha * smoothstep(0.002, 0.01, ragged), foam * 0.85 * smoothstep(0.002, 0.004, ragged));
+    // The waterline is the published film: no shape is painted on it here.
+    alpha = max(alpha * smoothstep(0.002, 0.01, depth), foam * 0.85 * smoothstep(0.002, 0.004, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
     // The car and anything else standing in the frame mirror in the sheet.
