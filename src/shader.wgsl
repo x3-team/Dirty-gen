@@ -613,7 +613,30 @@ fn fs_sky(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let d = normalize(dir);
         let sun = normalize(frame.sun_dir.xyz);
         let disc = pow(max(dot(d, sun), 0.0), 900.0) * 4.0;
-        return present(env_radiance(d, 0.0) + frame.sun_color.rgb * disc);
+        var sky = env_radiance(d, 0.0) + frame.sun_color.rgb * disc;
+        if (sand_field()) {
+            // Far dunes on the horizon, a few hundred metres out, softened by
+            // the haze. Backdrop only: nothing in the scene touches them.
+            let phi = atan2(d.z, d.x);
+            let a = phi * 5.0;
+            let prof = 0.004 + 0.04 * bw_fbm(vec2<f32>(a, 1.3)) + 0.012 * bw_fbm(vec2<f32>(a * 3.1, 7.7));
+            let ea = 0.004;
+            let slope = (0.04 * bw_fbm(vec2<f32>(a + ea * 5.0, 1.3)) - 0.04 * bw_fbm(vec2<f32>(a, 1.3))) / ea;
+            let horizon_y = d.y;
+            if (horizon_y < prof) {
+                // Lit by the sun on the faces that turn to it.
+                let side = vec3<f32>(-sin(phi), 0.0, cos(phi));
+                let fn_ = normalize(vec3<f32>(0.0, 1.0, 0.0) * 0.6 - d * 0.6 + side * slope * 2.0);
+                let sand = vec3<f32>(0.6, 0.44, 0.28);
+                let lit = sand * (frame.sun_color.rgb * clamp(dot(fn_, sun), 0.0, 1.0) * 1.25
+                    + sh_irradiance(fn_) * frame.env.y);
+                // Haze: the dunes sit far out, so most of their colour is air.
+                let air = env_radiance(vec3<f32>(d.x, 0.02, d.z), 0.3);
+                let depth_k = smoothstep(prof, prof - 0.02, horizon_y);
+                sky = mix(air, lit, mix(0.5, 0.72, depth_k));
+            }
+        }
+        return present(sky);
     }
     return present(sky_color(dir));
 }
@@ -1340,14 +1363,17 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             let a = f32(k) * 0.7854 + 0.39;
             let o = vec2<f32>(cos(a), sin(a));
             for (var r: i32 = 1; r <= 4; r = r + 1) {
-                let dist = f32(r) * 0.25;
+                let dist = f32(r) * 0.1;
                 let f = bc_film(xz + o * dist);
                 if (f.r + f.g > 0.002) {
                     shore_d = min(shore_d, dist);
                 }
             }
         }
-        let band = 1.0 - smoothstep(0.5, 1.0, shore_d);
+        // 20-40 cm of dark wet sand round the whole shore, from the film.
+        let band = 1.0 - smoothstep(0.2, 0.42, shore_d);
+        // A glossy rim right at the water, a hand's width.
+        let rim = 1.0 - smoothstep(0.05, 0.16, shore_d);
         let margin = max(max(smoothstep(0.0005, 0.004, film_t), smoothstep(0.25, 0.9, wet)), band);
         let soak = clamp(margin, 0.0, 1.0) * inside_t;
         // Under the film the water pass draws the depth; do not stack the two.
@@ -1359,12 +1385,12 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         // The gloss belongs to the band on dry land; under even a thin film
         // the water layer carries the reflection and the bed stays matte.
         let on_land = 1.0 - smoothstep(0.0003, 0.002, film_t);
-        rough_out = mix(rough_out, 0.45, smoothstep(0.35, 0.9, soak) * on_land);
+        rough_out = mix(rough_out, mix(0.45, 0.16, rim), smoothstep(0.35, 0.9, soak) * on_land);
         n = normalize(mix(n, n_geo, soak * 0.35));
         // The margin owns the gloss on the sand: the old pore-film sheen read
         // as water a metre past the shore.
         if (sand_field()) {
-            rough_out = max(rough_out, mix(0.55, mix(0.55, 0.45, smoothstep(0.35, 0.9, soak)), on_land));
+            rough_out = max(rough_out, mix(0.55, mix(0.55, mix(0.45, 0.16, rim), smoothstep(0.35, 0.9, soak)), on_land));
         }
         let under = smoothstep(0.002, 0.012, film_t);
         if (under > 0.0) {
@@ -1642,7 +1668,7 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
     // Graded toward the FluidNinja beach: warmer, more saturated, a little
     // more contrast, so the field is not a pale wash.
     let lum = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
-    albedo = max(mix(vec3<f32>(lum), albedo, 1.05) * vec3<f32>(1.02, 0.97, 0.9), vec3<f32>(0.0));
+    albedo = max(mix(vec3<f32>(lum), albedo, 1.1) * vec3<f32>(1.04, 0.96, 0.86), vec3<f32>(0.0));
     albedo *= 1.12;
     // Wind ripples and grain: centimetre relief in the normal, faded out
     // where a pixel covers more than the ripple so it does not shimmer.
@@ -1672,7 +1698,7 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
             let cx = bw_vnoise2d(q + vec2<f32>(e, 0.0)) - c0;
             let cz = bw_vnoise2d(q + vec2<f32>(0.0, e)) - c0;
             n = normalize(n - vec3<f32>(cx, 0.0, cz) * select(0.9, 0.6, o == 1) * fade);
-            albedo *= 1.0 + (c0 - 0.5) * select(0.22, 0.14, o == 1) * fade;
+            albedo *= 1.0 + (c0 - 0.5) * select(0.34, 0.22, o == 1) * fade;
         }
     }
     // Hummocks: half-metre swells in the normal only.
@@ -1741,7 +1767,7 @@ fn tire_wake(xz: vec2<f32>, surf: f32) -> vec2<f32> {
         let wake = exp(-arm * arm / (0.004 + back * 0.02)) * exp(-back / 2.4) * step(a, 0.0);
         let trail = exp(-out_b * out_b / 0.01) * exp(-back / 1.6) * step(a, 0.0);
         foam = max(foam, max(collar, max(wake, trail * 0.7)));
-        bulge = max(bulge, bow * 0.055 + collar * 0.018);
+        bulge = max(bulge, bow * 0.055 + collar * 0.03);
     }
     return vec2<f32>(foam, bulge);
 }
@@ -1927,7 +1953,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     var silt = mix(vec3<f32>(0.17, 0.10, 0.042), bed * vec3<f32>(0.7, 0.52, 0.32), 0.35) * mix(1.0, 0.45, deep_t);
     // What clear water scatters back is blue-green and dim; a little silt
     // warms it. Slurry is the brown suspension.
-    let clear_sc = vec3<f32>(0.085, 0.062, 0.034) * mix(1.0, 0.7, deep_t);
+    let clear_sc = vec3<f32>(0.1, 0.07, 0.036) * mix(1.0, 0.85, deep_t);
     // Shallow water shows the sand's own warmth; deep water the teal.
     silt = mix(mix(bed * vec3<f32>(0.5, 0.42, 0.3), clear_sc, smoothstep(0.015, 0.1, depth)), silt, 0.2);
     silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), max(slurry_frac, stir * 0.7));
@@ -2005,8 +2031,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // No white ring round the pool: the shore is the dark wet band on the
     // sand, foam only where a crest or a tire breaks the water.
     // A narrow broken line of dirty foam right at the waterline, in clumps.
-    let clumps = smoothstep(0.5, 0.72, noise(xz * 6.0 + vec2<f32>(t_now * 0.1, 0.0)) * 0.6 + noise(xz * 19.0) * 0.4);
-    let shore = shore_band * (1.0 - smoothstep(0.004, 0.009, depth)) * clumps;
+    let clumps = smoothstep(0.38, 0.6, noise(xz * 6.0 + vec2<f32>(t_now * 0.1, 0.0)) * 0.6 + noise(xz * 19.0) * 0.4);
+    let shore = shore_band * (1.0 - smoothstep(0.008, 0.016, depth)) * clumps;
     let foam_amt = clamp(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), shore), 0.0, 1.0);
     // Foam is a net of bubble walls, not a blotch: cell borders of a
     // drifting Voronoi, gated by the lace.
@@ -2034,7 +2060,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // A sharp waterline, not a fade: the film ends in a meniscus a few
     // millimetres wide that catches the sky as a thin bright line.
     let meniscus = shore_band * smoothstep(0.0015, 0.003, depth) * (1.0 - smoothstep(0.003, 0.006, depth));
-    lit = lit * (1.0 + meniscus * 0.35);
+    lit = lit * (1.0 + meniscus * 0.6);
     alpha = max(max(alpha, meniscus * 0.6) * smoothstep(0.0012, 0.003, depth), foam * 0.85 * smoothstep(0.0012, 0.003, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
@@ -2715,6 +2741,22 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let soaked = (1.0 - smoothstep(wl + 0.02, wl + 0.09, in.world.y)) * smoothstep(0.003, 0.01, wd);
         albedo = mix(albedo, albedo * vec3<f32>(0.42, 0.38, 0.33), soaked);
         rough = mix(rough, 0.18, soaked);
+        // A rim of silt dried on above the waterline, in patches.
+        let splash = (1.0 - smoothstep(wl + 0.08, wl + 0.2, in.world.y)) * (1.0 - soaked)
+            * smoothstep(0.4, 0.65, noise(in.world.xz * 9.0 + vec2<f32>(in.world.y * 14.0, 0.0)))
+            * smoothstep(0.003, 0.01, wd);
+        albedo = mix(albedo, vec3<f32>(0.2, 0.15, 0.1), splash * 0.85);
+        rough = mix(rough, 0.8, splash);
+    }
+    if (sand_field() && length(in.world.xz - frame.air[1].xz) < 3.2) {
+        // Fill on the Niva: sunlit sand bounces warm light up into the
+        // flanks and sills, and the open sky fills what the sun misses.
+        let nn = normalize(nrm);
+        let sun_d = normalize(frame.sun_dir.xyz);
+        let ground = vec3<f32>(0.5, 0.4, 0.28) * frame.sun_color.rgb * max(sun_d.y, 0.0) * 1.25;
+        let bounce = ground * clamp(0.5 - 0.5 * nn.y, 0.0, 1.0) * 0.55;
+        let sky_fill = sh_irradiance(nn) * frame.env.y * 0.9;
+        emit += albedo * (1.0 - metal) * (bounce + sky_fill);
     }
     var lit = shade_pbr(in.world, nrm, albedo, rough, metal, 1.0, emit);
     // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
