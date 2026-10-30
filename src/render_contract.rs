@@ -175,13 +175,60 @@ pub fn spray_density_kg_m3(kind: u8) -> f32 {
     }
 }
 
-/// Foam fraction, 0 to 1. Zero when the film is thinner than [`FOAM_MIN_FILM_M`].
+/// Foam fraction, 0 to 1, from the Froude number of the film.
+/// Zero when the film is thinner than [`FOAM_MIN_FILM_M`], the speed is 0,
+/// or either input is not finite.
 pub fn foam_fraction(speed_m_s: f32, thickness_m: f32) -> f32 {
-    if thickness_m < FOAM_MIN_FILM_M || speed_m_s <= 0.0 {
+    if !speed_m_s.is_finite()
+        || !thickness_m.is_finite()
+        || thickness_m < FOAM_MIN_FILM_M
+        || speed_m_s <= 0.0
+    {
         return 0.0;
     }
     let froude = speed_m_s / (GRAVITY * thickness_m).sqrt();
-    smooth01(FOAM_FROUDE_0, FOAM_FROUDE_1, froude)
+    finite0(smooth01(FOAM_FROUDE_0, FOAM_FROUDE_1, froude))
+}
+
+/// Foam on a lip that stands above the neighbouring film. Not the placed berm.
+fn crest_foam(excess_m: f32, thickness_m: f32) -> f32 {
+    if !excess_m.is_finite() || thickness_m < FOAM_MIN_FILM_M {
+        return 0.0;
+    }
+    smooth01(0.004, 0.018, excess_m)
+}
+
+/// Foam in the wet footprint of a tire that shoved the sheet this step.
+fn tire_foam(x: f32, z: f32, thickness_m: f32, pushes: &[crate::fluid_core::TirePush]) -> f32 {
+    if thickness_m < FOAM_MIN_FILM_M {
+        return 0.0;
+    }
+    let mut best = 0.0f32;
+    for push in pushes {
+        let reach = (push.radius * 1.45).max(0.2);
+        let d = (x - push.x).hypot(z - push.z);
+        if d >= reach {
+            continue;
+        }
+        best = best.max(smooth01(0.05, 0.55, 1.0 - d / reach));
+    }
+    best
+}
+
+fn finite0(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
+fn scrub(values: &mut [f32]) {
+    for v in values {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+    }
 }
 
 fn smooth01(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -250,10 +297,10 @@ pub fn publish(
             };
             // Crust thickness and crack opening stay 0. [`SOIL_KIND_DRY_CRUST`]
             // is not written into this map.
-            out.ground_rut[idx * 4] = bed + placed;
-            out.ground_rut[idx * 4 + 1] = rut;
-            out.ground_rut[idx * 4 + 2] = bed;
-            out.ground_rut[idx * 4 + 3] = placed;
+            out.ground_rut[idx * 4] = finite0(bed + placed);
+            out.ground_rut[idx * 4 + 1] = finite0(rut);
+            out.ground_rut[idx * 4 + 2] = finite0(bed);
+            out.ground_rut[idx * 4 + 3] = finite0(placed);
 
             let (moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
                 (
@@ -276,9 +323,15 @@ pub fn publish(
             } else {
                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             };
-            out.moisture[idx] = moisture;
-            out.film[idx * 2] = water_m;
-            out.film[idx * 2 + 1] = slurry_m;
+            let dry = !water_m.is_finite() || !slurry_m.is_finite() || water_m + slurry_m < 1.0e-5;
+            let (u, v) = if dry {
+                (0.0, 0.0)
+            } else {
+                (finite0(u), finite0(v))
+            };
+            out.moisture[idx] = finite0(moisture);
+            out.film[idx * 2] = finite0(water_m);
+            out.film[idx * 2 + 1] = finite0(slurry_m);
             out.flow[idx * 2] = u;
             out.flow[idx * 2 + 1] = v;
             if dust.is_none() {
@@ -345,13 +398,25 @@ pub fn publish(
                 count += 1.0;
             }
             let mean = if count > 0.0 { sum / count } else { h };
-            let excess = (h - mean).max(0.0);
-            let placed = out.ground_rut[idx * 4 + 3].max(0.0);
+            let excess = finite0((h - mean).max(0.0));
+            let placed = finite0(out.ground_rut[idx * 4 + 3].max(0.0));
             let u = out.flow[idx * 2];
             let v = out.flow[idx * 2 + 1];
-            let speed = (u * u + v * v).sqrt();
-            out.foam_crest[idx * 2] = foam_fraction(speed, h);
-            out.foam_crest[idx * 2 + 1] = placed + excess;
+            let speed = if u.is_finite() && v.is_finite() {
+                (u * u + v * v).sqrt()
+            } else {
+                0.0
+            };
+            let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
+            let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
+            let foam = match fluid {
+                Some(fluid) => foam_fraction(speed, h)
+                    .max(crest_foam(excess, h))
+                    .max(tire_foam(x, z, h, fluid.tire_pushes())),
+                None => foam_fraction(speed, h),
+            };
+            out.foam_crest[idx * 2] = finite0(foam);
+            out.foam_crest[idx * 2 + 1] = finite0(placed + excess);
         }
     }
 
@@ -401,19 +466,58 @@ pub fn publish(
         }
         let density = spray_density_kg_m3(piece.kind);
         let mass = if piece.volume > 0.0 {
-            piece.volume * density
+            finite0(piece.volume * density)
         } else {
             0.0
         };
-        let age = (piece.max_life - piece.life).max(0.0);
+        let age = finite0((piece.max_life - piece.life).max(0.0));
         out.spray[spray_count as usize] = SprayGpu {
-            pos_mass: [piece.pos.x, piece.pos.y, piece.pos.z, mass],
-            vel_age: [piece.vel.x, piece.vel.y, piece.vel.z, age],
+            pos_mass: [
+                finite0(piece.pos.x),
+                finite0(piece.pos.y),
+                finite0(piece.pos.z),
+                mass,
+            ],
+            vel_age: [
+                finite0(piece.vel.x),
+                finite0(piece.vel.y),
+                finite0(piece.vel.z),
+                age,
+            ],
             material: piece.kind as u32,
             alive: 1,
             _pad: [0, 0],
         };
         spray_count += 1;
+    }
+    if let Some(fluid) = fluid {
+        for drop in fluid.spray_drops() {
+            if spray_count >= SPRAY_CAPACITY {
+                break;
+            }
+            if drop.kind == KIND_DUST_MARK || !drop.volume.is_finite() || drop.volume <= 0.0 {
+                continue;
+            }
+            let mass = finite0(drop.volume * spray_density_kg_m3(drop.kind));
+            out.spray[spray_count as usize] = SprayGpu {
+                pos_mass: [
+                    finite0(drop.pos[0]),
+                    finite0(drop.pos[1]),
+                    finite0(drop.pos[2]),
+                    mass,
+                ],
+                vel_age: [
+                    finite0(drop.vel[0]),
+                    finite0(drop.vel[1]),
+                    finite0(drop.vel[2]),
+                    finite0(drop.age),
+                ],
+                material: drop.kind as u32,
+                alive: 1,
+                _pad: [0, 0],
+            };
+            spray_count += 1;
+        }
     }
 
     let flow_source = if fluid.is_some() {
@@ -433,6 +537,20 @@ pub fn publish(
     }
     if dust_source != DUST_NONE {
         valid |= VALID_DUST_SETTLED | VALID_DUST_FOG;
+    }
+
+    scrub(&mut out.ground_rut);
+    scrub(&mut out.moisture);
+    scrub(&mut out.film);
+    scrub(&mut out.flow);
+    scrub(&mut out.dust_settled);
+    scrub(&mut out.crust);
+    scrub(&mut out.wet_edge);
+    scrub(&mut out.foam_crest);
+    scrub(&mut out.dust_fog);
+    for slot in &mut out.spray {
+        scrub(&mut slot.pos_mass);
+        scrub(&mut slot.vel_age);
     }
 
     out.header = ContractHeader {
@@ -957,5 +1075,78 @@ mod tests {
         assert!((frame.header.origin_x - x0).abs() < 1.0e-4);
         assert!((frame.header.origin_z - z0).abs() < 1.0e-4);
         assert!((frame.header.extent_m - extent).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn through_drive_contract_is_finite_and_carries_foam_and_water() {
+        let mut drive = crate::world::ThroughDrive::new();
+        let dt = 1.0 / 30.0;
+        let mut frame = ContractFrame::new();
+        let mut foam_peak = 0.0f32;
+        let mut water_drops = 0u32;
+        // The ford is the puddle ending at z = -11.2. Keep going until the
+        // Niva is on the bank and the peeled drops are still in the air.
+        while drive.world.vehicle.pos.z < -4.0 {
+            drive.step(dt);
+            publish(
+                &mut frame,
+                &drive.world.soil,
+                &drive.world.particles.items,
+                [drive.world.vehicle.pos.x, drive.world.vehicle.pos.z],
+                drive.world.vehicle.pos.z,
+                0,
+                Some(&drive.fluid),
+                Some(drive.dust()),
+            );
+            assert!(
+                frame_is_finite(&frame),
+                "non-finite contract sample at z {:.2}",
+                drive.world.vehicle.pos.z
+            );
+            for foam in frame.foam_crest.iter().step_by(2) {
+                foam_peak = foam_peak.max(*foam);
+            }
+            if drive.world.vehicle.pos.z > -11.2 {
+                let drops = water_drop_count(&frame);
+                water_drops = water_drops.max(drops);
+            }
+        }
+        println!("foam peak {foam_peak} water-drop count {water_drops}");
+        assert!(foam_peak > 0.0, "foam peak {foam_peak}");
+        assert!(water_drops > 0, "water-drop count {water_drops}");
+    }
+
+    fn water_drop_count(frame: &ContractFrame) -> u32 {
+        frame.spray[..frame.header.spray_count as usize]
+            .iter()
+            .filter(|slot| {
+                slot.alive == 1
+                    && slot.material == 0
+                    && slot.pos_mass[3] > 0.0
+                    && slot.pos_mass.iter().all(|c| c.is_finite())
+                    && slot.vel_age.iter().all(|c| c.is_finite())
+            })
+            .count() as u32
+    }
+
+    fn frame_is_finite(frame: &ContractFrame) -> bool {
+        let maps = [
+            frame.ground_rut.as_slice(),
+            frame.moisture.as_slice(),
+            frame.film.as_slice(),
+            frame.flow.as_slice(),
+            frame.dust_settled.as_slice(),
+            frame.crust.as_slice(),
+            frame.wet_edge.as_slice(),
+            frame.foam_crest.as_slice(),
+            frame.dust_fog.as_slice(),
+        ];
+        if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
+            return false;
+        }
+        frame.spray.iter().all(|slot| {
+            slot.pos_mass.iter().all(|c| c.is_finite())
+                && slot.vel_age.iter().all(|c| c.is_finite())
+        })
     }
 }

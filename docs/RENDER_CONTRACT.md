@@ -2,7 +2,7 @@
 
 Version **1**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, fog, headlights, and wet sheen are not maps in this contract.
 
-Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, a new resolution, or a new foam or wet-edge formula is a version bump. Filling a channel that was already defined (crust thickness, once that state exists on the sheet) is not.
+Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
 The demo this contract serves is the Lada Niva. The window follows that vehicle.
 
@@ -75,6 +75,8 @@ Horizontal velocity of the film, metres per second, world +X and +Z. Thickness-w
 
 Writer: the fluid sheet. `header.flow_source` is 1 when that sheet was attached and 0 when it was not. Without the sheet the texels are 0 and `VALID_FLOW` is clear. Those zeros are not a measured still surface.
 
+A dry cell, film under 0.01 mm, is 0 even if the stored velocity is not. A sample that is not finite is written as 0. The same rule covers every map and the spray buffer: no NaN, no Inf.
+
 Valid: `VALID_FLOW` only when `flow_source` is 1, after `FluidCore::step`.
 
 ### Settled dust — binding 5
@@ -126,13 +128,17 @@ Valid: `VALID_WET_EDGE` on every publish.
 
 Foam is a fraction from 0 to 1. Crest is a height in metres.
 
-Foam is 0 when the film is thinner than 4 mm or the speed is 0. Otherwise it is a smoothstep of the Froude number `speed / sqrt(9.81 * thickness)` from 0.85 to 1.45.
+Foam is 0 when the film is thinner than 4 mm. Otherwise it is the maximum of three readings of the same sheet, each from 0 to 1:
 
-Crest is the placed berm, metres, plus how far the film stands above the mean of its four in-window neighbours. A flat pond adds nothing. A bow or a berm does.
+- Froude: a smoothstep of `speed / sqrt(9.81 * thickness)` from 0.85 to 1.45. Speed 0 stays 0.
+- Wave crest: a smoothstep of how far the film stands above the mean of its four in-window neighbours, from 4 mm to 18 mm.
+- Tires: the wet footprint of a tire that shoved the sheet on this step, full near the contact and 0 at 1.45 tire radii.
 
-Writer: the publisher, from flow, film, and placed height. It does not feed back into the solver. This field did not exist on the sheet before version 1.
+Crest is the placed berm, metres, plus that same film excess. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. A non-finite foam or crest sample is written as 0.
 
-Valid: `VALID_FOAM` on every publish. Without a fluid sheet, foam is 0 because the speed is 0. Crest from placed soil is still real.
+Writer: the publisher, from flow, film, placed height, and the tire shoves of the step that just ran. It does not feed back into the solver. This field did not exist on the sheet before version 1.
+
+Valid: `VALID_FOAM` on every publish. Without a fluid sheet, foam is 0. Crest from placed soil is still real.
 
 ### Spray — binding 10
 
@@ -163,9 +169,9 @@ Mass is `volume_m3 * density`. A piece with no ledger volume has mass 0.
 
 `header.spray_count` is how many of the 4096 slots are live, in particle-list order. Slots past the count are zero. Pieces beyond 4096 are not copied this frame.
 
-Writer: the particle list, after the particle step.
+Writer: the particle list, after the particle step, then the water drops the sheet has peeled and is still carrying in the air. Picture marks are not copied into that list. The peeled drops are not picture cards. A water drop is material 0, mass `volume * 1000` kg, age in seconds since it left the sheet. They are still in this buffer while the Niva leaves the ford.
 
-Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame.
+Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A non-finite position, velocity, mass, or age is written as 0.
 
 ## Header flags
 
@@ -214,3 +220,5 @@ The picture cache covers the fixed 192 × 192 soil square, 40 m on a side, centr
 ### 1
 
 Initial freeze. Ground and rut, moisture, water and slurry thickness, flow, settled dust, airborne dust and fog, crust and crack opening, wet/dry edge, foam and crest, and the spray buffer. Foam and crest are new. Crust and crack channels are defined and written as 0 until the sheet stores those metres.
+
+Dry cells and any other non-finite sample are written as 0. Layout unchanged. Foam on a published frame is the Froude term, the wave-crest lip, and the wet tire footprint, and it stays 0 where the film is under 4 mm. Spray includes the water drops the sheet peeled, still in the air as the Niva leaves the ford.

@@ -153,6 +153,22 @@ pub struct SprayEvent {
     pub kind: u8,
 }
 
+/// A water drop the sheet has already peeled off. It is not a picture particle.
+/// The render contract reads these while they are still in the air.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveSpray {
+    pub pos: [f32; 3],
+    pub vel: [f32; 3],
+    /// Cubic metres peeled from the water sheet.
+    pub volume: f32,
+    /// 0 is a water drop.
+    pub kind: u8,
+    /// Seconds since the sheet let it go.
+    pub age: f32,
+}
+
+const SPRAY_LIFE_S: f32 = 1.1;
+
 /// A request to move soil into the air column. The returned cubic metres are
 /// what actually entered. The caller takes that out of the ground.
 #[derive(Clone, Copy, Debug)]
@@ -378,7 +394,7 @@ pub fn advect_dust_density(
     let bed = vec![0.0f32; n];
     let nu = vec![0.4f32; n];
     let gate = vec![1u8; n];
-        for layer in 0..LAYERS {
+    for layer in 0..LAYERS {
         let mut before = 0.0f64;
         for iz in 0..RES {
             for ix in 0..RES {
@@ -412,7 +428,11 @@ pub fn advect_dust_density(
             0.0,
         );
         let after = h.iter().map(|c| *c as f64).sum::<f64>();
-        let scale = if after > 0.0 { (before / after) as f32 } else { 1.0 };
+        let scale = if after > 0.0 {
+            (before / after) as f32
+        } else {
+            1.0
+        };
         for iz in 0..RES {
             for ix in 0..RES {
                 let src = ix + layer * RES + iz * RES * LAYERS;
@@ -589,8 +609,8 @@ fn substep(
                 SheetDrive::Wind { x, z, .. } => x.hypot(z).max(1.6),
                 SheetDrive::Gravity { .. } => 1.6,
             };
-            u[idx] = (u[idx] * decay).clamp(-lim, lim);
-            v[idx] = (v[idx] * decay).clamp(-lim, lim);
+            u[idx] = finite_speed(u[idx] * decay, lim);
+            v[idx] = finite_speed(v[idx] * decay, lim);
         }
     }
     transport(h, u, v, gate, res, cell, dt, i0, i1, j0, j1, true, sc);
@@ -607,10 +627,19 @@ fn substep(
     }
 }
 
-fn confine_one(u: &mut [f32], v: &mut [f32], res: usize, i: usize, j: usize, cell: f32, dt: f32, eps: f32) {
+fn confine_one(
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    i: usize,
+    j: usize,
+    cell: f32,
+    dt: f32,
+    eps: f32,
+) {
     let idx = j * res + i;
     let w = vorticity_at(u, v, res, i, j, cell);
-    if w.abs() < 1.0e-4 {
+    if !w.is_finite() || w.abs() < 1.0e-4 {
         return;
     }
     let wxp = vorticity_at(u, v, res, (i + 1).min(res - 1), j, cell).abs();
@@ -619,8 +648,30 @@ fn confine_one(u: &mut [f32], v: &mut [f32], res: usize, i: usize, j: usize, cel
     let wzm = vorticity_at(u, v, res, i, j.saturating_sub(1), cell).abs();
     let nx = (wxp - wxm) / (2.0 * cell);
     let nz = (wzp - wzm) / (2.0 * cell);
-    u[idx] += eps * dt * (-nz * w);
-    v[idx] += eps * dt * (nx * w);
+    // A 2 cm cell under a tire makes |w| enormous. Skipping that kick keeps
+    // the sheet velocity finite. A small confinement still applies.
+    let du = eps * dt * (-nz * w);
+    let dv = eps * dt * (nx * w);
+    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+        u[idx] += du;
+        v[idx] += dv;
+    }
+}
+
+fn finite_speed(v: f32, lim: f32) -> f32 {
+    if !v.is_finite() {
+        0.0
+    } else {
+        v.clamp(-lim, lim)
+    }
+}
+
+fn finite0(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
 }
 
 fn vorticity_at(u: &[f32], v: &[f32], res: usize, i: usize, j: usize, cell: f32) -> f32 {
@@ -912,6 +963,10 @@ pub struct FluidCore {
     parked: HashMap<(i32, i32), Parked>,
     parked_dust: HashMap<(i32, i32), f32>,
     spray_m3: f32,
+    /// Drops peeled this pass that are still in the air.
+    drops: Vec<LiveSpray>,
+    /// Tire shoves from the step that just ran. Foam around the tires reads these.
+    last_pushes: Vec<TirePush>,
     pub frame: u32,
     pushes: Vec<TirePush>,
     wind: [f32; 2],
@@ -957,6 +1012,8 @@ impl FluidCore {
             parked: HashMap::new(),
             parked_dust: HashMap::new(),
             spray_m3: 0.0,
+            drops: Vec::new(),
+            last_pushes: Vec::new(),
             frame: 0,
             pushes: Vec::new(),
             wind: [1.1, 0.35],
@@ -1036,7 +1093,11 @@ impl FluidCore {
         };
         let idx = j * WINDOW_RES + i;
         let area = COARSE_CELL_M * COARSE_CELL_M;
-        let col = if water { &mut self.water } else { &mut self.slurry };
+        let col = if water {
+            &mut self.water
+        } else {
+            &mut self.slurry
+        };
         let have = col[idx] * area;
         let take = volume.min(have).max(0.0);
         if take <= 0.0 {
@@ -1168,6 +1229,7 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
+        self.last_pushes = pushes.clone();
         self.refine(&pushes);
         let fine_rect = self.fine_rect();
         self.apply_pushes(&pushes, true);
@@ -1184,7 +1246,54 @@ impl FluidCore {
         for s in &spray {
             self.spray_m3 += s.volume;
         }
+        self.keep_spray(&spray, dt);
         spray
+    }
+
+    /// Tire shoves applied on the step that just finished.
+    pub fn tire_pushes(&self) -> &[TirePush] {
+        &self.last_pushes
+    }
+
+    /// Water and other peeled drops still in the air. The picture mesh does
+    /// not draw these. The render contract does.
+    pub fn spray_drops(&self) -> &[LiveSpray] {
+        &self.drops
+    }
+
+    fn keep_spray(&mut self, fresh: &[SprayEvent], dt: f32) {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        for drop in &mut self.drops {
+            drop.vel[1] -= GRAVITY * dt;
+            drop.pos[0] += drop.vel[0] * dt;
+            drop.pos[1] += drop.vel[1] * dt;
+            drop.pos[2] += drop.vel[2] * dt;
+            drop.age += dt;
+        }
+        for event in fresh {
+            if event.kind != 0 || !event.volume.is_finite() || event.volume <= 0.0 {
+                continue;
+            }
+            self.drops.push(LiveSpray {
+                pos: [event.x, event.y, event.z],
+                vel: [event.vx, event.vy, event.vz],
+                volume: event.volume,
+                kind: event.kind,
+                age: 0.0,
+            });
+        }
+        self.drops.retain(|drop| {
+            drop.age < SPRAY_LIFE_S
+                && drop.pos[1] > 0.02
+                && drop.volume.is_finite()
+                && drop.pos.iter().all(|c| c.is_finite())
+                && drop.vel.iter().all(|c| c.is_finite())
+        });
+        const SPRAY_KEEP: usize = 8192;
+        if self.drops.len() > SPRAY_KEEP {
+            let skip = self.drops.len() - SPRAY_KEEP;
+            self.drops.drain(0..skip);
+        }
     }
 
     pub fn sample(&self, x: f32, z: f32) -> GroundSample {
@@ -1248,11 +1357,16 @@ impl FluidCore {
         let mut dust = vec![0.0f32; n];
         for idx in 0..n {
             height[idx] = self.bed[idx] + self.water[idx] + self.slurry[idx];
-            let hw = self.water[idx];
-            let hs = self.slurry[idx];
-            let h = (hw + hs).max(1.0e-6);
-            vel_u[idx] = (self.uw[idx] * hw + self.us[idx] * hs) / h;
-            vel_v[idx] = (self.vw[idx] * hw + self.vs[idx] * hs) / h;
+            let hw = finite0(self.water[idx]);
+            let hs = finite0(self.slurry[idx]);
+            let h = hw + hs;
+            if h < 1.0e-5 {
+                vel_u[idx] = 0.0;
+                vel_v[idx] = 0.0;
+            } else {
+                vel_u[idx] = finite0((self.uw[idx] * hw + self.us[idx] * hs) / h);
+                vel_v[idx] = finite0((self.vw[idx] * hw + self.vs[idx] * hs) / h);
+            }
             moisture[idx] = self.moisture[idx];
             dust[idx] = self.settled[idx];
         }
@@ -1287,34 +1401,35 @@ impl FluidCore {
     /// One coarse cell after the fine patch has been restricted back.
     ///
     /// `u` and `v` are the thickness-weighted water and slurry velocity.
-    /// A dry cell reports zero. This is the flow the render contract publishes.
-    /// Change the blend only with a render-contract version bump.
+    /// A dry cell reports zero. A non-finite sample reports zero. This is the
+    /// flow the render contract publishes. Change the blend only with a
+    /// render-contract version bump.
     pub fn coarse_cell(&self, i: usize, j: usize) -> Option<CoarseCell> {
         if i >= WINDOW_RES || j >= WINDOW_RES {
             return None;
         }
         let idx = j * WINDOW_RES + i;
-        let water_m = self.water[idx];
-        let slurry_m = self.slurry[idx];
+        let water_m = finite0(self.water[idx]);
+        let slurry_m = finite0(self.slurry[idx]);
         let film = water_m + slurry_m;
         let (u, v) = if film < 1.0e-5 {
             (0.0, 0.0)
         } else {
             (
-                (self.uw[idx] * water_m + self.us[idx] * slurry_m) / film,
-                (self.vw[idx] * water_m + self.vs[idx] * slurry_m) / film,
+                finite0((self.uw[idx] * water_m + self.us[idx] * slurry_m) / film),
+                finite0((self.vw[idx] * water_m + self.vs[idx] * slurry_m) / film),
             )
         };
         Some(CoarseCell {
             x: self.origin[0] + (i as f32 + 0.5) * COARSE_CELL_M,
             z: self.origin[1] + (j as f32 + 0.5) * COARSE_CELL_M,
-            bed_m: self.bed[idx],
+            bed_m: finite0(self.bed[idx]),
             water_m,
             slurry_m,
-            moisture: self.moisture[idx],
+            moisture: finite0(self.moisture[idx]),
             u,
             v,
-            settled_dust_m: self.settled[idx],
+            settled_dust_m: finite0(self.settled[idx]),
         })
     }
 
@@ -1916,10 +2031,7 @@ impl FluidCore {
                     vs: self.vs[idx],
                     dust: self.settled[idx],
                 };
-                if slot.water > 1.0e-8
-                    || slot.slurry > 1.0e-8
-                    || slot.dust > 1.0e-8
-                {
+                if slot.water > 1.0e-8 || slot.slurry > 1.0e-8 || slot.dust > 1.0e-8 {
                     self.parked.insert(key, slot);
                 } else {
                     self.parked.remove(&key);
@@ -2137,10 +2249,7 @@ fn snap_origin(center: [f32; 2], extent: f32, cell: f32) -> [f32; 2] {
 }
 
 fn world_key(x: f32, z: f32, cell: f32) -> (i32, i32) {
-    (
-        (x / cell).floor() as i32,
-        (z / cell).floor() as i32,
-    )
+    ((x / cell).floor() as i32, (z / cell).floor() as i32)
 }
 
 /// Bow height in metres. `k * speed * sqrt(depth / g)`, not a speed×depth flux.
@@ -2261,7 +2370,11 @@ mod tests {
                     mj += s * j as f32;
                 }
             }
-            if m <= 1.0e-6 { 0.0 } else { mj / m }
+            if m <= 1.0e-6 {
+                0.0
+            } else {
+                mj / m
+            }
         };
         let c0 = centroid(&h);
         for _ in 0..60 {
@@ -2280,7 +2393,10 @@ mod tests {
         }
         let after = column_sum(&h, cell);
         let c1 = centroid(&h);
-        assert!((after - before).abs() < 1.0e-3, "volume {before} -> {after}");
+        assert!(
+            (after - before).abs() < 1.0e-3,
+            "volume {before} -> {after}"
+        );
         assert!(
             c1 > c0 + 1.5,
             "slurry did not run downhill, centroid {c0:.2} -> {c1:.2}"
@@ -2295,7 +2411,10 @@ mod tests {
         let mut fluid = FluidCore::new([0.0, 0.0]);
         let poured = fluid.pour_water(-1.0, 1.0, -1.0, 1.0, 0.12);
         let before = fluid.ledger().total_m3;
-        assert!((before - poured).abs() < 1.0e-3, "pour {poured} ledger {before}");
+        assert!(
+            (before - poured).abs() < 1.0e-3,
+            "pour {poured} ledger {before}"
+        );
         fluid.recenter([55.0, 0.0]);
         fluid.recenter([0.0, 0.0]);
         let after = fluid.ledger();
