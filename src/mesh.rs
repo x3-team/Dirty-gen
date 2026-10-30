@@ -1912,6 +1912,33 @@ pub const PANEL_SPRAY_RIBBON: f32 = 50.0;
 pub const PANEL_SPRAY_DROP: f32 = 51.0;
 /// Mud drip or slurry drop from the contract spray buffer.
 pub const PANEL_SPRAY_MUD_DROP: f32 = 52.0;
+/// A round mud drop or a bead torn off a ribbon, drawn as a lit sphere on a
+/// camera-facing quad. The fraction is a per-drop seed for its outline.
+pub const PANEL_SPRAY_BLOB: f32 = 53.0;
+/// A clear water bead, same quad as the blob.
+pub const PANEL_SPRAY_BEAD: f32 = 54.0;
+
+/// One camera-facing quad that the shader turns into a sphere of radius `r`.
+fn push_blob(mesh: &mut CpuMesh, p: Vec3, r: f32, eye: Vec3, panel: f32, seed: f32) {
+    let to_eye = (eye - p).normalize_or_zero();
+    let mut right = Vec3::Y.cross(to_eye);
+    if right.length_squared() < 1.0e-6 {
+        right = Vec3::X;
+    }
+    let right = right.normalize();
+    let up = to_eye.cross(right).normalize_or_zero();
+    let base = mesh.vertices.len() as u32;
+    for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        mesh.vertices.push(MeshVertex {
+            pos: (p + (right * sx + up * sy) * r).to_array(),
+            nrm: to_eye.to_array(),
+            uv: [(sx + 1.0) * 0.5, (sy + 1.0) * 0.5],
+            panel: panel + seed.rem_euclid(1.0) * 0.98,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
 
 /// Material ids of the contract spray buffer the picture draws as liquid in
 /// flight. Clods (1, 3) stay solid pieces in `mud_chunks_with_ground`.
@@ -1924,9 +1951,10 @@ pub fn spray_is_liquid(material: u32) -> bool {
 /// Slurry pieces (5, 7) become torn ribbons: a strip along the piece's
 /// ballistic path over the last few hundredths of a second, its width set by
 /// the mass and wobbling along the length. Everything else liquid becomes a
-/// short drop streaked along its velocity. Strips face the camera about their
-/// own axis, so a ribbon never turns edge-on into a line. The shader tears
-/// the edges; there are no stamps or spheres here.
+/// short drop streaked along its velocity with a round head. Strips face the
+/// camera about their own axis, so a ribbon never turns edge-on into a line,
+/// and the shader gives them a rounded cross-section. A ribbon may neck and
+/// break in two, and sheds a few beads around its tail.
 pub fn spray_from_contract(
     spray: &[silt::render_contract::SprayGpu],
     count: usize,
@@ -1964,7 +1992,9 @@ pub fn spray_from_contract(
             let vol = mass / 1450.0;
             let sheet = if s.material == 7 { 0.006 } else { 0.004 };
             let len = (speed * 0.03 * (0.7 + 0.6 * h(1))).clamp(0.06, 0.32);
-            let w = (vol / (sheet * len)).sqrt().clamp(0.02, 0.12) * (0.6 + 0.8 * h(2));
+            // A sheet that wide does not stay a sheet in the air: it rolls into
+            // a rope about two thirds as wide, the rest goes into the beads.
+            let w = (vol / (sheet * len)).sqrt().clamp(0.02, 0.12) * (0.6 + 0.8 * h(2)) * 0.65;
             (len, w, 8usize, PANEL_SPRAY_RIBBON)
         } else {
             let density = silt::render_contract::spray_density_kg_m3(s.material as u8).max(1.0);
@@ -1981,7 +2011,7 @@ pub fn spray_from_contract(
             };
             (len, w, 2usize, panel)
         };
-        if mesh.vertices.len() + (segs + 1) * 2 >= MAX_VERTS {
+        if mesh.vertices.len() + (segs + 1) * 2 + 24 >= MAX_VERTS {
             break;
         }
         // Points back along the path, head first.
@@ -1992,6 +2022,8 @@ pub fn spray_from_contract(
             let back = span * (1.0 - t);
             pts.push(pos - vel * back + g * (0.5 * back * back));
         }
+        // Some ribbons have torn in two: one segment is left out.
+        let tear = (ribbon && h(6) > 0.3).then(|| 3 + (h(7) * 3.0) as usize);
         let base = mesh.vertices.len() as u32;
         let twist = h(3) * 6.283;
         for k in 0..=segs {
@@ -2025,7 +2057,15 @@ pub fn spray_from_contract(
                 1.0
             };
             let pinch = (t * (1.0 - t) * 4.0).sqrt().max(if ribbon { 0.18 } else { 0.35 });
-            let hw = width * 0.5 * wob.max(0.25) * pinch;
+            // Necking toward the tear, so the two halves end in tongues.
+            let neck = match tear {
+                Some(kb) => {
+                    let d = (t - (kb as f32 + 0.5) / segs as f32).abs() * segs as f32;
+                    (d / 1.2).clamp(0.3, 1.0)
+                }
+                None => 1.0,
+            };
+            let hw = width * 0.5 * wob.max(0.25) * pinch * neck;
             let frac = (t * 0.98).min(0.98);
             for (side_sign, v) in [(-1.0f32, 0.0f32), (1.0, 1.0)] {
                 mesh.vertices.push(MeshVertex {
@@ -2039,9 +2079,35 @@ pub fn spray_from_contract(
             }
         }
         for k in 0..segs as u32 {
+            if tear == Some(k as usize) {
+                continue;
+            }
             let a = base + k * 2;
             mesh.indices
                 .extend_from_slice(&[a, a + 1, a + 3, a, a + 3, a + 2]);
+        }
+        if ribbon {
+            // Beads shed off the edges and the tail, riding the same arc.
+            let to_eye = (eye - pos).normalize_or_zero();
+            let side = vel.cross(to_eye).normalize_or_zero();
+            let beads = 2 + (h(8) * 5.0) as u32;
+            for b in 0..beads {
+                let along = h(10 + b) * 1.3;
+                let back = span * along;
+                let off = (h(20 + b) - 0.5) * width * 1.6;
+                let lift = (h(30 + b) - 0.5) * width * 0.8;
+                let p = pos - vel * back + g * (0.5 * back * back) + side * off + Vec3::Y * lift;
+                let r = (width * (0.06 + 0.12 * h(40 + b))).clamp(0.003, 0.014);
+                push_blob(&mut mesh, p, r, eye, PANEL_SPRAY_BLOB, h(50 + b));
+            }
+        } else {
+            // The drop itself: a round head on its smear.
+            let head = if panel == PANEL_SPRAY_DROP {
+                PANEL_SPRAY_BEAD
+            } else {
+                PANEL_SPRAY_BLOB
+            };
+            push_blob(&mut mesh, pos, width * 0.55, eye, head, h(9));
         }
     }
     mesh

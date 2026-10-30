@@ -7,8 +7,8 @@
 
 use glam::Vec3;
 
-pub const ENV_W: u32 = 512;
-pub const ENV_H: u32 = 256;
+pub const ENV_W: u32 = 1024;
+pub const ENV_H: u32 = 512;
 
 pub struct EnvMap {
     /// Linear RGBA f32, level 0 first. Each level halves both sides.
@@ -24,6 +24,9 @@ pub struct SkyLight {
     pub sun_color: Vec3,
     pub zenith: Vec3,
     pub horizon: Vec3,
+    /// Daylight: a Preetham clear sky (turbidity 2.4) at the zenith level
+    /// instead of the two-colour gradient.
+    pub physical: bool,
 }
 
 /// Direction of the centre of texel (x, y). Matches `env_dir_uv` in the shader.
@@ -57,32 +60,99 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The shader's `sky_color` without the sun disc (the sun is direct light),
+/// Perez distribution, Preetham 1999: `(1 + A e^(B / cos t)) (1 + C e^(D g) + E cos^2 g)`.
+fn perez(c: [f32; 5], cos_t: f32, gamma: f32) -> f32 {
+    (1.0 + c[0] * (c[1] / cos_t.max(0.01)).exp())
+        * (1.0 + c[2] * (c[3] * gamma).exp() + c[4] * gamma.cos().powi(2))
+}
+
+/// Clear-sky radiance in linear sRGB, 1.0 at the zenith luminance.
+fn preetham(dir: Vec3, sun: Vec3) -> Vec3 {
+    let t = 2.4f32;
+    let ts = sun.y.clamp(0.02, 1.0).acos();
+    let cy = [0.1787 * t - 1.4630, -0.3554 * t + 0.4275, -0.0227 * t + 5.3251, 0.1206 * t - 2.5771, -0.0670 * t + 0.3703];
+    let cx = [-0.0193 * t - 0.2592, -0.0665 * t + 0.0008, -0.0004 * t + 0.2125, -0.0641 * t - 0.8989, -0.0033 * t + 0.0452];
+    let cyy = [-0.0167 * t - 0.2608, -0.0950 * t + 0.0092, -0.0079 * t + 0.2102, -0.0441 * t - 1.6537, -0.0109 * t + 0.0529];
+    let (t2, t3) = (ts * ts, ts * ts * ts);
+    let xz = t * t * (0.00166 * t3 - 0.00375 * t2 + 0.00209 * ts)
+        + t * (-0.02903 * t3 + 0.06377 * t2 - 0.03202 * ts + 0.00394)
+        + (0.11693 * t3 - 0.21196 * t2 + 0.06052 * ts + 0.25886);
+    let yz = t * t * (0.00275 * t3 - 0.00610 * t2 + 0.00317 * ts)
+        + t * (-0.04214 * t3 + 0.08970 * t2 - 0.04153 * ts + 0.00516)
+        + (0.15346 * t3 - 0.26756 * t2 + 0.06670 * ts + 0.26688);
+    let cos_t = dir.y.max(0.015);
+    let gamma = dir.dot(sun).clamp(-1.0, 1.0).acos();
+    let lum = perez(cy, cos_t, gamma) / perez(cy, 1.0, ts);
+    let x = xz * perez(cx, cos_t, gamma) / perez(cx, 1.0, ts);
+    let y = yz * perez(cyy, cos_t, gamma) / perez(cyy, 1.0, ts);
+    // xyY to XYZ to linear sRGB.
+    let big_x = x / y * lum;
+    let big_z = (1.0 - x - y) / y * lum;
+    Vec3::new(
+        3.2406 * big_x - 1.5372 * lum - 0.4986 * big_z,
+        -0.9689 * big_x + 1.8758 * lum + 0.0415 * big_z,
+        0.0557 * big_x - 0.2040 * lum + 1.0570 * big_z,
+    )
+    .max(Vec3::ZERO)
+}
+
+fn fbm(x: f32, z: f32, octaves: u32) -> f32 {
+    let (mut n, mut amp, mut f, mut norm) = (0.0, 0.5, 1.0, 0.0);
+    for o in 0..octaves {
+        let r = o as f32 * 1.7;
+        n += noise(x * f + 3.1 * r, z * f - 1.9 * r) * amp;
+        norm += amp;
+        amp *= 0.5;
+        f *= 2.07;
+    }
+    n / norm
+}
+
+/// Fair-weather cumulus on a deck 1.6 km up, seen in perspective: big
+/// heaps overhead, a dense band toward the horizon. Returns (colour, cover).
+fn cumulus(dir: Vec3, sky: &SkyLight, behind: Vec3) -> (Vec3, f32) {
+    if dir.y <= 0.004 {
+        return (Vec3::ZERO, 0.0);
+    }
+    let dist = 1.6 / dir.y.max(0.03);
+    let (px, pz) = (dir.x * dist, dir.z * dist);
+    // Coverage: large heaps with a cauliflower edge.
+    let base = fbm(px * 0.55 + 7.0, pz * 0.55 - 2.0, 3);
+    let detail = fbm(px * 2.6, pz * 2.6, 4);
+    let n = base * 0.78 + detail * 0.22;
+    let cover = smooth(0.50, 0.66, n);
+    // Thickness: how deep into the heap; the belly goes grey.
+    let thick = smooth(0.52, 0.80, n);
+    // Light comes from the sun side of each heap: offset sample toward the sun.
+    let s = Vec3::new(sky.sun.x, 0.0, sky.sun.z).normalize_or_zero() * 0.35;
+    let toward = fbm((px + s.x) * 0.55 + 7.0, (pz + s.z) * 0.55 - 2.0, 3) * 0.78 + detail * 0.22;
+    let lit = smooth(-0.06, 0.05, n - toward);
+    let sun_k = sky.sun_color * 0.62;
+    let top = Vec3::splat(1.02) + sun_k * 0.25;
+    let belly = Vec3::new(0.50, 0.55, 0.64);
+    let mut col = belly.lerp(top, (1.0 - thick * 0.7).max(lit * 0.9).clamp(0.0, 1.0));
+    // Silver lining where a thin edge faces the sun.
+    let d = dir.dot(sky.sun).max(0.0);
+    col += sky.sun_color * (1.0 - thick) * d.powf(8.0) * 0.6;
+    // Far cloud melts into the haze.
+    let haze = smooth(0.25, 0.02, dir.y);
+    col = col.lerp(behind * 1.08, haze * 0.65);
+    (col, cover * smooth(0.004, 0.06, dir.y))
+}
+
+/// The analytic sky without the sun disc (the sun is direct light),
 /// and a lit brown ground below the horizon so a wet floor reflects soil.
 fn sky_radiance(dir: Vec3, sky: &SkyLight) -> Vec3 {
-    let h = dir.y.clamp(-0.05, 1.0);
-    let mut col = sky.horizon.lerp(sky.zenith, smooth(-0.02, 0.55, h));
     let d = dir.dot(sky.sun).max(0.0);
-    col += sky.sun_color * d.powf(18.0) * 0.55;
-    // Cumulus on a plane overhead: four octaves, a lit top and a grey belly,
-    // thinning toward the horizon. They give the water something to mirror.
-    let s = 1.0 / (dir.y.abs() * 0.45 + 0.25);
-    let (cx, cz) = (dir.x * s * 0.18, dir.z * s * 0.18);
-    let mut n = 0.0;
-    let mut amp = 0.5;
-    let mut f = 1.0;
-    for _ in 0..4 {
-        n += noise(cx * f + 3.1 * f, cz * f - 1.7 * f) * amp;
-        amp *= 0.5;
-        f *= 2.03;
-    }
-    let cloud = smooth(0.44, 0.72, n) * smooth(0.0, 0.12, dir.y);
-    let toward = d.powf(4.0);
-    let lit = Vec3::new(0.96, 0.96, 0.97) + sky.sun_color * 0.12 * toward;
-    let belly = Vec3::new(0.58, 0.62, 0.70);
-    let shade = smooth(0.5, 0.85, n);
-    let cloud_col = lit.lerp(belly, shade * 0.6);
-    col = col.lerp(cloud_col, cloud * 0.85);
+    let mut col = if sky.physical {
+        let zl = sky.zenith.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        preetham(Vec3::new(dir.x, dir.y.max(0.0), dir.z).normalize(), sky.sun) * zl
+    } else {
+        let h = dir.y.clamp(-0.05, 1.0);
+        sky.horizon.lerp(sky.zenith, smooth(-0.02, 0.55, h)) + sky.sun_color * d.powf(18.0) * 0.55
+    };
+    let (cloud_col, cover) = cumulus(dir, sky, col);
+    col = col.lerp(cloud_col, cover);
     if dir.y < 0.0 {
         let ground = Vec3::new(0.16, 0.11, 0.07)
             * (sky.sun_color * sky.sun.y.max(0.0) * 1.25 + sky.zenith * 0.4);

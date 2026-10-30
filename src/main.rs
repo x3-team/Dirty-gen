@@ -2,6 +2,7 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
+mod air_noise;
 mod cc0;
 mod env;
 mod mesh;
@@ -710,6 +711,16 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     // SILT_BEAUTY_DUSK=1 keeps the low dusk sun.
     renderer.daylight = std::env::var_os("SILT_BEAUTY_DUSK").is_none();
     renderer.sand_field = true;
+    // SILT_BEAUTY_FOG=1: the same drive through morning ground fog, under the
+    // low sun with the headlamps on. The fog is picture only; the dust is the
+    // published grid. Stills and video get a `fog-` prefix.
+    let fog = std::env::var_os("SILT_BEAUTY_FOG").is_some();
+    if fog {
+        renderer.daylight = false;
+        renderer.fog = 0.11;
+        renderer.fog_height = 1.3;
+    }
+    let tag = if fog { "fog-" } else { "" };
     let dt = 1.0 / 30.0;
     let stills: [(f32, &str, fn(&World) -> CameraPose); 3] = [
         (-17.5, "puddle-wave", beauty_puddle_camera),
@@ -743,7 +754,7 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
                         Some(drive.dust()),
                     )
                     .expect("readback");
-                let path = dir.join(format!("{name}.png"));
+                let path = dir.join(format!("{tag}{name}.png"));
                 write_png(&path, width, height, &rgba).expect("still");
                 println!("beauty still {} at z {z:.1}", path.display());
                 saved[k] = true;
@@ -770,7 +781,7 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
         drive.step(dt);
     }
     if video {
-        let out = dir.join("through-drive-beauty.mp4");
+        let out = dir.join(if fog { "through-fog-beauty.mp4" } else { "through-drive-beauty.mp4" });
         let status = std::process::Command::new("ffmpeg")
             .args(["-y", "-framerate", "30", "-i"])
             .arg(frames.join("frame_%04d.png"))

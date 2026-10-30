@@ -22,6 +22,9 @@ struct Frame {
     // Niva headlamps: left xyz + intensity, right xyz + sand-field flag,
     // beam dir + outer cone cos.
     lamps: array<vec4<f32>, 3>,
+    // Air, picture only. 0: wind xyz m/s, ground fog 1/m. 1: Niva position,
+    // fog scale height. 2: Niva velocity, yaw.
+    air: array<vec4<f32>, 3>,
 }
 
 struct Model {
@@ -52,6 +55,9 @@ struct Model {
 // volume pipelines only; meshes bind the model uniform at group 2).
 @group(2) @binding(1) var scene_depth: texture_depth_2d;
 @group(2) @binding(2) var scene_color: texture_2d<f32>;
+// Tileable curl (rgb) and billow (a) noise for the dust and fog detail.
+@group(2) @binding(3) var air_noise: texture_3d<f32>;
+@group(2) @binding(4) var air_samp: sampler;
 
 @group(1) @binding(0) var height_tex: texture_2d<f32>;
 @group(1) @binding(1) var mat_tex: texture_2d<f32>;
@@ -206,7 +212,10 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let base = vec2<i32>(uv * dims);
     // Flat ground can shadow a few centimetres of rut. A wall keeps a larger bias.
     let slope = clamp(1.0 - n.y, 0.0, 1.0);
-    let bias = 0.00015 + slope * 0.0014;
+    // A low sun spreads one shadow texel over a long run of ground; without
+    // more bias the field prints the shadow map's grid.
+    let low_sun = 1.0 - smoothstep(0.3, 0.7, normalize(frame.sun_dir.xyz).y);
+    let bias = 0.00015 + slope * 0.0014 + low_sun * 0.0009;
     var blocked = 0.0;
     for (var y: i32 = -1; y <= 1; y = y + 1) {
         for (var x: i32 = -1; x <= 1; x = x + 1) {
@@ -858,7 +867,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
     // Pore moisture and the film are the contract's inside its window.
-    let wet = bc_moisture(xz, mat.r);
+    // Moisture wicks sideways through the grain: a jittered ring of taps
+    // spreads the 0.20 m cell edge into a soft damp front.
+    var wet_ring = 0.0;
+    let wj = noise(xz * 2.3) * 0.5 + 0.75;
+    for (var k: i32 = 0; k < 6; k = k + 1) {
+        let a = f32(k) * 1.0472 + wj * 2.0;
+        wet_ring += bc_moisture(xz + vec2<f32>(cos(a), sin(a)) * 0.38 * wj, mat.r);
+    }
+    let wet = mix(wet_ring / 6.0, bc_moisture(xz, mat.r), 0.35);
     let film_c = bc_film(xz);
     let water = mix(mat.g * 0.34, film_c.r + film_c.g, bc_inside(xz));
     let darken = mat.b;
@@ -970,15 +987,18 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // hairline net of its own; the published opening widens it when it lands.
     let crust_c = bc_crust(xz);
     let opening = crust_c.y;
-    let kind_crust = kind == 3u || ((kind == 9u || kind == 11u || kind == 4u) && dry > 0.6);
+    let kind_crust = kind == 3u || ((kind == 9u || kind == 11u || kind == 4u) && dry > 0.02);
+    // Cracks open as the mud dries: none in the wet, hairlines in the
+    // damp ring, full gaps on the baked plates. No threshold, no line.
+    let crack_age = smoothstep(0.08, 0.9, dry);
     if (kind_crust || opening > 0.0005) {
         // Baked crust: plates curl up, cracks go dark and matte.
         let scale = select(2.2, 3.4, kind == 3u);
         let edge = crack_edge(xz * scale);
         // Crack half-width in cell units: a hairline, or the published gap.
-        let width = max(select(0.0, select(select(0.022, 0.034, kind == 4u), 0.05, kind == 3u), kind_crust), opening * scale * 0.5);
+        let width = max(select(0.0, select(select(0.022, 0.034, kind == 4u), 0.05, kind == 3u), kind_crust) * select(mix(0.35, 1.0, crack_age), 1.0, kind == 3u), opening * scale * 0.5);
         let crack = (1.0 - smoothstep(width * 0.4, width * 1.6 + 0.01, edge))
-            * select(max(dry * 0.75, smoothstep(0.0005, 0.004, opening)), 1.0, kind == 3u);
+            * select(max(crack_age * 0.8, smoothstep(0.0005, 0.004, opening)), 1.0, kind == 3u);
         albedo = mix(albedo, albedo * 0.38, crack);
         let plate = smoothstep(0.05, 0.4, edge);
         albedo = mix(albedo, albedo * 1.08, plate * select(dry * 0.5, 1.0, kind == 3u) * 0.5);
@@ -987,7 +1007,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             // catch light at their rims.
             let pale = dot(albedo, vec3<f32>(0.3, 0.5, 0.2));
             let baked = mix(albedo, vec3<f32>(pale), 0.35) * 2.1 + vec3<f32>(0.03, 0.025, 0.02);
-            albedo = mix(albedo, baked, smoothstep(0.5, 0.95, dry));
+            albedo = mix(albedo, baked, smoothstep(0.3, 0.98, dry));
             let rim = smoothstep(0.03, 0.09, edge) * (1.0 - smoothstep(0.09, 0.2, edge));
             albedo *= 1.0 + rim * 0.25 * dry;
         }
@@ -1044,20 +1064,31 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let inside_t = bc_inside(xz);
     if (inside_t > 0.0) {
         let film_t = film_c.r + film_c.g;
-        // Soil within a stride of standing water is soaked dark; the ground
-        // past it stays light. Six taps on two rings, broken by noise.
-        var near_w = film_t;
+        // Soil near standing water is soaked dark and fades to the dry, light
+        // ground over about a metre. Three rings, each weaker the further it
+        // reaches, with a noise-jittered radius so the wet front has no line.
+        // The radius is jittered per grain as well, so the front between
+        // two rings dithers into a gradient instead of stepping.
+        let wob = noise(xz * 3.1) * 0.6 + noise(xz * 11.0) * 0.4;
+        let jit = 0.45 + wob * 0.5 + hash12(floor(xz * 60.0)) * 0.6;
+        var soak_w = smoothstep(0.0005, 0.006, film_t);
         for (var k: i32 = 0; k < 6; k = k + 1) {
-            let a = f32(k) * 1.0472 + 0.4;
+            let a = f32(k) * 1.0472 + 0.4 + wob * 0.8;
             let o = vec2<f32>(cos(a), sin(a));
-            let f1 = bc_film(xz + o * 0.3);
-            let f2 = bc_film(xz + o * 0.75);
-            near_w = max(near_w, max(f1.r + f1.g, (f2.r + f2.g) * 0.5));
+            let f1 = bc_film(xz + o * 0.25 * jit);
+            let f2 = bc_film(xz + o * 0.6 * jit);
+            let f3 = bc_film(xz + o * 1.15 * jit);
+            soak_w = max(soak_w, smoothstep(0.0005, 0.006, f1.r + f1.g) * 0.85);
+            soak_w = max(soak_w, smoothstep(0.0005, 0.006, f2.r + f2.g) * 0.58);
+            soak_w = max(soak_w, smoothstep(0.0005, 0.006, f3.r + f3.g) * 0.3);
         }
-        let wob = noise(xz * 4.0) * 0.6 + noise(xz * 13.0) * 0.4;
-        let soak = smoothstep(0.0005, 0.008, near_w * (0.5 + wob)) * inside_t;
-        albedo = mix(albedo, albedo * vec3<f32>(0.48, 0.42, 0.36), soak * 0.85);
-        rough_out = mix(rough_out, 0.26, soak * 0.75);
+        // Pore moisture keeps a damp tone where the film has already drained.
+        soak_w = max(soak_w, smoothstep(0.3, 0.85, wet) * 0.45);
+        let soak = clamp(soak_w, 0.0, 1.0) * inside_t;
+        // Under the film the bed is darkened below; do not stack the two.
+        let under_pre = smoothstep(0.002, 0.012, film_t);
+        albedo = mix(albedo, albedo * vec3<f32>(0.55, 0.49, 0.42), soak * 0.85 * (1.0 - under_pre * 0.6));
+        rough_out = mix(rough_out, 0.26, soak * soak * 0.75);
         n = normalize(mix(n, n_geo, soak * 0.35));
         let under = smoothstep(0.002, 0.012, film_t);
         if (under > 0.0) {
@@ -1123,12 +1154,12 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let edge_c = bc_wet_edge(xz);
     if (edge_c > 0.0) {
         let wob = noise(xz * 5.0) * 0.7 + noise(xz * 17.0) * 0.3;
-        let band = smoothstep(0.2, 0.65, edge_c * (0.55 + 0.9 * wob));
+        let band = smoothstep(0.05, 0.9, edge_c * (0.55 + 0.9 * wob));
         let dry_side = 1.0 - smoothstep(0.35, 0.55, wet);
         albedo = mix(albedo, albedo * vec3<f32>(0.72, 0.68, 0.64), band * dry_side);
         rough_out = mix(rough_out, rough_out * 0.8, band * dry_side);
         let tide = smoothstep(0.55, 0.85, edge_c * (0.5 + wob)) * (1.0 - band * 0.5) * dry_side;
-        albedo = mix(albedo, albedo * 1.25 + vec3<f32>(0.02, 0.018, 0.014), tide * 0.5);
+        albedo = mix(albedo, albedo * 1.1 + vec3<f32>(0.01, 0.009, 0.007), tide * 0.2);
     }
     // Settled dust, metres. A tenth of a millimetre greys the soil, a couple
     // of millimetres hide it. Dust is matte and fills the grain.
@@ -1502,7 +1533,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Fresnel reflection of the sky, and a tight GGX sun glint on the ripples.
     let fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
     let refl_dir = reflect(-view, nrm);
-    var refl = env_radiance(refl_dir, 0.05) * frame.env.y * 1.15;
+    // The sky the water mirrors is the sky drawn behind it, at full radiance.
+    var refl = env_radiance(refl_dir, 0.02) * 0.92;
     // A rut is a trench: a grazing reflection meets the bank before the sky.
     // March the heightfield a short way along the ray and show the soil it hits.
     var p = in.world + refl_dir * 0.04;
@@ -1897,6 +1929,13 @@ fn niva_body_mud(local: vec3<f32>, world: vec3<f32>, n: vec3<f32>) -> Coat {
 // Panel 50 is a slurry ribbon, 51 a water drop, 52 a mud drop. The fraction
 // of the panel is the distance along the strip, tail 0 to head 0.98; uv.x is
 // metres along the piece from its launch, uv.y runs across 0..1.
+// The sky on the water film over flying mud, at full radiance like the puddle.
+fn wet_skin(n: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
+    let ndv = clamp(dot(n, view), 0.0, 1.0);
+    let fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+    return env_radiance(reflect(-view, n), 0.04) * fres * 0.6;
+}
+
 fn spray_strip(in: MeshOut) -> vec4<f32> {
     let kind = floor(in.panel + 0.01);
     let t = clamp(fract(in.panel + 0.001) / 0.98, 0.0, 1.0);
@@ -1908,6 +1947,39 @@ fn spray_strip(in: MeshOut) -> vec4<f32> {
         n = -n;
     }
     let sun = normalize(frame.sun_dir.xyz);
+    if (kind > 52.5) {
+        // A drop as a lit sphere: the quad faces the camera, the normal is
+        // rebuilt from the disc, and the outline wobbles so it is not a dot.
+        let q = in.uv * 2.0 - 1.0;
+        let ang = atan2(q.y, q.x);
+        let seed = fract(in.panel) * 40.0;
+        let lump = noise(vec2<f32>(ang * 1.3 + seed, seed)) * 0.3 + noise(vec2<f32>(ang * 3.1, seed + 3.0)) * 0.14;
+        let r2 = dot(q, q) / ((1.0 - lump) * (1.0 - lump));
+        if (r2 > 1.0) {
+            discard;
+        }
+        let right = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), view) + vec3<f32>(1e-4, 0.0, 0.0));
+        let up = cross(view, right);
+        let nb = normalize(right * q.x + up * q.y + view * sqrt(max(1.0 - r2, 0.0)));
+        let soft = 1.0 - smoothstep(0.8, 1.0, r2);
+        if (kind < 53.5) {
+            let albedo = mix(vec3<f32>(0.2, 0.13, 0.07), vec3<f32>(0.3, 0.2, 0.11), noise(vec2<f32>(seed, 1.0)));
+            var lit = shade_pbr(in.world, nb, albedo, 0.1, 0.0, 1.0, vec3<f32>(0.0));
+            lit += wet_skin(nb, view);
+            let back = pow(clamp(dot(-view, sun), 0.0, 1.0), 3.0);
+            lit += frame.sun_color.rgb * vec3<f32>(0.36, 0.2, 0.08) * back * (1.0 - nb.y * 0.5) * 0.4;
+            return vec4<f32>(tonemap(atmosphere(in.world, lit)), soft);
+        }
+        // Clear bead: the sky and the sun mirrored on a ball, a dim body.
+        let ndv = clamp(dot(nb, view), 0.0, 1.0);
+        let fres = 0.04 + 0.96 * pow(1.0 - ndv, 5.0);
+        let refl = env_radiance(reflect(-view, nb), 0.02) * 0.9;
+        let body = vec3<f32>(0.22, 0.18, 0.13) * (sh_irradiance(nb) * frame.env.y + frame.sun_color.rgb * 0.3);
+        let halfv = normalize(sun + view);
+        let glint = frame.sun_color.rgb * min(ggx_d(clamp(dot(nb, halfv), 0.0, 1.0), 0.02) * 0.02, 30.0);
+        let lit = mix(body, refl, fres) + glint;
+        return vec4<f32>(tonemap(atmosphere(in.world, lit)), soft * clamp(0.45 + 0.55 * fres + glint.g * 0.1, 0.0, 1.0));
+    }
     if (kind < 50.5) {
         // Torn slurry. Each edge tears on its own, the tail frays into
         // tongues, and a few holes open where the sheet thinned.
@@ -1925,14 +1997,17 @@ fn spray_strip(in: MeshOut) -> vec4<f32> {
         }
         // Rounded cross-section and a wobbling skin, so the sheet is a
         // ribbon of liquid and not a flat card.
-        let roll = (in.uv.y - 0.5) * 1.6;
+        // A rope of liquid: the normal wraps round the strip like a cylinder
+        // out to the torn edge, so the sun draws a highlight along its length.
+        let sx = clamp((in.uv.y - 0.5) * 2.0 / max(limit, 0.25), -0.97, 0.97);
         let bump = noise(vec2<f32>(u * 48.0, in.uv.y * 3.0)) - 0.5;
         let tside = normalize(cross(n, view) + vec3<f32>(1e-4, 0.0, 0.0));
-        n = normalize(n + tside * (roll + bump * 0.5));
+        n = normalize(n * sqrt(1.0 - sx * sx) + tside * (sx + bump * 0.35));
         let g = noise(vec2<f32>(u * 9.0, in.uv.y * 2.0));
         // Liquid clay: brown, not tar. The gloss is the sky on a wet skin.
-        let albedo = mix(vec3<f32>(0.16, 0.095, 0.050), vec3<f32>(0.24, 0.15, 0.08), g);
-        var lit = shade_pbr(in.world, n, albedo, 0.14, 0.0, 1.0, vec3<f32>(0.0));
+        let albedo = mix(vec3<f32>(0.2, 0.13, 0.07), vec3<f32>(0.3, 0.2, 0.11), g);
+        var lit = shade_pbr(in.world, n, albedo, 0.1, 0.0, 1.0, vec3<f32>(0.0));
+        lit += wet_skin(n, view);
         // Both faces see the sky; a strip is not a closed solid.
         lit += albedo * sh_irradiance(-n) * frame.env.y * 0.5;
         // Thin edges let the low sun through as a warm rim.
@@ -1971,7 +2046,7 @@ fn spray_strip(in: MeshOut) -> vec4<f32> {
 
 @fragment
 fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
-    if (in.panel > 49.9 && in.panel < 52.99) {
+    if (in.panel > 49.9 && in.panel < 54.99) {
         return spray_strip(in);
     }
     let panel = i32(in.panel + 0.5);

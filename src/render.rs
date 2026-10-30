@@ -45,6 +45,10 @@ struct FrameData {
     /// Niva headlights: left lamp xyz + intensity, right lamp xyz, beam
     /// direction xyz + cosine of the outer cone. Intensity 0 is off.
     lamps: [[f32; 4]; 3],
+    /// Air for the dust and fog volume, picture only. 0: wind xyz (m/s),
+    /// ground fog extinction (1/m, 0 off). 1: Niva position xyz, fog scale
+    /// height (m). 2: Niva velocity xyz, yaw.
+    air: [[f32; 4]; 3],
 }
 
 #[repr(C)]
@@ -144,6 +148,11 @@ pub struct Renderer {
     pub daylight: bool,
     /// Lay the undisturbed field (kind 0) and the skirt as sand. Picture only.
     pub sand_field: bool,
+    /// Ground fog for the picture: extinction at the ground (1/m, 0 off) and
+    /// scale height (m). It drifts with `wind` and parts round the Niva.
+    pub fog: f32,
+    pub fog_height: f32,
+    pub wind: Vec3,
     pub show_props: bool,
     /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
     pub show_environment: bool,
@@ -164,8 +173,16 @@ pub struct Renderer {
     pipe_fog: Option<wgpu::RenderPipeline>,
     post_bgl: wgpu::BindGroupLayout,
     post_bg: wgpu::BindGroup,
+    air_noise_view: wgpu::TextureView,
+    air_samp: wgpu::Sampler,
     scene_copy: wgpu::Texture,
     scene_copy_view: wgpu::TextureView,
+    /// The dust and fog march runs at half resolution into this target and
+    /// is upsampled over the frame (`pipe_fog_up`): a quarter of the pixels.
+    fog_half_view: wgpu::TextureView,
+    fog_up_bgl: wgpu::BindGroupLayout,
+    fog_up_bg: wgpu::BindGroup,
+    pipe_fog_up: Option<wgpu::RenderPipeline>,
     /// Top-down debug view of the render contract. Off for the Niva picture.
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
@@ -786,6 +803,22 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let water_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
@@ -798,7 +831,37 @@ impl Renderer {
             push_constant_ranges: &[],
         });
         let (scene_copy, scene_copy_view) = make_scene_copy(&device, width, height);
-        let post_bg = make_post_bg(&device, &post_bgl, &depth_view, &scene_copy_view);
+        let fog_up_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fog-up"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 21,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let (fog_half_view, fog_up_bg) = make_fog_half(&device, &fog_up_bgl, width, height);
+        let (air_noise_view, air_samp) = make_air_noise(&device, &queue);
+        let post_bg = make_post_bg(
+            &device,
+            &post_bgl,
+            &depth_view,
+            &scene_copy_view,
+            &air_noise_view,
+            &air_samp,
+        );
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
             bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl],
@@ -1018,6 +1081,25 @@ impl Renderer {
                 &[],
                 color_format,
                 None,
+                false,
+                None,
+            )
+        });
+        let pipe_fog_up = contract.as_ref().map(|_| {
+            let up_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fog-up-layout"),
+                bind_group_layouts: &[&fog_up_bgl],
+                push_constant_ranges: &[],
+            });
+            pipeline(
+                &device,
+                &shader,
+                &up_layout,
+                "vs_fog",
+                Some("fs_fog_up"),
+                &[],
+                color_format,
+                None,
                 true,
                 None,
             )
@@ -1231,6 +1313,9 @@ impl Renderer {
             depth_format: formats.depth,
             daylight: false,
             sand_field: false,
+            fog: 0.0,
+            fog_height: 1.4,
+            wind: Vec3::new(1.1, 0.0, -0.65),
             show_props: true,
             show_environment: true,
             show_hills: true,
@@ -1244,8 +1329,14 @@ impl Renderer {
             contract_cpu: silt::render_contract::ContractFrame::new(),
             pipe_debug,
             pipe_fog,
+            pipe_fog_up,
+            fog_half_view,
+            fog_up_bgl,
+            fog_up_bg,
             post_bgl,
             post_bg,
+            air_noise_view,
+            air_samp,
             scene_copy,
             scene_copy_view,
             debug_contract: false,
@@ -1303,9 +1394,19 @@ impl Renderer {
             ..Default::default()
         });
         let (scene_copy, scene_copy_view) = make_scene_copy(&self.device, width, height);
+        let (fog_half_view, fog_up_bg) = make_fog_half(&self.device, &self.fog_up_bgl, width, height);
+        self.fog_half_view = fog_half_view;
+        self.fog_up_bg = fog_up_bg;
         self.scene_copy = scene_copy;
         self.scene_copy_view = scene_copy_view;
-        self.post_bg = make_post_bg(&self.device, &self.post_bgl, &self.depth_view, &self.scene_copy_view);
+        self.post_bg = make_post_bg(
+            &self.device,
+            &self.post_bgl,
+            &self.depth_view,
+            &self.scene_copy_view,
+            &self.air_noise_view,
+            &self.air_samp,
+        );
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
         self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1438,7 +1539,15 @@ impl Renderer {
         } else {
             Vec3::new(0.0, 0.0, 2.0)
         };
-        let extent = if self.daylight { 14.0 } else { 36.0 };
+        let mut extent = if self.daylight { 14.0 } else { 36.0 };
+        // The beauty drive keeps the shadow map on the Niva: a 36 m low-sun
+        // map saws the body's shadow edge into teeth.
+        let light_target = if self.sand_field {
+            extent = 16.0;
+            Vec3::new(world.vehicle.pos.x, 0.0, world.vehicle.pos.z)
+        } else {
+            light_target
+        };
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
         let light_proj = Mat4::orthographic_rh(-extent, extent, -extent, extent, 1.0, 130.0);
         let light_vp = light_proj * light_view;
@@ -1463,6 +1572,7 @@ impl Renderer {
                 sun_color: Vec3::from_slice(&sun_color[..3]),
                 zenith: Vec3::from_slice(&sky_zenith[..3]),
                 horizon: Vec3::from_slice(&sky_horizon[..3]),
+                physical: self.daylight,
             });
             self.env_baked = Some(self.daylight);
         }
@@ -1501,6 +1611,21 @@ impl Renderer {
                 if !self.niva_picture { 0.0 } else if self.daylight { 0.6 } else { 1.0 },
                 self.sand_field,
             ),
+            air: [
+                [self.wind.x, self.wind.y, self.wind.z, self.fog],
+                [
+                    world.vehicle.pos.x,
+                    world.vehicle.pos.y,
+                    world.vehicle.pos.z,
+                    self.fog_height,
+                ],
+                [
+                    world.vehicle.vel.x,
+                    world.vehicle.vel.y,
+                    world.vehicle.vel.z,
+                    world.vehicle.yaw,
+                ],
+            ],
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
@@ -1771,9 +1896,35 @@ impl Renderer {
             self.draw_glass(&mut pass);
         }
 
-        if let (true, Some(pipe), Some(gpu)) = (fog_volume, &self.pipe_fog, &self.contract) {
+        let air_pass = fog_volume || self.fog > 0.0;
+        if let (true, Some(pipe), Some(up), Some(gpu)) =
+            (air_pass, &self.pipe_fog, &self.pipe_fog_up, &self.contract)
+        {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("dust-volume"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.fog_half_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &self.frame_bg, &[]);
+                pass.set_bind_group(1, &self.tex_bg, &[]);
+                pass.set_bind_group(2, &self.post_bg, &[]);
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("dust-volume"),
+                label: Some("dust-volume-up"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.color_view,
                     resolve_target: None,
@@ -1786,12 +1937,8 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &self.frame_bg, &[]);
-            pass.set_bind_group(1, &self.tex_bg, &[]);
-            pass.set_bind_group(2, &self.post_bg, &[]);
-            pass.set_bind_group(3, &self.paint_bg, &[]);
-            pass.set_bind_group(4, &gpu.bind_group, &[]);
+            pass.set_pipeline(up);
+            pass.set_bind_group(0, &self.fog_up_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -3022,11 +3169,105 @@ fn make_scene_copy(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Tex
     (texture, view)
 }
 
+/// Half-resolution target for the dust and fog march, and the bind group the
+/// upsample reads it through. RGB is premultiplied by A.
+fn make_fog_half(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+) -> (wgpu::TextureView, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fog-half"),
+        size: wgpu::Extent3d {
+            width: width.div_ceil(2),
+            height: height.div_ceil(2),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("fog-half"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fog-up"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::Sampler(&samp),
+            },
+        ],
+    });
+    (view, bg)
+}
+
+/// The curl and billow volume the dust and fog march warps its detail with.
+fn make_air_noise(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, wgpu::Sampler) {
+    let n = crate::air_noise::AIR_NOISE;
+    let size = wgpu::Extent3d {
+        width: n,
+        height: n,
+        depth_or_array_layers: n,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("air-noise"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Snorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let texels = crate::air_noise::curl_volume();
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&texels),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(n * 4),
+            rows_per_image: Some(n),
+        },
+        size,
+    );
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("air-noise"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    (tex.create_view(&wgpu::TextureViewDescriptor::default()), samp)
+}
+
 fn make_post_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     depth_view: &wgpu::TextureView,
     scene_view: &wgpu::TextureView,
+    air_noise: &wgpu::TextureView,
+    air_samp: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("post"),
@@ -3039,6 +3280,14 @@ fn make_post_bg(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(air_noise),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(air_samp),
             },
         ],
     })
