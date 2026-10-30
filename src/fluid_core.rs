@@ -126,6 +126,60 @@ pub enum SheetDrive {
     Wind { x: f32, z: f32, vorticity: f32 },
 }
 
+/// Impermeable footprint of a wheel or a belly panel in the water grid.
+///
+/// The sheet treats every cell inside this box, and below the free surface,
+/// as a wall. The head, the downstream hole, and the wake are whatever the
+/// height–velocity step does against that wall. This is not a wave generator.
+#[derive(Clone, Copy, Debug)]
+pub struct HydroSolid {
+    pub x: f32,
+    pub z: f32,
+    /// Yaw of the long axis, radians. 0 points the long axis along +Z.
+    pub yaw: f32,
+    pub half_length: f32,
+    pub half_width: f32,
+    /// World Y of the underside. A cell is a wall only when the free surface
+    /// is above this.
+    pub bottom_y: f32,
+    pub top_y: f32,
+    /// Tire contact. Scour reads the shear on the fluid cells touching these.
+    pub contact: bool,
+    /// Cylinder radius, metres. Zero is a box (belly), and buoyancy is the
+    /// submerged box. A positive radius uses the submerged circular segment.
+    pub radius: f32,
+    /// Cylinder width, metres. Unused for a box.
+    pub width: f32,
+}
+
+/// Pressure force and displaced weight read back from the sheet after a step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HydroLoad {
+    pub force_x: f32,
+    pub force_z: f32,
+    pub buoyancy_n: f32,
+    pub hull_buoyancy_n: f32,
+    pub wheel_buoyancy_n: f32,
+    pub displaced_m3: f32,
+    pub eroded_m3: f32,
+    pub hole_m: f32,
+    pub wheel_blocks: u32,
+    pub belly_blocks: u32,
+}
+
+/// Periodic lips of an open channel. Water that piles at the downstream lip
+/// is averaged with the upstream lip so a long reach can keep a current.
+/// Off unless the caller sets one. Wheels and the belly do not use this.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamCycle {
+    pub x0: f32,
+    pub x1: f32,
+    pub z0: f32,
+    pub z1: f32,
+    pub dir_x: f32,
+    pub dir_z: f32,
+}
+
 /// One tire telling the sheet which way it is shoving.
 #[derive(Clone, Copy, Debug)]
 pub struct TirePush {
@@ -316,7 +370,7 @@ pub fn step_sheet(
     dt: f32,
     drive: SheetDrive,
 ) {
-    step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, 1.0e-6);
+    step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, 1.0e-6, None);
 }
 
 fn step_sheet_eps(
@@ -331,6 +385,7 @@ fn step_sheet_eps(
     dt: f32,
     drive: SheetDrive,
     eps: f32,
+    solid: Option<&[u8]>,
 ) {
     if dt <= 0.0 || res == 0 || h.len() < res * res {
         return;
@@ -349,7 +404,9 @@ fn step_sheet_eps(
     SCRATCH.with(|sc| {
         let mut sc = sc.borrow_mut();
         sc.fit(res * res);
-        step_sheet_scratch(h, u, v, bed, nu, gate, res, cell, dt, drive, eps, &mut sc);
+        step_sheet_scratch(
+            h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, &mut sc,
+        );
     });
 }
 
@@ -426,6 +483,7 @@ pub fn advect_dust_density(
                 vorticity: 0.35,
             },
             0.0,
+            None,
         );
         let after = h.iter().map(|c| *c as f64).sum::<f64>();
         let scale = if after > 0.0 {
@@ -457,6 +515,7 @@ fn step_sheet_scratch(
     dt: f32,
     drive: SheetDrive,
     eps: f32,
+    solid: Option<&[u8]>,
     sc: &mut Scratch,
 ) {
     let (mut i0, mut i1, mut j0, mut j1) = (res, 0usize, res, 0usize);
@@ -494,7 +553,7 @@ fn step_sheet_scratch(
     let dts = dt / nsub as f32;
     for _ in 0..nsub {
         substep(
-            h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, sc,
+            h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, sc,
         );
     }
 }
@@ -515,11 +574,17 @@ fn substep(
     i1: usize,
     j0: usize,
     j1: usize,
+    solid: Option<&[u8]>,
     sc: &mut Scratch,
 ) {
     let n = res * res;
     for idx in 0..n {
         sc.a[idx] = bed[idx] + h[idx];
+    }
+    // A wall is not a hole in the free surface. Copy the neighbouring water
+    // line onto solid cells so the pressure gradient does not fall into the body.
+    if let Some(mask) = solid {
+        lift_solid_surface(&mut sc.a, h, mask, res, i0, i1, j0, j1, eps, &mut sc.e);
     }
     blur_box(&sc.a, &mut sc.b, &mut sc.e, res, i0, i1, j0, j1, &GAUSS);
     blur_box(&sc.a, &mut sc.c, &mut sc.e, res, i0, i1, j0, j1, &STEEP);
@@ -534,6 +599,9 @@ fn substep(
     }
     let p = &sc.d;
     let eta = &sc.a;
+    if let Some(mask) = solid {
+        write_noslip_ghost(u, v, h, mask, res, i0, i1, j0, j1, eps);
+    }
     match drive {
         SheetDrive::Gravity { vorticity } => {
             for j in j0..=j1 {
@@ -543,7 +611,17 @@ fn substep(
                         continue;
                     }
                     let (px, pz) = grad(p, res, i, j, cell);
-                    let mob = sheet_mobility_for(nu[idx]);
+                    // Mud films keep their reduced mobility. A rigid body is a
+                    // wall, so the water against it feels the full free-surface
+                    // gradient and can pass around the geometry.
+                    let mut mob = sheet_mobility_for(nu[idx]);
+                    if let Some(mask) = solid {
+                        // Thin films on the bank already sit on a steep bed. Full
+                        // gravity there runs them up to the speed cap and back.
+                        if h[idx] > 0.08 && solid_near(mask, res, i, j, 1) {
+                            mob = mob.max(1.0);
+                        }
+                    }
                     u[idx] += -GRAVITY * px * mob * dt;
                     v[idx] += -GRAVITY * pz * mob * dt;
                     if vorticity > 0.0 {
@@ -613,8 +691,22 @@ fn substep(
             v[idx] = finite_speed(v[idx] * decay, lim);
         }
     }
-    transport(h, u, v, gate, res, cell, dt, i0, i1, j0, j1, true, sc);
-    transport(h, u, v, gate, res, cell, dt, i0, i1, j0, j1, false, sc);
+    if let Some(mask) = solid {
+        // Water that is aimed at the body goes around it. Leaving it in the
+        // upstream cell is what builds a reflected bore instead of a bow.
+        redirect_into_walls(h, u, v, mask, bed, res, cell, dt, i0, i1, j0, j1, sc);
+        // No penetration: drop the velocity that points into the wall.
+        // Tangential flow stays, which is what shears the wake.
+        block_into_solid(u, v, h, mask, res, i0, i1, j0, j1, eps);
+        write_noslip_ghost(u, v, h, mask, res, i0, i1, j0, j1, eps);
+    }
+    let banks = if solid.is_some() { Some(bed) } else { None };
+    transport(
+        h, u, v, gate, res, cell, dt, i0, i1, j0, j1, true, solid, banks, sc,
+    );
+    transport(
+        h, u, v, gate, res, cell, dt, i0, i1, j0, j1, false, solid, banks, sc,
+    );
     for j in j0..=j1 {
         for i in i0..=i1 {
             let idx = j * res + i;
@@ -761,6 +853,8 @@ fn transport(
     j0: usize,
     j1: usize,
     along_x: bool,
+    solid: Option<&[u8]>,
+    bed: Option<&[f32]>,
     sc: &mut Scratch,
 ) {
     let n = res * res;
@@ -773,7 +867,19 @@ fn transport(
             for i in i0..i1 {
                 let a = j * res + i;
                 let b = a + 1;
-                move_edge(h, u, gate, a, b, 0.5 * (u[a] + u[b]), cell, dt, sc);
+                move_edge(
+                    h,
+                    u,
+                    gate,
+                    a,
+                    b,
+                    0.5 * (u[a] + u[b]),
+                    cell,
+                    dt,
+                    solid,
+                    bed,
+                    sc,
+                );
             }
         }
     } else {
@@ -781,7 +887,19 @@ fn transport(
             for i in i0..=i1 {
                 let a = j * res + i;
                 let b = a + res;
-                move_edge(h, v, gate, a, b, 0.5 * (v[a] + v[b]), cell, dt, sc);
+                move_edge(
+                    h,
+                    v,
+                    gate,
+                    a,
+                    b,
+                    0.5 * (v[a] + v[b]),
+                    cell,
+                    dt,
+                    solid,
+                    bed,
+                    sc,
+                );
             }
         }
     }
@@ -801,12 +919,26 @@ fn move_edge(
     vel: f32,
     cell: f32,
     dt: f32,
+    solid: Option<&[u8]>,
+    bed: Option<&[f32]>,
     sc: &mut Scratch,
 ) {
+    if let Some(solid) = solid {
+        if solid[a] != 0 || solid[b] != 0 {
+            return;
+        }
+    }
     if vel.abs() < 1.0e-5 {
         return;
     }
     let (donor, recv) = if vel > 0.0 { (a, b) } else { (b, a) };
+    // A dry bank above the donor's free surface does not take water.
+    // Only the solid path passes a bed; a bare sheet spreads as before.
+    if let Some(bed) = bed {
+        if h[recv] <= 1.0e-6 && bed[recv] > bed[donor] + h[donor] + 1.0e-3 {
+            return;
+        }
+    }
     let room = h[donor] - sc.removed[donor];
     if room <= 1.0e-8 {
         return;
@@ -821,6 +953,392 @@ fn move_edge(
     }
     sc.removed[donor] += dh;
     sc.added[recv] += dh;
+}
+
+/// Free-surface stand-in for a wall. Each solid cell takes the mean of the
+/// wet cells within two cells, so the body is not a hole in η.
+fn lift_solid_surface(
+    eta: &mut [f32],
+    h: &[f32],
+    solid: &[u8],
+    res: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    eps: f32,
+    tmp: &mut [f32],
+) {
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if solid[idx] == 0 {
+                continue;
+            }
+            let mut acc = 0.0f32;
+            let mut n = 0.0f32;
+            for dj in -2i32..=2 {
+                for di in -2i32..=2 {
+                    if di == 0 && dj == 0 {
+                        continue;
+                    }
+                    let ni = i as i32 + di;
+                    let nj = j as i32 + dj;
+                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                        continue;
+                    }
+                    let nidx = nj as usize * res + ni as usize;
+                    if solid[nidx] != 0 || h[nidx] <= eps {
+                        continue;
+                    }
+                    acc += eta[nidx];
+                    n += 1.0;
+                }
+            }
+            tmp[idx] = if n > 0.0 { acc / n } else { eta[idx] };
+        }
+    }
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if solid[idx] != 0 {
+                eta[idx] = tmp[idx];
+            }
+        }
+    }
+}
+
+/// No-slip ghost: the wall velocity is the negation of the neighbouring fluid.
+/// Vorticity on the fluid side is then the shear of that wall, not a drawn vortex.
+fn write_noslip_ghost(
+    u: &mut [f32],
+    v: &mut [f32],
+    h: &[f32],
+    solid: &[u8],
+    res: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    eps: f32,
+) {
+    let mut ghosts = Vec::new();
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if solid[idx] == 0 {
+                continue;
+            }
+            let mut au = 0.0f32;
+            let mut av = 0.0f32;
+            let mut n = 0.0f32;
+            for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let ni = i as i32 + di;
+                let nj = j as i32 + dj;
+                if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                    continue;
+                }
+                let nidx = nj as usize * res + ni as usize;
+                if solid[nidx] != 0 || h[nidx] <= eps {
+                    continue;
+                }
+                au += u[nidx];
+                av += v[nidx];
+                n += 1.0;
+            }
+            if n > 0.0 {
+                ghosts.push((idx, -au / n, -av / n));
+            } else {
+                ghosts.push((idx, 0.0, 0.0));
+            }
+        }
+    }
+    for (idx, gu, gv) in ghosts {
+        u[idx] = gu;
+        v[idx] = gv;
+    }
+}
+
+/// Remove the into-wall part of the fluid velocity. The tangential part stays.
+fn block_into_solid(
+    u: &mut [f32],
+    v: &mut [f32],
+    h: &[f32],
+    solid: &[u8],
+    res: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    eps: f32,
+) {
+    let mut next = Vec::new();
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if solid[idx] != 0 || h[idx] <= eps {
+                continue;
+            }
+            let mut ux = u[idx];
+            let mut vx = v[idx];
+            let mut hit = false;
+            for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let ni = i as i32 + di;
+                let nj = j as i32 + dj;
+                if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                    continue;
+                }
+                let nidx = nj as usize * res + ni as usize;
+                if solid[nidx] == 0 {
+                    continue;
+                }
+                let nx = di as f32;
+                let nz = dj as f32;
+                let vn = ux * nx + vx * nz;
+                if vn > 0.0 {
+                    ux -= vn * nx;
+                    vx -= vn * nz;
+                    hit = true;
+                }
+            }
+            if hit {
+                next.push((idx, ux, vx));
+            }
+        }
+    }
+    for (idx, ux, vx) in next {
+        u[idx] = ux;
+        v[idx] = vx;
+    }
+}
+
+/// Push water (or slurry) out of cells the body now occupies. The volume is
+/// split across the open neighbours. A cell with nowhere to go keeps its column.
+fn displace_occupied(h: &mut [f32], u: &mut [f32], v: &mut [f32], solid: &[u8], res: usize) {
+    let n = res * res;
+    let mut give = vec![0.0f32; n];
+    for j in 0..res {
+        for i in 0..res {
+            let idx = j * res + i;
+            if solid[idx] == 0 {
+                continue;
+            }
+            let vol = h[idx];
+            if vol <= 1.0e-8 {
+                h[idx] = 0.0;
+                u[idx] = 0.0;
+                v[idx] = 0.0;
+                continue;
+            }
+            let mut neigh = Vec::with_capacity(4);
+            for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let ni = i as i32 + di;
+                let nj = j as i32 + dj;
+                if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                    continue;
+                }
+                let nidx = nj as usize * res + ni as usize;
+                if solid[nidx] == 0 {
+                    neigh.push(nidx);
+                }
+            }
+            if neigh.is_empty() {
+                for dj in -2i32..=2 {
+                    for di in -2i32..=2 {
+                        let ni = i as i32 + di;
+                        let nj = j as i32 + dj;
+                        if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                            continue;
+                        }
+                        let nidx = nj as usize * res + ni as usize;
+                        if solid[nidx] == 0 {
+                            neigh.push(nidx);
+                        }
+                    }
+                }
+            }
+            if neigh.is_empty() {
+                continue;
+            }
+            h[idx] = 0.0;
+            u[idx] = 0.0;
+            v[idx] = 0.0;
+            let share = vol / neigh.len() as f32;
+            for nidx in neigh {
+                give[nidx] += share;
+            }
+        }
+    }
+    for idx in 0..n {
+        if give[idx] > 0.0 {
+            h[idx] += give[idx];
+        }
+    }
+}
+
+/// Move the discharge that points into a wall out to the open flanks.
+/// The wall stays dry. The volume stays on the sheet.
+fn redirect_into_walls(
+    h: &mut [f32],
+    u: &[f32],
+    v: &[f32],
+    solid: &[u8],
+    bed: &[f32],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    sc: &mut Scratch,
+) {
+    let n = res * res;
+    for idx in 0..n {
+        sc.removed[idx] = 0.0;
+        sc.added[idx] = 0.0;
+    }
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if solid[idx] != 0 || h[idx] < 0.02 {
+                continue;
+            }
+            for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                let ni = i as i32 + di;
+                let nj = j as i32 + dj;
+                if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                    continue;
+                }
+                let nidx = nj as usize * res + ni as usize;
+                if solid[nidx] == 0 {
+                    continue;
+                }
+                // Own speed into the wall, or the stream feeding this cell if the
+                // wall has already stopped it. Either way the discharge turns aside.
+                let mut vn = u[idx] * di as f32 + v[idx] * dj as f32;
+                let ui = i as i32 - di;
+                let uj = j as i32 - dj;
+                if ui >= 0 && uj >= 0 && ui < res as i32 && uj < res as i32 {
+                    let uidx = uj as usize * res + ui as usize;
+                    if solid[uidx] == 0 {
+                        let feed = u[uidx] * di as f32 + v[uidx] * dj as f32;
+                        if feed > vn {
+                            vn = feed;
+                        }
+                    }
+                }
+                if vn < 0.05 {
+                    continue;
+                }
+                let perps: [(i32, i32); 2] = if di != 0 {
+                    [(0, -1), (0, 1)]
+                } else {
+                    [(-1, 0), (1, 0)]
+                };
+                let mut dest = [0usize; 2];
+                let mut n_dest = 0usize;
+                let mut flank = 0.0f32;
+                for (pi, pj) in perps {
+                    let qi = i as i32 + pi;
+                    let qj = j as i32 + pj;
+                    if qi < 0 || qj < 0 || qi >= res as i32 || qj >= res as i32 {
+                        continue;
+                    }
+                    let q = qj as usize * res + qi as usize;
+                    if solid[q] != 0 {
+                        continue;
+                    }
+                    if h[q] <= 1.0e-6 && bed[q] > bed[idx] + h[idx] + 1.0e-3 {
+                        continue;
+                    }
+                    dest[n_dest] = q;
+                    flank += h[q];
+                    n_dest += 1;
+                }
+                if n_dest == 0 {
+                    continue;
+                }
+                // Only the water standing above the path around the body turns
+                // aside. The rest is the bow.
+                let excess = h[idx] - flank / n_dest as f32;
+                if excess < 2.0e-3 {
+                    continue;
+                }
+                let room = h[idx] - sc.removed[idx];
+                if room < 1.0e-6 {
+                    continue;
+                }
+                let frac = (vn * dt / cell).min(0.45);
+                let dh = excess.min(h[idx] * frac).min(room);
+                if dh < 1.0e-8 {
+                    continue;
+                }
+                sc.removed[idx] += dh;
+                let share = dh / n_dest as f32;
+                for q in dest.iter().take(n_dest) {
+                    sc.added[*q] += share;
+                }
+            }
+        }
+    }
+    for idx in 0..n {
+        if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
+            h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+        }
+    }
+}
+
+fn solid_near(mask: &[u8], res: usize, i: usize, j: usize, radius: i32) -> bool {
+    for dj in -radius..=radius {
+        for di in -radius..=radius {
+            if di == 0 && dj == 0 {
+                continue;
+            }
+            let ni = i as i32 + di;
+            let nj = j as i32 + dj;
+            if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                continue;
+            }
+            if mask[nj as usize * res + ni as usize] != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn solid_contains(solid: &HydroSolid, x: f32, z: f32) -> bool {
+    let dx = x - solid.x;
+    let dz = z - solid.z;
+    let fwd_x = solid.yaw.sin();
+    let fwd_z = solid.yaw.cos();
+    let right_x = fwd_z;
+    let right_z = -fwd_x;
+    let along = dx * fwd_x + dz * fwd_z;
+    let lat = dx * right_x + dz * right_z;
+    along.abs() <= solid.half_length.max(0.0) && lat.abs() <= solid.half_width.max(0.0)
+}
+
+fn solid_overlaps(solid: &HydroSolid, x: f32, z: f32, eta: f32, bed: f32) -> bool {
+    if solid.half_length <= 1.0e-4 || solid.half_width <= 1.0e-4 {
+        return false;
+    }
+    if !solid_contains(solid, x, z) {
+        return false;
+    }
+    eta > solid.bottom_y + 1.0e-4 && bed < solid.top_y
+}
+
+fn cylinder_segment_volume(depth: f32, radius: f32, width: f32) -> f32 {
+    let d = depth.clamp(0.0, radius * 2.0);
+    if d <= 1.0e-4 || width <= 0.0 || radius <= 1.0e-3 {
+        return 0.0;
+    }
+    let c = ((radius - d) / radius).clamp(-1.0, 1.0);
+    let area =
+        radius * radius * c.acos() - (radius - d) * (2.0 * radius * d - d * d).max(0.0).sqrt();
+    area.max(0.0) * width
 }
 
 fn column_sum(h: &[f32], cell: f32) -> f32 {
@@ -970,6 +1488,13 @@ pub struct FluidCore {
     pub frame: u32,
     pushes: Vec<TirePush>,
     wind: [f32; 2],
+    /// Wheel and belly walls. Empty means the sheet has no body in it.
+    solids: Vec<HydroSolid>,
+    /// Metres of bed removed by contact shear, per coarse cell.
+    bed_drop: Vec<f32>,
+    eroded_m3: f32,
+    scour_hole_m: f32,
+    cycle: Option<StreamCycle>,
 }
 
 impl FluidCore {
@@ -1017,7 +1542,95 @@ impl FluidCore {
             frame: 0,
             pushes: Vec::new(),
             wind: [1.1, 0.35],
+            solids: Vec::new(),
+            bed_drop: vec![0.0; n],
+            eroded_m3: 0.0,
+            scour_hole_m: 0.0,
+            cycle: None,
         }
+    }
+
+    /// Replace the walls for the next step. An empty slice is open water.
+    pub fn set_hydro_solids(&mut self, solids: &[HydroSolid]) {
+        self.solids.clear();
+        self.solids.extend_from_slice(solids);
+    }
+
+    pub fn hydro_solids(&self) -> &[HydroSolid] {
+        &self.solids
+    }
+
+    /// Open-channel lips. `None` leaves the sheet closed at its own banks.
+    pub fn set_stream_cycle(&mut self, cycle: Option<StreamCycle>) {
+        self.cycle = cycle;
+    }
+
+    /// Initial bed and water thickness. Returns the water volume now on the sheet.
+    pub fn map_water_bed(&mut self, mut f: impl FnMut(f32, f32) -> (f32, f32)) -> f32 {
+        self.restrict_fine();
+        let mut vol = 0.0f32;
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = self.coarse_xz(i, j);
+                let (bed, water) = f(x, z);
+                let idx = j * WINDOW_RES + i;
+                self.bed[idx] = if bed.is_finite() { bed } else { 0.0 };
+                let w = if water.is_finite() {
+                    water.max(0.0)
+                } else {
+                    0.0
+                };
+                self.water[idx] = w;
+                if w > 0.0 {
+                    self.moisture[idx] = self.moisture[idx].max(0.8);
+                    if self.grain[idx] == Grain::Other as u8 {
+                        self.grain[idx] = Grain::Silt as u8;
+                    }
+                }
+                vol += w * area;
+            }
+        }
+        vol
+    }
+
+    /// Initial horizontal velocity. Call once. Later steps are the sheet's.
+    pub fn map_water_velocity(&mut self, mut f: impl FnMut(f32, f32, f32) -> (f32, f32)) {
+        self.restrict_fine();
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let idx = j * WINDOW_RES + i;
+                if self.water[idx] <= 1.0e-6 {
+                    continue;
+                }
+                let (x, z) = self.coarse_xz(i, j);
+                let (u, v) = f(x, z, self.water[idx]);
+                self.uw[idx] = if u.is_finite() { u } else { 0.0 };
+                self.vw[idx] = if v.is_finite() { v } else { 0.0 };
+            }
+        }
+    }
+
+    pub fn non_finite_count(&self) -> u32 {
+        let mut n = 0u32;
+        for arr in [
+            &self.water,
+            &self.slurry,
+            &self.uw,
+            &self.vw,
+            &self.us,
+            &self.vs,
+            &self.bed,
+            &self.moisture,
+            &self.bed_drop,
+        ] {
+            for v in arr {
+                if !v.is_finite() {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     pub fn set_wind(&mut self, x: f32, z: f32) {
@@ -1239,6 +1852,10 @@ impl FluidCore {
         self.apply_pushes_outside(&pushes, fine_rect);
         self.step_pair(dt, false);
         spray.extend(self.peel_spray(&pushes, false, fine_rect));
+        if !self.solids.is_empty() {
+            self.scour_contacts(dt);
+        }
+        self.cycle_stream();
         self.step_dust(dt, slow);
         if slow {
             self.settle_dust();
@@ -1524,11 +2141,373 @@ impl FluidCore {
         }
     }
 
+    /// Force, buoyancy, and the scour account, read from the coarse sheet.
+    pub fn hydro_load(&self) -> HydroLoad {
+        let mask = if self.solids.is_empty() {
+            vec![0u8; WINDOW_RES * WINDOW_RES]
+        } else {
+            self.solid_mask(false)
+        };
+        let mut force_x = 0.0f32;
+        let mut force_z = 0.0f32;
+        let mut wheel_blocks = 0u32;
+        let mut belly_blocks = 0u32;
+        let cell = COARSE_CELL_M;
+        let res = WINDOW_RES;
+        for m in &mask {
+            if *m == 1 {
+                wheel_blocks += 1;
+            } else if *m == 2 {
+                belly_blocks += 1;
+            }
+        }
+        for j in 0..res {
+            for i in 0..res {
+                let idx = j * res + i;
+                if mask[idx] != 0 {
+                    continue;
+                }
+                let h = self.water[idx];
+                if h < 1.0e-4 || !h.is_finite() {
+                    continue;
+                }
+                for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                    let ni = i as i32 + di;
+                    let nj = j as i32 + dj;
+                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                        continue;
+                    }
+                    let nidx = nj as usize * res + ni as usize;
+                    if mask[nidx] == 0 {
+                        continue;
+                    }
+                    let nx = di as f32;
+                    let nz = dj as f32;
+                    let hydro = 1000.0 * GRAVITY * h * h * 0.5 * cell;
+                    force_x += nx * hydro;
+                    force_z += nz * hydro;
+                    let vn = self.uw[idx] * nx + self.vw[idx] * nz;
+                    if vn > 0.0 {
+                        let dyn_f = 0.5 * 1000.0 * vn * vn * h * cell;
+                        force_x += nx * dyn_f;
+                        force_z += nz * dyn_f;
+                    }
+                }
+            }
+        }
+        let mut wheel_b = 0.0f32;
+        let mut hull_b = 0.0f32;
+        let mut displaced = 0.0f32;
+        for solid in &self.solids {
+            let Some((bed, water)) = self.ring_surface(solid) else {
+                continue;
+            };
+            if solid.radius > 0.0 {
+                let vol = cylinder_segment_volume(water, solid.radius, solid.width);
+                displaced += vol;
+                wheel_b += 1000.0 * GRAVITY * vol;
+            } else {
+                let eta = bed + water;
+                let height = (solid.top_y - solid.bottom_y).max(0.0);
+                let sub = (eta - solid.bottom_y).clamp(0.0, height);
+                let vol = (solid.half_length * 2.0) * (solid.half_width * 2.0) * sub * 0.36;
+                displaced += vol;
+                hull_b += 1000.0 * GRAVITY * vol;
+            }
+        }
+        HydroLoad {
+            force_x,
+            force_z,
+            buoyancy_n: wheel_b + hull_b,
+            hull_buoyancy_n: hull_b,
+            wheel_buoyancy_n: wheel_b,
+            displaced_m3: displaced,
+            eroded_m3: self.eroded_m3,
+            hole_m: self.scour_hole_m,
+            wheel_blocks,
+            belly_blocks,
+        }
+    }
+
+    fn ring_surface(&self, solid: &HydroSolid) -> Option<(f32, f32)> {
+        let reach = solid.half_length.max(solid.half_width) + 0.55;
+        let i0 = ((solid.x - reach - self.origin[0]) / COARSE_CELL_M).floor() as i32;
+        let i1 = ((solid.x + reach - self.origin[0]) / COARSE_CELL_M).floor() as i32;
+        let j0 = ((solid.z - reach - self.origin[1]) / COARSE_CELL_M).floor() as i32;
+        let j1 = ((solid.z + reach - self.origin[1]) / COARSE_CELL_M).floor() as i32;
+        let mut bed = 0.0f32;
+        let mut water = 0.0f32;
+        let mut n = 0.0f32;
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                if i < 0 || j < 0 || i >= WINDOW_RES as i32 || j >= WINDOW_RES as i32 {
+                    continue;
+                }
+                let (x, z) = self.coarse_xz(i as usize, j as usize);
+                if solid_contains(solid, x, z) {
+                    continue;
+                }
+                if (x - solid.x).hypot(z - solid.z) > reach {
+                    continue;
+                }
+                let idx = j as usize * WINDOW_RES + i as usize;
+                if self.water[idx] < 0.01 {
+                    continue;
+                }
+                bed += self.bed[idx];
+                water += self.water[idx];
+                n += 1.0;
+            }
+        }
+        if n < 1.0 {
+            None
+        } else {
+            Some((bed / n, water / n))
+        }
+    }
+
+    fn solid_mask(&self, fine: bool) -> Vec<u8> {
+        let (res, cell, origin, water, bed) = if fine {
+            (
+                FINE_RES,
+                FINE_CELL_M,
+                self.fine_origin,
+                self.fine_water.as_slice(),
+                self.fine_bed.as_slice(),
+            )
+        } else {
+            (
+                WINDOW_RES,
+                COARSE_CELL_M,
+                self.origin,
+                self.water.as_slice(),
+                self.bed.as_slice(),
+            )
+        };
+        let mut mask = vec![0u8; res * res];
+        for j in 0..res {
+            for i in 0..res {
+                let x = origin[0] + (i as f32 + 0.5) * cell;
+                let z = origin[1] + (j as f32 + 0.5) * cell;
+                let idx = j * res + i;
+                // The free surface beside a cell that the body has already
+                // emptied. The wall stays up for as long as that water stands
+                // above the solid's underside.
+                let mut eta = bed[idx] + water[idx];
+                for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                    let ni = i as i32 + di;
+                    let nj = j as i32 + dj;
+                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                        continue;
+                    }
+                    let nidx = nj as usize * res + ni as usize;
+                    eta = eta.max(bed[nidx] + water[nidx]);
+                }
+                for solid in self.solids.iter().filter(|s| !s.contact) {
+                    if solid_overlaps(solid, x, z, eta, bed[idx]) {
+                        mask[idx] = 2;
+                    }
+                }
+                for solid in self.solids.iter().filter(|s| s.contact) {
+                    if solid_overlaps(solid, x, z, eta, bed[idx]) {
+                        mask[idx] = 1;
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    /// Excess shear beside a tire contact entrains bed into the slurry sheet.
+    fn scour_contacts(&mut self, dt: f32) {
+        if dt <= 0.0 || self.solids.is_empty() {
+            return;
+        }
+        let mask = self.solid_mask(false);
+        let res = WINDOW_RES;
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut cut = vec![0.0f32; res * res];
+        for j in 1..res - 1 {
+            for i in 1..res - 1 {
+                let idx = j * res + i;
+                if mask[idx] != 0 || self.water[idx] < 0.02 {
+                    continue;
+                }
+                let mut touch = false;
+                for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nidx = (j as i32 + dj) as usize * res + (i as i32 + di) as usize;
+                    if mask[nidx] == 1 {
+                        touch = true;
+                        break;
+                    }
+                }
+                if !touch {
+                    continue;
+                }
+                let speed = self.uw[idx].hypot(self.vw[idx]);
+                if !speed.is_finite() {
+                    continue;
+                }
+                let tau = 1000.0 * 0.03 * speed * speed;
+                let tau_c = 1.5f32;
+                if tau <= tau_c {
+                    continue;
+                }
+                let rate = (0.0035 * (tau / tau_c - 1.0)).min(0.012);
+                let room = (0.08 - self.bed_drop[idx]).max(0.0);
+                cut[idx] = (rate * dt).min(room);
+            }
+        }
+        for idx in 0..res * res {
+            let dh = cut[idx];
+            if dh <= 0.0 {
+                continue;
+            }
+            self.bed[idx] -= dh;
+            self.slurry[idx] += dh;
+            self.us[idx] = self.uw[idx];
+            self.vs[idx] = self.vw[idx];
+            self.grain[idx] = Grain::Silt as u8;
+            self.moisture[idx] = self.moisture[idx].max(0.9);
+            self.bed_drop[idx] += dh;
+            self.eroded_m3 += dh * area;
+            self.scour_hole_m = self.scour_hole_m.max(self.bed_drop[idx]);
+        }
+    }
+
+    /// Recycle a reach. The downstream lip copies the flowing interior so the
+    /// bank does not reflect, and the volume that left is put back on the
+    /// upstream lip. No lip, no change.
+    fn cycle_stream(&mut self) {
+        let Some(cyc) = self.cycle else {
+            return;
+        };
+        let along_z = cyc.dir_z.abs() >= cyc.dir_x.abs();
+        let cell = COARSE_CELL_M;
+        let res = WINDOW_RES;
+        let lip = |p: f32, origin: f32| -> i32 { ((p - origin) / cell).floor() as i32 };
+        if along_z {
+            let j_up = lip(cyc.z0, self.origin[1]);
+            let j_dn = lip(cyc.z1, self.origin[1]);
+            // Reference is a few cells inside the upstream lip, away from the
+            // car and away from the bank. The last four rows copy it.
+            let (j_ref, j_out0, j_out1, j_inlet) = if cyc.dir_z >= 0.0 {
+                (j_up + 6, j_dn - 3, j_dn, j_up)
+            } else {
+                (j_dn - 6, j_up, j_up + 3, j_dn)
+            };
+            if j_up < 1
+                || j_dn >= res as i32 - 1
+                || j_ref <= j_out1 && j_ref >= j_out0
+                || j_out0 <= j_up
+            {
+                return;
+            }
+            let i0 = lip(cyc.x0, self.origin[0]);
+            let i1 = lip(cyc.x1, self.origin[0]);
+            for i in i0..i1 {
+                if i < 0 || i >= res as i32 {
+                    continue;
+                }
+                self.recycle_column(
+                    i as usize,
+                    j_ref as usize,
+                    j_out0 as usize,
+                    j_out1 as usize,
+                    j_inlet as usize,
+                    true,
+                );
+            }
+        } else {
+            let i_up = lip(cyc.x0, self.origin[0]);
+            let i_dn = lip(cyc.x1, self.origin[0]);
+            let (i_ref, i_out0, i_out1, i_inlet) = if cyc.dir_x >= 0.0 {
+                (i_up + 6, i_dn - 3, i_dn, i_up)
+            } else {
+                (i_dn - 6, i_up, i_up + 3, i_dn)
+            };
+            if i_up < 1 || i_dn >= res as i32 - 1 || i_out0 <= i_up {
+                return;
+            }
+            let j0 = lip(cyc.z0, self.origin[1]);
+            let j1 = lip(cyc.z1, self.origin[1]);
+            for j in j0..j1 {
+                if j < 0 || j >= res as i32 {
+                    continue;
+                }
+                self.recycle_column(
+                    j as usize,
+                    i_ref as usize,
+                    i_out0 as usize,
+                    i_out1 as usize,
+                    i_inlet as usize,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn recycle_column(
+        &mut self,
+        cross: usize,
+        interior: usize,
+        out0: usize,
+        out1: usize,
+        inlet: usize,
+        along_z: bool,
+    ) {
+        let res = WINDOW_RES;
+        let at = |a: usize, b: usize| -> usize {
+            if along_z {
+                a * res + b
+            } else {
+                b * res + a
+            }
+        };
+        let src = at(interior, cross);
+        if self.water[src] < 0.02 || !self.water[src].is_finite() {
+            return;
+        }
+        let mut surplus = 0.0f32;
+        for out in out0..=out1 {
+            let idx = at(out, cross);
+            if self.water[idx].is_finite() {
+                surplus += self.water[idx] - self.water[src];
+            }
+            self.water[idx] = self.water[src];
+            self.uw[idx] = self.uw[src];
+            self.vw[idx] = self.vw[src];
+        }
+        let inn = at(inlet, cross);
+        let next = (self.water[inn] + surplus).max(0.0);
+        if next.is_finite() {
+            self.water[inn] = next;
+        }
+        if self.vw[src].abs() + self.uw[src].abs() > 0.05 {
+            self.uw[inn] = self.uw[src];
+            self.vw[inn] = self.vw[src];
+        }
+    }
+
     fn step_pair(&mut self, dt: f32, fine: bool) {
         let (res, cell) = if fine {
             (FINE_RES, FINE_CELL_M)
         } else {
             (WINDOW_RES, COARSE_CELL_M)
+        };
+        let mask = if fine && !self.fine_on {
+            None
+        } else if self.solids.is_empty() && self.cycle.is_none() {
+            None
+        } else if self.solids.is_empty() {
+            let n = if fine {
+                FINE_RES * FINE_RES
+            } else {
+                WINDOW_RES * WINDOW_RES
+            };
+            Some(vec![0u8; n])
+        } else {
+            Some(self.solid_mask(fine))
         };
         let n = res * res;
         let nu_w = vec![dynamic_viscosity(Grain::Water, 1.0); n];
@@ -1570,30 +2549,63 @@ impl FluidCore {
             soften_border(uw, vw, res);
             soften_border(us, vs, res);
         }
-        step_sheet(
-            water,
-            uw,
-            vw,
-            &bed,
-            &nu_w,
-            &gate,
-            res,
-            cell,
-            dt,
-            SheetDrive::Gravity { vorticity: 0.08 },
-        );
-        step_sheet(
-            slurry,
-            us,
-            vs,
-            &bed,
-            &nu_s,
-            &gate,
-            res,
-            cell,
-            dt,
-            SheetDrive::Gravity { vorticity: 0.05 },
-        );
+        if let Some(mask) = &mask {
+            displace_occupied(water, uw, vw, mask, res);
+            displace_occupied(slurry, us, vs, mask, res);
+            step_sheet_eps(
+                water,
+                uw,
+                vw,
+                &bed,
+                &nu_w,
+                &gate,
+                res,
+                cell,
+                dt,
+                SheetDrive::Gravity { vorticity: 0.08 },
+                1.0e-6,
+                Some(mask),
+            );
+            step_sheet_eps(
+                slurry,
+                us,
+                vs,
+                &bed,
+                &nu_s,
+                &gate,
+                res,
+                cell,
+                dt,
+                SheetDrive::Gravity { vorticity: 0.05 },
+                1.0e-6,
+                Some(mask),
+            );
+        } else {
+            step_sheet(
+                water,
+                uw,
+                vw,
+                &bed,
+                &nu_w,
+                &gate,
+                res,
+                cell,
+                dt,
+                SheetDrive::Gravity { vorticity: 0.08 },
+            );
+            step_sheet(
+                slurry,
+                us,
+                vs,
+                &bed,
+                &nu_s,
+                &gate,
+                res,
+                cell,
+                dt,
+                SheetDrive::Gravity { vorticity: 0.05 },
+            );
+        }
     }
 
     fn apply_pushes(&mut self, pushes: &[TirePush], fine: bool) {

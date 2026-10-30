@@ -4,6 +4,7 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use crate::adhesion::{self, Adhesion};
+use crate::fluid_core::HydroSolid;
 use crate::patch::{contact_patch, step_tread, stuck_compact_breakaway, TreadCoat, TreadStep};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, mech_for_sample, on_launch_crest,
@@ -45,6 +46,11 @@ const WHEEL_MUD_CAP: f32 = 1.5;
 pub const PANEL_MUD_CAP: f32 = 0.85;
 
 /// Hardpoints: FL, FR, RL, RR. Local space, Y up, Z forward.
+fn submerged_half_chord(radius: f32, depth: f32) -> f32 {
+    let d = depth.min(radius * 2.0).max(0.0);
+    (2.0 * radius * d - d * d).max(0.0).sqrt()
+}
+
 pub fn hardpoints() -> [Vec3; 4] {
     [
         Vec3::new(-0.74, HARD_Y, 1.08),
@@ -140,6 +146,9 @@ pub struct Vehicle {
     pub water_lift_n: f32,
     /// Hull drag from the water crossing, newtons. Zero off the water.
     pub water_drag_n: f32,
+    /// Horizontal force from the fluid pressure on the wheels and the belly.
+    /// Zero unless a sheet reported a load. It does not oppose velocity.
+    pub water_push_n: Vec3,
     /// Set once the free surface reaches the air intake. Engine torque stays zero.
     pub engine_stalled: bool,
     /// Stuck mud: mass, packed tread, arch brake, shader thickness.
@@ -197,6 +206,7 @@ impl Vehicle {
             jump_hold: 0.0,
             water_lift_n: 0.0,
             water_drag_n: 0.0,
+            water_push_n: Vec3::ZERO,
             engine_stalled: false,
             adhesion: Adhesion::default(),
         }
@@ -317,6 +327,52 @@ impl Vehicle {
         }
         self.panels = [PanelMud::default(); PANEL_COUNT];
         self.adhesion = Adhesion::default();
+    }
+
+    /// Wheel and belly walls for the shared sheet. `depth_at` is the water
+    /// thickness at a point, in metres. A dry tire is left out. The belly is
+    /// always passed; the sheet blocks it only where the free surface reaches it.
+    pub fn hydro_solids(&self, depth_at: impl Fn(f32, f32) -> f32) -> Vec<HydroSolid> {
+        let ori = self.orientation();
+        let mut out = Vec::with_capacity(5);
+        for i in 0..4 {
+            let w = self.pos + ori * self.wheel_center_local(i);
+            let depth = depth_at(w.x, w.z).max(0.0);
+            if depth < 0.02 {
+                continue;
+            }
+            let half = submerged_half_chord(WHEEL_RADIUS, depth);
+            if half < 0.04 {
+                continue;
+            }
+            let fwd = ori * (Quat::from_rotation_y(self.wheels[i].steer) * Vec3::Z);
+            out.push(HydroSolid {
+                x: w.x,
+                z: w.z,
+                yaw: fwd.x.atan2(fwd.z),
+                half_length: half,
+                half_width: WHEEL_WIDTH * 0.5,
+                bottom_y: w.y - WHEEL_RADIUS,
+                top_y: w.y + WHEEL_RADIUS,
+                contact: true,
+                radius: WHEEL_RADIUS,
+                width: WHEEL_WIDTH,
+            });
+        }
+        let belly = self.pos + ori * Vec3::new(0.0, -0.20, 0.10);
+        out.push(HydroSolid {
+            x: belly.x,
+            z: belly.z,
+            yaw: self.yaw,
+            half_length: 1.15,
+            half_width: 0.70,
+            bottom_y: belly.y,
+            top_y: belly.y + 0.50,
+            contact: false,
+            radius: 0.0,
+            width: 0.0,
+        });
+        out
     }
 
     pub fn wheel_center_local(&self, index: usize) -> Vec3 {
@@ -676,6 +732,8 @@ impl Vehicle {
                 force -= (hv / spd) * self.water_drag_n;
             }
         }
+        force.x += self.water_push_n.x;
+        force.z += self.water_push_n.z;
         let mut torque_local = Vec3::ZERO;
         let held = self.jump_hold > 0.0;
         if self.jump_hold > 0.0 {
