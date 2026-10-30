@@ -259,7 +259,10 @@ impl Vehicle {
         best
     }
 
-    /// How far the free surface stands above the belly, metres.
+    /// How far the free water surface stands above the belly, metres.
+    ///
+    /// A berm or rut wall is soil. Counting that height as water lifts the
+    /// hull off the clay it is trying to climb.
     pub fn body_draft(&self, soil: &SoilField) -> f32 {
         let ori = self.orientation();
         let pts = [
@@ -273,8 +276,13 @@ impl Vehicle {
         for p in pts {
             let w = self.pos + ori * p;
             let s = soil.sample(w.x, w.z);
-            let surface = s.height + s.water;
-            draft = draft.max(surface - w.y);
+            let above_bed = w.y - s.height;
+            let water_draft = if above_bed >= 0.0 {
+                s.water - above_bed
+            } else {
+                s.water
+            };
+            draft = draft.max(water_draft);
         }
         draft.max(0.0)
     }
