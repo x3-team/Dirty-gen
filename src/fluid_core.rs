@@ -4,7 +4,8 @@
 //! separable filter, a wide gaussian plus a steeper kernel. Viscosity is
 //! the mix, and it enters by overloading the divergence the projection
 //! removes. Dust is a 2.5D air grid on the same advection, projection, and
-//! vorticity confinement. The window moves with the Niva: a coarse sheet
+//! vorticity confinement. The Niva body and wheels inject velocity on that
+//! grid, and the wake is confined there. The window moves with the Niva: a coarse sheet
 //! about 20 cm across the near field, a 2 cm sheet under the tires, and
 //! cells that leave the window are parked so the volume comes back.
 //! Slow exchange runs every few frames. Spray is a volume handed to the
@@ -1449,6 +1450,29 @@ impl FluidCore {
         self.dust[idx]
     }
 
+    /// Horizontal dust-sheet velocity in contract order, vertical channel 0.
+    ///
+    /// This is not the body wake. The ledger path publishes `Dust::write_air_velocity`
+    /// instead. Index `(x + layer * 128 + z * 128 * 8) * 4`, R +X, G +Y, B +Z, A 0.
+    pub fn write_air_velocity(&self, dst: &mut [f32]) {
+        let n = AIR_RES * AIR_LAYERS * AIR_RES;
+        if dst.len() < n * 4 || self.dust_u.len() < n || self.dust_v.len() < n {
+            return;
+        }
+        for iz in 0..AIR_RES {
+            for layer in 0..AIR_LAYERS {
+                for ix in 0..AIR_RES {
+                    let src = (layer * AIR_RES + iz) * AIR_RES + ix;
+                    let dst_i = (ix + layer * AIR_RES + iz * AIR_RES * AIR_LAYERS) * 4;
+                    dst[dst_i] = finite0(self.dust_u[src]);
+                    dst[dst_i + 1] = 0.0;
+                    dst[dst_i + 2] = finite0(self.dust_v[src]);
+                    dst[dst_i + 3] = 0.0;
+                }
+            }
+        }
+    }
+
     /// Loudest airborne columns, then the settled film, up to `limit` marks.
     /// Heights are metres above the bed. This does not move mass.
     pub fn dust_marks(&self, limit: usize) -> Vec<DustMark> {
@@ -2250,6 +2274,906 @@ fn snap_origin(center: [f32; 2], extent: f32, cell: f32) -> [f32; 2] {
 
 fn world_key(x: f32, z: f32, cell: f32) -> (i32, i32) {
     ((x / cell).floor() as i32, (z / cell).floor() as i32)
+}
+
+/// Vorticity confinement, metres per second. The kick is this times N × ω × dt.
+/// High enough that the body shear rolls up behind the rear face instead of
+/// diffusing below [`WAKE_VORTICITY_MIN`].
+pub const AIR_CONFINE: f32 = 6.0;
+/// |ω| the wake behind the body must clear, 1/s. Scored 0.5–5 m aft of the
+/// rear face, inside the track, not on the free-stream shear at the lee edge.
+pub const WAKE_VORTICITY_MIN: f32 = 6.0;
+/// Milliseconds allowed for one air step in an unoptimized `cargo test`:
+/// inject, advect, confine, and the density flux. A quiet debug run of the
+/// proof drive sits near 28 ms. Optimized builds are well under this.
+pub const AIR_STEP_BUDGET_MS: f32 = 48.0;
+/// Share of the wake residual that moves dust. Free-stream wind is already
+/// applied by [`advect_dust_density`].
+pub const AIR_DENSITY_COUPLING: f32 = 0.04;
+
+const AIR_FEATHER_M: f32 = 0.22;
+const AIR_WIND_RATE: f32 = 1.35;
+const AIR_WIN_LAT: f32 = 4.2;
+const AIR_WIN_Z0: f32 = -8.6;
+const AIR_WIN_Z1: f32 = 3.0;
+
+/// Niva body half-extents in the chassis frame, metres. +X right, +Y up, +Z forward.
+pub const NIVA_BODY_HALF: [f32; 3] = [0.86, 0.62, 1.78];
+/// Body centre relative to the chassis origin. The origin sits at the height
+/// used by [`crate::dust::CHASSIS_Y`].
+pub const NIVA_BODY_OFFSET: [f32; 3] = [0.0, 0.38, 0.02];
+/// Hub centres relative to that chassis origin. Same plan as `dust::HUBS`.
+pub const NIVA_WHEEL_HUB: [[f32; 3]; 4] = [
+    [-0.74, -0.20, 1.08],
+    [0.74, -0.20, 1.08],
+    [-0.74, -0.20, -1.18],
+    [0.74, -0.20, -1.18],
+];
+pub const NIVA_WHEEL_RADIUS: f32 = 0.38;
+pub const NIVA_WHEEL_HALF_WIDTH: f32 = 0.14;
+
+/// Wind and chassis for one air step. Velocity is stored as world metres per second.
+#[derive(Clone, Copy, Debug)]
+pub struct AirDrive {
+    pub wind_x: f32,
+    pub wind_z: f32,
+    pub speed: f32,
+    pub forward: [f32; 3],
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    pub chassis: [f32; 3],
+    /// World velocity of the grid itself. The dust window is fixed to the chassis.
+    pub scroll: [f32; 3],
+    /// Wake sample in the chassis frame: |lateral| ≤ lat, y in range, forward in z.
+    pub wake_lat: f32,
+    pub wake_y0: f32,
+    pub wake_y1: f32,
+    pub wake_z0: f32,
+    pub wake_z1: f32,
+}
+
+/// A box or a wheel that forces the air. `spin` is radians per second about `right`.
+#[derive(Clone, Copy, Debug)]
+pub struct AirSolid {
+    pub center: [f32; 3],
+    pub half: [f32; 3],
+    pub right: [f32; 3],
+    pub forward: [f32; 3],
+    pub up: [f32; 3],
+    /// World velocity of the solid's origin, before spin, metres per second.
+    pub velocity: [f32; 3],
+    pub spin: f32,
+    pub cylinder: bool,
+    pub radius: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AirReport {
+    /// Peak smoothed |ω| in the wake, 1/s.
+    pub peak_vorticity: f32,
+    pub wake_cells: u32,
+    pub nan_count: u32,
+}
+
+/// Body and four wheels for the straight Niva. Hubs match `dust::HUBS`.
+pub fn niva_air(
+    chassis: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    speed: f32,
+    slip: [f32; 4],
+    wind_x: f32,
+    wind_z: f32,
+) -> (AirDrive, [AirSolid; 5]) {
+    let forward = norm3(forward, [0.0, 0.0, 1.0]);
+    let right = norm3(right, [1.0, 0.0, 0.0]);
+    let up = norm3(cross3(forward, right), [0.0, 1.0, 0.0]);
+    let speed = if speed.is_finite() {
+        speed.max(0.0)
+    } else {
+        0.0
+    };
+    let body_vel = scale3(forward, speed);
+    let center = add3(
+        chassis,
+        add3(
+            scale3(right, NIVA_BODY_OFFSET[0]),
+            add3(
+                scale3(up, NIVA_BODY_OFFSET[1]),
+                scale3(forward, NIVA_BODY_OFFSET[2]),
+            ),
+        ),
+    );
+    let body = AirSolid {
+        center,
+        half: NIVA_BODY_HALF,
+        right,
+        forward,
+        up,
+        velocity: body_vel,
+        spin: 0.0,
+        cylinder: false,
+        radius: 0.0,
+    };
+    let mut solids = [body; 5];
+    for i in 0..4 {
+        let h = NIVA_WHEEL_HUB[i];
+        let hub = add3(
+            chassis,
+            add3(
+                scale3(right, h[0]),
+                add3(scale3(up, h[1]), scale3(forward, h[2])),
+            ),
+        );
+        let omega = (speed + slip[i].abs()) / NIVA_WHEEL_RADIUS;
+        solids[i + 1] = AirSolid {
+            center: hub,
+            half: [NIVA_WHEEL_HALF_WIDTH, NIVA_WHEEL_RADIUS, NIVA_WHEEL_RADIUS],
+            right,
+            forward,
+            up,
+            velocity: body_vel,
+            spin: omega,
+            cylinder: true,
+            radius: NIVA_WHEEL_RADIUS,
+        };
+    }
+    let rear = NIVA_BODY_OFFSET[2] - NIVA_BODY_HALF[2];
+    let drive = AirDrive {
+        wind_x,
+        wind_z,
+        speed,
+        forward,
+        right,
+        up,
+        chassis,
+        scroll: [0.0, 0.0, speed * forward[2]],
+        wake_lat: 1.35,
+        wake_y0: 0.28,
+        wake_y1: 1.45,
+        wake_z0: rear - 4.6,
+        wake_z1: rear - 0.50,
+    };
+    (drive, solids)
+}
+
+thread_local! {
+    static AIR_OMEGA: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
+
+/// World AABB of every solid, expanded by the occupancy feather.
+fn solids_aabb(solids: &[AirSolid]) -> [f32; 6] {
+    if solids.is_empty() {
+        return [0.0, 0.0, 0.0, -1.0, -1.0, -1.0];
+    }
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for solid in solids {
+        let (hx, hy, hz) = if solid.cylinder {
+            (
+                solid.half[0] + AIR_FEATHER_M,
+                solid.radius + AIR_FEATHER_M,
+                solid.radius + AIR_FEATHER_M,
+            )
+        } else {
+            (
+                solid.half[0] + AIR_FEATHER_M,
+                solid.half[1] + AIR_FEATHER_M,
+                solid.half[2] + AIR_FEATHER_M,
+            )
+        };
+        let ex = solid.right[0].abs() * hx + solid.up[0].abs() * hy + solid.forward[0].abs() * hz;
+        let ey = solid.right[1].abs() * hx + solid.up[1].abs() * hy + solid.forward[1].abs() * hz;
+        let ez = solid.right[2].abs() * hx + solid.up[2].abs() * hy + solid.forward[2].abs() * hz;
+        min[0] = min[0].min(solid.center[0] - ex);
+        min[1] = min[1].min(solid.center[1] - ey);
+        min[2] = min[2].min(solid.center[2] - ez);
+        max[0] = max[0].max(solid.center[0] + ex);
+        max[1] = max[1].max(solid.center[1] + ey);
+        max[2] = max[2].max(solid.center[2] + ez);
+    }
+    [min[0], min[1], min[2], max[0], max[1], max[2]]
+}
+
+#[inline(always)]
+fn point_in_aabb(p: [f32; 3], aabb: [f32; 6]) -> bool {
+    p[0] >= aabb[0]
+        && p[0] <= aabb[3]
+        && p[1] >= aabb[1]
+        && p[1] <= aabb[4]
+        && p[2] >= aabb[2]
+        && p[2] <= aabb[5]
+}
+
+#[inline(always)]
+fn row_stream(streams: &[[f32; 3]], ix: usize, x: f32, drive: &AirDrive) -> [f32; 3] {
+    if ix < streams.len() {
+        streams[ix]
+    } else {
+        stream_at(x, drive)
+    }
+}
+
+/// Inject the solids, advect the velocity, confine vorticity.
+///
+/// `vel` and `scratch` are world metres per second, xyz, indexed like the dust
+/// volume: `x + y * nx + z * nx * ny`. `warm` is false on the first step so the
+/// grid starts on the free stream instead of a dead calm.
+pub fn step_vehicle_air(
+    vel: &mut [f32],
+    scratch: &mut [f32],
+    origin: [f32; 3],
+    cell: [f32; 3],
+    res: [usize; 3],
+    drive: &AirDrive,
+    solids: &[AirSolid],
+    dt: f32,
+    warm: bool,
+) -> AirReport {
+    let n = res[0].saturating_mul(res[1]).saturating_mul(res[2]);
+    if dt <= 0.0 || !dt.is_finite() || n == 0 || vel.len() < n * 3 || scratch.len() < n * 3 {
+        return AirReport {
+            peak_vorticity: 0.0,
+            wake_cells: 0,
+            nan_count: 0,
+        };
+    }
+    let (ix0, ix1, iz0, iz1) = air_window(origin, cell, res, drive);
+    let aabb = solids_aabb(solids);
+    let mut stream_row = [[0.0f32; 3]; 160];
+    let stream_n = if res[0] <= stream_row.len() {
+        res[0]
+    } else {
+        0
+    };
+    for ix in 0..stream_n {
+        let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+        stream_row[ix] = stream_at(x, drive);
+    }
+    let streams: &[[f32; 3]] = if stream_n == 0 {
+        &[]
+    } else {
+        &stream_row[..stream_n]
+    };
+    if !warm {
+        for iz in 0..res[2] {
+            for iy in 0..res[1] {
+                for ix in 0..res[0] {
+                    let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+                    store3(vel, at3(res, ix, iy, iz), row_stream(streams, ix, x, drive));
+                }
+            }
+        }
+    }
+    for iz in 0..res[2] {
+        for iy in 0..res[1] {
+            for ix in 0..res[0] {
+                if ix >= ix0 && ix <= ix1 && iz >= iz0 && iz <= iz1 {
+                    continue;
+                }
+                let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+                let i = at3(res, ix, iy, iz);
+                let fs = row_stream(streams, ix, x, drive);
+                store3(vel, i, fs);
+                store3(scratch, i, fs);
+            }
+        }
+    }
+    let wind_a = 1.0 - (-dt * AIR_WIND_RATE).exp();
+    let keep_w = 1.0 - wind_a;
+    for iz in iz0..=iz1 {
+        for iy in 0..res[1] {
+            for ix in ix0..=ix1 {
+                let p = cell_xyz(origin, cell, ix, iy, iz);
+                let fs = row_stream(streams, ix, p[0], drive);
+                let (occ, target) = if point_in_aabb(p, aabb) {
+                    solid_target(p, solids, fs)
+                } else {
+                    (0.0, fs)
+                };
+                let i = at3(res, ix, iy, iz);
+                let cur = load3(vel, i);
+                let keep = (1.0 - occ) * keep_w;
+                let wind_w = (1.0 - occ) * wind_a;
+                let mixed = [
+                    target[0] * occ + fs[0] * wind_w + cur[0] * keep,
+                    target[1] * occ + fs[1] * wind_w + cur[1] * keep,
+                    target[2] * occ + fs[2] * wind_w + cur[2] * keep,
+                ];
+                store3(scratch, i, mixed);
+            }
+        }
+    }
+    // Semi-Lagrangian in the chassis window. Upstream of the window is the free stream.
+    let max_rel = 3.0 * cell[0].max(cell[2]) / dt;
+    for iz in iz0..=iz1 {
+        for iy in 0..res[1] {
+            for ix in ix0..=ix1 {
+                let i = at3(res, ix, iy, iz);
+                let cur = load3(scratch, i);
+                let mut rx = cur[0] - drive.scroll[0];
+                let mut rz = cur[2] - drive.scroll[2];
+                let sp = rx.hypot(rz);
+                if sp > max_rel && sp.is_finite() {
+                    let s = max_rel / sp;
+                    rx *= s;
+                    rz *= s;
+                }
+                let p = cell_xyz(origin, cell, ix, iy, iz);
+                let bx = p[0] - rx * dt;
+                let bz = p[2] - rz * dt;
+                let sampled = sample_layer(scratch, origin, cell, res, drive, iy, bx, bz);
+                store3(vel, i, sampled);
+            }
+        }
+    }
+    // Vorticity of the advected field, then confinement. One ω sample per cell.
+    let mut nan_count = 0u32;
+    AIR_OMEGA.with(|slot| {
+        let mut omega = slot.borrow_mut();
+        if omega.len() < n {
+            omega.resize(n, 0.0);
+        }
+        for iz in iz0..=iz1 {
+            for iy in 0..res[1] {
+                for ix in ix0..=ix1 {
+                    omega[at3(res, ix, iy, iz)] = vort_xz(vel, res, ix, iy, iz, cell);
+                }
+            }
+        }
+        for iz in iz0..=iz1 {
+            for iy in 0..res[1] {
+                for ix in ix0..=ix1 {
+                    let i = at3(res, ix, iy, iz);
+                    let mut v = load3(vel, i);
+                    let edge = ix == ix0 || ix == ix1 || iz == iz0 || iz == iz1;
+                    if !edge {
+                        let w = omega[i];
+                        if w.is_finite() && w.abs() > 1.0e-4 {
+                            let wxp = omega[at3(res, ix + 1, iy, iz)].abs();
+                            let wxm = omega[at3(res, ix - 1, iy, iz)].abs();
+                            let wzp = omega[at3(res, ix, iy, iz + 1)].abs();
+                            let wzm = omega[at3(res, ix, iy, iz - 1)].abs();
+                            let mut nx = (wxp - wxm) / (2.0 * cell[0]);
+                            let mut nz = (wzp - wzm) / (2.0 * cell[2]);
+                            let nlen = nx.hypot(nz);
+                            if nlen > 1.0e-4 && nlen.is_finite() {
+                                nx /= nlen;
+                                nz /= nlen;
+                                let mut du = AIR_CONFINE * dt * (-nz * w);
+                                let mut dw = AIR_CONFINE * dt * (nx * w);
+                                let kick = du.hypot(dw);
+                                if kick > 1.35 {
+                                    let s = 1.35 / kick;
+                                    du *= s;
+                                    dw *= s;
+                                }
+                                if du.is_finite() && dw.is_finite() {
+                                    v[0] += du;
+                                    v[2] += dw;
+                                }
+                            }
+                        }
+                    }
+                    let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+                    let fs = row_stream(streams, ix, x, drive);
+                    if !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite() {
+                        nan_count += 1;
+                        v = fs;
+                    }
+                    let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    if sp > 32.0 && sp.is_finite() {
+                        let s = 32.0 / sp;
+                        v[0] *= s;
+                        v[1] *= s;
+                        v[2] *= s;
+                    }
+                    store3(vel, i, v);
+                }
+            }
+        }
+    });
+    let (peak, cells) = wake_vorticity(vel, origin, cell, res, drive, ix0, ix1, iz0, iz1);
+    AirReport {
+        peak_vorticity: peak,
+        wake_cells: cells,
+        nan_count,
+    }
+}
+
+/// Move dust with the wake residual. The sum of `vol` is put back after the flux.
+///
+/// Returns the absolute gap between the flux sum and the sum that was restored,
+/// in cubic metres. A clean step is a few ulps.
+pub fn advect_density_by_air(
+    vol: &mut [f32],
+    scratch: &mut [f32],
+    vel: &[f32],
+    origin: [f32; 3],
+    cell: [f32; 3],
+    res: [usize; 3],
+    drive: &AirDrive,
+    solids: &[AirSolid],
+    dt: f32,
+) -> f32 {
+    let n = res[0].saturating_mul(res[1]).saturating_mul(res[2]);
+    if dt <= 0.0 || n == 0 || vol.len() < n || scratch.len() < n || vel.len() < n * 3 {
+        return 0.0;
+    }
+    let mut before = 0.0f64;
+    let mut x0 = res[0];
+    let mut x1 = 0usize;
+    let mut z0 = res[2];
+    let mut z1 = 0usize;
+    let mut any = false;
+    for iz in 0..res[2] {
+        for iy in 0..res[1] {
+            for ix in 0..res[0] {
+                let v = vol[at3(res, ix, iy, iz)];
+                if v > 0.0 {
+                    any = true;
+                    before += v as f64;
+                    x0 = x0.min(ix);
+                    x1 = x1.max(ix);
+                    z0 = z0.min(iz);
+                    z1 = z1.max(iz);
+                }
+            }
+        }
+    }
+    if !any {
+        return 0.0;
+    }
+    scratch[..n].copy_from_slice(&vol[..n]);
+    x0 = x0.saturating_sub(2).max(2);
+    z0 = z0.saturating_sub(2).max(2);
+    x1 = (x1 + 2).min(res[0].saturating_sub(3));
+    z1 = (z1 + 2).min(res[2].saturating_sub(3));
+    if x0 > x1 || z0 > z1 {
+        return 0.0;
+    }
+    let dx = cell[0].max(1.0e-4);
+    let dz = cell[2].max(1.0e-4);
+    let aabb = solids_aabb(solids);
+    let mut stream_row = [[0.0f32; 3]; 160];
+    let stream_n = if res[0] <= stream_row.len() {
+        res[0]
+    } else {
+        0
+    };
+    for ix in 0..stream_n {
+        let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+        stream_row[ix] = stream_at(x, drive);
+    }
+    let streams: &[[f32; 3]] = if stream_n == 0 {
+        &[]
+    } else {
+        &stream_row[..stream_n]
+    };
+    for iz in z0..=z1 {
+        for iy in 0..res[1] {
+            for ix in x0..=x1 {
+                let i0 = at3(res, ix, iy, iz);
+                if ix + 1 < res[0] - 1 {
+                    let i1 = at3(res, ix + 1, iy, iz);
+                    let face = 0.5
+                        * (wake_residual(
+                            vel, origin, cell, res, drive, solids, aabb, streams, ix, iy, iz,
+                        )[0] + wake_residual(
+                            vel,
+                            origin,
+                            cell,
+                            res,
+                            drive,
+                            solids,
+                            aabb,
+                            streams,
+                            ix + 1,
+                            iy,
+                            iz,
+                        )[0])
+                        * AIR_DENSITY_COUPLING;
+                    transfer(scratch, vol, i0, i1, face, dt, dx);
+                }
+                if iz + 1 < res[2] - 1 {
+                    let i1 = at3(res, ix, iy, iz + 1);
+                    let face = 0.5
+                        * (wake_residual(
+                            vel, origin, cell, res, drive, solids, aabb, streams, ix, iy, iz,
+                        )[2] + wake_residual(
+                            vel,
+                            origin,
+                            cell,
+                            res,
+                            drive,
+                            solids,
+                            aabb,
+                            streams,
+                            ix,
+                            iy,
+                            iz + 1,
+                        )[2])
+                        * AIR_DENSITY_COUPLING;
+                    transfer(scratch, vol, i0, i1, face, dt, dz);
+                }
+            }
+        }
+    }
+    let mut after = 0.0f64;
+    for v in &scratch[..n] {
+        after += *v as f64;
+    }
+    let gap = (before - after).abs() as f32;
+    if after > 1.0e-12 {
+        let scale = (before / after) as f32;
+        if scale.is_finite() {
+            for v in &mut scratch[..n] {
+                *v *= scale;
+            }
+        }
+    }
+    vol[..n].copy_from_slice(&scratch[..n]);
+    gap
+}
+
+fn transfer(next: &mut [f32], src: &[f32], a: usize, b: usize, face: f32, dt: f32, cell: f32) {
+    if !face.is_finite() || face == 0.0 || src[a] <= 0.0 && src[b] <= 0.0 {
+        return;
+    }
+    let frac = (face.abs() * dt / cell).min(0.18);
+    if frac <= 0.0 {
+        return;
+    }
+    if face > 0.0 {
+        let take = src[a] * frac;
+        next[a] -= take;
+        next[b] += take;
+    } else {
+        let take = src[b] * frac;
+        next[b] -= take;
+        next[a] += take;
+    }
+}
+
+fn wake_residual(
+    vel: &[f32],
+    origin: [f32; 3],
+    cell: [f32; 3],
+    res: [usize; 3],
+    drive: &AirDrive,
+    solids: &[AirSolid],
+    aabb: [f32; 6],
+    streams: &[[f32; 3]],
+    ix: usize,
+    iy: usize,
+    iz: usize,
+) -> [f32; 3] {
+    let p = cell_xyz(origin, cell, ix, iy, iz);
+    if point_in_aabb(p, aabb) && solid_occupancy(p, solids) > 0.42 {
+        return [0.0; 3];
+    }
+    let fs = row_stream(streams, ix, p[0], drive);
+    let v = load3(vel, at3(res, ix, iy, iz));
+    [v[0] - fs[0], v[1] - fs[1], v[2] - fs[2]]
+}
+
+fn solid_occupancy(p: [f32; 3], solids: &[AirSolid]) -> f32 {
+    let mut best = 0.0f32;
+    for solid in solids {
+        best = best.max(occupancy(p, solid));
+    }
+    best
+}
+
+fn air_window(
+    origin: [f32; 3],
+    cell: [f32; 3],
+    res: [usize; 3],
+    drive: &AirDrive,
+) -> (usize, usize, usize, usize) {
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut min_z = f32::MAX;
+    let mut max_z = f32::MIN;
+    for &lat in &[-AIR_WIN_LAT, AIR_WIN_LAT] {
+        for &along in &[AIR_WIN_Z0, AIR_WIN_Z1] {
+            let p = chassis_point(drive, lat, 0.0, along);
+            min_x = min_x.min(p[0]);
+            max_x = max_x.max(p[0]);
+            min_z = min_z.min(p[2]);
+            max_z = max_z.max(p[2]);
+        }
+    }
+    let ix0 = index_floor(min_x, origin[0], cell[0], res[0]);
+    let ix1 = index_floor(max_x, origin[0], cell[0], res[0]);
+    let iz0 = index_floor(min_z, origin[2], cell[2], res[2]);
+    let iz1 = index_floor(max_z, origin[2], cell[2], res[2]);
+    (ix0.min(ix1), ix0.max(ix1), iz0.min(iz1), iz0.max(iz1))
+}
+
+fn index_floor(world: f32, origin: f32, cell: f32, n: usize) -> usize {
+    if n == 0 || cell <= 0.0 {
+        return 0;
+    }
+    let i = ((world - origin) / cell).floor() as i32;
+    i.clamp(0, n as i32 - 1) as usize
+}
+
+fn wake_vorticity(
+    vel: &[f32],
+    origin: [f32; 3],
+    cell: [f32; 3],
+    res: [usize; 3],
+    drive: &AirDrive,
+    ix0: usize,
+    ix1: usize,
+    iz0: usize,
+    iz1: usize,
+) -> (f32, u32) {
+    let mut peak = 0.0f32;
+    let mut cells = 0u32;
+    if ix1 <= ix0 + 1 || iz1 <= iz0 + 1 {
+        return (0.0, 0);
+    }
+    for iz in (iz0 + 1)..iz1 {
+        for iy in 0..res[1] {
+            for ix in (ix0 + 1)..ix1 {
+                let p = cell_xyz(origin, cell, ix, iy, iz);
+                let rel = sub3(p, drive.chassis);
+                let lat = dot3(rel, drive.right);
+                let along = dot3(rel, drive.forward);
+                let y = p[1];
+                if lat.abs() > drive.wake_lat
+                    || y < drive.wake_y0
+                    || y > drive.wake_y1
+                    || along < drive.wake_z0
+                    || along > drive.wake_z1
+                {
+                    continue;
+                }
+                let w = vort_xz(vel, res, ix, iy, iz, cell);
+                if !w.is_finite() {
+                    continue;
+                }
+                let avg = 0.5 * w.abs()
+                    + 0.125
+                        * (vort_xz(vel, res, ix + 1, iy, iz, cell).abs()
+                            + vort_xz(vel, res, ix - 1, iy, iz, cell).abs()
+                            + vort_xz(vel, res, ix, iy, iz + 1, cell).abs()
+                            + vort_xz(vel, res, ix, iy, iz - 1, cell).abs());
+                if avg.is_finite() {
+                    peak = peak.max(avg);
+                    if avg > WAKE_VORTICITY_MIN {
+                        cells += 1;
+                    }
+                }
+            }
+        }
+    }
+    (peak, cells)
+}
+
+#[inline(always)]
+fn vort_xz(vel: &[f32], res: [usize; 3], ix: usize, iy: usize, iz: usize, cell: [f32; 3]) -> f32 {
+    let nx = res[0];
+    let nz = res[2];
+    if nx < 3 || nz < 3 || ix == 0 || iz == 0 || ix + 1 >= nx || iz + 1 >= nz {
+        return 0.0;
+    }
+    let vp = load3(vel, at3(res, ix + 1, iy, iz));
+    let vm = load3(vel, at3(res, ix - 1, iy, iz));
+    let wp = load3(vel, at3(res, ix, iy, iz + 1));
+    let wm = load3(vel, at3(res, ix, iy, iz - 1));
+    let dvdx = (vp[2] - vm[2]) / (2.0 * cell[0]);
+    let dudz = (wp[0] - wm[0]) / (2.0 * cell[2]);
+    dvdx - dudz
+}
+
+#[inline(always)]
+fn sample_layer(
+    vel: &[f32],
+    origin: [f32; 3],
+    cell: [f32; 3],
+    res: [usize; 3],
+    drive: &AirDrive,
+    iy: usize,
+    x: f32,
+    z: f32,
+) -> [f32; 3] {
+    let fx = (x - origin[0]) / cell[0] - 0.5;
+    let fz = (z - origin[2]) / cell[2] - 0.5;
+    if !fx.is_finite() || !fz.is_finite() {
+        return stream_at(x, drive);
+    }
+    let x0 = fx.floor().clamp(0.0, (res[0] - 1) as f32) as usize;
+    let z0 = fz.floor().clamp(0.0, (res[2] - 1) as f32) as usize;
+    let x1 = (x0 + 1).min(res[0] - 1);
+    let z1 = (z0 + 1).min(res[2] - 1);
+    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+    let tz = (fz - z0 as f32).clamp(0.0, 1.0);
+    let s00 = load3(vel, at3(res, x0, iy, z0));
+    let s10 = load3(vel, at3(res, x1, iy, z0));
+    let s01 = load3(vel, at3(res, x0, iy, z1));
+    let s11 = load3(vel, at3(res, x1, iy, z1));
+    let a = lerp3(s00, s10, tx);
+    let b = lerp3(s01, s11, tx);
+    lerp3(a, b, tz)
+}
+
+#[inline(always)]
+fn stream_at(world_x: f32, drive: &AirDrive) -> [f32; 3] {
+    let forward = drive.forward;
+    let right = drive.right;
+    let rel_x = drive.wind_x - forward[0] * drive.speed;
+    let rel_z = drive.wind_z - forward[2] * drive.speed;
+    let rel = [rel_x, 0.0, rel_z];
+    let gu = dot3(rel, right);
+    let gv = dot3(rel, forward) * dust_stream_hold(world_x);
+    let planar = add3(scale3(right, gu), scale3(forward, gv));
+    add3(planar, scale3(forward, drive.speed))
+}
+
+#[inline(always)]
+fn solid_target(p: [f32; 3], solids: &[AirSolid], freestream: [f32; 3]) -> (f32, [f32; 3]) {
+    let mut box_occ = 0.0f32;
+    let mut box_vel = freestream;
+    let mut cyl_occ = 0.0f32;
+    let mut cyl_vel = freestream;
+    for solid in solids {
+        let occ = occupancy(p, solid);
+        if occ <= 0.0 {
+            continue;
+        }
+        let vel = solid_velocity(p, solid);
+        if solid.cylinder {
+            if occ > cyl_occ {
+                cyl_occ = occ;
+                cyl_vel = vel;
+            }
+        } else if occ > box_occ {
+            box_occ = occ;
+            box_vel = vel;
+        }
+    }
+    if cyl_occ > 0.30 && cyl_occ + 0.05 >= box_occ {
+        (cyl_occ, cyl_vel)
+    } else if box_occ > 0.0 {
+        (box_occ, box_vel)
+    } else {
+        (0.0, freestream)
+    }
+}
+
+#[inline(always)]
+fn solid_velocity(p: [f32; 3], solid: &AirSolid) -> [f32; 3] {
+    let mut v = solid.velocity;
+    if solid.cylinder && solid.spin != 0.0 {
+        let r = sub3(p, solid.center);
+        let tang = cross3(solid.right, r);
+        v = add3(v, scale3(tang, solid.spin));
+    }
+    v
+}
+
+#[inline(always)]
+fn occupancy(p: [f32; 3], solid: &AirSolid) -> f32 {
+    let d = sub3(p, solid.center);
+    let lx = dot3(d, solid.right);
+    let ly = dot3(d, solid.up);
+    let lz = dot3(d, solid.forward);
+    let sd = if solid.cylinder {
+        let axial = lx.abs() - solid.half[0];
+        let radial = (ly * ly + lz * lz).sqrt() - solid.radius.max(0.05);
+        sd_box(axial, radial, f32::MIN)
+    } else {
+        sd_box(
+            lx.abs() - solid.half[0],
+            ly.abs() - solid.half[1],
+            lz.abs() - solid.half[2],
+        )
+    };
+    let feather = AIR_FEATHER_M;
+    let t = ((feather - sd) / (2.0 * feather)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline(always)]
+fn sd_box(dx: f32, dy: f32, dz: f32) -> f32 {
+    if dz == f32::MIN {
+        let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
+        let inside = dx.max(dy).min(0.0);
+        return outside + inside;
+    }
+    let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2) + dz.max(0.0).powi(2)).sqrt();
+    let inside = dx.max(dy).max(dz).min(0.0);
+    outside + inside
+}
+
+fn chassis_point(drive: &AirDrive, lat: f32, y: f32, along: f32) -> [f32; 3] {
+    add3(
+        drive.chassis,
+        add3(
+            scale3(drive.right, lat),
+            add3(
+                scale3(drive.up, y - drive.chassis[1]),
+                scale3(drive.forward, along),
+            ),
+        ),
+    )
+}
+
+#[inline(always)]
+fn cell_xyz(origin: [f32; 3], cell: [f32; 3], ix: usize, iy: usize, iz: usize) -> [f32; 3] {
+    [
+        origin[0] + (ix as f32 + 0.5) * cell[0],
+        origin[1] + (iy as f32 + 0.5) * cell[1],
+        origin[2] + (iz as f32 + 0.5) * cell[2],
+    ]
+}
+
+#[inline(always)]
+fn at3(res: [usize; 3], ix: usize, iy: usize, iz: usize) -> usize {
+    ix + iy * res[0] + iz * res[0] * res[1]
+}
+
+#[inline(always)]
+fn load3(buf: &[f32], i: usize) -> [f32; 3] {
+    let b = i * 3;
+    [buf[b], buf[b + 1], buf[b + 2]]
+}
+
+#[inline(always)]
+fn store3(buf: &mut [f32], i: usize, v: [f32; 3]) {
+    let b = i * 3;
+    buf[b] = v[0];
+    buf[b + 1] = v[1];
+    buf[b + 2] = v[2];
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+#[inline(always)]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline(always)]
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+#[inline(always)]
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+#[inline(always)]
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline(always)]
+fn scale3(a: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn norm3(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1.0e-6 && len.is_finite() {
+        scale3(v, 1.0 / len)
+    } else {
+        fallback
+    }
 }
 
 /// Bow height in metres. `k * speed * sqrt(depth / g)`, not a speed×depth flux.
