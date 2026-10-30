@@ -18,6 +18,10 @@ pub const SLOW_PERIOD: u32 = 6;
 /// Tire patch where the fine cell is used. Weight is 1 inside, 0 at the rim.
 const TIRE_INNER: f32 = 0.22;
 const TIRE_OUTER: f32 = 0.55;
+/// Fine patch centered on the chassis, metres. The Niva's hubs sit about
+/// 1.4 m out, so a 0.55 m disk at the origin leaves the axles and the belly
+/// outside the solver. Half of the 3.2 m axle patch covers every contact.
+pub const VEHICLE_PATCH_R: f32 = 1.60;
 
 /// Where the Niva is, and which frame the slow clock is on.
 #[derive(Clone, Copy, Debug)]
@@ -93,7 +97,8 @@ pub fn resolution(window: &SolverWindow, x: f32, z: f32, tires: &[TireAnchor]) -
     if !window.steps(x, z) {
         return Resolution::Frozen;
     }
-    if tires.iter().any(|t| tire_weight(*t, x, z) > 0.0) {
+    let from_focus = (x - window.focus_x).hypot(z - window.focus_z);
+    if from_focus <= VEHICLE_PATCH_R || tires.iter().any(|t| tire_weight(*t, x, z) > 0.0) {
         Resolution::Fine
     } else {
         Resolution::Coarse
@@ -170,6 +175,25 @@ mod tests {
         assert_eq!(far, Resolution::Frozen);
         assert!(!window.steps(1.0 + 45.0, -2.0));
         assert!(!slow_due(&window, 1.0 + 45.0, -2.0, 0));
+    }
+
+    #[test]
+    fn the_fine_patch_covers_the_whole_vehicle() {
+        let mut window = SolverWindow::default();
+        window.follow(0.0, 0.0);
+        // Rear hub. A 0.55 m disk on the chassis does not reach it.
+        let x = -0.74_f32;
+        let z = -1.18_f32;
+        assert!(
+            x.hypot(z) > TIRE_OUTER,
+            "rear hub {:.2} m should sit outside the {:.2} m tire disk",
+            x.hypot(z),
+            TIRE_OUTER
+        );
+        assert!(x.hypot(z) < VEHICLE_PATCH_R);
+        assert_eq!(resolution(&window, x, z, &[]), Resolution::Fine);
+        assert_eq!(resolution(&window, 0.74, 1.08, &[]), Resolution::Fine);
+        assert_eq!(resolution(&window, 4.0, 0.0, &[]), Resolution::Coarse);
     }
 
     #[test]

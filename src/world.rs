@@ -395,6 +395,7 @@ impl World {
     }
 
     pub fn step(&mut self, dt: f32, input: &Input) {
+        // The fine patch is the whole Niva, not a disk that ends before the hubs.
         self.lod.follow(self.vehicle.pos.x, self.vehicle.pos.z);
         let substeps = 2;
         let h = dt / substeps as f32;
@@ -695,6 +696,27 @@ impl World {
 
         let planted = contacts.iter().filter(|c| c.active).count();
         self.note_flight(planted, dt);
+        // Hull forces stay off during the crest hop. Once a tire is down, the
+        // puddle under the whole patch drags, including when only one hub is
+        // in the deep water.
+        if self.vehicle.jump_hold > 0.0 {
+            self.vehicle.water_lift_n = 0.0;
+            self.vehicle.water_drag_n = 0.0;
+        } else {
+            let draft = self.vehicle.body_draft(&self.soil);
+            let hold_water = if planted > 0 {
+                self.vehicle.window_sample(&self.soil).water
+            } else {
+                0.0
+            };
+            let depth = if planted > 0 {
+                draft.max(hold_water)
+            } else {
+                draft
+            };
+            self.vehicle.water_lift_n = water_body_buoyancy(draft);
+            self.vehicle.water_drag_n = water_body_drag(speed, depth);
+        }
         self.vehicle.integrate(&contacts, &self.soil, dt);
         let tread = self.vehicle.step_adhesion(&contacts, dt);
         self.shed_slurry_grooves(&contacts, &tread, dt);
@@ -3791,17 +3813,20 @@ fn chase_line(
     }
     let steer = (err / if aim_lip { 0.36 } else { 0.30 }).clamp(-1.0, 1.0);
     let under = soil.sample(pos.x, pos.z);
+    let window_water = water_under_vehicle(soil, pos.x, pos.z);
     // Full throttle on the firm run-up. The lip, not a key, is what launches.
     let on_runup = aim_lip || (pos.x < -4.0 && (-3.6..3.0).contains(&pos.z));
     // Ease off on the straight, and brake in standing water so the tires
     // slip, throw spray, and cut a rut before the buggy climbs back out.
+    // The brake sees the whole patch: the chassis point can already be dry
+    // while a hub is still in the puddle.
     let (throttle, brake) = if on_runup && under.water < 0.04 {
         if speed > 4.25 {
             (0.08, 0.0)
         } else {
             (1.0, 0.0)
         }
-    } else if under.water > 0.05 && speed > 0.62 {
+    } else if window_water > 0.05 && speed > 0.62 {
         (0.0, 1.0)
     } else if speed > 3.05 {
         (0.1, 0.0)
@@ -3850,6 +3875,22 @@ pub fn demo_camera(_t: f32, _pos: Vec3, _yaw: f32) -> CameraPose {
         target,
         ortho_width: Some(25.5),
     }
+}
+
+/// Deepest standing water inside the vehicle patch around `x`, `z`.
+fn water_under_vehicle(soil: &SoilField, x: f32, z: f32) -> f32 {
+    let r = crate::lod::VEHICLE_PATCH_R;
+    let mut water = 0.0_f32;
+    let scales = [-1.0_f32, -0.5, 0.0, 0.5, 1.0];
+    for dz in scales {
+        for dx in scales {
+            if dx.hypot(dz) > 1.01 {
+                continue;
+            }
+            water = water.max(soil.sample(x + dx * r, z + dz * r).water);
+        }
+    }
+    water
 }
 
 fn track_perimeter() -> f32 {

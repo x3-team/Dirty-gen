@@ -217,6 +217,39 @@ impl Vehicle {
         (s.water, stall, flooded)
     }
 
+    /// Wettest ground inside the chassis patch. Hubs are ~1.4 m from the
+    /// origin, so a sample at the chassis (or a 0.55 m tire disk) misses the
+    /// puddle that is actually under the axles and the belly.
+    pub fn window_sample(&self, soil: &SoilField) -> SoilSample {
+        let ori = self.orientation();
+        let locals = [
+            Vec3::ZERO,
+            Vec3::new(-0.74, -0.16, 1.08),
+            Vec3::new(0.74, -0.16, 1.08),
+            Vec3::new(-0.74, -0.16, -1.18),
+            Vec3::new(0.74, -0.16, -1.18),
+            Vec3::new(0.0, -0.20, 0.15),
+            Vec3::new(-0.36, -0.16, 0.40),
+            Vec3::new(0.36, -0.16, 0.40),
+            Vec3::new(0.0, -0.18, -0.55),
+        ];
+        let mut best = soil.sample(self.pos.x, self.pos.z);
+        let reach = crate::lod::VEHICLE_PATCH_R;
+        for local in locals {
+            let w = self.pos + ori * local;
+            if (w.x - self.pos.x).hypot(w.z - self.pos.z) > reach {
+                continue;
+            }
+            let s = soil.sample(w.x, w.z);
+            let wetter = s.water > best.water + 0.005
+                || ((s.water - best.water).abs() <= 0.005 && s.softness > best.softness);
+            if wetter {
+                best = s;
+            }
+        }
+        best
+    }
+
     /// How far the free surface stands above the belly, metres.
     pub fn body_draft(&self, soil: &SoilField) -> f32 {
         let ori = self.orientation();
@@ -336,6 +369,7 @@ impl Vehicle {
             throttle.clamp(-1.0, 1.0)
         };
         let brake = brake.clamp(0.0, 1.0);
+        let hold = self.window_sample(soil);
 
         for i in 0..4 {
             let hp = hps[i];
@@ -343,8 +377,24 @@ impl Vehicle {
             let wc0 = self.pos + ori * local_c0;
             let up = ori * Vec3::Y;
             let up_y = up.y.max(0.4);
-            let sample = soil.sample(wc0.x, wc0.z);
-            let z0 = sample.height - wc0.y + WHEEL_RADIUS;
+            let mut sample = soil.sample(wc0.x, wc0.z);
+            let local_water = sample.water;
+            let z0_bed = sample.height - wc0.y + WHEEL_RADIUS;
+            // The free surface, not the bed. A tire sitting in the sheet was
+            // marked airborne, so the puddle never sank it or took its grip.
+            let z0 = if z0_bed > 0.004 {
+                z0_bed
+            } else {
+                z0_bed + local_water
+            };
+            let in_patch =
+                (wc0.x - self.pos.x).hypot(wc0.z - self.pos.z) <= crate::lod::VEHICLE_PATCH_R;
+            if in_patch && hold.water > 0.02 {
+                sample.wetness = sample.wetness.max(hold.wetness);
+                sample.loose = sample.loose.max(hold.loose);
+                sample.water = sample.water.max(hold.water);
+                sample.softness = sample.softness.max(hold.softness);
+            }
 
             let (compression, sinkage, normal) = if z0 <= 0.004 {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
@@ -354,8 +404,8 @@ impl Vehicle {
                     z0,
                     up_y,
                     self.wheels[i].slip,
-                    terramech_for(sample.kind(), sample.softness, sample.water),
-                    sample.water,
+                    terramech_for(sample.kind(), sample.softness, local_water),
+                    local_water,
                 )
             };
 
