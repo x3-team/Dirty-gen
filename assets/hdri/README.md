@@ -1,0 +1,1 @@
+- `sky.hdr` — Poly Haven "kloofendal_48d_partly_cloudy_puresky" (2K .hdr), https://polyhaven.com/a/kloofendal_48d_partly_cloudy_puresky — CC0 license.
