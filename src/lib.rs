@@ -11,11 +11,8 @@ pub mod fluid_core;
 pub mod lod;
 pub mod particles;
 pub mod patch;
-<<<<<<< HEAD
-pub mod snow;
-=======
 pub mod render_contract;
->>>>>>> b0ecf3d (Freeze the physics-to-render data contract.)
+pub mod snow;
 pub mod soil;
 pub mod vehicle;
 pub mod world;
