@@ -1,0 +1,12 @@
+[package]
+name = "dust_trail"
+version = "0.1.0"
+edition = "2021"
+description = "Dust channel on the shared air grid: slip and dryness inject, wet ground does not, settled dust stays down"
+license = "MIT"
+
+[dependencies]
+glam = "=0.29.3"
+png = "=0.17.16"
+pollster = "=0.4.0"
+wgpu = "=23.0.1"
