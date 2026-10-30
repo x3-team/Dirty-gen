@@ -64,10 +64,25 @@ fn sky_radiance(dir: Vec3, sky: &SkyLight) -> Vec3 {
     let mut col = sky.horizon.lerp(sky.zenith, smooth(-0.02, 0.55, h));
     let d = dir.dot(sky.sun).max(0.0);
     col += sky.sun_color * d.powf(18.0) * 0.55;
+    // Cumulus on a plane overhead: four octaves, a lit top and a grey belly,
+    // thinning toward the horizon. They give the water something to mirror.
     let s = 1.0 / (dir.y.abs() * 0.45 + 0.25);
-    let n = noise(dir.x * s * 0.18, dir.z * s * 0.18);
-    let cloud = smooth(0.58, 0.82, n) * smooth(0.08, 0.4, dir.y);
-    col = col.lerp(Vec3::new(0.93, 0.94, 0.96), cloud * 0.7);
+    let (cx, cz) = (dir.x * s * 0.18, dir.z * s * 0.18);
+    let mut n = 0.0;
+    let mut amp = 0.5;
+    let mut f = 1.0;
+    for _ in 0..4 {
+        n += noise(cx * f + 3.1 * f, cz * f - 1.7 * f) * amp;
+        amp *= 0.5;
+        f *= 2.03;
+    }
+    let cloud = smooth(0.44, 0.72, n) * smooth(0.0, 0.12, dir.y);
+    let toward = d.powf(4.0);
+    let lit = Vec3::new(0.96, 0.96, 0.97) + sky.sun_color * 0.12 * toward;
+    let belly = Vec3::new(0.58, 0.62, 0.70);
+    let shade = smooth(0.5, 0.85, n);
+    let cloud_col = lit.lerp(belly, shade * 0.6);
+    col = col.lerp(cloud_col, cloud * 0.85);
     if dir.y < 0.0 {
         let ground = Vec3::new(0.16, 0.11, 0.07)
             * (sky.sun_color * sky.sun.y.max(0.0) * 1.25 + sky.zenith * 0.4);

@@ -142,6 +142,8 @@ pub struct Renderer {
     depth_format: wgpu::TextureFormat,
     /// Midday sun and sky. The window keeps the low sun unless a still asks.
     pub daylight: bool,
+    /// Lay the undisturbed field (kind 0) and the skirt as sand. Picture only.
+    pub sand_field: bool,
     pub show_props: bool,
     /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
     pub show_environment: bool,
@@ -160,8 +162,10 @@ pub struct Renderer {
     contract_cpu: silt::render_contract::ContractFrame,
     pipe_debug: Option<wgpu::RenderPipeline>,
     pipe_fog: Option<wgpu::RenderPipeline>,
-    fog_bgl: wgpu::BindGroupLayout,
-    fog_bg: wgpu::BindGroup,
+    post_bgl: wgpu::BindGroupLayout,
+    post_bg: wgpu::BindGroup,
+    scene_copy: wgpu::Texture,
+    scene_copy_view: wgpu::TextureView,
     /// Top-down debug view of the render contract. Off for the Niva picture.
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
@@ -757,6 +761,44 @@ impl Renderer {
             bind_group_layouts: &terrain_groups,
             push_constant_ranges: &[],
         });
+        // Scene depth and a copy of the opaque frame, for the water's screen
+        // reflections and the dust volume's march.
+        let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let water_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
+            Some(gpu) => vec![&frame_bgl, &tex_bgl, &post_bgl, &paint_bgl, &gpu.layout],
+            None => vec![&frame_bgl, &tex_bgl, &post_bgl],
+        };
+        let water_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("water-layout"),
+            bind_group_layouts: &water_groups,
+            push_constant_ranges: &[],
+        });
+        let (scene_copy, scene_copy_view) = make_scene_copy(&device, width, height);
+        let post_bg = make_post_bg(&device, &post_bgl, &depth_view, &scene_copy_view);
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
             bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl],
@@ -803,7 +845,7 @@ impl Renderer {
         let pipe_water = pipeline(
             &device,
             &shader,
-            terrain_layout_ref,
+            &water_layout,
             "vs_water",
             Some("fs_water"),
             terrain_buffers(),
@@ -961,23 +1003,10 @@ impl Renderer {
             None,
         );
         // Dust volume. Only with the contract: it marches the dust_fog grid.
-        let fog_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("fog-depth"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
-        });
         let pipe_fog = contract.as_ref().map(|contract_gpu| {
             let fog_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("fog-layout"),
-                bind_group_layouts: &[&frame_bgl, &tex_bgl, &fog_bgl, &paint_bgl, &contract_gpu.layout],
+                bind_group_layouts: &[&frame_bgl, &tex_bgl, &post_bgl, &paint_bgl, &contract_gpu.layout],
                 push_constant_ranges: &[],
             });
             pipeline(
@@ -993,7 +1022,6 @@ impl Renderer {
                 None,
             )
         });
-        let fog_bg = make_fog_bg(&device, &fog_bgl, &depth_view);
 
         // Debug view. It reads only the render contract. Compiling it here
         // keeps a contract edit from landing with a shader that does not match.
@@ -1202,6 +1230,7 @@ impl Renderer {
             height_packed: formats.height_packed,
             depth_format: formats.depth,
             daylight: false,
+            sand_field: false,
             show_props: true,
             show_environment: true,
             show_hills: true,
@@ -1215,8 +1244,10 @@ impl Renderer {
             contract_cpu: silt::render_contract::ContractFrame::new(),
             pipe_debug,
             pipe_fog,
-            fog_bgl,
-            fog_bg,
+            post_bgl,
+            post_bg,
+            scene_copy,
+            scene_copy_view,
             debug_contract: false,
             debug_mode: 0,
         }
@@ -1271,7 +1302,10 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        self.fog_bg = make_fog_bg(&self.device, &self.fog_bgl, &self.depth_view);
+        let (scene_copy, scene_copy_view) = make_scene_copy(&self.device, width, height);
+        self.scene_copy = scene_copy;
+        self.scene_copy_view = scene_copy_view;
+        self.post_bg = make_post_bg(&self.device, &self.post_bgl, &self.depth_view, &self.scene_copy_view);
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
         self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1462,7 +1496,11 @@ impl Renderer {
                 if self.env_from_file { 1.0 } else { 0.0 },
                 if self.daylight { 0.86 } else { 1.0 },
             ],
-            lamps: headlamps(&world.vehicle, if self.daylight || !self.niva_picture { 0.0 } else { 1.0 }),
+            lamps: headlamps(
+                &world.vehicle,
+                if !self.niva_picture { 0.0 } else if self.daylight { 0.6 } else { 1.0 },
+                self.sand_field,
+            ),
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
@@ -1631,13 +1669,83 @@ impl Renderer {
                 draw_indexed(&mut pass, &self.props);
             }
 
-            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
-            pass.set_bind_group(3, &self.paint_bg, &[]);
+        }
+
+        // The water reflects the opaque frame: copy it, then draw the water
+        // with the depth read-only so the same depth can be sampled.
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self.scene_copy,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("water"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.post_bg, &[]);
             if let Some(gpu) = &self.contract {
+                pass.set_bind_group(3, &self.paint_bg, &[]);
                 pass.set_bind_group(4, &gpu.bind_group, &[]);
             }
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("after-water"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
 
             // Sheets are thin. Back-face cull hides the side the camera sees.
             pass.set_pipeline(&self.pipe_mesh_double);
@@ -1681,7 +1789,7 @@ impl Renderer {
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.tex_bg, &[]);
-            pass.set_bind_group(2, &self.fog_bg, &[]);
+            pass.set_bind_group(2, &self.post_bg, &[]);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(4, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
@@ -2881,7 +2989,8 @@ fn debug_contract_view_reads_the_published_maps() {
 /// Niva headlamps in world space. The body is fitted with the hubs at
 /// y -0.20 and the front axle at z 1.08 (niva.rs); the lamps sit 0.40 m above
 /// the hubs and 0.74 m ahead of the axle, 0.56 m either side.
-fn headlamps(vehicle: &Vehicle, on: f32) -> [[f32; 4]; 3] {
+/// The right lamp's w carries the sand-field flag for the ground shader.
+fn headlamps(vehicle: &Vehicle, on: f32, sand: bool) -> [[f32; 4]; 3] {
     let ori = vehicle.orientation();
     let left = vehicle.pos + ori * Vec3::new(-0.56, 0.20, 1.82);
     let right = vehicle.pos + ori * Vec3::new(0.56, 0.20, 1.82);
@@ -2889,22 +2998,48 @@ fn headlamps(vehicle: &Vehicle, on: f32) -> [[f32; 4]; 3] {
     let dir = (ori * Vec3::new(0.0, -0.05, 1.0)).normalize_or_zero();
     [
         [left.x, left.y, left.z, on],
-        [right.x, right.y, right.z, 0.0],
+        [right.x, right.y, right.z, if sand { 1.0 } else { 0.0 }],
         [dir.x, dir.y, dir.z, 0.86],
     ]
 }
 
-fn make_fog_bg(
+fn make_scene_copy(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-copy"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn make_post_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     depth_view: &wgpu::TextureView,
+    scene_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("fog-depth"),
+        label: Some("post"),
         layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 1,
-            resource: wgpu::BindingResource::TextureView(depth_view),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+        ],
     })
 }

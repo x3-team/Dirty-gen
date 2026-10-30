@@ -706,6 +706,10 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
         std::fs::create_dir_all(&frames).expect("frame dir");
     }
     let mut drive = silt::ThroughDrive::new();
+    // Day light shows the bed through the water and the caustics on it.
+    // SILT_BEAUTY_DUSK=1 keeps the low dusk sun.
+    renderer.daylight = std::env::var_os("SILT_BEAUTY_DUSK").is_none();
+    renderer.sand_field = true;
     let dt = 1.0 / 30.0;
     let stills: [(f32, &str, fn(&World) -> CameraPose); 3] = [
         (-17.5, "puddle-wave", beauty_puddle_camera),
@@ -777,6 +781,61 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
         assert!(status.success(), "ffmpeg failed: {status}");
         println!("video {}", out.display());
     }
+}
+
+/// A drying puddle bed for the crust: wet mud in the middle, cracking clay
+/// around it, baked crust at the rim, sand beyond. The scene only sets the
+/// soil's own kind and wetness fields; the shaders read them as they would
+/// a published crust.
+fn capture_beauty_crust(renderer: &mut Renderer, width: u32, height: u32, dir: &Path) {
+    use silt::soil::SurfaceKind;
+    std::fs::create_dir_all(dir).expect("beauty dir");
+    renderer.daylight = true;
+    renderer.sand_field = true;
+    let mut world = World::flat(0.35);
+    // A clean field. World::flat's settle scar crashes lavapipe's shader JIT.
+    world.soil = silt::soil::SoilField::flat(0.35);
+    world.particles.clear();
+    world.vehicle.clear_loose_mud();
+    world.bike.pos = Vec3::new(80.0, 0.0, 80.0);
+    let soil = &mut world.soil;
+    let res = soil.res;
+    let half = soil.size * 0.5;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            // An uneven drying front, so the zones are not rings.
+            let wob = (x * 0.9).sin() * 0.35 + (z * 1.3 + x * 0.4).cos() * 0.3;
+            let r = ((x - 1.0).powi(2) + (z - 3.0).powi(2) * 1.6).sqrt() + wob;
+            let idx = j * res + i;
+            // One mud, drying from the rim in: wet in the middle, a cracking
+            // band, baked plates outside. The kind stays one so the bands blend.
+            if r > 9.0 {
+                continue;
+            }
+            let kind = SurfaceKind::WetMud;
+            let wet = 0.9 - 0.82 * ((r - 1.2) / 3.0).clamp(0.0, 1.0);
+            soil.kind[idx] = kind as u8;
+            soil.wetness[idx] = wet;
+            soil.base_wetness[idx] = wet;
+            let dip = ((4.0 - r) / 4.0).clamp(0.0, 1.0) * 0.05;
+            soil.height[idx] -= dip;
+            soil.initial_height[idx] -= dip;
+            soil.bed[idx] -= dip;
+        }
+    }
+    world.vehicle.pos = Vec3::new(-3.6, 0.56, 6.5);
+    world.vehicle.yaw = 2.4;
+    let cam = CameraPose {
+        eye: Vec3::new(4.2, 1.7, -2.6),
+        target: Vec3::new(0.4, 0.0, 3.4),
+        ortho_width: None,
+    };
+    let rgba = renderer.draw(&world, cam, None, true).expect("readback");
+    let path = dir.join("drying-crust.png");
+    write_png(&path, width, height, &rgba).expect("still");
+    println!("beauty still {}", path.display());
 }
 
 fn vehicle_axes(world: &World) -> (Vec3, Vec3, Vec3) {
@@ -876,6 +935,15 @@ fn capture(args: &[String]) {
         renderer.niva_picture = true;
         renderer.water_column = true;
         capture_beauty_drive(&mut renderer, parsed.width, parsed.height, &dir, video);
+        return;
+    }
+    if let Some(at) = args.iter().position(|s| s == "--beauty-crust") {
+        let dir = PathBuf::from(args.get(at + 1).expect("--beauty-crust <dir>"));
+        renderer.show_bike = false;
+        renderer.show_props = false;
+        renderer.show_hills = false;
+        renderer.niva_picture = true;
+        capture_beauty_crust(&mut renderer, parsed.width, parsed.height, &dir);
         return;
     }
     if args.iter().any(|s| s == "--through-drive") {
@@ -1228,7 +1296,7 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         match flag {
             "--software" => software = true,
             "--through-drive" => {}
-            "--beauty-drive" => {
+            "--beauty-drive" | "--beauty-crust" => {
                 i += 1;
             }
             "--beauty-video" => {}

@@ -1817,7 +1817,9 @@ pub fn mud_chunks_split(
         if !p.alive || p.life <= 0.0 || p.kind != silt::particles::KIND_SLURRY_RIBBON || p.ledger {
             continue;
         }
-        if in_flight(p) {
+        // With the contract, slurry lying in the rut is the published film
+        // (drawn by the water pass); the cut-out strips would double it.
+        if spray_from_contract || in_flight(p) {
             continue;
         }
         if mesh.vertices.len() + 6000 >= MAX_VERTS {

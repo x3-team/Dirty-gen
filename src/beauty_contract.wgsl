@@ -150,6 +150,17 @@ fn bc_crust(xz: vec2<f32>) -> vec2<f32> {
     return max(bc_bilinear(bc_crust_tex, xz).rg, vec2<f32>(0.0)) * bc_inside(xz);
 }
 
+const BC_VALID_GROUND: u32 = 1u;
+
+// Rut depth below the starting height and placed spoil, metres.
+fn bc_rut(xz: vec2<f32>) -> vec2<f32> {
+    if (!bc_has(BC_VALID_GROUND)) {
+        return vec2<f32>(0.0);
+    }
+    let g = bc_bilinear(bc_ground_rut, xz);
+    return max(vec2<f32>(g.g, g.a), vec2<f32>(0.0)) * bc_inside(xz);
+}
+
 // Settled dust depth, metres.
 fn bc_dust_settled(xz: vec2<f32>) -> f32 {
     if (!bc_has(BC_VALID_DUST_SETTLED)) {
@@ -164,11 +175,9 @@ fn bc_dust_settled(xz: vec2<f32>) -> f32 {
 // in-scattered light over the frame. Sun with its shadow map, sky fill, and
 // the Niva headlamps.
 
-@group(2) @binding(1) var fog_depth: texture_depth_2d;
-
 // Extinction per unit volume fraction, 1/m. A fraction of 1e-4 is a thin
-// haze (0.24 per metre), 1e-3 a cloud you lose the far side of.
-const FOG_SIGMA: f32 = 2400.0;
+// haze (0.36 per metre), 1e-3 a cloud you lose the far side of.
+const FOG_SIGMA: f32 = 3600.0;
 const FOG_STEPS: i32 = 28;
 const DUST_ALBEDO: vec3<f32> = vec3<f32>(0.62, 0.52, 0.40);
 
@@ -204,6 +213,24 @@ fn bc_fog_at(p: vec3<f32>) -> f32 {
     return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
 }
 
+// Nearest texel, for the cheap march toward the sun.
+fn bc_fog_near(p: vec3<f32>) -> f32 {
+    let cell = vec3<f32>(bc_header.air_cell_x, bc_header.air_cell_y, bc_header.air_cell_z);
+    let origin = vec3<f32>(bc_header.air_origin_x, bc_header.air_origin_y, bc_header.air_origin_z);
+    return fog_tap(vec3<i32>(floor((p - origin) / max(cell, vec3<f32>(1e-4)))));
+}
+
+// Billows inside the published cells. The grid is 12.5 cm; a plume is
+// rounded lobes and wisps, so the density is modulated by drifting noise
+// that keeps the cell's mean. Picture only.
+fn fog_billow(p: vec3<f32>, t: f32) -> f32 {
+    let drift = vec2<f32>(0.9, -0.55) * t;
+    let q = p.xz * 1.6 - drift + vec2<f32>(p.y * 0.9, -p.y * 0.6);
+    let lobes = noise(q) * 0.62 + noise(q * 2.7 + vec2<f32>(5.2, 1.3)) * 0.38;
+    let wisp = noise(q * 6.1 - drift * 1.7);
+    return clamp(0.25 + lobes * 1.25 + (wisp - 0.5) * 0.35, 0.0, 2.0);
+}
+
 // Henyey-Greenstein. Dust throws most light forward.
 fn hg_phase(cos_t: f32, g: f32) -> f32 {
     let g2 = g * g;
@@ -223,7 +250,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (!bc_has(BC_VALID_DUST_FOG)) {
         discard;
     }
-    let d = textureLoad(fog_depth, vec2<i32>(frag.xy), 0);
+    let d = textureLoad(scene_depth, vec2<i32>(frag.xy), 0);
     let uv = frag.xy / max(frame.params.xy, vec2<f32>(1.0));
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, d, 1.0);
     let w = frame.inv_view_proj * ndc;
@@ -255,11 +282,19 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var light = vec3<f32>(0.0);
     for (var k: i32 = 0; k < FOG_STEPS; k = k + 1) {
         let p = ro + rd * (t_near + (f32(k) + jitter) * dt);
-        let sigma = bc_fog_at(p) * FOG_SIGMA;
-        if (sigma < 1e-3) {
+        let base = bc_fog_at(p);
+        if (base * FOG_SIGMA < 1e-3) {
             continue;
         }
-        var l_in = frame.sun_color.rgb * 1.25 * sun_phase * shadow_factor(p, vec3<f32>(0.0, 1.0, 0.0)) + sky;
+        let sigma = base * FOG_SIGMA * fog_billow(p, frame.misc.x);
+        // Self-shadow: three coarse steps toward the sun through the cloud,
+        // so the sunlit side glows and the far side goes grey.
+        var od = 0.0;
+        for (var j: i32 = 1; j <= 3; j = j + 1) {
+            od += bc_fog_near(p + sun * (f32(j) * 0.35));
+        }
+        let sun_t = exp(-od * FOG_SIGMA * 0.35);
+        var l_in = frame.sun_color.rgb * 1.25 * sun_phase * sun_t * shadow_factor(p, vec3<f32>(0.0, 1.0, 0.0)) + sky;
         if (lamp_on > 0.0) {
             for (var i: i32 = 0; i < 2; i = i + 1) {
                 let b = lamp_beam(i, p);
