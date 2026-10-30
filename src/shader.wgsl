@@ -828,6 +828,13 @@ fn water_depth(xz: vec2<f32>) -> f32 {
     return max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
 }
 
+// Solved column for a crossing. misc.w selects the wider pack so a bow
+// above the old 0.34 m film range is the free surface, not a flat sheet.
+fn water_column(xz: vec2<f32>) -> f32 {
+    let scale = select(0.34, 0.90, frame.misc.w > 0.5);
+    return mat_bilinear(xz).g * scale;
+}
+
 // A dry patch with water on both sides is a hole in the sheet, not a shore.
 // The outer bank has water on only one side, so this does not grow the pond.
 fn covered_depth(xz: vec2<f32>) -> f32 {
@@ -858,22 +865,28 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let local = height_bilinear(in.xz);
     let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
+    let column = water_column(in.xz);
+    let free = frame.misc.w > 0.5 && column > 0.04;
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
     // cut the tire like a clip plane. The pond stays that blurred surface.
     // A cut holds its own sheet down in the groove.
+    // A crossing sets misc.w and the sheet is the solved column, so the
+    // bow is the crest of that column.
     let cover = local + 0.01;
     let pond = max(water_bed(in.xz) + 0.016 + rip, cover) + smoothstep(0.02, 0.16, depth) * 0.012;
     let fill = smoothstep(0.04, 0.12, depth) * min(dug * 0.5, 0.032);
     let in_rut = local + 0.01 + rip + fill;
-    let y = select(pond, in_rut, dug > 0.018 && depth > 0.004);
+    let y_sheet = select(pond, in_rut, dug > 0.018 && depth > 0.004);
+    let surface = water_bed(in.xz) + column;
+    let y = select(y_sheet, surface, free);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
     o.world = world;
     o.ij = in.ij;
-    o.depth = depth;
+    o.depth = select(depth, column, free);
     return o;
 }
 
@@ -905,12 +918,24 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz - e) > 0.02
         || -stamp_bilinear(xz + ez) > 0.02
         || -stamp_bilinear(xz - ez) > 0.02;
-    if (near_cut || own < 0.008 || in.depth < 0.008) {
+    let free = frame.misc.w > 0.5 && in.depth > 0.04;
+    if (free) {
+        if (in.depth < 0.04) {
+            discard;
+        }
+    } else if (near_cut || own < 0.008 || in.depth < 0.008) {
         discard;
     }
     let n = ripple_normal(xz, frame.misc.x);
-    // Keep the surface facing up. A bowed normal is what made the gray metal disc.
-    let nrm = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
+    // Keep the pond facing up. A bowed normal is what made the gray metal disc.
+    // The crossing crest uses the solved slope so the ridge is a face, not a tint.
+    let flat = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
+    let de = 0.22;
+    let h0 = water_bed(xz) + water_column(xz);
+    let hx = water_bed(xz + vec2<f32>(de, 0.0)) + water_column(xz + vec2<f32>(de, 0.0));
+    let hz = water_bed(xz + vec2<f32>(0.0, de)) + water_column(xz + vec2<f32>(0.0, de));
+    let slope = normalize(vec3<f32>(-(hx - h0) / de, 1.0, -(hz - h0) / de));
+    let nrm = select(flat, normalize(mix(vec3<f32>(0.0, 1.0, 0.0), slope, 0.7)), free);
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
@@ -938,7 +963,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // A damp speck still opens the groove. A film and a slurry keep the
     // opacity of the bed under them.
     let skim = 1.0 - smoothstep(0.012, 0.028, in.depth);
-    let alpha = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
+    let solved = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
+    // A bowl is a cut, and the groove path opens that cut. The ford sheet is
+    // the free surface, so the crest stays a surface instead of a tint.
+    let alpha = select(solved, max(solved, 0.90), free);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);

@@ -544,6 +544,8 @@ struct CaptureArgs {
     moisture_sinkage_proof: PathBuf,
     stuck_recovery: bool,
     stuck_recovery_proof: PathBuf,
+    water_crossing: bool,
+    water_crossing_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -668,6 +670,10 @@ fn capture(args: &[String]) {
     }
     if parsed.stuck_recovery {
         capture_stuck_recovery(&mut renderer, &parsed);
+        return;
+    }
+    if parsed.water_crossing {
+        capture_water_crossing(&mut renderer, &parsed);
         return;
     }
     let mut world = World::demo();
@@ -882,6 +888,9 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
     let mut stuck_recovery = false;
     let mut stuck_recovery_proof =
         PathBuf::from(format!("{MEDIA}/stuck-recovery-proof.png"));
+    let mut water_crossing = false;
+    let mut water_crossing_proof =
+        PathBuf::from(format!("{MEDIA}/water-crossing-proof.png"));
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -1014,6 +1023,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     stuck_recovery_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--water-crossing-proof" => {
+                water_crossing = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    water_crossing_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--niva-groove-roll" => niva_groove_roll = PathBuf::from(val(&mut i)),
             "--niva-groove-spin" => niva_groove_spin = PathBuf::from(val(&mut i)),
             "--niva-sidewall-shed" => niva_sidewall_shed = PathBuf::from(val(&mut i)),
@@ -1121,6 +1136,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         moisture_sinkage_proof,
         stuck_recovery,
         stuck_recovery_proof,
+        water_crossing,
+        water_crossing_proof,
     }
 }
 
@@ -2415,6 +2432,90 @@ fn capture_stuck_recovery(renderer: &mut Renderer, parsed: &CaptureArgs) {
 #[cfg(not(target_arch = "wasm32"))]
 fn stuck_recovery_camera(world: &World) -> CameraPose {
     moisture_pad_camera(world, 5.2)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_water_crossing(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = true;
+
+    let mut world = World::wet_clay();
+    let out = world.cross_water();
+    silence_chunks(&mut world);
+
+    println!(
+        "water-crossing wave {:.4} m formula {:.4} spd {:.3} depth {:.3} draft {:.3}",
+        out.bow, out.bow_formula, out.speed, out.depth, out.draft
+    );
+    println!(
+        "water-crossing drag {:.1} n buoy {:.1} n stall {:.3} m intake {:.3} m",
+        out.drag, out.buoy, out.stall, out.intake
+    );
+    println!(
+        "water-crossing scour {:.4} turbid {:.4} water {:.4}->{:.4}->{:.4} \
+         cut {:.4} placed {:.4} cloud {:.4}",
+        out.scour, out.turbid, out.water0, out.water, out.water_end, out.cut, out.placed, out.cloud
+    );
+    println!(
+        "water-crossing scour clay {:.4} silt {:.4} sand {:.4} cloud {:.4} {:.4} {:.4} \
+         stick {:.2} {:.2} {:.2}",
+        out.scour_clay,
+        out.scour_silt,
+        out.scour_sand,
+        out.cloud_clay,
+        out.cloud_silt,
+        out.cloud_sand,
+        out.stick_clay,
+        out.stick_silt,
+        out.stick_sand
+    );
+
+    let pose = water_crossing_camera(&world);
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    if let Some(parent) = parsed.water_crossing_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(
+        &parsed.water_crossing_proof,
+        parsed.width,
+        parsed.height,
+        &rgba,
+    )
+    .expect("water crossing still");
+    println!(
+        "cc0 water-crossing {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
+        parsed.water_crossing_proof.display(),
+        pose.eye.x,
+        pose.eye.y,
+        pose.eye.z,
+        pose.target.x,
+        pose.target.y,
+        pose.target.z
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn water_crossing_camera(world: &World) -> CameraPose {
+    let vehicle = &world.vehicle;
+    let fwd = vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    // The crest stands about two metres ahead of the chassis.
+    let crest = vehicle.pos + fwd * 2.05;
+    let sample = world.soil.sample(crest.x, crest.z);
+    let y = sample.height + sample.water;
+    let look = vehicle.pos + fwd * 1.65 + Vec3::Y * (y + 0.08);
+    // Low front quarter. The crest's top edge crosses the hood.
+    let eye = crest + fwd * 2.45 - right * 2.25;
+    let eye = Vec3::new(eye.x, y + 0.42, eye.z);
+    CameraPose {
+        eye,
+        target: look,
+        ortho_width: Some(5.8),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

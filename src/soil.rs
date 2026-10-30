@@ -604,6 +604,10 @@ pub struct SoilField {
     /// that left the column. The mesh adds this to the solid. It is not a
     /// second surface.
     pub slurry: Vec<f32>,
+    /// Soil held in the water column, metres. Scour moves it off the bed.
+    /// It is not height and it is not a second water. The closed soil sum is
+    /// bed plus placed plus this cloud.
+    pub cloud: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -884,6 +888,92 @@ pub fn wheel_buoyancy(depth: f32, radius: f32, width: f32) -> f32 {
     (area.max(0.0) * width * 1_150.0 * 9.81).min(4_500.0)
 }
 
+/// Fresh water. The crossing drag and buoyancy use this density.
+pub const WATER_RHO: f32 = 1000.0;
+
+/// Bow crest above the still column, metres.
+/// `h = k * speed * depth`, so a faster bow in deeper water stands higher.
+/// Zero when the hull is barely moving or the column is a film.
+pub fn water_bow_height(speed: f32, depth: f32) -> f32 {
+    let v = speed.max(0.0);
+    let d = depth.max(0.0);
+    if v < 0.05 || d < 0.02 {
+        return 0.0;
+    }
+    (0.20 * v * d).min(0.24).min(d * 0.85)
+}
+
+/// Horizontal drag on the hull, newtons. Quadratic in speed, linear in the
+/// depth the nose is pushing. Zero in a film or at rest.
+pub fn water_body_drag(speed: f32, depth: f32) -> f32 {
+    let v = speed.abs();
+    let d = depth.max(0.0);
+    if v < 0.04 || d < 0.02 {
+        return 0.0;
+    }
+    let width = 1.52_f32;
+    let area = width * d.min(0.90);
+    let cd = 0.55_f32;
+    (0.5 * WATER_RHO * cd * area * v * v).min(12_000.0)
+}
+
+/// Upward force on the hull from the volume under the free surface, newtons.
+/// The wheels already carry their own buoyancy. `draft` is how far the
+/// surface stands above the belly.
+pub fn water_body_buoyancy(draft: f32) -> f32 {
+    let d = draft.max(0.0);
+    if d < 0.004 {
+        return 0.0;
+    }
+    let plan = 1.48_f32 * 2.55;
+    let fill = 0.34_f32;
+    let volume = plan * d.min(0.70) * fill;
+    (WATER_RHO * 9.81 * volume).min(8_000.0)
+}
+
+/// Metres of bed a 1 m/s current through 0.30 m of water attacks per second.
+/// Clay is slower than silt. Sand is faster.
+pub fn water_scour_pace(kind: SurfaceKind) -> f32 {
+    match water_grain(kind) {
+        Some(SurfaceKind::WetMud) => 0.032,
+        Some(SurfaceKind::Silt) => 0.080,
+        Some(SurfaceKind::Sand) => 0.160,
+        _ => 0.0,
+    }
+}
+
+/// Share of attacked soil that re-sticks to the bed instead of entering the cloud.
+/// Clay holds. Sand does not.
+pub fn water_stick(kind: SurfaceKind) -> f32 {
+    match water_grain(kind) {
+        Some(SurfaceKind::WetMud) => 0.74,
+        Some(SurfaceKind::Silt) => 0.46,
+        Some(SurfaceKind::Sand) => 0.14,
+        _ => 0.0,
+    }
+}
+
+/// Metres per second that stay suspended at the reference current.
+/// Clay clouds slower than silt. Sand clouds faster because it scours faster
+/// and less of it sticks.
+pub fn water_cloud_pace(kind: SurfaceKind) -> f32 {
+    water_scour_pace(kind) * (1.0 - water_stick(kind))
+}
+
+fn water_grain(kind: SurfaceKind) -> Option<SurfaceKind> {
+    match kind {
+        SurfaceKind::WetMud
+        | SurfaceKind::PackedClay
+        | SurfaceKind::FreshCut
+        | SurfaceKind::Berm
+        | SurfaceKind::PlacedClod
+        | SurfaceKind::CutLip => Some(SurfaceKind::WetMud),
+        SurfaceKind::Silt => Some(SurfaceKind::Silt),
+        SurfaceKind::Sand => Some(SurfaceKind::Sand),
+        _ => None,
+    }
+}
+
 /// Longitudinal drag. Dry ground keeps the old 2.5% of the load. Standing
 /// water adds drag in proportion to depth, so a film and a slurry do not roll
 /// the same.
@@ -997,6 +1087,7 @@ impl SoilField {
             tread_lat: vec![0.0; n],
             airborne: 0.0,
             slurry: vec![0.0; n],
+            cloud: vec![0.0; n],
         }
     }
 
@@ -1319,6 +1410,12 @@ impl SoilField {
 
     fn sync(&mut self, idx: usize) {
         self.height[idx] = self.bed[idx] + self.placed[idx] + self.slurry[idx];
+    }
+
+    pub fn rebuild_height(&mut self) {
+        for idx in 0..self.bed.len() {
+            self.sync(idx);
+        }
     }
 
     /// Put bed, placed, and loose back and rebuild height. For proof stills after
@@ -3918,6 +4015,447 @@ impl SoilField {
         vol
     }
 
+    /// Dig a bowl and fill it with free water. Spoil from the bowl is placed
+    /// on the apron outside the pool, so the soil sum does not change. The
+    /// returned value is the cubic metres of water in the bowl.
+    pub fn fill_water_pool(
+        &mut self,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        bowl: f32,
+        depth: f32,
+        kind: SurfaceKind,
+    ) -> f32 {
+        let bowl = bowl.max(0.0);
+        let depth = depth.max(0.0);
+        if depth <= 1.0e-5 || bowl <= 1.0e-5 {
+            return 0.0;
+        }
+        let half = self.size * 0.5;
+        let area = self.cell * self.cell;
+        let apron = 2.2_f32;
+        let mut pool: Vec<usize> = Vec::new();
+        let mut rim: Vec<usize> = Vec::new();
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                let idx = j * self.res + i;
+                let inside = x >= x0 && x < x1 && z >= z0 && z < z1;
+                let near = x >= x0 - apron
+                    && x < x1 + apron
+                    && z >= z0 - apron
+                    && z < z1 + apron;
+                if inside {
+                    pool.push(idx);
+                } else if near {
+                    rim.push(idx);
+                }
+            }
+        }
+        if pool.is_empty() || rim.is_empty() {
+            return 0.0;
+        }
+        let spoil = bowl * pool.len() as f32 * area;
+        let cells = pool.len() as f32;
+        let dh = spoil / (rim.len() as f32 * area);
+        for &idx in &pool {
+            self.bed[idx] -= bowl;
+            self.water[idx] = depth;
+            self.slurry[idx] = 0.0;
+            self.cloud[idx] = 0.0;
+            self.wetness[idx] = 0.96;
+            self.kind[idx] = kind as u8;
+            self.darken[idx] = (self.darken[idx] + 0.18).min(0.55);
+            self.sync(idx);
+        }
+        for idx in rim {
+            self.placed[idx] += dh;
+            if self.placed[idx] > 0.01 {
+                self.kind[idx] = SurfaceKind::Berm as u8;
+            }
+            self.sync(idx);
+        }
+        depth * cells * area
+    }
+
+    /// Tires meet the bed. A wide bowl is not a rut, and a water column is not
+    /// slurry, so neither one is left on the contact for this pass.
+    pub fn begin_ford_contacts(&mut self, x0: f32, x1: f32, z0: f32, z1: f32) -> FordContactMask {
+        let half = self.size * 0.5;
+        let film = 0.04_f32;
+        let mut initial = Vec::new();
+        let mut water = Vec::new();
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let x = (i as f32 + 0.5) * self.cell - half;
+                let z = (j as f32 + 0.5) * self.cell - half;
+                if x < x0 || x >= x1 || z < z0 || z >= z1 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.initial_height[idx] - self.bed[idx] > 1.0e-4 {
+                    initial.push((idx, self.initial_height[idx]));
+                    self.initial_height[idx] = self.bed[idx];
+                }
+                if self.water[idx] > film {
+                    water.push((idx, self.water[idx]));
+                    self.water[idx] = film;
+                }
+            }
+        }
+        FordContactMask { initial, water }
+    }
+
+    pub fn end_ford_contacts(&mut self, mask: FordContactMask) {
+        for (idx, h0) in mask.initial {
+            self.initial_height[idx] = h0;
+        }
+        for (idx, depth) in mask.water {
+            self.water[idx] = depth;
+        }
+    }
+
+    pub fn water_volume(&self) -> f32 {
+        let area = self.cell * self.cell;
+        self.water.iter().sum::<f32>() * area
+    }
+
+    pub fn cloud_volume(&self) -> f32 {
+        let area = self.cell * self.cell;
+        self.cloud.iter().sum::<f32>() * area
+    }
+
+    /// Move water from the wake onto a transverse crest ahead of the hull.
+    /// The crest height tracks [`water_bow_height`]. The water sum is unchanged.
+    /// The crest is a ridge across the bow, not a blob.
+    pub fn raise_water_bow(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        speed: f32,
+        still_depth: f32,
+    ) -> WaterBow {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let still = still_depth.max(0.0);
+        let target_h = water_bow_height(speed, still);
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let reach = 2.8_f32;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let bow_near = 0.20_f32;
+        let bow_far = 1.65_f32;
+        let half_bow = 1.05_f32;
+        let wake_far = -2.35_f32;
+        let wake_near = -0.20_f32;
+        let half_wake = 0.95_f32;
+        let mut bow: Vec<(usize, f32)> = Vec::new();
+        let mut wake: Vec<usize> = Vec::new();
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                let idx = j as usize * self.res + i as usize;
+                if (bow_near..=bow_far).contains(&along)
+                    && lat.abs() <= half_bow
+                    && self.water[idx] > 0.008
+                {
+                    let span = (bow_far - bow_near).max(0.05);
+                    let u = ((along - bow_near) / span).clamp(0.0, 1.0);
+                    let crest = (std::f32::consts::PI * u).sin();
+                    let across = (1.0 - (lat.abs() / half_bow).clamp(0.0, 1.0)).powf(0.55);
+                    let w = crest * across;
+                    if w > 0.04 {
+                        bow.push((idx, w));
+                    }
+                } else if (wake_far..=wake_near).contains(&along)
+                    && lat.abs() <= half_wake
+                    && self.water[idx] > 0.008
+                {
+                    wake.push(idx);
+                }
+            }
+        }
+        if bow.is_empty() {
+            return WaterBow::default();
+        }
+        let area = self.cell * self.cell;
+        let floor = (still * 0.55).max(0.04);
+        let mut returned = 0.0_f32;
+        for (idx, w) in &bow {
+            let want = still + target_h * *w;
+            let extra = self.water[*idx] - want;
+            if extra > 1.0e-5 {
+                self.water[*idx] = want;
+                returned += extra;
+            }
+        }
+        if returned > 1.0e-6 && !wake.is_empty() {
+            let share = returned / wake.len() as f32;
+            for idx in &wake {
+                self.water[*idx] += share;
+            }
+        }
+        let mut need = 0.0_f32;
+        let mut weight = 0.0_f32;
+        for (idx, w) in &bow {
+            let want = still + target_h * *w;
+            let deficit = (want - self.water[*idx]).max(0.0);
+            if deficit > 1.0e-5 {
+                need += deficit;
+                weight += *w;
+            }
+        }
+        let mut spare = 0.0_f32;
+        for idx in &wake {
+            spare += (self.water[*idx] - floor).max(0.0);
+        }
+        let moved = need.min(spare);
+        if moved > 1.0e-6 && weight > 1.0e-6 && spare > 1.0e-6 {
+            let take_frac = moved / spare;
+            for idx in &wake {
+                let surplus = (self.water[*idx] - floor).max(0.0);
+                self.water[*idx] -= surplus * take_frac;
+            }
+            for (idx, w) in &bow {
+                let want = still + target_h * *w;
+                let deficit = (want - self.water[*idx]).max(0.0);
+                if deficit <= 1.0e-5 {
+                    continue;
+                }
+                self.water[*idx] += moved * (deficit / need);
+            }
+        }
+        let mut peak = 0.0_f32;
+        let mut bow_m3 = 0.0_f32;
+        for (idx, w) in &bow {
+            let extra = (self.water[*idx] - still).max(0.0);
+            peak = peak.max(extra);
+            if *w > 0.45 {
+                bow_m3 += extra * area;
+            }
+        }
+        let mut wake_m3 = 0.0_f32;
+        for idx in &wake {
+            wake_m3 += (still - self.water[*idx]).max(0.0) * area;
+        }
+        WaterBow {
+            height: peak,
+            bow_m3,
+            wake_m3,
+        }
+    }
+
+    /// Highest free surface on the bow ridge minus the quiet pool, metres.
+    pub fn water_bow_crest(&self, x: f32, z: f32, forward: Vec3, quiet: f32) -> f32 {
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let reach = 2.2_f32;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let mut peak = quiet;
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                if !(0.25..=1.55).contains(&along) || lat.abs() > 0.95 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if self.water[idx] < 0.02 {
+                    continue;
+                }
+                let surface = self.bed[idx] + self.placed[idx] + self.water[idx];
+                peak = peak.max(surface);
+            }
+        }
+        (peak - quiet).max(0.0)
+    }
+
+    /// Mean free surface in the pool, away from a hull at `x,z`.
+    pub fn quiet_water_surface(&self, x0: f32, x1: f32, z0: f32, z1: f32, x: f32, z: f32) -> f32 {
+        let half = self.size * 0.5;
+        let mut sum = 0.0_f32;
+        let mut n = 0.0_f32;
+        for j in 0..self.res {
+            for i in 0..self.res {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                if cx < x0 || cx >= x1 || cz < z0 || cz >= z1 {
+                    continue;
+                }
+                if (cx - x).hypot(cz - z) < 2.4 {
+                    continue;
+                }
+                let idx = j * self.res + i;
+                if self.water[idx] < 0.05 {
+                    continue;
+                }
+                sum += self.bed[idx] + self.placed[idx] + self.water[idx];
+                n += 1.0;
+            }
+        }
+        if n < 1.0 {
+            0.0
+        } else {
+            sum / n
+        }
+    }
+
+    /// Current in the wake scours the bed. Soil that does not stick enters
+    /// the cloud. Water volume is unchanged.
+    pub fn scour_water_wake(
+        &mut self,
+        x: f32,
+        z: f32,
+        forward: Vec3,
+        speed: f32,
+        depth: f32,
+        dt: f32,
+    ) -> f32 {
+        let speed = speed.max(0.0);
+        let dt = dt.max(0.0);
+        let depth = depth.max(0.0);
+        if speed < 0.15 || dt <= 0.0 || depth < 0.02 {
+            return 0.0;
+        }
+        let forward = horizontal(forward);
+        let right = Vec3::new(forward.z, 0.0, -forward.x);
+        let half = self.size * 0.5;
+        let res = self.res as isize;
+        let reach = 3.5_f32;
+        let i0 = (((x - reach) + half) / self.cell).floor() as isize;
+        let i1 = (((x + reach) + half) / self.cell).floor() as isize;
+        let j0 = (((z - reach) + half) / self.cell).floor() as isize;
+        let j1 = (((z + reach) + half) / self.cell).floor() as isize;
+        let area = self.cell * self.cell;
+        let shear = speed * speed * (depth / 0.30);
+        let mut clouded = 0.0_f32;
+        for j in j0.max(0)..=j1.min(res - 1) {
+            for i in i0.max(0)..=i1.min(res - 1) {
+                let cx = (i as f32 + 0.5) * self.cell - half;
+                let cz = (j as f32 + 0.5) * self.cell - half;
+                let rel_x = cx - x;
+                let rel_z = cz - z;
+                let lat = rel_x * right.x + rel_z * right.z;
+                let along = rel_x * forward.x + rel_z * forward.z;
+                // Behind the rear axle, so the current cuts a rut the tires
+                // have already left. Digging under the contact bogs the hull.
+                if !(-3.15..=-1.70).contains(&along) {
+                    continue;
+                }
+                let track = (lat.abs() - 0.74).abs();
+                if track >= 0.28 && lat.abs() >= 0.22 {
+                    continue;
+                }
+                let idx = j as usize * self.res + i as usize;
+                if self.water[idx] < 0.04 {
+                    continue;
+                }
+                let kind = SurfaceKind::from_u8(self.kind[idx]);
+                let pace = water_scour_pace(kind);
+                if pace <= 0.0 {
+                    continue;
+                }
+                let leave = (pace * shear * (1.0 - water_stick(kind)) * dt).min(0.006);
+                if leave <= 1.0e-6 {
+                    continue;
+                }
+                self.bed[idx] -= leave;
+                self.cloud[idx] += leave;
+                clouded += leave * area;
+                self.sync(idx);
+            }
+        }
+        clouded
+    }
+
+    /// Ease the free surface inside the pool toward level. The water sum is
+    /// unchanged. Scour holes take water from the higher cells beside them.
+    pub fn level_pool_water(&mut self, x0: f32, x1: f32, z0: f32, z1: f32) {
+        let res = self.res;
+        for _ in 0..3 {
+            let water = self.water.clone();
+            let mut next = water.clone();
+            for j in 0..res {
+                for i in 0..res {
+                    let a = j * res + i;
+                    if !self.in_water_pool(a, x0, x1, z0, z1, &water) {
+                        continue;
+                    }
+                    if i + 1 < res {
+                        self.water_level_flux(a, a + 1, x0, x1, z0, z1, &water, &mut next);
+                    }
+                    if j + 1 < res {
+                        self.water_level_flux(a, a + res, x0, x1, z0, z1, &water, &mut next);
+                    }
+                }
+            }
+            self.water = next;
+        }
+    }
+
+    fn in_water_pool(&self, idx: usize, x0: f32, x1: f32, z0: f32, z1: f32, water: &[f32]) -> bool {
+        let half = self.size * 0.5;
+        let i = idx % self.res;
+        let j = idx / self.res;
+        let x = (i as f32 + 0.5) * self.cell - half;
+        let z = (j as f32 + 0.5) * self.cell - half;
+        x >= x0 && x < x1 && z >= z0 && z < z1 && water[idx] > 0.008
+    }
+
+    fn water_level_flux(
+        &self,
+        a: usize,
+        b: usize,
+        x0: f32,
+        x1: f32,
+        z0: f32,
+        z1: f32,
+        water: &[f32],
+        next: &mut [f32],
+    ) {
+        if !self.in_water_pool(a, x0, x1, z0, z1, water)
+            || !self.in_water_pool(b, x0, x1, z0, z1, water)
+        {
+            return;
+        }
+        let sa = self.bed[a] + self.placed[a] + water[a];
+        let sb = self.bed[b] + self.placed[b] + water[b];
+        let dh = sa - sb;
+        if dh.abs() < 0.004 {
+            return;
+        }
+        let donor = if dh > 0.0 { a } else { b };
+        let recv = if donor == a { b } else { a };
+        let head = dh.abs();
+        let depth = (head * 0.18).min(water[donor] * 0.35).min(next[donor]);
+        if depth <= 1.0e-6 {
+            return;
+        }
+        next[donor] -= depth;
+        next[recv] += depth;
+    }
+
     /// Cubic metres of slurry on the field.
     pub fn slurry_volume(&self) -> f32 {
         let area = self.cell * self.cell;
@@ -4997,7 +5535,7 @@ impl SoilField {
         let mut water = 0.0_f32;
         let mut slurry = 0.0_f32;
         for idx in 0..self.bed.len() {
-            soil += self.bed[idx] + self.placed[idx];
+            soil += self.bed[idx] + self.placed[idx] + self.cloud[idx];
             water += self.water[idx];
             slurry += self.slurry[idx];
         }
@@ -5440,6 +5978,7 @@ impl SoilField {
             tread_lat,
             airborne: 0.0,
             slurry,
+            cloud: vec![0.0; n],
         })
     }
 
@@ -6472,6 +7011,22 @@ pub struct BowWakePass {
     pub bow_m3: f32,
     /// Cubic metres thinned behind the tread in the wake.
     pub wake_m3: f32,
+}
+
+/// Free-water bow ahead of the hull. `height` is metres above the still column.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaterBow {
+    pub height: f32,
+    pub bow_m3: f32,
+    pub wake_m3: f32,
+}
+
+/// Cells patched so a ford contact reads the bed. The bowl is not a spun rut,
+/// and the standing column is fluid, not slurry under the tire. Restoring
+/// puts the cut and the column back, so the ledger is unchanged.
+pub struct FordContactMask {
+    initial: Vec<(usize, f32)>,
+    water: Vec<(usize, f32)>,
 }
 
 /// Water plus soil, split into the solid, the free column, and the slurry.
