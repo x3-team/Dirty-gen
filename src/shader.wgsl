@@ -1333,20 +1333,38 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         // wet the sand at the shore is, the shader only darkens and glosses
         // it. `wet` is already spread over the 0.20 m cells, so the band
         // fades into the dry without a step.
-        let margin = max(smoothstep(0.0005, 0.004, film_t), smoothstep(0.25, 0.9, wet));
+        // Plus the band the shore wicks up: distance to the published film,
+        // read on rings out to a metre. Full strength to 0.5 m, dry by 1 m.
+        var shore_d = 9.0;
+        for (var k: i32 = 0; k < 8; k = k + 1) {
+            let a = f32(k) * 0.7854 + 0.39;
+            let o = vec2<f32>(cos(a), sin(a));
+            for (var r: i32 = 1; r <= 4; r = r + 1) {
+                let dist = f32(r) * 0.25;
+                let f = bc_film(xz + o * dist);
+                if (f.r + f.g > 0.002) {
+                    shore_d = min(shore_d, dist);
+                }
+            }
+        }
+        let band = 1.0 - smoothstep(0.5, 1.0, shore_d);
+        let margin = max(max(smoothstep(0.0005, 0.004, film_t), smoothstep(0.25, 0.9, wet)), band);
         let soak = clamp(margin, 0.0, 1.0) * inside_t;
         // Under the film the water pass draws the depth; do not stack the two.
         let under_pre = smoothstep(0.002, 0.012, film_t);
-        albedo = mix(albedo, albedo * 0.55, soak);
+        // Wet sand: darker and more saturated, the water fills the grain.
+        let wet_lum = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let wet_col = max(mix(vec3<f32>(wet_lum), albedo, 1.35), vec3<f32>(0.0)) * vec3<f32>(0.42, 0.38, 0.34);
+        albedo = mix(albedo, wet_col, soak);
         // The gloss belongs to the band on dry land; under even a thin film
         // the water layer carries the reflection and the bed stays matte.
         let on_land = 1.0 - smoothstep(0.0003, 0.002, film_t);
-        rough_out = mix(rough_out, 0.15, smoothstep(0.35, 0.9, soak) * on_land);
+        rough_out = mix(rough_out, 0.45, smoothstep(0.35, 0.9, soak) * on_land);
         n = normalize(mix(n, n_geo, soak * 0.35));
         // The margin owns the gloss on the sand: the old pore-film sheen read
         // as water a metre past the shore.
         if (sand_field()) {
-            rough_out = max(rough_out, mix(0.55, mix(0.55, 0.15, smoothstep(0.35, 0.9, soak)), on_land));
+            rough_out = max(rough_out, mix(0.55, mix(0.55, 0.45, smoothstep(0.35, 0.9, soak)), on_land));
         }
         let under = smoothstep(0.002, 0.012, film_t);
         if (under > 0.0) {
@@ -1624,8 +1642,8 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
     // Graded toward the FluidNinja beach: warmer, more saturated, a little
     // more contrast, so the field is not a pale wash.
     let lum = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
-    albedo = max(mix(vec3<f32>(lum), albedo, 1.12) * vec3<f32>(1.03, 0.93, 0.84), vec3<f32>(0.0));
-    albedo = pow(albedo, vec3<f32>(1.1)) * 1.06;
+    albedo = max(mix(vec3<f32>(lum), albedo, 1.05) * vec3<f32>(1.02, 0.97, 0.9), vec3<f32>(0.0));
+    albedo *= 1.12;
     // Wind ripples and grain: centimetre relief in the normal, faded out
     // where a pixel covers more than the ripple so it does not shimmer.
     let micro = 1.0 - smoothstep(0.012, 0.05, fw);
@@ -1637,7 +1655,9 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
         let g0 = hash12(floor(gq));
         let gx = hash12(floor(gq) + vec2<f32>(1.0, 0.0)) - g0;
         let gz = hash12(floor(gq) + vec2<f32>(0.0, 1.0)) - g0;
-        n = normalize(n + (vec3<f32>(wdir.x, 0.0, wdir.y) * ripple * 0.22 + vec3<f32>(gx, 0.0, gz) * 0.12) * micro);
+        n = normalize(n + (vec3<f32>(wdir.x, 0.0, wdir.y) * ripple * 0.38 + vec3<f32>(gx, 0.0, gz) * 0.12) * micro);
+        // The lee side of each ripple holds a little shade-darker grain.
+        albedo *= 1.0 - 0.06 * smoothstep(0.3, 1.0, ripple) * micro;
         albedo *= 1.0 + (g0 - 0.5) * 0.14 * micro;
     }
     // Grain: millimetre relief from two octaves of smooth value noise (the
@@ -1845,6 +1865,26 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let calm = smoothstep(0.015, 0.06, depth);
     let bw_n = bw_wave_normal(xz - flow * t_now * 0.5, t_now);
     nrm = normalize(nrm + vec3<f32>(bw_n.x, 0.0, bw_n.z) * mix(0.15, 0.5, calm));
+    // Cat's-paw wind ripples: two octaves of value noise stretched across
+    // the wind, so the crests run side-on to it and break the sky up.
+    let wv = frame.air[0].xz;
+    let wd = select(vec2<f32>(0.8, 0.6), normalize(wv), dot(wv, wv) > 1e-4);
+    let wp = vec2<f32>(-wd.y, wd.x);
+    var wg = vec2<f32>(0.0);
+    for (var o: i32 = 0; o < 2; o = o + 1) {
+        let f_along = select(16.0, 40.0, o == 1);
+        let f_across = select(4.0, 10.0, o == 1);
+        let drift = t_now * select(0.9, 1.6, o == 1);
+        let q = vec2<f32>(dot(xz, wd) * f_along - drift * f_along * 0.1, dot(xz, wp) * f_across) + vec2<f32>(f32(o) * 17.0, 3.0);
+        let h0 = bw_vnoise2d(q);
+        let ha = bw_vnoise2d(q + vec2<f32>(0.25, 0.0)) - h0;
+        let hc = bw_vnoise2d(q + vec2<f32>(0.0, 0.25)) - h0;
+        // Back to world slope: d/d(along) and d/d(across).
+        let amp = select(0.035, 0.018, o == 1);
+        wg += (wd * ha * f_along + wp * hc * f_across) * 4.0 * amp / f_along;
+    }
+    let gust = 0.5 + 0.5 * noise(xz * 0.6 + wd * t_now * 0.4);
+    nrm = normalize(nrm - vec3<f32>(wg.x, 0.0, wg.y) * mix(0.6, 1.4, gust) * smoothstep(0.003, 0.015, depth));
     // Rings run out from each wheel standing in the water, and the bow
     // pushes a swell ahead of it.
     nrm = normalize(nrm + wheel_ripples(xz, in.world.y, t_now) * calm_or_film(depth));
@@ -1877,13 +1917,20 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Light scattered by the silt in the column, lit by sun and sky.
     // Deep columns go darker: light that scatters back out has crossed more silt.
     let deep_t = smoothstep(0.04, 0.25, depth);
+    // Silt the tires stir up round their contact patches.
+    var stir = 0.0;
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let c = frame.tires[i * 2];
+        let dd = xz - c.xz;
+        stir = max(stir, exp(-dot(dd, dd) / 0.12));
+    }
     var silt = mix(vec3<f32>(0.17, 0.10, 0.042), bed * vec3<f32>(0.7, 0.52, 0.32), 0.35) * mix(1.0, 0.45, deep_t);
     // What clear water scatters back is blue-green and dim; a little silt
     // warms it. Slurry is the brown suspension.
     let clear_sc = vec3<f32>(0.085, 0.062, 0.034) * mix(1.0, 0.7, deep_t);
     // Shallow water shows the sand's own warmth; deep water the teal.
     silt = mix(mix(bed * vec3<f32>(0.5, 0.42, 0.3), clear_sc, smoothstep(0.015, 0.1, depth)), silt, 0.2);
-    silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), slurry_frac);
+    silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), max(slurry_frac, stir * 0.7));
     let ndl = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
     let light = frame.sun_color.rgb * ndl * shadow * 1.25 * 0.45 + sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * frame.env.y;
     let body = silt * light;
@@ -1893,7 +1940,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let fres = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
     let refl_dir = reflect(-view, nrm);
     // The sky the water mirrors is the sky drawn behind it, at full radiance.
-    var refl = env_radiance(refl_dir, 0.06) * 0.92;
+    let w_rough = mix(0.28, 0.14, smoothstep(0.01, 0.08, depth));
+    var refl = env_radiance(refl_dir, w_rough) * 0.92;
     // A rut is a trench: a grazing reflection meets the bank before the sky.
     // March the heightfield a short way along the ray and show the soil it hits.
     var p = in.world + refl_dir * 0.04;
@@ -1952,11 +2000,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let nmax = max(max(fpx.r + fpx.g, fnx.r + fnx.g), max(fpz.r + fpz.g, fnz.r + fnz.g));
     let wash = 0.5 + 0.5 * sin(t_now * 1.7 + noise(xz * 1.3) * 6.0);
     let shore_band = (1.0 - smoothstep(0.0006 + 0.0015 * wash, 0.003 + 0.002 * wash, nmin))
-        * smoothstep(0.012, 0.03, nmax) * (1.0 - smoothstep(0.012, 0.025, depth)) * inside;
+        * smoothstep(0.006, 0.02, nmax) * inside;
     let gaps = smoothstep(0.32, 0.62, noise(xz * 7.0 + vec2<f32>(t_now * 0.3, -t_now * 0.2)));
     // No white ring round the pool: the shore is the dark wet band on the
     // sand, foam only where a crest or a tire breaks the water.
-    let shore = shore_band * gaps * 0.0;
+    // A narrow broken line of dirty foam right at the waterline, in clumps.
+    let clumps = smoothstep(0.5, 0.72, noise(xz * 6.0 + vec2<f32>(t_now * 0.1, 0.0)) * 0.6 + noise(xz * 19.0) * 0.4);
+    let shore = shore_band * (1.0 - smoothstep(0.004, 0.009, depth)) * clumps;
     let foam_amt = clamp(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), shore), 0.0, 1.0);
     // Foam is a net of bubble walls, not a blotch: cell borders of a
     // drifting Voronoi, gated by the lace.
@@ -1981,13 +2031,17 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // The thinnest film is a clear sheet over the sand: it keeps its
     // reflection and glint and lets the grain through.
     // The waterline is the published film: no shape is painted on it here.
-    alpha = max(alpha * smoothstep(0.002, 0.01, depth), foam * 0.85 * smoothstep(0.002, 0.004, depth));
+    // A sharp waterline, not a fade: the film ends in a meniscus a few
+    // millimetres wide that catches the sky as a thin bright line.
+    let meniscus = shore_band * smoothstep(0.0015, 0.003, depth) * (1.0 - smoothstep(0.003, 0.006, depth));
+    lit = lit * (1.0 + meniscus * 0.35);
+    alpha = max(max(alpha, meniscus * 0.6) * smoothstep(0.0012, 0.003, depth), foam * 0.85 * smoothstep(0.0012, 0.003, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
     // The car and anything else standing in the frame mirror in the sheet.
     let ssr = water_ssr(in.world + nrm * 0.005, refl_dir);
     if (ssr.a > 0.0) {
-        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth);
+        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth) * mix(0.55, 0.85, smoothstep(0.01, 0.08, depth));
         out_rgb = mix(out_rgb, ssr.rgb * 0.92, clamp(k / max(alpha, 0.05), 0.0, 1.0));
         alpha = max(alpha, k);
     }
@@ -2651,6 +2705,17 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         emit = vec3<f32>(0.9, 0.02, 0.01);
     }
 
+    // Anything standing in the published film is soaked to just above the
+    // waterline: tire rubber, rim and sills go dark and glossy there.
+    // Mesh passes do not bind the contract group; the picture cache carries
+    // the same solved water for them.
+    if (sand_field()) {
+        let wd = water_depth(in.world.xz);
+        let wl = height_bilinear(in.world.xz) + wd;
+        let soaked = (1.0 - smoothstep(wl + 0.02, wl + 0.09, in.world.y)) * smoothstep(0.003, 0.01, wd);
+        albedo = mix(albedo, albedo * vec3<f32>(0.42, 0.38, 0.33), soaked);
+        rough = mix(rough, 0.18, soaked);
+    }
     var lit = shade_pbr(in.world, nrm, albedo, rough, metal, 1.0, emit);
     // Clods skip the blue sky fill. That fill is what turned wet mud into a gray stone.
     if (in.panel > 45.5 && in.panel < 46.5) {

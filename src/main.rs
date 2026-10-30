@@ -883,13 +883,12 @@ fn beauty_puddle_side_camera(world: &World) -> CameraPose {
     }
 }
 
-/// Sun for the side still: behind the Niva and on the lens side, 37 degrees
-/// up. The near flank catches it, and the silhouette runs forward and away
-/// across the sand and water in front of the bumper, where the low camera
-/// sees it.
+/// Sun for the side still: behind the Niva and on its far side, 38 degrees
+/// up, so the body and wheel shadows fall toward the lens onto the water and
+/// sand beside the car, inside the low frame.
 fn beauty_puddle_side_sun(world: &World) -> Vec3 {
     let (_, fwd, right) = vehicle_axes(world);
-    (-fwd * 0.6 + right * 0.45 + Vec3::Y * 0.57).normalize()
+    (-fwd * 0.55 - right * 0.4 + Vec3::Y * 0.7).normalize()
 }
 
 /// Behind the rear arch, low, so ribbons torn off the tread fly at the lens.
