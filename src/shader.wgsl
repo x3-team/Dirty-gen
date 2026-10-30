@@ -216,18 +216,65 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     // more bias the field prints the shadow map's grid.
     let low_sun = 1.0 - smoothstep(0.3, 0.7, normalize(frame.sun_dir.xyz).y);
     let bias = 0.00015 + slope * 0.0014 + low_sun * 0.0009;
+    // Texel size and depth range in metres, read back from the ortho matrix.
+    let m = frame.light_vp;
+    let texel_m = 2.0 / (length(vec3<f32>(m[0].x, m[1].x, m[2].x)) * dims.x);
+    let depth_m = 1.0 / max(length(vec3<f32>(m[0].z, m[1].z, m[2].z)), 1e-6);
+    // Blocker search, then a filter as wide as the penumbra: the sun disc and
+    // the bright sky round it blur a shadow by ~2 cm per metre of gap, so a
+    // wheel's shadow is crisp at the tread and soft at the roof line.
+    var blocker = 0.0;
+    var found = 0.0;
+    for (var k: i32 = 0; k < 9; k = k + 1) {
+        let o = vec2<i32>(k % 3 - 1, k / 3 - 1) * 3;
+        let c = clamp(base + o, vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+        let s = decode_depth(textureLoad(shadow_tex, c, 0));
+        if (ndc.z > s + bias) {
+            blocker += s;
+            found += 1.0;
+        }
+    }
+    if (found < 0.5) {
+        return 1.0;
+    }
+    let gap = (ndc.z - blocker / found) * depth_m;
+    let step = clamp(gap * 0.02 / max(texel_m, 1e-5) / 1.5, 1.0, 6.0);
     var blocked = 0.0;
-    for (var y: i32 = -1; y <= 1; y = y + 1) {
-        for (var x: i32 = -1; x <= 1; x = x + 1) {
-            let c = clamp(base + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
-            let s = decode_depth(textureLoad(shadow_tex, c, 0));
-            if (ndc.z > s + bias) {
-                blocked = blocked + 1.0;
-            }
+    for (var k: i32 = 0; k < 16; k = k + 1) {
+        // A rotated 4x4 grid, so the filter does not print a square.
+        let g = vec2<f32>(f32(k % 4) - 1.5, f32(k / 4) - 1.5);
+        let r = vec2<f32>(g.x * 0.966 - g.y * 0.259, g.x * 0.259 + g.y * 0.966) * step;
+        let c = clamp(base + vec2<i32>(round(r)), vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+        let s = decode_depth(textureLoad(shadow_tex, c, 0));
+        if (ndc.z > s + bias) {
+            blocked = blocked + 1.0;
         }
     }
     // 0.92 so the airborne buggy and the clods throw a shadow you can see.
-    return 1.0 - blocked / 9.0 * 0.92;
+    return 1.0 - blocked / 16.0 * 0.92;
+}
+
+// Sky occlusion on the ground under the vehicle: the body hides most of the
+// sky from the soil below it and each tire hides it round its contact patch.
+// This is what seats the car; the sun shadow alone reads as a decal.
+fn niva_ground_ao(world: vec3<f32>) -> f32 {
+    let yaw = frame.air[2].w;
+    let fwd = vec2<f32>(sin(yaw), cos(yaw));
+    let d = world.xz - frame.air[1].xz;
+    let l = vec2<f32>(d.x * fwd.y - d.y * fwd.x, dot(d, fwd));
+    // Signed distance to the 1.7 x 3.7 m footprint.
+    let q = abs(l) - vec2<f32>(0.85, 1.85);
+    let sd = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+    let height = max(world.y - (frame.air[1].y - 0.9), 0.0);
+    var ao = 1.0 - 0.72 * (1.0 - smoothstep(-0.35, 0.7, sd)) * (1.0 - smoothstep(0.1, 0.8, height));
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let c = frame.tires[i * 2];
+        let contact = c.xyz - vec3<f32>(0.0, c.w, 0.0);
+        let dd = world - contact;
+        let r2 = dot(dd.xz, dd.xz) + dd.y * dd.y * 4.0;
+        ao *= 1.0 - 0.6 * exp(-r2 / 0.06);
+    }
+    return ao;
 }
 
 // Aerial perspective: a thin haze that warms toward the sun, then the old
@@ -974,9 +1021,10 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (kind == 10u) { rough_out = max(rough_out, 0.74); }
     if (kind == 11u) { rough_out = mix(rough_out, 0.2, smoothstep(0.35, 0.85, wet)); }
     let lug_h = tread_delta(xz);
-    if (lug_h < -0.003) {
-        let k = clamp(-lug_h / 0.045, 0.0, 1.0);
-        albedo *= mix(1.0, 0.52, k);
+    if (lug_h < -0.002) {
+        // Pressed lugs: the grain packs dark in the groove of each lug.
+        let k = clamp(-lug_h / 0.035, 0.0, 1.0);
+        albedo *= mix(1.0, 0.42, k);
     }
     // Moisture is shown, not simulated: wetness from the solver closes the
     // pores (rougher -> smoother) and floods the low texels of the height map
@@ -1059,6 +1107,55 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let murk_col = vec3<f32>(0.10, 0.062, 0.03) * mix(1.0, 0.6, smoothstep(0.04, 0.14, water));
         albedo = mix(albedo, murk_col, rut_water * smoothstep(0.01, 0.06, water));
     }
+    // ---- The open sand field is not one flat swatch: tone drifts over metres,
+    // damp patches hold in the low spots, hummocks catch the sun, and pebbles
+    // lie scattered in the grain. Picture only; the solver's height is untouched.
+    if (sand_field() && (kind == 0u || kind == 10u)) {
+        let big = noise(xz * 0.11 + vec2<f32>(13.0, 7.0)) * 0.6 + noise(xz * 0.37) * 0.4;
+        let warm = noise(xz * 0.23 + vec2<f32>(-4.0, 9.0));
+        albedo *= mix(0.86, 1.1, big) * mix(vec3<f32>(1.04, 0.98, 0.9), vec3<f32>(0.95, 0.98, 1.05), warm);
+        // Hummocks: half-metre swells in the normal only.
+        let hq = xz * 1.7;
+        let h0 = noise(hq) + 0.5 * noise(hq * 2.3 + vec2<f32>(5.0, 1.0));
+        let hx = noise(hq + vec2<f32>(0.05, 0.0)) + 0.5 * noise((hq + vec2<f32>(0.05, 0.0)) * 2.3 + vec2<f32>(5.0, 1.0));
+        let hz = noise(hq + vec2<f32>(0.0, 0.05)) + 0.5 * noise((hq + vec2<f32>(0.0, 0.05)) * 2.3 + vec2<f32>(5.0, 1.0));
+        n = normalize(n + vec3<f32>(h0 - hx, 0.0, h0 - hz) * 3.2);
+        // Damp patches in the hollows: darker, a little smoother.
+        let damp_p = smoothstep(0.58, 0.72, noise(xz * 0.19 + vec2<f32>(2.0, -6.0)) * 0.7 + (1.0 - h0 / 1.5) * 0.3);
+        albedo = mix(albedo, albedo * vec3<f32>(0.68, 0.62, 0.55), damp_p * 0.8);
+        rough_out = mix(rough_out, rough_out * 0.75, damp_p);
+        // Pebbles: one per 16 cm cell at most, 1.5 to 4 cm, rounded domes
+        // with a dark contact ring. Rare larger stones on a 70 cm lattice.
+        for (var pl: i32 = 0; pl < 2; pl = pl + 1) {
+            let sc = select(6.0, 1.4, pl == 1);
+            let cp = xz * sc;
+            let cell = floor(cp);
+            let rnd = hash22(cell + vec2<f32>(f32(pl) * 17.0, 3.0));
+            let keep = hash12(cell * 1.31 + vec2<f32>(f32(pl) * 5.0, 9.0));
+            if (keep < select(0.16, 0.05, pl == 1)) {
+                let centre = (cell + 0.2 + rnd * 0.6) / sc;
+                let rad = mix(0.015, 0.04, rnd.y) * select(1.0, 2.6, pl == 1);
+                let d = xz - centre;
+                // Slightly oval and lumpy, not a disc.
+                let ang = atan2(d.y, d.x);
+                let r = length(d * vec2<f32>(1.0, 1.0 + 0.35 * rnd.x)) / (rad * (1.0 + 0.15 * sin(ang * 3.0 + rnd.x * 6.0)));
+                // Under standing water a dome caught the film's mirror gloss and
+                // lit up white; the bed there stays the wet grain.
+                if (r < 1.25 && film_c.r + film_c.g < 0.002) {
+                    let tone = hash12(cell + vec2<f32>(7.0, f32(pl)));
+                    let stone = mix(vec3<f32>(0.2, 0.18, 0.16), vec3<f32>(0.4, 0.36, 0.31), tone)
+                        * mix(0.85, 1.1, noise(xz * 90.0));
+                    let body = 1.0 - smoothstep(0.85, 1.0, r);
+                    let ring = smoothstep(0.9, 1.0, r) * (1.0 - smoothstep(1.0, 1.25, r));
+                    albedo = mix(albedo, stone, body);
+                    albedo *= 1.0 - ring * 0.45;
+                    let dome = d / max(rad, 1e-4) * 1.6 * body;
+                    n = normalize(mix(n, normalize(vec3<f32>(dome.x, 1.0, dome.y)), body));
+                    rough_out = mix(rough_out, 0.55, body);
+                }
+            }
+        }
+    }
     // ---- Contract water on the bed: soaked dark rim, saturated bed, caustics.
     var caustic = 0.0;
     let inside_t = bc_inside(xz);
@@ -1118,6 +1215,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let rp = bc_rut(xz);
     if ((rp.x > 0.004 || rp.y > 0.004) && !track_near(xz)) {
         let rut_k = smoothstep(0.004, 0.025, rp.x);
+        // Packed and a little damper than the loose top: the floor goes darker,
+        // so the lane reads from a distance.
+        albedo *= mix(1.0, 0.72, rut_k);
         // A pressed floor is smoother than the field.
         rough_out = mix(rough_out, rough_out * 0.8, rut_k);
         n = normalize(mix(n, n_geo, rut_k * 0.3));
@@ -1185,7 +1285,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let sun_k = clamp(sun_d.y, 0.0, 1.0) * shadow_factor(in.world + n_geo * 0.02, n_geo);
         emit = albedo * frame.sun_color.rgb * caustic * sun_k * 1.6;
     }
-    let lit = shade_pbr(in.world, n, albedo, rough_out, 0.0, mix(1.0, ao, 0.6), emit);
+    let lit = shade_pbr(in.world, n, albedo, rough_out, 0.0, mix(1.0, ao, 0.6) * niva_ground_ao(in.world), emit);
     return present(lit);
 }
 
@@ -1349,6 +1449,30 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
 // Water the Niva's tires push around: a foam collar at the contact, a bow
 // ahead, a V wake and a trail behind. Picture only, from the tire poses in
 // the frame; x is foam 0..1, y is how far the bow lifts the sheet, metres.
+// Slope of the rings round each wheel that stands in water, as a normal
+// offset. Capillary rings: about 9 cm apart, running out at ~0.35 m/s and
+// fading over a metre.
+fn wheel_ripples(xz: vec2<f32>, surf: f32, t: f32) -> vec3<f32> {
+    var g = vec2<f32>(0.0);
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let c = frame.tires[i * 2];
+        if (c.y - c.w > surf + 0.04) {
+            continue;
+        }
+        let d = xz - c.xz;
+        let r = length(d);
+        if (r < 0.12 || r > 2.5) {
+            continue;
+        }
+        let k = 70.0;
+        let amp = exp(-r / 0.7) * smoothstep(0.12, 0.3, r);
+        // The rings break up on the wind ripples: the phase wanders a little.
+        let wob = noise(xz * 6.0 + vec2<f32>(f32(i) * 3.0, t * 0.5)) * 1.6;
+        g += d / r * cos(r * k - t * 24.0 + f32(i) * 1.7 + wob) * amp;
+    }
+    return vec3<f32>(g.x, 0.0, g.y) * 0.15;
+}
+
 fn tire_wake(xz: vec2<f32>, surf: f32) -> vec2<f32> {
     var foam = 0.0;
     var bulge = 0.0;
@@ -1373,7 +1497,7 @@ fn tire_wake(xz: vec2<f32>, surf: f32) -> vec2<f32> {
         let wake = exp(-arm * arm / (0.004 + back * 0.02)) * exp(-back / 2.4) * step(a, 0.0);
         let trail = exp(-out_b * out_b / 0.01) * exp(-back / 1.6) * step(a, 0.0);
         foam = max(foam, max(collar, max(wake, trail * 0.7)));
-        bulge = max(bulge, bow * 0.035 + collar * 0.012);
+        bulge = max(bulge, bow * 0.055 + collar * 0.018);
     }
     return vec2<f32>(foam, bulge);
 }
@@ -1497,6 +1621,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let rx = noise(q + vec2<f32>(re * 7.0, 0.0) + drift) + 0.5 * noise((q + vec2<f32>(re * 7.0, 0.0)) * 2.3 - drift * 1.4);
     let rz = noise(q + vec2<f32>(0.0, re * 7.0) + drift) + 0.5 * noise((q + vec2<f32>(0.0, re * 7.0)) * 2.3 - drift * 1.4);
     nrm = normalize(nrm + vec3<f32>(r0 - rx, 0.0, r0 - rz) * 0.22 * calm);
+    // Rings run out from each wheel standing in the water, and the bow
+    // pushes a swell ahead of it.
+    nrm = normalize(nrm + wheel_ripples(xz, in.world.y, t_now) * calm_or_film(depth));
     // Running water combs into streaks along the current.
     if (speed > 0.05) {
         let along = flow / speed;
@@ -1519,12 +1646,18 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Slurry is far more opaque than muddy water.
     // Puddle water is clear enough to show its bed through 10 cm; only the
     // published slurry fraction turns it to opaque mud.
-    let sigma = mix(vec3<f32>(5.5, 7.0, 10.0), vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
+    // Clear water eats red first, so the deep middle turns teal and dark
+    // while the shallow rim stays the colour of the sand under it.
+    let sigma = mix(vec3<f32>(12.0, 6.5, 4.8), vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
     let trans = exp(-sigma * path);
     // Light scattered by the silt in the column, lit by sun and sky.
     // Deep columns go darker: light that scatters back out has crossed more silt.
     let deep_t = smoothstep(0.04, 0.25, depth);
     var silt = mix(vec3<f32>(0.17, 0.10, 0.042), bed * vec3<f32>(0.7, 0.52, 0.32), 0.35) * mix(1.0, 0.45, deep_t);
+    // What clear water scatters back is blue-green and dim; a little silt
+    // warms it. Slurry is the brown suspension.
+    let clear_sc = vec3<f32>(0.035, 0.075, 0.08) * mix(1.0, 0.6, deep_t);
+    silt = mix(clear_sc, silt, 0.3);
     silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), slurry_frac);
     let ndl = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
     let light = frame.sun_color.rgb * ndl * shadow * 1.25 * 0.45 + sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * frame.env.y;
@@ -1571,7 +1704,12 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // a bow and a V wake.
     let race = smoothstep(0.4, 1.6, speed) * 0.6;
     let wake = tire_wake(xz, in.world.y).x * smoothstep(0.006, 0.025, depth) * inside;
-    let foam_amt = clamp(max(max(fc.r, crest_lace), max(max(churn, race), wake)), 0.0, 1.0);
+    // Swash at the shore: a thin film that runs up and drains, laced white
+    // where it breaks on the sand.
+    let shore_band = smoothstep(0.004, 0.011, depth) * (1.0 - smoothstep(0.014, 0.04, depth));
+    let wash = 0.5 + 0.5 * sin(t_now * 1.7 + noise(xz * 1.3) * 6.0);
+    let shore = shore_band * (0.45 + 0.4 * wash);
+    let foam_amt = clamp(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), shore), 0.0, 1.0);
     // Foam is a net of bubble walls, not a blotch: cell borders of a
     // drifting Voronoi, gated by the lace.
     let bubbles = 1.0 - smoothstep(0.0, 0.12, cell_border(lace_p * 2.2));
@@ -1589,7 +1727,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     lit = mix(lit, foam_col, foam * 0.8);
     alpha = max(alpha, foam * 0.9);
     // Feather the shoreline so the edge is a wet margin, not a cut line.
-    alpha = alpha * smoothstep(0.012, 0.03, depth);
+    alpha = max(alpha * smoothstep(0.012, 0.03, depth), foam * 0.85 * smoothstep(0.004, 0.009, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
     // The car and anything else standing in the frame mirror in the sheet.

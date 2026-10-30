@@ -251,6 +251,22 @@ pub fn from_hdr(bytes: &[u8], sky: &SkyLight) -> Option<EnvMap> {
         proc_sum += p.dot(Vec3::new(0.2126, 0.7152, 0.0722)) as f64 * w;
     }
     let scale = if file_sum > 0.0 { (proc_sum / file_sum) as f32 } else { 1.0 };
+    // A "puresky" file mirrors the sky below the horizon. Under it lies the
+    // lit soil, the same ground the analytic sky puts there.
+    for y in ENV_H / 2..ENV_H {
+        for x in 0..ENV_W {
+            let dir = texel_dir(x as f32, y as f32, ENV_W, ENV_H);
+            let k = smooth(0.0, -0.08, dir.y);
+            if k <= 0.0 {
+                continue;
+            }
+            let g = sky_radiance(dir, sky) / scale.max(1e-6);
+            let c = &mut px[(y * ENV_W + x) as usize];
+            c[0] += (g.x - c[0]) * k;
+            c[1] += (g.y - c[1]) * k;
+            c[2] += (g.z - c[2]) * k;
+        }
+    }
     for c in px.iter_mut() {
         // The sun stays direct light. Clamp the HDRI disc so it does not add
         // a second, unshadowed sun to every glossy surface.
@@ -387,8 +403,8 @@ pub fn find_hdri() -> Option<Vec<u8>> {
         .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("hdr")))
         .collect();
     files.sort();
-    // Only an outdoor sky lights this scene. `sky_*.hdr` is picked up by
-    // itself; any other file (an interior such as lebombo, a night sky) only
+    // Only an outdoor sky lights this scene. `sky.hdr` or `sky_*.hdr` is
+    // picked up by itself; any other file (an interior such as lebombo, a night sky) only
     // by naming it in SILT_HDRI.
     let path = std::env::var_os("SILT_HDRI")
         .map(std::path::PathBuf::from)
@@ -398,7 +414,7 @@ pub fn find_hdri() -> Option<Vec<u8>> {
                 .find(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("sky_"))
+                        .is_some_and(|n| n == "sky.hdr" || n.starts_with("sky_"))
                 })
                 .cloned()
         })?;

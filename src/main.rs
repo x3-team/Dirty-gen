@@ -722,12 +722,13 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     }
     let tag = if fog { "fog-" } else { "" };
     let dt = 1.0 / 30.0;
-    let stills: [(f32, &str, fn(&World) -> CameraPose); 3] = [
+    let stills: [(f32, &str, fn(&World) -> CameraPose); 4] = [
         (-17.5, "puddle-wave", beauty_puddle_camera),
+        (-17.5, "puddle-side", beauty_puddle_side_camera),
         (-6.5, "slurry-spray", beauty_spray_camera),
         (9.0, "dust-exit", beauty_dust_camera),
     ];
-    let mut saved = [false; 3];
+    let mut saved = [false; 4];
     // SILT_BEAUTY_STILLS=puddle-wave,... renders only those stills and stops.
     let only = std::env::var("SILT_BEAUTY_STILLS").ok();
     if let Some(list) = &only {
@@ -862,6 +863,17 @@ fn beauty_puddle_camera(world: &World) -> CameraPose {
     CameraPose {
         eye: p + fwd * 4.8 + right * 3.2 + Vec3::Y * 1.25,
         target: p + fwd * 0.4 - Vec3::Y * 0.05,
+        ortho_width: None,
+    }
+}
+
+/// Low at the side, level with the hubs: the puddle in front, the front
+/// wheel in the water, the bank behind. The fixed shot for puddle iterations.
+fn beauty_puddle_side_camera(world: &World) -> CameraPose {
+    let (p, fwd, right) = vehicle_axes(world);
+    CameraPose {
+        eye: p + fwd * 2.6 + right * 3.3 + Vec3::Y * 0.2,
+        target: p + fwd * 1.0 + right * 0.6 - Vec3::Y * 0.45,
         ortho_width: None,
     }
 }

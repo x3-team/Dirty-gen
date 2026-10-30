@@ -1428,9 +1428,12 @@ impl Renderer {
     /// Fill the env map for this sky: the HDRI when one was found, else the
     /// analytic sky. Every mip is written; the shader picks one by roughness.
     fn bake_env(&mut self, sky: &crate::env::SkyLight) {
+        // The HDRI is a midday sky; the low dusk sun keeps the analytic sky
+        // it was tuned under.
         let map = self
             .hdri
             .as_deref()
+            .filter(|_| sky.physical)
             .and_then(|bytes| crate::env::from_hdr(bytes, sky))
             .unwrap_or_else(|| crate::env::procedural(sky));
         for (level, (w, h, px)) in map.levels.iter().enumerate() {
@@ -1530,7 +1533,8 @@ impl Renderer {
         let view_proj = proj * view;
         // The window keeps the low sun. Persist stills ask for daylight.
         let sun = if self.daylight {
-            Vec3::new(0.38, 0.88, 0.18).normalize()
+            // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
+            Vec3::new(0.593, 0.755, 0.281).normalize()
         } else {
             Vec3::new(0.88, 0.32, 0.24).normalize()
         };
