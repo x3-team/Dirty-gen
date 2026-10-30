@@ -399,7 +399,7 @@ fn niva_box_hit(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> bool {
     // Local frame: x across the car, y up, z along it.
     let lo = vec3<f32>(rel.x * fwd.y - rel.z * fwd.x, rel.y, dot(rel.xz, fwd));
     let ld = vec3<f32>(d.x * fwd.y - d.z * fwd.x, d.y, dot(d.xz, fwd));
-    let half_ext = vec3<f32>(0.85, 0.8, 1.9);
+    let half_ext = vec3<f32>(0.8, 0.45, 1.8);
     let inv = 1.0 / select(ld, vec3<f32>(1e-6), abs(ld) < vec3<f32>(1e-6));
     let t0 = (-half_ext - lo) * inv;
     let t1 = (half_ext - lo) * inv;
@@ -1329,36 +1329,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let inside_t = bc_inside(xz);
     if (inside_t > 0.0) {
         let film_t = film_c.r + film_c.g;
-        // Wet margin from waterHeight - terrainHeight. Here the ground is dry,
-        // so take the water level of the film around it: sand that sits at
-        // or just above a nearby water line wicks it up and goes dark and
-        // glossy (albedo x0.55, roughness 0.15), fading out over 0.5-1 m.
-        let h_here = height_bilinear(xz);
-        let wob = noise(xz * 3.1) * 0.6 + noise(xz * 11.0) * 0.4;
-        let jit = 0.75 + wob * 0.5;
-        var margin = smoothstep(0.0005, 0.004, film_t);
-        for (var k: i32 = 0; k < 8; k = k + 1) {
-            let a = f32(k) * 0.7854 + wob * 0.8;
-            let o = vec2<f32>(cos(a), sin(a));
-            for (var r: i32 = 1; r <= 3; r = r + 1) {
-                let dist = f32(r) * 0.12 * jit;
-                let q = xz + o * dist;
-                let f = bc_film(q);
-                let has = smoothstep(0.0005, 0.004, f.r + f.g);
-                // Water level there minus the ground here, in metres.
-                let above = height_bilinear(q) + f.r + f.g - h_here;
-                let wick = smoothstep(-0.05, 0.0, above);
-                // 20-40 cm of dark wet sand, softening into the dry.
-                let reach = 1.0 - smoothstep(0.18, 0.42, dist + (1.0 - wob) * 0.08);
-                margin = max(margin, has * wick * reach);
-            }
-        }
-        // Pore moisture keeps a damp tone where the film has already drained.
-        margin = max(margin, smoothstep(0.3, 0.85, wet) * 0.45);
+        // Wet band from the published pore moisture: the solver says how
+        // wet the sand at the shore is, the shader only darkens and glosses
+        // it. `wet` is already spread over the 0.20 m cells, so the band
+        // fades into the dry without a step.
+        let margin = max(smoothstep(0.0005, 0.004, film_t), smoothstep(0.25, 0.9, wet));
         let soak = clamp(margin, 0.0, 1.0) * inside_t;
         // Under the film the water pass draws the depth; do not stack the two.
         let under_pre = smoothstep(0.002, 0.012, film_t);
-        albedo = mix(albedo, albedo * 0.55, soak * (1.0 - under_pre * 0.5));
+        albedo = mix(albedo, albedo * 0.55, soak);
         // The gloss belongs to the band on dry land; under even a thin film
         // the water layer carries the reflection and the bed stays matte.
         let on_land = 1.0 - smoothstep(0.0003, 0.002, film_t);
@@ -1376,8 +1355,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             let slurry_f = film_c.g / max(film_t, 1e-4);
             let ratio = webgl_water_caustic(xz, film_t, frame.misc.x);
             caustic = max(ratio - 0.85, 0.0) * 2.2 * (1.0 - slurry_f) * under;
-            // Saturated sand under the water is the dark wet tone.
-            albedo = mix(albedo, albedo * 0.55, max(under, 1.0 - on_land));
+            // Saturated: already x0.55 from the wet band above; a second
+            // darkening printed a black rim along the shallows.
             rough_out = mix(rough_out, 0.55, under);
         }
     } else if (sand_field()) {
@@ -1661,6 +1640,21 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
         n = normalize(n + (vec3<f32>(wdir.x, 0.0, wdir.y) * ripple * 0.22 + vec3<f32>(gx, 0.0, gz) * 0.12) * micro);
         albedo *= 1.0 + (g0 - 0.5) * 0.14 * micro;
     }
+    // Grain: millimetre relief from two octaves of smooth value noise (the
+    // bevy_water noise), each faded once a pixel covers its cells.
+    for (var o: i32 = 0; o < 2; o = o + 1) {
+        let f = select(260.0, 780.0, o == 1);
+        let fade = 1.0 - smoothstep(0.6 / f, 2.5 / f, fw);
+        if (fade > 0.0) {
+            let q = xz * f + vec2<f32>(f32(o) * 31.0, 7.0);
+            let e = 0.35;
+            let c0 = bw_vnoise2d(q);
+            let cx = bw_vnoise2d(q + vec2<f32>(e, 0.0)) - c0;
+            let cz = bw_vnoise2d(q + vec2<f32>(0.0, e)) - c0;
+            n = normalize(n - vec3<f32>(cx, 0.0, cz) * select(0.9, 0.6, o == 1) * fade);
+            albedo *= 1.0 + (c0 - 0.5) * select(0.22, 0.14, o == 1) * fade;
+        }
+    }
     // Hummocks: half-metre swells in the normal only.
     let hq = xz * 1.7;
     let h0 = noise(hq) + 0.5 * noise(hq * 2.3 + vec2<f32>(5.0, 1.0));
@@ -1671,37 +1665,6 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
     let damp_p = smoothstep(0.58, 0.72, noise(xz * 0.19 + vec2<f32>(2.0, -6.0)) * 0.7 + (1.0 - h0 / 1.5) * 0.3);
     albedo = mix(albedo, albedo * vec3<f32>(0.68, 0.62, 0.55), damp_p * 0.8);
     rough_out = mix(rough_out, rough_out * 0.75, damp_p);
-    // Pebbles: one per 16 cm cell at most, 1.5 to 4 cm, rounded domes
-    // with a dark contact ring. Rare larger stones on a 70 cm lattice.
-    for (var pl: i32 = 0; pl < 2; pl = pl + 1) {
-        let sc = select(6.0, 1.4, pl == 1);
-        let cp = xz * sc;
-        let cell = floor(cp);
-        let rnd = hash22(cell + vec2<f32>(f32(pl) * 17.0, 3.0));
-        let keep = hash12(cell * 1.31 + vec2<f32>(f32(pl) * 5.0, 9.0));
-        if (keep < select(0.07, 0.03, pl == 1)) {
-            let centre = (cell + 0.2 + rnd * 0.6) / sc;
-            let rad = mix(0.015, 0.04, rnd.y) * select(1.0, 2.6, pl == 1);
-            let d = xz - centre;
-            // Slightly oval and lumpy, not a disc.
-            let ang = atan2(d.y, d.x);
-            let r = length(d * vec2<f32>(1.0, 1.0 + 0.35 * rnd.x)) / (rad * (1.0 + 0.15 * sin(ang * 3.0 + rnd.x * 6.0)));
-            // Under standing water a dome caught the film's mirror gloss and
-            // lit up white; the bed there stays the wet grain.
-            if (r < 1.25 && under_water < 0.002) {
-                let tone = hash12(cell + vec2<f32>(7.0, f32(pl)));
-                let stone = mix(vec3<f32>(0.2, 0.18, 0.16), vec3<f32>(0.4, 0.36, 0.31), tone)
-                    * mix(0.85, 1.1, noise(xz * 90.0));
-                let body = 1.0 - smoothstep(0.85, 1.0, r);
-                let ring = smoothstep(0.9, 1.0, r) * (1.0 - smoothstep(1.0, 1.25, r));
-                albedo = mix(albedo, stone, body);
-                albedo *= 1.0 - ring * 0.45;
-                let dome = d / max(rad, 1e-4) * 1.6 * body;
-                n = normalize(mix(n, normalize(vec3<f32>(dome.x, 1.0, dome.y)), body));
-                rough_out = mix(rough_out, 0.55, body);
-            }
-        }
-    }
     return SandOut(albedo, n, rough_out);
 }
 
@@ -1721,10 +1684,15 @@ fn wheel_ripples(xz: vec2<f32>, surf: f32, t: f32) -> vec3<f32> {
             continue;
         }
         let k = 70.0;
-        let amp = exp(-r / 0.7) * smoothstep(0.12, 0.3, r);
-        // The rings break up on the wind ripples: the phase wanders a little.
-        let wob = noise(xz * 6.0 + vec2<f32>(f32(i) * 3.0, t * 0.5)) * 1.6;
-        g += d / r * cos(r * k - t * 24.0 + f32(i) * 1.7 + wob) * amp;
+        // Rings die out fast and unevenly: the front breaks on the ripples
+        // already on the water, so the phase wanders and whole arcs drop out.
+        let ang = atan2(d.y, d.x);
+        let arcs = smoothstep(0.25, 0.75, noise(vec2<f32>(ang * 2.2 + f32(i) * 5.0, r * 2.5 - t * 0.6)));
+        let amp = exp(-r / 0.42) * smoothstep(0.12, 0.3, r) * mix(0.15, 1.0, arcs);
+        let wob = (noise(xz * 3.5 + vec2<f32>(f32(i) * 3.0, t * 0.5)) - 0.5) * 7.0
+            + (noise(xz * 11.0 - vec2<f32>(t * 0.7, f32(i))) - 0.5) * 2.5;
+        let dir = normalize(d / r + vec2<f32>(noise(xz * 4.0) - 0.5, noise(xz * 4.0 + 9.0) - 0.5) * 0.6);
+        g += dir * cos(r * k * (0.85 + 0.3 * noise(xz * 1.7)) - t * 24.0 + f32(i) * 1.7 + wob) * amp;
     }
     return vec3<f32>(g.x, 0.0, g.y) * 0.15;
 }
@@ -1904,7 +1872,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // published slurry fraction turns it to opaque mud.
     // Clear water eats red first, so the deep middle turns teal and dark
     // while the shallow rim stays the colour of the sand under it.
-    let sigma = mix(vec3<f32>(4.0, 7.0, 11.0), vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
+    let sigma = mix(vec3<f32>(2.2, 4.0, 6.8), vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
     let trans = exp(-sigma * path);
     // Light scattered by the silt in the column, lit by sun and sky.
     // Deep columns go darker: light that scatters back out has crossed more silt.
@@ -1942,7 +1910,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             break;
         }
     }
-    if (frame.lamps[1].w > 0.5 && niva_box_hit(in.world, refl_dir, 12.0)) {
+    // Only right under the body: farther out the screen-space march finds
+    // the car itself, and a box would print a slab into the mirror.
+    if (frame.lamps[1].w > 0.5 && niva_box_hit(in.world, refl_dir, 0.9)) {
         // The underside and the sills in the reflection: dark, lit only by
         // the sky bounced off the ground.
         refl = sh_irradiance(vec3<f32>(0.0, -1.0, 0.0)) * frame.env.y * 0.12;
@@ -1994,7 +1964,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let lace_f = smoothstep(1.0 - foam_amt * 0.9, 1.05 - foam_amt * 0.6, lace);
     let foam = clamp(lace_f * (0.55 + 0.45 * bubbles) + bubbles * foam_amt * 0.35, 0.0, 1.0)
         * smoothstep(0.002, 0.005, depth);
-    let foam_col = mix(vec3<f32>(0.55, 0.44, 0.30), vec3<f32>(0.72, 0.64, 0.52), 1.0 - slurry_frac) * light;
+    // Foam on silty water is dirty beige, never white.
+    let foam_col = mix(vec3<f32>(0.36, 0.28, 0.19), vec3<f32>(0.5, 0.42, 0.31), 1.0 - slurry_frac) * light;
 
     // Blend over the soil: dst * T * (1 - F) + body * (1 - T) * (1 - F) + refl * F.
     let opacity = clamp(1.0 - (trans.r + trans.g + trans.b) / 3.0, 0.0, 1.0);
