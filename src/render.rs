@@ -79,7 +79,7 @@ pub struct Renderer {
     env_sh: [[f32; 4]; 9],
     env_from_file: bool,
     /// Which sky the env map was baked for. None until the first frame.
-    env_baked: Option<bool>,
+    env_baked: Option<(bool, [u32; 3])>,
     hdri: Option<Vec<u8>>,
     model_buf: wgpu::Buffer,
     model_bg: wgpu::BindGroup,
@@ -152,6 +152,9 @@ pub struct Renderer {
     /// scale height (m). It drifts with `wind` and parts round the Niva.
     pub fog: f32,
     pub fog_height: f32,
+    /// A still can place the sun (unit vector toward it); None keeps the
+    /// day or dusk sun.
+    pub sun_override: Option<Vec3>,
     pub wind: Vec3,
     pub show_props: bool,
     /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
@@ -1315,6 +1318,7 @@ impl Renderer {
             sand_field: false,
             fog: 0.0,
             fog_height: 1.4,
+            sun_override: None,
             wind: Vec3::new(1.1, 0.0, -0.65),
             show_props: true,
             show_environment: true,
@@ -1532,7 +1536,9 @@ impl Renderer {
         };
         let view_proj = proj * view;
         // The window keeps the low sun. Persist stills ask for daylight.
-        let sun = if self.daylight {
+        let sun = if let Some(s) = self.sun_override {
+            s.normalize()
+        } else if self.daylight {
             // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
             Vec3::new(0.593, 0.755, 0.281).normalize()
         } else {
@@ -1570,7 +1576,9 @@ impl Renderer {
                 [0.10, 0.062, 0.038, 1.0],
             )
         };
-        if self.env_baked != Some(self.daylight) {
+        // The HDRI is turned to the sun, so a moved sun rebakes it.
+        let env_key = (self.daylight, sun.to_array().map(f32::to_bits));
+        if self.env_baked != Some(env_key) {
             self.bake_env(&crate::env::SkyLight {
                 sun,
                 sun_color: Vec3::from_slice(&sun_color[..3]),
@@ -1578,7 +1586,7 @@ impl Renderer {
                 horizon: Vec3::from_slice(&sky_horizon[..3]),
                 physical: self.daylight,
             });
-            self.env_baked = Some(self.daylight);
+            self.env_baked = Some(env_key);
         }
         let frame = FrameData {
             view_proj: view_proj.to_cols_array_2d(),

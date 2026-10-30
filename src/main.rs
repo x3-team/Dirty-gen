@@ -724,7 +724,7 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     let dt = 1.0 / 30.0;
     let stills: [(f32, &str, fn(&World) -> CameraPose); 4] = [
         (-17.5, "puddle-wave", beauty_puddle_camera),
-        (-17.5, "puddle-side", beauty_puddle_side_camera),
+        (-15.0, "puddle-side", beauty_puddle_side_camera),
         (-6.5, "slurry-spray", beauty_spray_camera),
         (9.0, "dust-exit", beauty_dust_camera),
     ];
@@ -745,6 +745,8 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
         let z = drive.world.vehicle.pos.z;
         for (k, (at, name, cam)) in stills.iter().enumerate() {
             if !saved[k] && z >= *at {
+                renderer.sun_override =
+                    (*name == "puddle-side").then(|| beauty_puddle_side_sun(&drive.world));
                 let rgba = renderer
                     .draw_with_sheet(
                         &drive.world,
@@ -759,6 +761,7 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
                 write_png(&path, width, height, &rgba).expect("still");
                 println!("beauty still {} at z {z:.1}", path.display());
                 saved[k] = true;
+                renderer.sun_override = None;
             }
         }
         if video {
@@ -871,11 +874,25 @@ fn beauty_puddle_camera(world: &World) -> CameraPose {
 /// wheel in the water, the bank behind. The fixed shot for puddle iterations.
 fn beauty_puddle_side_camera(world: &World) -> CameraPose {
     let (p, fwd, right) = vehicle_axes(world);
+    // 3.6 m up, 7 m out to the side, looking down about 28 degrees: the
+    // whole Niva side-on, the puddle and the dry sand round it.
     CameraPose {
-        eye: p + fwd * 2.6 + right * 3.3 + Vec3::Y * 0.2,
-        target: p + fwd * 1.0 + right * 0.6 - Vec3::Y * 0.45,
+        // Framed a little ahead of the Niva: the heightfield ends 5 m behind
+        // it at this point of the drive, and the puddle past that edge is not
+        // drawn.
+        eye: p + fwd * 1.8 + right * 7.0 + Vec3::Y * 3.6,
+        target: p + fwd * 1.4 + right * 0.4 - Vec3::Y * 0.2,
         ortho_width: None,
     }
+}
+
+/// Sun for the side still: behind the Niva and beyond it, 41 degrees up, so
+/// its silhouette falls forward and toward the lens across the sand and the
+/// shallows, as in the FluidNinja beach shot. A sun on the camera's side hid
+/// the shadow behind the body; on the water it drowned in the reflection.
+fn beauty_puddle_side_sun(world: &World) -> Vec3 {
+    let (_, fwd, right) = vehicle_axes(world);
+    (-fwd * 0.5 - right * 0.5 + Vec3::Y * 0.62).normalize()
 }
 
 /// Behind the rear arch, low, so ribbons torn off the tread fly at the lens.
