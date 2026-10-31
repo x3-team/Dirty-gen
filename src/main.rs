@@ -945,7 +945,9 @@ fn beauty_puddle_side_camera(world: &World) -> CameraPose {
 /// sand beside the car, inside the low frame.
 fn beauty_puddle_side_sun(world: &World) -> Vec3 {
     let (_, fwd, right) = vehicle_axes(world);
-    (-fwd * 0.55 - right * 0.4 + Vec3::Y * 0.7).normalize()
+    // High (~70 degrees) so the body's shadow lies under the car, shifted a
+    // little toward the lens, and meets each wheel at its contact.
+    (-fwd * 0.35 - right * 0.32 + Vec3::Y * 1.35).normalize()
 }
 
 /// Behind the rear arch, low, so ribbons torn off the tread fly at the lens.

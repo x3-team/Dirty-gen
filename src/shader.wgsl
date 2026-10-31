@@ -1438,7 +1438,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let band_w = mix(0.4, 0.6, noise(xz * 2.3 + vec2<f32>(1.0, 4.0)));
         let band = 1.0 - smoothstep(0.25, band_w, shore_d);
         // A glossy rim right at the water, a hand's width.
-        let rim = 1.0 - smoothstep(0.05, 0.16, shore_d);
+        let rim = 1.0 - smoothstep(0.03, 0.1, shore_d);
         // The published moisture only darkens where it is near saturation;
         // past the rim the sand dries back to its own colour.
         let margin = max(max(smoothstep(0.0005, 0.004, film_t), smoothstep(0.75, 0.98, wet) * 0.5), band);
@@ -1460,7 +1460,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             // Backlit, any sheen on the rippled sand lit every crest white.
             // Dry and damp sand stay matte; only the hand's-width rim at the
             // water is glossy.
-            rough_out = max(rough_out, mix(mix(0.88, 0.62, band), 0.15, rim * on_land));
+            rough_out = max(rough_out, mix(mix(0.88, 0.62, band), 0.32, rim * on_land));
         }
         let under = smoothstep(0.002, 0.012, film_t);
         if (under > 0.0) {
@@ -1836,6 +1836,13 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
         let cg = bw_vnoise2d(cq) * 0.65 + bw_vnoise2d(cq * 2.7 + vec2<f32>(3.0, 1.0)) * 0.35;
         albedo *= 1.0 + (cg - 0.5) * 0.22 * cfade;
     }
+    // Mottling and pocks that hold at distance: the far field is not a flat card.
+    let pq = xz * 9.0;
+    let pm = noise(pq) * 0.5 + noise(pq * 2.3 + vec2<f32>(4.0, 7.0)) * 0.3 + noise(pq * 5.1) * 0.2;
+    albedo *= 1.0 + (pm - 0.5) * 0.22;
+    let px = noise((xz + vec2<f32>(0.02, 0.0)) * 9.0) - noise(pq);
+    let pz = noise((xz + vec2<f32>(0.0, 0.02)) * 9.0) - noise(pq);
+    n = normalize(n - vec3<f32>(px, 0.0, pz) * 2.2);
     // Hummocks: half-metre swells in the normal only.
     let hq = xz * 1.7;
     let h0 = noise(hq) + 0.5 * noise(hq * 2.3 + vec2<f32>(5.0, 1.0));
@@ -2052,16 +2059,19 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let wd = vec2<f32>(wd0.x * cos(swing) - wd0.y * sin(swing), wd0.x * sin(swing) + wd0.y * cos(swing));
     let wp = vec2<f32>(-wd.y, wd.x);
     var wg = vec2<f32>(0.0);
-    for (var o: i32 = 0; o < 2; o = o + 1) {
-        let f_along = select(16.0, 40.0, o == 1);
-        let f_across = select(9.0, 24.0, o == 1);
-        let drift = t_now * select(0.9, 1.6, o == 1);
+    let lens_d = length(in.world - frame.cam_pos.xyz);
+    let near_k = mix(0.45, 1.0, smoothstep(1.5, 5.0, lens_d));
+    for (var o: i32 = 0; o < 3; o = o + 1) {
+        let fo = f32(o);
+        let f_along = 16.0 * pow(2.5, fo);
+        let f_across = 9.0 * pow(2.6, fo);
+        let drift = t_now * (0.9 + 0.7 * fo);
         let q = vec2<f32>(dot(xz, wd) * f_along - drift * f_along * 0.1, dot(xz, wp) * f_across) + vec2<f32>(f32(o) * 17.0, 3.0);
         let h0 = bw_vnoise2d(q);
         let ha = bw_vnoise2d(q + vec2<f32>(0.25, 0.0)) - h0;
         let hc = bw_vnoise2d(q + vec2<f32>(0.0, 0.25)) - h0;
         // Back to world slope: d/d(along) and d/d(across).
-        let amp = select(0.035, 0.018, o == 1);
+        let amp = select(select(0.035, 0.018, o == 1), 0.009, o == 2) * near_k;
         wg += (wd * ha * f_along + wp * hc * f_across) * 4.0 * amp / f_along;
     }
     // Cat's paws: wind touches the water in patches; between them it is glassy.
@@ -3026,10 +3036,15 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
             wd = max(wd, 0.02);
         }
         // Wet to 5-8 cm above the waterline, the line wandering a little.
-        let wet_top = wl + 0.06 + 0.03 * noise(in.world.xz * 17.0 + vec2<f32>(in.world.y * 9.0, 0.0));
+        let wet_top = wl + 0.02 + 0.02 * noise(in.world.xz * 17.0 + vec2<f32>(in.world.y * 9.0, 0.0));
         let soaked = (1.0 - smoothstep(wet_top - 0.008, wet_top + 0.004, in.world.y)) * smoothstep(0.003, 0.01, wd);
         albedo = mix(albedo, albedo * vec3<f32>(0.3, 0.27, 0.23), soaked);
         rough = mix(rough, 0.16, soaked);
+        // Beads of water on the rubber just above the wet band: tiny glossy spots.
+        let bead_z = in.world.y - wet_top;
+        let beads = smoothstep(0.82, 0.9, noise(in.world.xz * 90.0 + vec2<f32>(in.world.y * 110.0, 3.0)))
+            * (1.0 - smoothstep(0.0, 0.06, bead_z)) * step(0.0, bead_z) * smoothstep(0.003, 0.01, wd);
+        rough = mix(rough, 0.06, beads);
         // A rim of silt dried on above the waterline, in patches.
         let splash = (1.0 - smoothstep(wl + 0.08, wl + 0.2, in.world.y)) * (1.0 - soaked)
             * smoothstep(0.4, 0.65, noise(in.world.xz * 9.0 + vec2<f32>(in.world.y * 14.0, 0.0)))
