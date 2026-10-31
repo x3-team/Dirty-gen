@@ -4422,6 +4422,9 @@ impl ThroughDrive {
         // then scrape any column that still stands above that surface.
         self.fluid.pond_ruts();
         seat_rut_sheet(&mut self.fluid, &self.world.soil);
+        // The seat can raise a crest the sheet step did not see. Foam from
+        // that impact goes on the sheet, then the publisher only copies it.
+        self.fluid.note_surface_foam(dt);
         mirror_fluid(&self.fluid, &mut self.world.soil);
         if (-18.6..-11.5).contains(&z) {
             // One crescent ahead of the bumper, wider than the body.

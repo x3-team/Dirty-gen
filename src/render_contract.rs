@@ -195,31 +195,6 @@ pub fn foam_fraction(speed_m_s: f32, thickness_m: f32) -> f32 {
     finite0(smooth01(FOAM_FROUDE_0, FOAM_FROUDE_1, froude))
 }
 
-/// Foam on a lip that stands above the neighbouring film. Not the placed berm.
-fn crest_foam(excess_m: f32, thickness_m: f32) -> f32 {
-    if !excess_m.is_finite() || thickness_m < FOAM_MIN_FILM_M {
-        return 0.0;
-    }
-    smooth01(0.004, 0.018, excess_m)
-}
-
-/// Foam in the wet footprint of a tire that shoved the sheet this step.
-fn tire_foam(x: f32, z: f32, thickness_m: f32, pushes: &[crate::fluid_core::TirePush]) -> f32 {
-    if thickness_m < FOAM_MIN_FILM_M {
-        return 0.0;
-    }
-    let mut best = 0.0f32;
-    for push in pushes {
-        let reach = (push.radius * 1.45).max(0.2);
-        let d = (x - push.x).hypot(z - push.z);
-        if d >= reach {
-            continue;
-        }
-        best = best.max(smooth01(0.05, 0.55, 1.0 - d / reach));
-    }
-    best
-}
-
 fn finite0(v: f32) -> f32 {
     if v.is_finite() {
         v
@@ -414,22 +389,11 @@ pub fn publish(
             let mean = if count > 0.0 { sum / count } else { h };
             let excess = finite0((h - mean).max(0.0));
             let placed = finite0(out.ground_rut[idx * 4 + 3].max(0.0));
-            let u = out.flow[idx * 2];
-            let v = out.flow[idx * 2 + 1];
-            let speed = if u.is_finite() && v.is_finite() {
-                (u * u + v * v).sqrt()
-            } else {
-                0.0
-            };
-            let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
-            let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
             let foam = match fluid {
-                Some(fluid) => foam_fraction(speed, h)
-                    .max(crest_foam(excess, h))
-                    .max(tire_foam(x, z, h, fluid.tire_pushes())),
-                None => foam_fraction(speed, h),
+                Some(fluid) if h >= FOAM_MIN_FILM_M => finite0(fluid.foam_grid()[idx]).clamp(0.0, 1.0),
+                _ => 0.0,
             };
-            out.foam_crest[idx * 2] = finite0(foam);
+            out.foam_crest[idx * 2] = foam;
             out.foam_crest[idx * 2 + 1] = finite0(placed + excess);
         }
     }

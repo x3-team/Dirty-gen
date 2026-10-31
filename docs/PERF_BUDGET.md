@@ -67,3 +67,24 @@ Base is `main` at 5eee5fa (merge of #97), not the #97 branch. Intel(R) Xeon(R) P
 The open 2 cm sheet takes one CFL pass and lets flat, slow tiles sleep. It skips the small divergence projection; a wall, the coarse sheet, and gravity keep that projection. Confinement on that open sheet is the same snapshot Jacobi the row workers run, on the calling thread, with the vorticity stored once per cell. Open wind does not build the pressure field the wind force never reads. The halved dust volume steps one layer per worker; each layer starts from a zero scratch, and the ground-sheet scratch is restored when the step returns. The body in the e2e and the creek stays on the forward Gauss–Seidel sweep. A Jacobi sweep there moved standing slurry to 0.0503 m, outside 0.0536 ± 0.003, and it is not restored.
 
 Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger gap 0.000492 m³. Step mean 16.509 ms (budget 33.004), p95 31.104 ms, air 0.235 ms (budget 1.5). Drive p95 8.104 ms. Solver frame 2.505 ms (budget 7). A second timing of the same 96 steps read solver sum 5.695 ms.
+
+## Foam and stirred silt
+
+Base is `main` at 396af7e. Intel(R) Xeon(R) Processor, 4 cores. dt = 1/30. 24 warmup steps, then 96. The before column is the fine-sheet row above. The after column is release `e2e_niva` on this change. Caps are unchanged: solver sum ≤ 7 ms, solver frame ≤ 7 ms, e2e step ≤ 33.004 ms, air ≤ 1.5 ms.
+
+| Subsystem | Before | After |
+| --- | ---: | ---: |
+| Water | 0.927 | 0.979 |
+| Slurry | 0.539 | 0.557 |
+| Soil / rut | 0.951 | 1.136 |
+| Air | 0.295 | 0.312 |
+| Dust | 1.899 | 1.141 |
+| restrict_fine | 0.169 | 0.169 |
+| Window 40 m | 0.354 | 0.462 |
+| Sheet prep | 0.209 | 0.211 |
+| Sheet rest | 0.316 | 1.369 |
+| Solver sum | 5.659 | 6.336 |
+| Step mean | 5.916 | 6.631 |
+| Step p95 | — | 8.625 |
+
+Sheet rest is the foam advection, the silt fluxes, and the crest pass. The seat after the sheet step writes the crest foam and is in the soil row. Dust and the window moved between runs; the standing books did not. Release e2e: water 4.607669 m³, slurry 0.883442 m³, soil 0.972286 m³, dust 0.024066 m³, ledger gap 0.000495 m³. Slurry depth 0.0555 m, puddle depth 0.0893 m. Step mean 17.792 ms (budget 33.004), p95 34.107 ms, air 0.276 ms (budget 1.5). Solver frame 3.025 ms (budget 7). The stirred-silt book is not the standing slurry pour. In the puddle scene its gap was 0, on 0.002573 m³ lifted.
