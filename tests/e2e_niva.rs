@@ -17,6 +17,9 @@ use silt::soil::SoilField;
 use silt::vehicle::{Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
 
 const DT: f32 = 1.0 / 30.0;
+/// Release through-drive step mean, milliseconds.
+/// Locked at a measured 31.231 ms plus 20 percent. Not the 7 ms frame budget.
+const E2E_STEP_BUDGET_MS: f64 = 37.477;
 const SPEED: f32 = 8.0;
 const SLIP: f32 = 1.6;
 const PUDDLE_X: f32 = 3.2;
@@ -284,6 +287,7 @@ fn e2e_niva() {
     let mut step_ms = 0.0_f64;
     let mut air_ms = 0.0_f64;
     let mut timed = 0.0_f64;
+    let mut step_samples: Vec<f64> = Vec::new();
     let mut max_gap = 0.0_f64;
     let mut step_i = 0u32;
     let mut nan = 0u32;
@@ -376,6 +380,7 @@ fn e2e_niva() {
             step_ms += elapsed;
             air_ms += dust.last_air_ms() as f64;
             timed += 1.0;
+            step_samples.push(elapsed);
         }
         let after_tire = dust.emitted_by_tire();
         for i in 0..4 {
@@ -630,6 +635,8 @@ fn e2e_niva() {
     };
     let step_mean = if timed > 0.0 { step_ms / timed } else { 0.0 };
     let air_mean = if timed > 0.0 { air_ms / timed } else { 0.0 };
+    let step_p95 = percentile_95(&mut step_samples);
+    let hardware = hardware_line();
     let dust_gap = (dust.emitted_m3() as f64
         - dust.dust_air_m3() as f64
         - dust.dust_settled_m3() as f64)
@@ -644,7 +651,12 @@ fn e2e_niva() {
          e2e_niva dust emitted {dry_emitted:.6} air {:.6} settled {:.6} wet settled {settled_wet:.6} map {track_dust_map:.6} wet lift {wet_lift:.6}\n\
          e2e_niva water {:.6} slurry {:.6} soil {:.6} dust {:.6} sum {:.6} gap {:.8} max gap {:.8}\n\
          e2e_niva nan {nan}\n\
-         e2e_niva step ms {step_mean:.3} air step ms {air_mean:.3}",
+         e2e_niva step ms {step_mean:.3} air step ms {air_mean:.3}\n\
+         E2E_STEPS n={timed:.0} dt={DT:.6}\n\
+         E2E_MEAN ms={step_mean:.3}\n\
+         E2E_P95 ms={step_p95:.3}\n\
+         E2E_BUDGET ms={E2E_STEP_BUDGET_MS:.3}\n\
+         E2E_HARDWARE {hardware}",
         dust.dust_air_m3(),
         dust.dust_settled_m3(),
         final_books.water,
@@ -779,4 +791,35 @@ fn e2e_niva() {
         air_mean < AIR_STEP_BUDGET_MS as f64,
         "air step {air_mean:.3} ms over {AIR_STEP_BUDGET_MS}"
     );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        step_mean <= E2E_STEP_BUDGET_MS,
+        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the release measurement"
+    );
+}
+
+fn percentile_95(samples: &mut [f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((samples.len() as f64) * 0.95).ceil() as usize;
+    samples[(idx.saturating_sub(1)).min(samples.len() - 1)]
+}
+
+fn hardware_line() -> String {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("model name"))
+                .and_then(|rest| rest.split(':').nth(1))
+                .map(|name| name.trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown cpu".to_string());
+    format!("{model}, {cores} cores")
 }
