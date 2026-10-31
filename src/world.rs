@@ -4408,7 +4408,15 @@ impl ThroughDrive {
         self.report.speed_peak = self.report.speed_peak.max(8.0);
         self.report.end_z = z;
         other_ms += tick.ms();
-        self.fluid.recenter([0.0, z]);
+        // The 40 m sheet stays fixed in world space until the car nears an edge.
+        // That cuts scroll work mid-puddle while the full e2e still recenters.
+        let (_x0, z0, extent) = self.fluid.window_bounds();
+        let margin = 4.0;
+        if z < z0 + margin || z > z0 + extent - margin {
+            self.fluid.recenter([0.0, z]);
+        } else {
+            self.fluid.set_center([0.0, z]);
+        }
         // The bow from the previous frame is a picture on the soil. The force
         // sample has to see the sheet, then the cut is copied onto that sheet.
         let tick = ProfTick::start();
@@ -4473,9 +4481,7 @@ impl ThroughDrive {
         }
         soil_ms += tick.ms();
         let tick = ProfTick::start();
-        if !(-17.2..=-12.2).contains(&z) {
-            self.world.particles.update(&mut self.world.soil, dt);
-        }
+        self.world.particles.update(&mut self.world.soil, dt);
         // Ledger ribbons are spawned first and used to fill the cap, so the
         // sheets off the body never reached the mesh. Keep the newest picture
         // sheets and let the ledger pieces stay only until they land.
@@ -4547,12 +4553,8 @@ impl ThroughDrive {
         self.paint_dust_picture();
         other_ms += tick.ms();
         let tick = ProfTick::start();
-        // Scripted puddle transit: the chassis height is fixed and the groove
-        // is already stamped. Re-seating four wheels every step is pure cost.
-        if !(-17.2..=-12.2).contains(&z) {
-            self.note_rut();
-            self.seat_tires_in_ruts();
-        }
+        self.note_rut();
+        self.seat_tires_in_ruts();
         soil_ms += tick.ms();
         let tick = ProfTick::start();
         let dust_books = self.dust.ledger();

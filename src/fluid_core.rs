@@ -4384,8 +4384,7 @@ impl FluidCore {
         self.wind = [x, z];
     }
 
-    /// Track the chase point without sliding the window. Used between throttled
-    /// [`Self::recenter`] calls on the scripted through-drive.
+    /// Track the chase point without sliding the coarse or air windows.
     pub fn set_center(&mut self, center: [f32; 2]) {
         self.center = center;
     }
