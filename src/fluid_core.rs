@@ -1499,6 +1499,11 @@ pub struct FluidCore {
     eroded_m3: f32,
     scour_hole_m: f32,
     cycle: Option<StreamCycle>,
+    /// Scratch for [`Self::seat_rut_water`]. Sized once so a step does not allocate.
+    seat_pressed: Vec<f32>,
+    seat_is_rut: Vec<bool>,
+    seat_floor: Vec<bool>,
+    seat_etas: Vec<f32>,
 }
 
 impl FluidCore {
@@ -1551,7 +1556,22 @@ impl FluidCore {
             eroded_m3: 0.0,
             scour_hole_m: 0.0,
             cycle: None,
+            seat_pressed: vec![0.0; n],
+            seat_is_rut: vec![false; n],
+            seat_floor: vec![false; n],
+            seat_etas: Vec::with_capacity(n),
         }
+    }
+
+    /// Coarse water and slurry are both under a dry film, and the fine patch is off.
+    ///
+    /// Does not restrict. A live fine patch can still hold water the coarse
+    /// grid has not seen, so that case is not dry.
+    pub fn coarse_sheet_is_dry(&self) -> bool {
+        if self.fine_on {
+            return false;
+        }
+        self.water.iter().all(|h| *h < 1.0e-5) && self.slurry.iter().all(|h| *h < 1.0e-5)
     }
 
     /// Replace the walls for the next step. An empty slice is open water.
@@ -1836,40 +1856,40 @@ impl FluidCore {
         self.restrict_fine();
         let n = WINDOW_RES;
         let area = COARSE_CELL_M * COARSE_CELL_M;
-        let mut pressed = vec![0.0_f32; n * n];
-        let mut is_rut = vec![false; n * n];
-        let mut floor = vec![false; n * n];
-        let mut etas = Vec::new();
+        // Every cell is overwritten. A floor flag left from the previous step
+        // would pour water onto a cell that is no longer the pond.
+        self.seat_etas.clear();
         for j in 0..n {
             for i in 0..n {
                 let idx = j * n + i;
                 let (x, z) = self.coarse_xz(i, j);
                 let (ground, rut) = classify(x, z);
                 let ground = if ground.is_finite() { ground } else { 0.0 };
-                pressed[idx] = ground;
-                is_rut[idx] = rut;
                 let water = self.water[idx];
+                self.seat_pressed[idx] = ground;
+                self.seat_is_rut[idx] = rut;
                 // A floor the tires have drained still counts. Otherwise the
                 // pond disappears, the rut is no longer "connected", and the
                 // column left in the cut stands above a dry bed.
-                if !rut
+                let on_floor = !rut
                     && (-0.02..0.04).contains(&ground)
-                    && (water > 0.008 || self.moisture[idx] > 0.55)
-                {
-                    floor[idx] = true;
-                    etas.push(ground + water);
+                    && (water > 0.008 || self.moisture[idx] > 0.55);
+                self.seat_floor[idx] = on_floor;
+                if on_floor {
+                    self.seat_etas.push(ground + water);
                 }
             }
         }
-        if etas.len() < 8 {
+        if self.seat_etas.len() < 8 {
             return None;
         }
-        etas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let eta = etas[etas.len() / 2];
+        self.seat_etas
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let eta = self.seat_etas[self.seat_etas.len() / 2];
         let mut excess = 0.0_f32;
         let rad = 8i32;
         for idx in 0..n * n {
-            if !is_rut[idx] || self.water[idx] < 0.012 {
+            if !self.seat_is_rut[idx] || self.water[idx] < 0.012 {
                 continue;
             }
             let i = idx % n;
@@ -1882,7 +1902,7 @@ impl FluidCore {
                     if ii < 0 || jj < 0 || ii >= n as i32 || jj >= n as i32 {
                         continue;
                     }
-                    if floor[(jj as usize) * n + ii as usize] {
+                    if self.seat_floor[(jj as usize) * n + ii as usize] {
                         near = true;
                         break;
                     }
@@ -1896,13 +1916,13 @@ impl FluidCore {
             }
             // The column is measured from the pressed ground. The original
             // height is that ground plus the rut, and it is not the datum.
-            let limit = (eta - pressed[idx]).max(0.0);
+            let limit = (eta - self.seat_pressed[idx]).max(0.0);
             if self.water[idx] > limit + 0.004 {
                 let drop = self.water[idx] - limit;
                 self.water[idx] = limit;
                 excess += drop * area;
             }
-            let slurry_room = (eta - pressed[idx] - self.water[idx]).max(0.0);
+            let slurry_room = (eta - self.seat_pressed[idx] - self.water[idx]).max(0.0);
             if self.slurry[idx] > slurry_room + 0.004 {
                 self.slurry[idx] = slurry_room;
             }
@@ -1911,16 +1931,16 @@ impl FluidCore {
         // same pond: a column that stands above it is poured back onto the floor.
         // Leaving it makes one cell on the shore a wall of water.
         for idx in 0..n * n {
-            if is_rut[idx] || pressed[idx] < 0.02 {
+            if self.seat_is_rut[idx] || self.seat_pressed[idx] < 0.02 {
                 continue;
             }
-            let limit = (eta - pressed[idx]).max(0.0);
+            let limit = (eta - self.seat_pressed[idx]).max(0.0);
             if self.water[idx] > limit + 0.004 {
                 let drop = self.water[idx] - limit;
                 self.water[idx] = limit;
                 excess += drop * area;
             }
-            let slurry_room = (eta - pressed[idx] - self.water[idx]).max(0.0);
+            let slurry_room = (eta - self.seat_pressed[idx] - self.water[idx]).max(0.0);
             if self.slurry[idx] > slurry_room + 0.004 {
                 self.slurry[idx] = slurry_room;
             }
@@ -1928,13 +1948,13 @@ impl FluidCore {
         if excess > 1.0e-8 {
             let mut room = 0.0_f32;
             for idx in 0..n * n {
-                if floor[idx] {
+                if self.seat_floor[idx] {
                     room += self.water[idx].max(0.0);
                 }
             }
             if room > 1.0e-6 {
                 for idx in 0..n * n {
-                    if floor[idx] && self.water[idx] > 0.0 {
+                    if self.seat_floor[idx] && self.water[idx] > 0.0 {
                         self.water[idx] += excess / area * (self.water[idx] / room);
                     }
                 }

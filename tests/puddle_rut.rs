@@ -465,14 +465,14 @@ fn assert_tread_profile(frame: &ContractFrame, label: &str, z: f32) {
     assert!(row.len() > 10, "{label}: cross-track is short");
     for s in row.iter().filter(|s| s.x.abs() <= 0.15) {
         assert!(
-            s.rut < 0.008,
-            "{label}: rut {0:.4} at x {1:.2} fills the gap between the wheels",
+            s.rut <= 1.0e-4,
+            "{label}: rut {0:.6} at x {1:.2} fills the gap between the wheels",
             s.rut,
             s.x
         );
         assert!(
-            s.berm < 0.012,
-            "{label}: berm {0:.4} at x {1:.2} is a band between the wheels",
+            s.berm <= 1.0e-4,
+            "{label}: berm {0:.6} at x {1:.2} is a band between the wheels",
             s.berm,
             s.x
         );
@@ -778,6 +778,8 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
     let mut flow_max = f32::MIN;
     let mut spray_max = 0u32;
     let mut dry_bad = 0u32;
+    let mut gap_rut = 0.0_f32;
+    let mut gap_berm = 0.0_f32;
     while drive.world.vehicle.pos.z < -8.0 {
         drive.step(dt);
         publish(
@@ -855,17 +857,62 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
             if drops > 0 {
                 saw_spray = true;
             }
+            // The gap between the treads. Cell centres at ±0.30 are the inner
+            // edge of the groove, so they stay out of this band.
+            let res = frame.header.window_res as i32;
+            for j in 0..res {
+                for i in 0..res {
+                    let cx = frame.header.origin_x + (i as f32 + 0.5) * frame.header.cell_m;
+                    if cx.abs() > 0.15 {
+                        continue;
+                    }
+                    let idx = j as usize * res as usize + i as usize;
+                    let rut = frame.ground_rut[idx * 4 + 1];
+                    let berm = frame.ground_rut[idx * 4 + 3];
+                    gap_rut = gap_rut.max(rut);
+                    gap_berm = gap_berm.max(berm);
+                    let cz = frame.header.origin_z + (j as f32 + 0.5) * frame.header.cell_m;
+                    assert!(
+                        rut <= 1.0e-4,
+                        "rut {rut:.6} m at x {cx:.3} z {cz:.3} fills the gap between the tracks"
+                    );
+                    assert!(
+                        berm <= 1.0e-4,
+                        "berm {berm:.6} m at x {cx:.3} z {cz:.3} is a band between the tracks"
+                    );
+                }
+            }
         }
     }
     let (flow_u_min, flow_u_max) = channel_minmax(&frame.flow, 2, 0);
     let (flow_v_min, flow_v_max) = channel_minmax(&frame.flow, 2, 1);
     println!(
-        "puddle foam {foam_min:.4}..{foam_max:.4}  crest {crest_min:.4}..{crest_max:.4}  flow speed 0..{flow_max:.4}  last-frame flow u {flow_u_min:.4}..{flow_u_max:.4} v {flow_v_min:.4}..{flow_v_max:.4}  spray drops {spray_max}  dry bad {dry_bad}"
+        "puddle foam {foam_min:.4}..{foam_max:.4}  crest {crest_min:.4}..{crest_max:.4}  flow speed {flow_min:.4}..{flow_max:.4}  last-frame flow u {flow_u_min:.4}..{flow_u_max:.4} v {flow_v_min:.4}..{flow_v_max:.4}  spray drops {spray_max}  dry bad {dry_bad}  gap rut {gap_rut:.6} berm {gap_berm:.6}"
     );
     assert_eq!(dry_bad, 0, "dry cells published a velocity or foam");
     assert!(saw_wave, "no wave in the puddle");
     assert!(foam_max > 0.0, "foam max {foam_max}");
     assert!(saw_spray, "no spray drops while the wave is up");
     assert!(spray_max > 0, "spray count {spray_max}");
-    let _ = flow_min;
+    assert!(
+        foam_min >= 0.0 && foam_max <= 1.0,
+        "foam {foam_min:.4}..{foam_max:.4} left 0..=1"
+    );
+    assert!(
+        crest_max <= 0.40,
+        "crest max {crest_max:.4} m is above 0.40 m"
+    );
+    assert!(flow_min >= 0.0, "flow min {flow_min:.4} m/s");
+    assert!(
+        flow_max <= 2.5,
+        "flow max {flow_max:.4} m/s is above 2.5 m/s"
+    );
+    assert!(
+        (1000..=8000).contains(&spray_max),
+        "spray drops {spray_max} outside 1000..=8000"
+    );
+    assert!(
+        gap_rut <= 1.0e-4 && gap_berm <= 1.0e-4,
+        "gap between the tracks rut {gap_rut:.6} berm {gap_berm:.6}"
+    );
 }

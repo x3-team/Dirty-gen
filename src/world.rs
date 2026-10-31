@@ -5,7 +5,8 @@ use glam::Vec3;
 use crate::adhesion::{AdhereContact, AdhesionReport, PASS_OFFER_M3_S};
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::fluid_core::{
-    bow_height_m, dust_may_lift, FluidCore, Grain, SprayEvent, TirePush,
+    bow_height_m, dust_may_lift, FluidCore, Grain, SprayEvent, TirePush, COARSE_CELL_M,
+    WINDOW_RES,
 };
 use crate::particles::Particles;
 use crate::patch::{
@@ -5250,6 +5251,13 @@ fn pull_substrate(fluid: &mut FluidCore, soil: &SoilField) {
 
 /// Rut water sits on the pressed ground and does not rise above the pond.
 fn seat_rut_sheet(fluid: &mut FluidCore, soil: &SoilField) {
+    // Skip before `seat_rut_water` restricts the fine patch. A dry coarse
+    // sheet with no tire cut has nothing to cap. A live fine patch stays,
+    // because the coarse samples can be stale, and a sheet that still holds
+    // water is seated even when the rut has not changed.
+    if fluid.coarse_sheet_is_dry() && !window_has_rut(fluid, soil) {
+        return;
+    }
     fluid.seat_rut_water(|x, z| {
         let Some(idx) = soil.idx_at(x, z) else {
             return (0.0, false);
@@ -5258,6 +5266,25 @@ fn seat_rut_sheet(fluid: &mut FluidCore, soil: &SoilField) {
         let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
         (pressed, rut > 0.012)
     });
+}
+
+/// A tire cut inside the fluid window. Samples the same coarse centres the seat uses.
+fn window_has_rut(fluid: &FluidCore, soil: &SoilField) -> bool {
+    let (x0, z0, _extent) = fluid.window_bounds();
+    for j in 0..WINDOW_RES {
+        for i in 0..WINDOW_RES {
+            let x = x0 + (i as f32 + 0.5) * COARSE_CELL_M;
+            let z = z0 + (j as f32 + 0.5) * COARSE_CELL_M;
+            let Some(idx) = soil.idx_at(x, z) else {
+                continue;
+            };
+            let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            if rut > 0.012 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn mirror_fluid(fluid: &FluidCore, soil: &mut SoilField) {
