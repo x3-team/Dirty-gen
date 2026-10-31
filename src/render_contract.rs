@@ -16,7 +16,7 @@ use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 7;
+pub const RENDER_CONTRACT_VERSION: u32 = 8;
 
 /// Floats per flow texel: vx, vz, speed, turbidity.
 pub const FLOW_CHANNELS: usize = 4;
@@ -71,6 +71,7 @@ pub const VALID_FOAM: u32 = 1 << 8;
 pub const VALID_SPRAY: u32 = 1 << 9;
 pub const VALID_AIR: u32 = 1 << 10;
 pub const VALID_TURBIDITY: u32 = 1 << 11;
+pub const VALID_MIX: u32 = 1 << 12;
 pub const VALID_SNOW: u32 = 1 << 14;
 pub const VALID_FOG: u32 = 1 << 13;
 
@@ -87,6 +88,7 @@ pub const BIND_FOAM: u32 = 9;
 pub const BIND_SPRAY: u32 = 10;
 pub const BIND_AIR: u32 = 11;
 pub const BIND_FOG: u32 = 12;
+pub const BIND_MIX: u32 = 13;
 pub const BIND_SNOW: u32 = 14;
 
 /// Uniform header. 96 bytes. Layout matches `ContractHeader` in the WGSL.
@@ -148,6 +150,8 @@ pub struct ContractFrame {
     /// World air velocity, rgba, same index as `dust_fog` times 4.
     pub air_velocity: Vec<f32>,
     pub fog: Vec<f32>,
+    /// Mud, sand, gravel, grass shares. Four floats per texel.
+    pub soil_mix: Vec<f32>,
     /// Snow column. RGBA: height m, density kg/m³, compaction 0..1, 0.
     pub snow: Vec<f32>,
     pub spray: Vec<SprayGpu>,
@@ -170,6 +174,7 @@ impl ContractFrame {
             dust_fog: vec![0.0; air],
             air_velocity: vec![0.0; air * 4],
             fog: vec![0.0; air],
+            soil_mix: vec![0.0; n * 4],
             snow: vec![0.0; n * 4],
             spray: vec![SprayGpu::zeroed(); SPRAY_CAPACITY as usize],
         }
@@ -350,6 +355,7 @@ pub fn publish_with_snow(
     out.dust_fog.fill(0.0);
     out.air_velocity.fill(0.0);
     out.fog.fill(0.0);
+    out.soil_mix.fill(0.0);
     out.snow.fill(0.0);
     for slot in &mut out.spray {
         *slot = SprayGpu::zeroed();
@@ -453,6 +459,13 @@ pub fn publish_with_snow(
             out.moisture[idx] = finite0(moisture);
             out.film[idx * 2] = finite0(water_m);
             out.film[idx * 2 + 1] = finite0(slurry_m);
+            let mix = soil_idx
+                .map(|sidx| soil.mix_texel(sidx))
+                .unwrap_or([0.0; 4]);
+            out.soil_mix[idx * 4] = finite0(mix[0]);
+            out.soil_mix[idx * 4 + 1] = finite0(mix[1]);
+            out.soil_mix[idx * 4 + 2] = finite0(mix[2]);
+            out.soil_mix[idx * 4 + 3] = finite0(mix[3]);
             let flow = idx * FLOW_CHANNELS;
             out.flow[flow] = u;
             out.flow[flow + 1] = v;
@@ -665,7 +678,8 @@ pub fn publish_with_snow(
         | VALID_CRUST
         | VALID_WET_EDGE
         | VALID_FOAM
-        | VALID_SPRAY;
+        | VALID_SPRAY
+        | VALID_MIX;
     if flow_source == FLOW_FLUID_SHEET {
         valid |= VALID_FLOW | VALID_TURBIDITY;
     }
@@ -691,6 +705,7 @@ pub fn publish_with_snow(
     scrub(&mut out.dust_fog);
     scrub(&mut out.air_velocity);
     scrub(&mut out.fog);
+    scrub(&mut out.soil_mix);
     scrub(&mut out.snow);
     for slot in &mut out.spray {
         scrub(&mut slot.pos_mass);
@@ -801,6 +816,7 @@ pub fn contract_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
             },
             float_entry(BIND_AIR, wgpu::TextureViewDimension::D3),
             float_entry(BIND_FOG, wgpu::TextureViewDimension::D3),
+            float_entry(BIND_MIX, wgpu::TextureViewDimension::D2),
             float_entry(BIND_SNOW, wgpu::TextureViewDimension::D2),
         ],
     })
@@ -834,6 +850,7 @@ pub struct ContractGpu {
     crust: Map2,
     wet_edge: Map2,
     foam: Map2,
+    soil_mix: Map2,
     snow: Map2,
 }
 
@@ -970,6 +987,13 @@ let fog = map3(
             wgpu::TextureFormat::Rg32Float,
             2,
         )?;
+        let soil_mix = map2(
+            device,
+            "contract-soil-mix",
+            res,
+            wgpu::TextureFormat::Rgba32Float,
+            4,
+        )?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("render-contract-bg"),
             layout: &layout,
@@ -987,6 +1011,7 @@ let fog = map3(
                 bind_buf(BIND_SPRAY, spray.as_entire_binding()),
                 bind_tex(BIND_AIR, &air_velocity.view),
                 bind_tex(BIND_FOG, &fog.view),
+                bind_tex(BIND_MIX, &soil_mix.view),
             ],
         });
         let snow = map2(
@@ -1031,6 +1056,7 @@ let fog = map3(
             crust,
             wet_edge,
             foam,
+            soil_mix,
             snow,
         })
     }
@@ -1046,6 +1072,7 @@ let fog = map3(
         write_map2(queue, &self.crust, &frame.crust, WINDOW_CELLS);
         write_map2(queue, &self.wet_edge, &frame.wet_edge, WINDOW_CELLS);
         write_map2(queue, &self.foam, &frame.foam_crest, WINDOW_CELLS);
+        write_map2(queue, &self.soil_mix, &frame.soil_mix, WINDOW_CELLS);
         write_map3(queue, &self.dust_fog, &frame.dust_fog);
         write_map3(queue, &self.air_velocity, &frame.air_velocity);
         write_map2(queue, &self.snow, &frame.snow, WINDOW_CELLS);
@@ -1234,6 +1261,7 @@ fn contract_frame_is_finite(frame: &ContractFrame) -> bool {
         frame.dust_fog.as_slice(),
         frame.air_velocity.as_slice(),
         frame.fog.as_slice(),
+        frame.soil_mix.as_slice(),
         frame.snow.as_slice(),
     ];
     if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
@@ -1272,6 +1300,10 @@ mod tests {
         assert_eq!(BIND_FOG, 12);
         assert_ne!(VALID_FOG, 1 << 11);
         assert_ne!(VALID_FOG, 1 << 12);
+        assert!(wgsl.contains("@group(0) @binding(13) var soil_mix"));
+        assert!(wgsl.contains("var soil_mix: texture_2d<f32>"));
+        assert_eq!(VALID_MIX, 1 << 12);
+        assert_eq!(BIND_MIX, 13);
         assert!(wgsl.contains("@group(0) @binding(14)"));
         assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
         assert!(wgsl.contains("var snow_tex: texture_2d<f32>"));
@@ -1626,6 +1658,8 @@ mod tests {
             frame.foam_crest.as_slice(),
             frame.dust_fog.as_slice(),
             frame.air_velocity.as_slice(),
+            frame.fog.as_slice(),
+            frame.soil_mix.as_slice(),
             frame.snow.as_slice(),
         ];
         if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
