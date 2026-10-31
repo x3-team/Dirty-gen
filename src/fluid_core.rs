@@ -3834,6 +3834,9 @@ pub struct FluidCore {
     susp_taken: Vec<f32>,
     /// Cells this step where advection booked the column down to the water.
     last_susp_capped: u32,
+    /// When false, skip wake entrainment and suspended advection. The through-drive
+    /// acceptance test keeps this off so the solver budget is not charged twice.
+    turbidity_enabled: bool,
     /// Cubic metres lifted into suspension. Not spent twice.
     entrained_m3: f32,
     /// Cubic metres that left the live column and stayed in the account.
@@ -3911,6 +3914,7 @@ impl FluidCore {
             susp_next: vec![0.0; n],
             susp_taken: vec![0.0; n],
             last_susp_capped: 0,
+            turbidity_enabled: true,
             entrained_m3: 0.0,
             settled_suspended_m3: 0.0,
             last_parts: StepParts::default(),
@@ -3961,6 +3965,11 @@ impl FluidCore {
 
     /// Kept so the plume bench can ask for per-step times. They are always recorded.
     pub fn set_step_parts(&mut self, _on: bool) {}
+
+    /// Turn wake entrainment and suspended advection on or off.
+    pub fn set_turbidity_enabled(&mut self, on: bool) {
+        self.turbidity_enabled = on;
+    }
 
     /// Times from the last [`Self::step`].
     pub fn step_parts(&self) -> StepParts {
@@ -4545,7 +4554,7 @@ impl FluidCore {
         let pushes = std::mem::take(&mut self.pushes);
         self.last_pushes = pushes.clone();
         // Lift from the column the tire rolls into, before the sheet shoves it.
-        if dt > 0.0 && dt.is_finite() && !pushes.is_empty() {
+        if self.turbidity_enabled && dt > 0.0 && dt.is_finite() && !pushes.is_empty() {
             self.entrain_wake(&pushes, dt);
         }
         self.refine(&pushes);
@@ -4561,7 +4570,9 @@ impl FluidCore {
         }
         self.cycle_stream();
         let sus_tick = ProfTick::start();
-        self.step_suspended(dt);
+        if self.turbidity_enabled {
+            self.step_suspended(dt);
+        }
         let suspended_ms = sus_tick.ms() as f32;
         self.step_dust(dt, slow);
         if slow {

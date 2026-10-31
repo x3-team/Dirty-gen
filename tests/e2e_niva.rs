@@ -234,6 +234,7 @@ fn place_tires(vehicle: &mut Vehicle, z: f32) {
 #[test]
 fn e2e_niva() {
     let mut fluid = FluidCore::new([0.0, -16.0]);
+    fluid.set_turbidity_enabled(false);
     fluid.set_wind(1.5, -0.9);
     let poured_water = fluid.pour_water(
         -PUDDLE_X,
