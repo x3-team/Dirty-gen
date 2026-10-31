@@ -22,9 +22,9 @@ use crate::soil::{
     TRACK_ZS,
 };
 use crate::vehicle::{
-    hardpoints, Contact, Vehicle, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR, PANEL_FENDER_RL,
-    PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR, PANEL_RIGHT, WHEEL_RADIUS,
-    WHEEL_WIDTH,
+    hardpoints, Contact, Vehicle, HARD_Y, PANEL_BELLY, PANEL_FENDER_FL, PANEL_FENDER_FR,
+    PANEL_FENDER_RL, PANEL_FENDER_RR, PANEL_LEFT, PANEL_MUD_CAP, PANEL_NOSE, PANEL_REAR,
+    PANEL_RIGHT, REST_LEN, SUSP_TRAVEL, WHEEL_RADIUS, WHEEL_WIDTH,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -4194,6 +4194,10 @@ pub struct ThroughDrive {
     dust_in: f32,
     /// Steps between tread curls, so the ones in the air can fall onto the track.
     ribbon_tick: u32,
+    /// Tire force pair last stamped into the puddle, newtons. The rut depth is
+    /// the Bekker sinkage of this pair on the wet sand, not a painted groove.
+    pub puddle_normal_n: f32,
+    pub puddle_push_n: f32,
 }
 
 impl ThroughDrive {
@@ -4223,6 +4227,7 @@ impl ThroughDrive {
         fluid.scale_columns(|x, z| (puddle_mask(x, z), slurry_rut_mask(x, z)));
         fluid.soften_rims(1.7);
         mirror_fluid(&fluid, &mut world.soil);
+        paint_puddle_sand(&mut world.soil);
         world.vehicle.pos.x = 0.0;
         world.vehicle.pos.z = -20.0;
         world.vehicle.yaw = 0.0;
@@ -4258,6 +4263,8 @@ impl ThroughDrive {
             },
             dust_in: 0.0,
             ribbon_tick: 0,
+            puddle_normal_n: 0.0,
+            puddle_push_n: 0.0,
         }
     }
 
@@ -4295,6 +4302,10 @@ impl ThroughDrive {
         self.report.speed_peak = self.report.speed_peak.max(8.0);
         self.report.end_z = z;
         self.fluid.recenter([0.0, z]);
+        // The bow from the previous frame is a picture on the soil. The force
+        // sample has to see the sheet, then the cut is copied onto that sheet.
+        mirror_fluid(&self.fluid, &mut self.world.soil);
+        self.stamp_puddle_tires(dt);
         pull_substrate(&mut self.fluid, &self.world.soil);
         let forward = Vec3::new(0.0, 0.0, 1.0);
         let tires = crate::dust::tires_at(z, 8.0, 1.6);
@@ -4336,6 +4347,9 @@ impl ThroughDrive {
         let spray = self.fluid.step(dt);
         self.report.spray_m3 = self.fluid.ledger().spray_m3;
         self.spawn_spray(&spray, forward);
+        // The cut is already on the bed. Pond water into it so the free
+        // surface stays with the puddle instead of falling into the groove.
+        self.fluid.pond_ruts();
         mirror_fluid(&self.fluid, &mut self.world.soil);
         if (-18.6..-11.5).contains(&z) {
             // One crescent ahead of the bumper, wider than the body.
@@ -4412,6 +4426,7 @@ impl ThroughDrive {
         self.lay_rut_ribbons();
         self.paint_dust_picture();
         self.note_rut();
+        self.seat_tires_in_ruts();
         let dust_books = self.dust.ledger();
         self.report.dust_injected_m3 = dust_books.emitted_m3;
         self.report.dust_air_m3 = dust_books.dust_air_m3;
@@ -4624,6 +4639,106 @@ impl ThroughDrive {
         let _ = (spray, forward);
     }
 
+    /// Plastic rut under each tire that is still in the puddle.
+    ///
+    /// The chassis height is scripted, so the spring solved against a locked
+    /// body is not the load on the sand. Each tire carries a share of the
+    /// Niva's weight. The shear is the contact model's shear at that load.
+    /// Depth is [`crate::soil::rut_depth_from_force`] of that pair on the wet
+    /// sand under the tread. Spoil is the berm. A slump into slurry would be
+    /// wiped when the sheet is mirrored back, so that spoil stays placed.
+    fn stamp_puddle_tires(&mut self, dt: f32) {
+        let tires = crate::dust::tires_at(self.world.vehicle.pos.z, 8.0, 1.6);
+        for tire in &tires {
+            let column = self.fluid.sample(tire.contact.x, tire.contact.z);
+            if column.water_m < 0.02 || puddle_mask(tire.contact.x, tire.contact.z) < 0.20 {
+                continue;
+            }
+            let Some(idx) = self.world.soil.idx_at(tire.contact.x, tire.contact.z) else {
+                continue;
+            };
+            // The force sample is the undisturbed wet sand, not the ponded
+            // column in a rut already cut and not the loose smear on it.
+            self.world.soil.kind[idx] = SurfaceKind::Sand as u8;
+            self.world.soil.wetness[idx] = 0.90;
+            self.world.soil.base_wetness[idx] = self.world.soil.base_wetness[idx].max(0.90);
+            self.world.soil.loose[idx] = 0.012;
+            let sheet = sheet_beside(&self.fluid, tire.contact.z);
+            if sheet > 0.01 {
+                self.world.soil.water[idx] = sheet;
+            }
+        }
+        pin_rut_samples(&mut self.world.soil, &self.fluid);
+        let slurry_before = self.world.soil.slurry.clone();
+        let placed_before = self.world.soil.placed.clone();
+        let contacts = self
+            .world
+            .vehicle
+            .compute_contacts(&self.world.soil, 0.35, 0.0, dt);
+        let carry = crate::vehicle::MASS * 9.81 / 4.0;
+        for c in &contacts {
+            let column = self.fluid.sample(c.wheel_center.x, c.wheel_center.z);
+            if column.water_m < 0.02 || puddle_mask(c.wheel_center.x, c.wheel_center.z) < 0.20 {
+                continue;
+            }
+            if c.normal < 1.0 && c.push < 1.0 {
+                continue;
+            }
+            let normal = c.normal.min(carry).max(0.0);
+            let push = if c.normal > 1.0 {
+                c.push * (normal / c.normal)
+            } else {
+                c.push
+            };
+            let load = (normal * normal + push * push).sqrt();
+            let prev = (self.puddle_normal_n * self.puddle_normal_n
+                + self.puddle_push_n * self.puddle_push_n)
+                .sqrt();
+            if load >= prev {
+                self.puddle_normal_n = normal;
+                self.puddle_push_n = push;
+            }
+            // The solved hub sits below the uncut bed, and the stamp then
+            // reads the ground ahead of it as a slope and skips the lane.
+            // The force is the contact pair. The groove is cut at ride height.
+            let center = Vec3::new(c.wheel_center.x, WHEEL_RADIUS, c.wheel_center.z);
+            self.world.soil.stamp_wheel(
+                center,
+                WHEEL_RADIUS,
+                WHEEL_WIDTH,
+                c.forward,
+                c.right,
+                c.sinkage.max(0.02),
+                c.slip,
+                dt,
+                true,
+                normal,
+                push,
+            );
+        }
+        restore_berm_slump(&mut self.world.soil, &slurry_before, &placed_before);
+    }
+
+    /// Drop each wet tire onto the cut it just made. The chassis stays at the
+    /// scripted height. Compression is what puts the tread on the rut floor.
+    fn seat_tires_in_ruts(&mut self) {
+        let pos_y = self.world.vehicle.pos.y;
+        let drop = REST_LEN - HARD_Y + WHEEL_RADIUS;
+        for i in 0..4 {
+            let hp = hardpoints()[i];
+            let x = self.world.vehicle.pos.x + hp.x;
+            let z = self.world.vehicle.pos.z + hp.z;
+            let sample = self.world.soil.sample(x, z);
+            let column = self.fluid.sample(x, z);
+            if column.water_m < 0.02 || sample.rut < 0.015 {
+                continue;
+            }
+            let floor = sample.height - sample.placed - sample.slurry;
+            let c = (floor - pos_y + drop).clamp(0.0, SUSP_TRAVEL);
+            self.world.vehicle.wheels[i].compression = c;
+        }
+    }
+
     fn note_rut(&mut self) {
         let soil = &self.world.soil;
         let mut deepest = self.report.rut_m;
@@ -4683,6 +4798,120 @@ impl ThroughReport {
 fn smooth01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Wet sand under the puddle. The bed stays where it was poured; the tire
+/// cuts it. Cells outside the oval keep the flat undisturbed ground.
+fn paint_puddle_sand(soil: &mut SoilField) {
+    let half = soil.size * 0.5;
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            if puddle_mask(x, z) < 0.15 {
+                continue;
+            }
+            let idx = j * soil.res + i;
+            soil.kind[idx] = SurfaceKind::Sand as u8;
+            soil.wetness[idx] = soil.wetness[idx].max(0.90);
+            soil.base_wetness[idx] = soil.base_wetness[idx].max(0.90);
+            soil.loose[idx] = soil.loose[idx].max(0.012);
+        }
+    }
+}
+
+/// Sheet thickness beside the tracks, not the extra column ponded in a cut.
+fn sheet_beside(fluid: &FluidCore, z: f32) -> f32 {
+    let mut sum = 0.0_f32;
+    let mut n = 0.0_f32;
+    for x in [-2.6_f32, -1.8, 0.0, 1.8, 2.6] {
+        let s = fluid.sample(x, z);
+        if s.bed_m > -0.01 && s.bed_m < 0.02 && s.water_m > 0.02 {
+            sum += s.water_m;
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        sum / n
+    } else {
+        0.0
+    }
+}
+
+/// A rut that has already ponded is a deeper water column. The Bekker sample
+/// is the sand beside that cut, or the next stamp digs because of the pond.
+fn pin_rut_samples(soil: &mut SoilField, fluid: &FluidCore) {
+    let half = soil.size * 0.5;
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            if puddle_mask(x, z) < 0.15 {
+                continue;
+            }
+            let idx = j * soil.res + i;
+            let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            if rut < 0.008 || soil.placed[idx] > 0.008 {
+                continue;
+            }
+            soil.kind[idx] = SurfaceKind::Sand as u8;
+            soil.wetness[idx] = 0.90;
+            soil.loose[idx] = 0.012;
+            let sheet = sheet_beside(fluid, z);
+            if sheet > 0.01 {
+                soil.water[idx] = sheet;
+            }
+        }
+    }
+}
+
+/// Creep under the patch moves berm spoil into slurry. The sheet mirror
+/// replaces that slurry and the cubic metres would vanish. Put them back
+/// on the berm the slump came from.
+fn restore_berm_slump(soil: &mut SoilField, slurry_before: &[f32], placed_before: &[f32]) {
+    let mut extra = 0.0_f32;
+    for i in 0..soil.slurry.len() {
+        let gain = (soil.slurry[i] - slurry_before[i]).max(0.0);
+        if gain > 0.0 {
+            soil.slurry[i] = slurry_before[i];
+            extra += gain;
+        }
+    }
+    if extra <= 1.0e-8 {
+        soil.rebuild_height();
+        return;
+    }
+    let mut sources: Vec<(usize, f32)> = Vec::new();
+    let mut lost = 0.0_f32;
+    for i in 0..soil.placed.len() {
+        if soil.kind[i] != SurfaceKind::Berm as u8 {
+            continue;
+        }
+        let drop = (placed_before[i] - soil.placed[i]).max(0.0);
+        if drop > 1.0e-6 {
+            sources.push((i, drop));
+            lost += drop;
+        }
+    }
+    if sources.is_empty() {
+        let mut berms = Vec::new();
+        for i in 0..soil.kind.len() {
+            if soil.kind[i] == SurfaceKind::Berm as u8 {
+                berms.push(i);
+            }
+        }
+        if !berms.is_empty() {
+            let add = extra / berms.len() as f32;
+            for idx in berms {
+                soil.placed[idx] += add;
+            }
+        }
+    } else {
+        for (idx, drop) in sources {
+            soil.placed[idx] += extra * (drop / lost);
+        }
+    }
+    soil.rebuild_height();
 }
 
 /// Soft oval, wholly inside the heightfield. 1 in the middle, 0 outside.

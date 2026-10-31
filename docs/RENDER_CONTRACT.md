@@ -52,6 +52,8 @@ Solid ground is bed + placed. Rut is how far the bed sits below the height the c
 
 Writer: the soil heightfield at the texel centre. Off that 40 m soil square, bed comes from the fluid sheet when it is attached, and rut and placed are 0.
 
+Under the puddle the same channels carry a tire-force rut. On wet sand the bed drops by the Bekker depth of the tire's normal and shear, and the spoil is the berm in placed. G is that bed drop. A is the berm. Water is not in this binding; the film binding holds the sheet, including the water that ponds into the cut so the free surface stays with the puddle. Ground is still bed + placed, and the visible top of the wet cell is still ground + slurry, with water on that. No new channel, unit, or resolution. Version stays 2.
+
 Valid: `VALID_GROUND` is set on every publish.
 
 ### Moisture — binding 2
@@ -253,3 +255,5 @@ Dry cells and any other non-finite sample are written as 0. Layout unchanged. Fo
 `air_velocity`, binding 11, `rgba32float` 3D, 128 × 8 × 128. R, G, B are world velocity in m/s (+X, +Y, +Z). A is 0. Same origin and cell as `dust_fog`. `VALID_AIR` is bit 10, set when `dust_source` is 1 or 2.
 
 With the dust ledger, `step_vehicle_air` writes the field: the Niva body and wheels inject velocity, vorticity confinement leaves a wake, and wind advects the field. Without the ledger, the samples are the fluid sheet's horizontal dust velocity and a zero vertical channel. The header stays 96 bytes. Debug mode 14 shows air speed.
+
+Filling binding 1 for the puddle rut does not bump this version. G is the tire-force bed drop on wet sand under the Niva, A is the berm placed from that cut, and the film binding carries the water ponded into the groove. Layout unchanged.
