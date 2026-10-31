@@ -1070,12 +1070,22 @@ fn win_demo_place_vehicle_on_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
     win_demo_seat_vehicle_in_seam(world, x, z, yaw);
 }
 
+fn win_demo_pool_surface_y() -> f32 {
+    silt::soil::SoilField::win_demo_pool_rim_height(0.22)
+}
+
+fn win_demo_hub_on_water(_sink: f32) -> f32 {
+    use silt::vehicle::WHEEL_RADIUS;
+    // Hub height so the mesh contact patch meets the flat pool plane (not bowl bed).
+    win_demo_pool_surface_y() + WHEEL_RADIUS - 0.012
+}
+
 fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
     use silt::vehicle::WHEEL_RADIUS;
     world.vehicle.yaw = yaw;
     world.vehicle.pitch = 0.0;
     world.vehicle.roll = 0.0;
-    let rim = silt::soil::SoilField::win_demo_pool_rim_height(0.22);
+    let surface = win_demo_pool_surface_y();
     let sink = 0.032_f32;
     for wh in world.vehicle.wheels.iter_mut() {
         wh.sinkage = sink;
@@ -1085,14 +1095,13 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
         wh.compression = 0.08;
     }
     let pad = world.soil.sample(x, z);
-    world.vehicle.pos = Vec3::new(x, pad.height.max(rim) + WHEEL_RADIUS * 0.78, z);
+    world.vehicle.pos = Vec3::new(x, pad.height.max(surface) + WHEEL_RADIUS * 0.78, z);
     for _ in 0..56 {
         let mut lift = 0.0_f32;
         for i in 0..4 {
             let local = world.vehicle.wheel_center_local(i);
             let hub = world.vehicle.pos + world.vehicle.orientation() * local;
-            let ground = world.soil.sample(hub.x, hub.z);
-            let target = ground.height + WHEEL_RADIUS * (1.0 - sink * 0.45);
+            let target = win_demo_hub_on_water(sink);
             lift = lift.max(target - hub.y);
         }
         if lift.abs() < 0.0008 {
@@ -1100,14 +1109,26 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
         }
         world.vehicle.pos.y += lift * 0.55;
     }
-    for i in 0..4 {
-        let local = world.vehicle.wheel_center_local(i);
-        let hub = world.vehicle.pos + world.vehicle.orientation() * local;
-        let ground = world.soil.sample(hub.x, hub.z);
-        let min_hub = ground.height.max(rim) + WHEEL_RADIUS * 0.98;
-        if hub.y < min_hub {
-            world.vehicle.pos.y += min_hub - hub.y;
+    win_demo_clamp_hubs_on_water(world, sink);
+}
+
+fn win_demo_clamp_hubs_on_water(world: &mut World, sink: f32) {
+    use silt::vehicle::WHEEL_RADIUS;
+    let target = win_demo_hub_on_water(sink);
+    let tol = WHEEL_RADIUS * 0.018;
+    for _ in 0..8 {
+        let mut adjust = 0.0_f32;
+        for i in 0..4 {
+            let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+            let err = target - hub.y;
+            if err.abs() > tol {
+                adjust += err * 0.25;
+            }
         }
+        if adjust.abs() < 0.0004 {
+            break;
+        }
+        world.vehicle.pos.y += adjust;
     }
 }
 
@@ -1126,15 +1147,12 @@ fn win_demo_calm_wheels_in_pool(world: &mut World) {
 }
 
 fn win_demo_seat_vehicle_on_bowl(world: &mut World) {
-    use silt::vehicle::WHEEL_RADIUS;
-    let rim = silt::soil::SoilField::win_demo_pool_rim_height(0.22);
     let sink = 0.032_f32;
     for _ in 0..40 {
         let mut lift = 0.0_f32;
         for i in 0..4 {
             let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
-            let ground = world.soil.sample(hub.x, hub.z);
-            let target = ground.height.max(rim) + WHEEL_RADIUS * (1.0 - sink * 0.4);
+            let target = win_demo_hub_on_water(sink);
             lift = lift.max(target - hub.y);
         }
         if lift.abs() < 0.0006 {
@@ -1142,6 +1160,7 @@ fn win_demo_seat_vehicle_on_bowl(world: &mut World) {
         }
         world.vehicle.pos.y += lift * 0.58;
     }
+    win_demo_clamp_hubs_on_water(world, sink);
 }
 
 fn win_demo_still_touchup(world: &mut World) {

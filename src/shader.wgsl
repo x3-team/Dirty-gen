@@ -719,7 +719,17 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
     if (win_demo_flat_terrain()) {
-        let h = win_demo_clamp_surface_y(in.xz, height_bilinear(in.xz));
+        var h = height_bilinear(in.xz);
+        let c = beauty_seam_center();
+        let dx = (in.xz.x - c.x) / 1.32;
+        let dz = (in.xz.y - c.y) / 1.02;
+        let r = sqrt(dx * dx + dz * dz);
+        if (r < 1.26) {
+            let flat_bed = win_demo_pool_level() - 0.10;
+            let t = smoothstep(1.24, 0.62, r);
+            h = mix(h, flat_bed, t);
+        }
+        h = win_demo_clamp_surface_y(in.xz, h);
         var o: TerrOut;
         o.clip = frame.view_proj * vec4<f32>(in.xz.x, h, in.xz.y, 1.0);
         o.world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -789,7 +799,12 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
     let wet = mat.r;
     let demo_seam_terrain = win_demo_flat_terrain() && distance(xz, beauty_seam_center()) < 3.35;
-    let water = select(mat.g * 0.34, water_column(xz), puddle_beauty_on());
+    let horiz_terrain = n.y > 0.62;
+    let water = select(
+        mat.g * 0.34,
+        water_column(xz),
+        puddle_beauty_on() && (!demo_seam_terrain || horiz_terrain),
+    );
     let darken = mat.b;
     let pool_beauty = puddle_beauty_on() && !demo_seam_terrain;
     let pool_fill = select(0.0, smoothstep(0.045, 0.11, mat.g), pool_beauty);
@@ -804,7 +819,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let seam_wet_rim = select(
         0.0,
         smoothstep(0.055, 0.018, pool_col) * (1.0 - smoothstep(0.004, 0.014, pool_col)),
-        demo_seam_terrain,
+        demo_seam_terrain && horiz_terrain,
     );
     // Exported skin, metres. Zero where the pad has not baked.
     let crust_rg = crust_bilinear(xz);
@@ -932,7 +947,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let drowned = smoothstep(0.012, 0.05, water) * (1.0 - pool_interior);
     // Film and slurry live on this mesh. A glossy sheet over the cut is a flat card.
     let dug = max(-stamp_bilinear(xz), 0.0);
-    let in_cut = dug > 0.012 && water > 0.008;
+    let in_cut = dug > 0.012 && water > 0.008 && (!demo_seam_terrain || horiz_terrain);
     var depth_t = 0.0;
     if (in_cut) {
         // A 3 cm film stays a tint on the clay. Only the deep end murks the mesh.
@@ -1104,9 +1119,9 @@ fn win_demo_clamp_surface_y(xz: vec2<f32>, y: f32) -> f32 {
     if (!win_demo_flat_terrain()) {
         return y;
     }
-    let bed = height_bilinear(xz);
     let level = win_demo_pool_level();
-    return clamp(y, bed - 0.02, max(level + 0.14, bed + 0.06));
+    // Never drape the sheet on the bowl walls — only the flat top surface.
+    return min(y, level + 0.15);
 }
 
 // Windows win-demo seam pool: one flat plane, not a carved bowl mesh.
@@ -1234,14 +1249,21 @@ fn scene_uv_from_world(p: vec3<f32>) -> vec2<f32> {
 
 // wgpu water.wgsl-style screen reflection: march in reflection direction and
 // sample the pre-water colour buffer (Niva + sky already drawn).
+fn mirror_across_pool_y(p: vec3<f32>) -> vec3<f32> {
+    let plane_y = win_demo_pool_level();
+    return vec3<f32>(p.x, 2.0 * plane_y - p.y, p.z);
+}
+
 fn pool_scene_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
     let refl = reflect(-view, nrm);
     var accum = vec3<f32>(0.0);
     var wsum = 0.0;
     var p = world + nrm * 0.014;
+    let demo_planar = win_demo_flat_terrain();
     for (var i: u32 = 0u; i < 12u; i = i + 1u) {
         p = p + refl * 0.07;
-        let uv = scene_uv_from_world(p);
+        let sample_p = select(p, mirror_across_pool_y(p), demo_planar);
+        let uv = scene_uv_from_world(sample_p);
         if (uv.x > 0.03 && uv.x < 0.97 && uv.y > 0.03 && uv.y < 0.97) {
             let s = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
             let w = 1.0 / (1.0 + f32(i) * 0.22);
@@ -1299,25 +1321,30 @@ fn reflect_vehicle_scene(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> v
     let refl = reflect(-view, nrm);
     var accum = vec3<f32>(0.0);
     var wt = 0.0;
-    let pts = array<vec3<f32>, 3>(
+    let pts = array<vec3<f32>, 4>(
         center,
         center + vec3<f32>(-0.42, 0.12, 0.18),
-        center + vec3<f32>(0.38, 0.08, -0.22),
+        center + vec3<f32>(-0.58, 0.38, 0.05),
+        center + vec3<f32>(-0.52, 0.52, 0.02),
     );
-    for (var pi: u32 = 0u; pi < 3u; pi = pi + 1u) {
+    for (var pi: u32 = 0u; pi < 4u; pi = pi + 1u) {
         let p = pts[pi];
         let to_c = p - world;
         let aim = max(dot(refl, normalize(to_c)), 0.0);
         let beauty = puddle_beauty_on();
-        if (aim < select(select(0.04, 0.012, beauty), 0.008, demo_side)) {
+        if (aim < select(select(0.04, 0.012, beauty), 0.006, demo_side)) {
             continue;
         }
-        let veh_uv = scene_uv_from_world(p);
+        var p_m = p;
+        if (demo_side) {
+            p_m = mirror_across_pool_y(p);
+        }
+        let veh_uv = scene_uv_from_world(p_m);
         if (veh_uv.x < 0.02 || veh_uv.x > 0.98 || veh_uv.y < 0.02 || veh_uv.y > 0.98) {
             continue;
         }
         let samp = textureSampleLevel(scene_color, scene_samp, veh_uv, 0.0).rgb;
-        let w = pow(aim, select(select(0.28, 0.18, beauty), 0.12, demo_side));
+        let w = pow(aim, select(select(0.28, 0.18, beauty), 0.10, demo_side));
         accum += samp * w;
         wt += w;
     }
@@ -1325,7 +1352,7 @@ fn reflect_vehicle_scene(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> v
         return vec3<f32>(0.0);
     }
     let beauty = puddle_beauty_on();
-    return (accum / wt) * select(select(1.45, 1.85, beauty), 2.05, demo_side);
+    return (accum / wt) * select(select(1.45, 1.85, beauty), 2.25, demo_side);
 }
 
 fn beauty_bow_wave(xz: vec2<f32>, t: f32) -> f32 {
@@ -1369,6 +1396,7 @@ fn niva_planar_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec
     let refl = reflect(-view, nrm);
     var accum = vec3<f32>(0.0);
     var wt = 0.0;
+    let aim_gate = select(0.22, 0.04, win_demo_flat_terrain());
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
         let slot = i * 2u;
         let hub = frame.tires[slot].xyz;
@@ -1376,11 +1404,11 @@ fn niva_planar_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec
         if (tire_meta.w < 0.2) {
             continue;
         }
-        let body = hub + vec3<f32>(0.0, 0.78, 0.0);
+        let door = i < 2u;
+        let body = hub + vec3<f32>(select(0.0, -0.52, door), select(0.78, 0.48, door), 0.0);
         let mirror = vec3<f32>(body.x, 2.0 * plane_y - body.y, body.z);
         let to_m = normalize(mirror - world);
         let aim = max(dot(refl, to_m), 0.0);
-        let aim_gate = select(0.22, 0.06, win_demo_flat_terrain());
         if (aim < aim_gate) {
             continue;
         }
@@ -1389,14 +1417,14 @@ fn niva_planar_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec
             continue;
         }
         let samp = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
-        let w = aim * (0.55 + tire_meta.w * 0.45);
+        let w = aim * (0.55 + tire_meta.w * 0.45) * select(1.0, 1.35, door);
         accum += samp * w;
         wt += w;
     }
     if (wt < 0.05) {
         return vec3<f32>(0.0);
     }
-    return (accum / wt) * 1.08;
+    return (accum / wt) * select(1.08, 1.22, win_demo_flat_terrain());
 }
 
 fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
@@ -1657,12 +1685,19 @@ fn shade_seam_pool(
         let absorb = exp(-thickness * vec3<f32>(0.75, 0.16, 0.08));
         body = mix(mix(bed * vec3<f32>(0.55, 0.45, 0.34), water_tint, 0.45), water_deep, deep);
         body *= 0.35 + 0.65 * absorb;
+        let belly = body_cover(xz) > 0.12;
+        if (belly) {
+            body = water_tint * 0.22;
+        }
     } else {
         body = mix(mix(bed * vec3<f32>(0.42, 0.34, 0.26), water_tint * 0.62, 0.55), body, 1.0 - shallow * 0.35);
     }
     body *= 0.22 + 0.88 * ndl;
     let refl_dir = reflect(-view, nrm);
     var reflect_col = pool_scene_reflect(in.world, nrm, view);
+    if (win_demo_flat_terrain() && refl_dir.y < -0.12) {
+        reflect_col = mix(reflect_col, sky_reflect(refl_dir), 0.55);
+    }
     let ibl = sky_reflect(refl_dir);
     let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 96.0);
     let ibl_mix = select(0.52, 0.18, win_demo_flat_terrain());
@@ -1680,7 +1715,7 @@ fn shade_seam_pool(
         reflect_col = mix(
             reflect_col,
             planar,
-            select(select(0.48, 0.62, ultra), 0.72, win_demo_flat_terrain()),
+            select(select(0.48, 0.62, ultra), 0.82, win_demo_flat_terrain()),
         );
     }
     let fres_w = clamp(
@@ -1689,6 +1724,9 @@ fn shade_seam_pool(
         1.0,
     );
     var col = mix(body, reflect_col, fres_w);
+    if (win_demo_flat_terrain() && body_cover(xz) > 0.12) {
+        col = mix(col, reflect_col, 0.92);
+    }
     if (win_demo_flat_terrain()) {
         let g = length(solver_column_grad(xz));
         let shore_foam = smoothstep(0.08, 0.22, thickness) * (1.0 - smoothstep(0.22, 0.32, thickness));
@@ -1715,8 +1753,9 @@ fn shade_seam_pool(
         let dx = (xz.x - c.x) / 1.32;
         let dz = (xz.y - c.y) / 1.02;
         let r = sqrt(dx * dx + dz * dz);
-        alpha = max(alpha, smoothstep(1.22, 0.42, r) * 0.92);
-        alpha = max(alpha, 0.86);
+        let edge = smoothstep(1.24, 0.72, r);
+        alpha *= edge;
+        alpha = max(alpha, edge * 0.78);
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
@@ -1769,11 +1808,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || (in_seam_pan && column_here > 0.0008);
     let beauty_pool = beauty && pool_here;
     let demo_pool = win_demo_flat_terrain() && demo_column > 0.00045;
-    let chassis_pad = win_demo_flat_terrain() && win_demo_in_pool(xz) && body_cover(xz) > 0.04;
     let keep_water = free
         || pool_here
         || demo_pool
-        || chassis_pad
+        || (win_demo_flat_terrain() && win_demo_in_pool(xz))
         || (beauty && tire_pad)
         || (beauty && in_seam_pan)
         || (seam_still && column_here > 0.0005);
@@ -1781,12 +1819,18 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         if (!keep_water) {
             discard;
         }
+        let level = win_demo_pool_level();
+        let bed_h = height_bilinear(xz);
+        // Top surface only — do not shade the bowl volume skirt.
+        if (bed_h < level - 0.07 && demo_column < 0.012) {
+            discard;
+        }
     } else if (!keep_water && (near_cut || own < 0.008 || in.depth < 0.008)) {
         discard;
     }
     let seam_pool = select(
         (beauty || win_demo_flat_terrain()) && (in_seam_pan || tire_pad || column_here > 0.0008),
-        win_demo_flat_terrain() && (demo_column > 0.00035 || tire_pad || chassis_pad),
+        win_demo_flat_terrain() && (demo_column > 0.00035 || tire_pad || win_demo_in_pool(xz)),
         win_demo_flat_terrain(),
     );
     if (seam_pool) {
