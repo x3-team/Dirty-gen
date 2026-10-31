@@ -933,6 +933,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     win_demo_seat_vehicle_in_seam(&mut parked, px + 0.36, pz + 0.04, parked_yaw);
     win_demo_calm_wheels_in_pool(&mut parked);
     win_demo_still_touchup(&mut parked);
+    win_demo_seat_vehicle_on_bowl(&mut parked);
     parked.time = 1.2;
     let pose = win_demo_low_pose(&parked);
 
@@ -956,9 +957,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     win_demo_seat_vehicle_in_seam(&mut driven, px + 0.52, pz + 0.30, parked_yaw);
     win_demo_stage_bow_in_pool(&mut driven);
     win_demo_still_touchup(&mut driven);
+    win_demo_seat_vehicle_on_bowl(&mut driven);
     driven.time = 12.6;
-    renderer.puddle_beauty = saved_beauty;
-    renderer.water_column = saved_column;
+    renderer.puddle_beauty = true;
+    renderer.water_column = true;
     let rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
     for name in ["puddle-low-after.png", "puddle-patches.png"] {
         let path = media.join(name);
@@ -996,6 +998,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     win_demo_stage_bow_in_pool(&mut wheel);
     wheel.time = 9.2;
     win_demo_still_touchup(&mut wheel);
+    win_demo_seat_vehicle_on_bowl(&mut wheel);
+    renderer.puddle_beauty = true;
+    renderer.water_column = true;
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
         &media.join("puddle-wheel.png"),
@@ -1031,9 +1036,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     win_demo_seat_vehicle_in_seam(&mut drive, px + 0.42, pz + 0.18, -2.58);
     win_demo_stage_bow_in_pool(&mut drive);
     win_demo_still_touchup(&mut drive);
+    win_demo_seat_vehicle_on_bowl(&mut drive);
     drive.time = 11.4;
-    renderer.puddle_beauty = saved_beauty;
-    renderer.water_column = saved_column;
+    renderer.puddle_beauty = true;
+    renderer.water_column = true;
     // Shader rings/bow/splash only — particle ribbons cut holes in the flat pool mesh.
     renderer.show_mud_particles = false;
     renderer.show_mud_drops = false;
@@ -1069,30 +1075,44 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
     world.vehicle.yaw = yaw;
     world.vehicle.pitch = 0.0;
     world.vehicle.roll = 0.0;
-    let liquid = win_demo_pool_liquid(&world.soil, x, z);
-    let pad = world.soil.sample(x, z);
-    let sink = 0.052 + liquid.min(0.22) * 0.08;
+    let rim = silt::soil::SoilField::win_demo_pool_rim_height(0.22);
+    let sink = 0.032_f32;
     for wh in world.vehicle.wheels.iter_mut() {
         wh.sinkage = sink;
-        wh.in_water = liquid > 0.02;
+        wh.in_water = true;
         wh.omega = 0.0;
         wh.normal = 5200.0;
+        wh.compression = 0.08;
     }
-    world.vehicle.pos = Vec3::new(x, pad.height + WHEEL_RADIUS * 0.66, z);
-    for _ in 0..36 {
-        let mut max_drop = 0.0_f32;
+    let pad = world.soil.sample(x, z);
+    world.vehicle.pos = Vec3::new(x, pad.height.max(rim) + WHEEL_RADIUS * 0.78, z);
+    for _ in 0..56 {
+        let mut lift = 0.0_f32;
         for i in 0..4 {
             let local = world.vehicle.wheel_center_local(i);
             let hub = world.vehicle.pos + world.vehicle.orientation() * local;
             let ground = world.soil.sample(hub.x, hub.z);
-            let target = ground.height + WHEEL_RADIUS * (0.52 - sink * 0.20);
-            max_drop = max_drop.max(hub.y - target);
+            let target = ground.height + WHEEL_RADIUS * (1.0 - sink * 0.45);
+            lift = lift.max(target - hub.y);
         }
-        if max_drop < 0.0015 {
+        if lift.abs() < 0.0008 {
             break;
         }
-        world.vehicle.pos.y -= max_drop * 0.48;
+        world.vehicle.pos.y += lift * 0.55;
     }
+    let mut hubs = [(0.0_f32, 0.0_f32); 4];
+    for i in 0..4 {
+        let local = world.vehicle.wheel_center_local(i);
+        let hub = world.vehicle.pos + world.vehicle.orientation() * local;
+        hubs[i] = (hub.x, hub.z);
+        let ground = world.soil.sample(hub.x, hub.z);
+        let pen = ground.height + WHEEL_RADIUS * 0.96 - hub.y;
+        if pen > 0.004 {
+            world.vehicle.pos.y += pen;
+        }
+    }
+    world.soil.win_demo_flatten_wheel_bowls(&hubs, sink);
+    world.soil.rebuild_height();
 }
 
 fn win_demo_stage_wheels_in_pool(world: &mut World) {
@@ -1110,17 +1130,42 @@ fn win_demo_calm_wheels_in_pool(world: &mut World) {
 }
 
 fn win_demo_rear_hubs_xz(world: &World) -> Vec<(f32, f32)> {
-    let mut out = Vec::with_capacity(2);
+    let mut out = Vec::with_capacity(4);
+    let back = world.vehicle.orientation() * Vec3::new(0.0, 0.0, -1.0);
     for i in [2_usize, 3] {
         let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
         out.push((hub.x, hub.z));
+        out.push((hub.x + back.x * 0.52, hub.z + back.z * 0.52));
     }
     out
 }
 
+fn win_demo_seat_vehicle_on_bowl(world: &mut World) {
+    use silt::vehicle::WHEEL_RADIUS;
+    let sink = 0.032_f32;
+    for _ in 0..40 {
+        let mut lift = 0.0_f32;
+        for i in 0..4 {
+            let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+            let ground = world.soil.sample(hub.x, hub.z);
+            let target = ground.height + WHEEL_RADIUS * (1.0 - sink * 0.4);
+            lift = lift.max(target - hub.y);
+        }
+        if lift.abs() < 0.0006 {
+            break;
+        }
+        world.vehicle.pos.y += lift * 0.58;
+    }
+}
+
 fn win_demo_still_touchup(world: &mut World) {
-    let hubs = win_demo_rear_hubs_xz(world);
-    world.soil.win_demo_still_touchup(&hubs);
+    let rear = win_demo_rear_hubs_xz(world);
+    let mut wheels = Vec::with_capacity(4);
+    for i in 0..4 {
+        let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+        wheels.push((hub.x, hub.z));
+    }
+    world.soil.win_demo_still_touchup(&rear, &wheels);
 }
 
 fn win_demo_stage_bow_in_pool(world: &mut World) {

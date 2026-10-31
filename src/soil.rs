@@ -7500,16 +7500,28 @@ impl SoilField {
         field
     }
 
-    /// Shallow elliptical bowl on the hero pad (keeps height span under QA bound).
+    /// Flat pool surface matches the pad grade (lip is wet soil, not a raised berm).
+    pub fn win_demo_pool_rim_height(field_bed: f32) -> f32 {
+        field_bed
+    }
+
     fn win_demo_bowl_bed(r: f32, field_bed: f32) -> f32 {
-        if r > 1.18 {
+        if r > 1.48 {
             return field_bed;
         }
-        let core = (1.0_f32 - r / 1.15).max(0.0);
-        let rim = smooth01(0.62, 1.05, r);
-        let bowl = field_bed - core * 0.048;
-        let rim_h = field_bed + 0.028;
-        lerp(bowl, rim_h, rim)
+        let core = (1.0_f32 - r / 1.32).max(0.0);
+        let rim = smooth01(0.82, 1.38, r);
+        let bowl = field_bed - core * core * 0.25;
+        lerp(bowl, field_bed, rim)
+    }
+
+    /// Standing water depth (m) from bed to flat pool surface at the rim.
+    fn win_demo_pool_fill_depth(r: f32) -> f32 {
+        if r > 1.38 {
+            return 0.0;
+        }
+        let core = (1.0_f32 - r / 1.32).max(0.0);
+        0.008 + core * core * 0.26
     }
 
     /// Hero seam pool for Windows stills: bowl bed + standing water. Re-applied
@@ -7518,29 +7530,21 @@ impl SoilField {
         let res = self.res;
         let cell = self.cell;
         let half = self.size * 0.5;
-        let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.32_f32, 1.02_f32);
+        let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.62_f32, 1.26_f32);
         let bed = 0.22_f32;
-        let pad_x = 1.58_f32;
-        let pad_z = 1.28_f32;
         for j in 0..res {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
                 let z = (j as f32 + 0.5) * cell - half;
-                let ux = (x - sx).abs() / pad_x;
-                let uz = (z - sz).abs() / pad_z;
-                if ux > 1.0 || uz > 1.0 {
-                    continue;
-                }
                 let dx = (x - sx) / srx;
                 let dz = (z - sz) / srz;
                 let r = (dx * dx + dz * dz).sqrt();
+                if r > 1.55 {
+                    continue;
+                }
                 let idx = j * res + i;
-                let in_core = r <= 1.15;
-                let bed_feather = if r <= 1.15 {
-                    1.0
-                } else {
-                    smooth01(1.38, 1.05, r)
-                };
+                let in_core = r <= 1.32;
+                let bed_feather = smooth01(1.55, 1.18, r);
                 self.placed[idx] = 0.0;
                 self.loose[idx] = 0.0;
                 self.tread_amp[idx] = 0.0;
@@ -7549,15 +7553,11 @@ impl SoilField {
                 self.crust[idx] = 0.0;
                 self.crack[idx] = 0.0;
                 if bed_feather > 0.02 {
-                    self.bed[idx] = Self::win_demo_bowl_bed(r, bed);
+                    let bowl_h = Self::win_demo_bowl_bed(r, bed);
+                    self.bed[idx] = lerp(self.bed[idx], bowl_h, bed_feather);
                     self.initial_height[idx] = self.bed[idx];
                 }
-                let seam_water = if r <= 1.15 {
-                    let core = (1.0 - r / 1.15).max(0.0);
-                    0.05 + core * 0.17
-                } else {
-                    0.0
-                };
+                let seam_water = Self::win_demo_pool_fill_depth(r);
                 if seam_water > 0.0 {
                     self.water[idx] = self.water[idx].max(seam_water);
                 }
@@ -7572,64 +7572,26 @@ impl SoilField {
                     self.wetness[idx] = 1.0;
                     self.darken[idx] = self.darken[idx].max(0.24);
                     self.roughness[idx] = self.roughness[idx].min(0.08);
+                } else if r > 1.05 && r < 1.42 {
+                    self.wetness[idx] = self.wetness[idx].max(0.72);
+                    self.darken[idx] = self.darken[idx].max(0.32);
+                    self.kind[idx] = SurfaceKind::WetMud as u8;
                 }
                 self.sync(idx);
             }
         }
         self.win_demo_hero_spike_cleanup();
-        self.win_demo_chassis_pool_flat();
-    }
-
-    /// Flat bed + standing water under every still pose (no center berm between tires).
-    pub fn win_demo_chassis_pool_flat(&mut self) {
-        let res = self.res;
-        let cell = self.cell;
-        let half = self.size * 0.5;
-        let bed = 0.22_f32;
-        let poses = [
-            (-0.69_f32, 0.19_f32, 1.12_f32, 0.68_f32),
-            (-0.57_f32, 0.41_f32, 1.14_f32, 0.82_f32),
-            (-0.69_f32, 0.21_f32, 1.12_f32, 0.68_f32),
-            (-1.05_f32, -0.43_f32, 1.14_f32, 0.76_f32),
-            (-0.63_f32, 0.33_f32, 1.12_f32, 0.74_f32),
-        ];
-        for j in 0..res {
-            for i in 0..res {
-                let x = (i as f32 + 0.5) * cell - half;
-                let z = (j as f32 + 0.5) * cell - half;
-                let mut hit = false;
-                for (cx, cz, rx, rz) in poses {
-                    let ux = (x - cx).abs() / rx;
-                    let uz = (z - cz).abs() / rz;
-                    if ux <= 1.0 && uz <= 1.0 {
-                        hit = true;
-                        break;
-                    }
-                }
-                if !hit {
-                    continue;
-                }
-                let idx = j * res + i;
-                self.placed[idx] = 0.0;
-                self.loose[idx] = 0.0;
-                self.tread_amp[idx] = 0.0;
-                self.water[idx] = self.water[idx].max(0.14);
-                self.slurry[idx] = 0.002;
-                self.wetness[idx] = 1.0;
-                self.kind[idx] = SurfaceKind::WetMud as u8;
-                self.sync(idx);
-            }
-        }
     }
 
     /// Re-flatten hero pad after vehicle placement for still captures.
-    pub fn win_demo_still_touchup(&mut self, rear_hubs: &[(f32, f32)]) {
-        self.win_demo_chassis_pool_flat();
+    pub fn win_demo_still_touchup(&mut self, rear_hubs: &[(f32, f32)], wheel_hubs: &[(f32, f32)]) {
         self.win_demo_clear_pool_spoil();
         self.win_demo_hero_spike_cleanup();
+        self.win_demo_flatten_wheel_bowls(wheel_hubs, 0.032);
         for &(hx, hz) in rear_hubs {
             self.win_demo_flatten_rear_mound(hx, hz);
         }
+        self.win_demo_clear_pool_spoil();
         self.rebuild_height();
     }
 
@@ -7643,17 +7605,17 @@ impl SoilField {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
                 let z = (j as f32 + 0.5) * cell - half;
-                let dx = (x + 1.05) / 1.32;
-                let dz = (z - 0.15) / 1.02;
+                let dx = (x + 1.05) / 1.58;
+                let dz = (z - 0.15) / 1.22;
                 let r = (dx * dx + dz * dz).sqrt();
-                if r > 1.22 {
+                if r > 1.38 {
                     continue;
                 }
                 let idx = j * res + i;
                 let bowl_h = Self::win_demo_bowl_bed(r, bed);
-                if self.placed[idx] > 0.008
-                    || self.loose[idx] > 0.012
-                    || self.height[idx] > bowl_h + 0.004
+                if r <= 1.38 || self.placed[idx] > 0.001
+                    || self.loose[idx] > 0.004
+                    || self.height[idx] > bowl_h + 0.001
                 {
                     self.placed[idx] = 0.0;
                     self.loose[idx] = 0.0;
@@ -7666,13 +7628,18 @@ impl SoilField {
         }
     }
 
-    /// Spoil beside the seated rear hub on the hero seam pad (stills only).
-    fn win_demo_flatten_rear_mound(&mut self, hub_x: f32, hub_z: f32) {
+    /// Contact patches after seating — no tread spoil under the tires.
+    pub fn win_demo_flatten_wheel_bowls(&mut self, hubs: &[(f32, f32)], _sink: f32) {
+        for &(hx, hz) in hubs {
+            self.win_demo_flatten_patch(hx, hz, 0.52);
+        }
+    }
+
+    fn win_demo_flatten_patch(&mut self, hub_x: f32, hub_z: f32, radius: f32) {
         let res = self.res;
         let cell = self.cell;
         let half = self.size * 0.5;
         let bed = 0.22_f32;
-        let radius = 0.82_f32;
         let r2 = radius * radius;
         for j in 0..res {
             for i in 0..res {
@@ -7687,18 +7654,23 @@ impl SoilField {
                 self.placed[idx] = 0.0;
                 self.loose[idx] = 0.0;
                 self.tread_amp[idx] = 0.0;
-                self.tread_ang[idx] = 0.0;
-                self.tread_lat[idx] = 0.0;
-                self.crust[idx] = 0.0;
-                self.crack[idx] = 0.0;
-                let dx = (x + 1.05) / 1.32;
-                let dz = (z - 0.15) / 1.02;
+                let dx = (x + 1.05) / 1.58;
+                let dz = (z - 0.15) / 1.22;
                 let r = (dx * dx + dz * dz).sqrt();
                 self.bed[idx] = Self::win_demo_bowl_bed(r, bed);
                 self.initial_height[idx] = self.bed[idx];
                 self.sync(idx);
             }
         }
+    }
+
+    /// Spoil beside the seated rear hub on the hero seam pad (stills only).
+    fn win_demo_flatten_rear_mound(&mut self, hub_x: f32, hub_z: f32) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        self.win_demo_flatten_patch(hub_x, hub_z, 1.08);
     }
 
     /// Berms and tread spikes in the side-camera frustum, hero pad only.
@@ -7722,12 +7694,14 @@ impl SoilField {
                 self.tread_lat[idx] = 0.0;
                 self.crust[idx] = 0.0;
                 self.crack[idx] = 0.0;
-                let dx = (x + 1.05) / 1.32;
-                let dz = (z - 0.15) / 1.02;
+                let dx = (x + 1.05) / 1.58;
+                let dz = (z - 0.15) / 1.22;
                 let r = (dx * dx + dz * dz).sqrt();
                 let bowl_h = Self::win_demo_bowl_bed(r, bed);
-                if r <= 1.15 && self.height[idx] > bowl_h + 0.003 {
+                if r <= 1.32 && self.height[idx] > bowl_h + 0.001 {
                     self.bed[idx] = bowl_h;
+                    self.placed[idx] = 0.0;
+                    self.loose[idx] = 0.0;
                     self.slurry[idx] = 0.002;
                     self.initial_height[idx] = self.bed[idx];
                     self.sync(idx);
@@ -7747,7 +7721,7 @@ impl SoilField {
                 }
                 if x > -1.92 && x < -0.28 && z > -0.62 && z < 0.92 && self.height[idx] > bed + 0.006 {
                     self.placed[idx] = 0.0;
-                    self.bed[idx] = if r <= 1.15 {
+                    self.bed[idx] = if r <= 1.32 {
                         Self::win_demo_bowl_bed(r, bed)
                     } else {
                         bed

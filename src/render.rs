@@ -1287,12 +1287,21 @@ impl Renderer {
         let light_proj = Mat4::orthographic_rh(-extent, extent, -extent, extent, 1.0, 130.0);
         let light_vp = light_proj * light_view;
         let (sun_color, sky_zenith, sky_horizon, amb) = if self.daylight {
-            (
-                [1.70, 1.78, 1.90, 1.0],
-                [0.42, 0.64, 0.98, 1.0],
-                [0.76, 0.84, 0.96, 1.0],
-                [0.18, 0.20, 0.22, 1.0],
-            )
+            if self.win_demo_still {
+                (
+                    [1.70, 1.78, 1.90, 1.0],
+                    [0.10, 0.32, 0.82, 1.0],
+                    [0.78, 0.84, 0.92, 1.0],
+                    [0.18, 0.20, 0.22, 1.0],
+                )
+            } else {
+                (
+                    [1.70, 1.78, 1.90, 1.0],
+                    [0.42, 0.64, 0.98, 1.0],
+                    [0.76, 0.84, 0.96, 1.0],
+                    [0.18, 0.20, 0.22, 1.0],
+                )
+            }
         } else {
             (
                 [1.15, 0.74, 0.42, 1.0],

@@ -80,8 +80,8 @@ fn win_demo_seam_heights_stay_bounded() {
     );
     let hub = world.soil.sample(cx, cz);
     assert!(
-        hub.height < 0.26,
-        "seam hub height pyramid {:.3}",
+        hub.height < 0.02,
+        "seam hub should sit in bowl floor {:.3}",
         hub.height
     );
     let mut max_h = 0.0_f32;
@@ -97,8 +97,13 @@ fn win_demo_seam_heights_stay_bounded() {
         xi += 1;
     }
     assert!(
-        max_h < 0.235,
-        "hero pad bump {:.3}",
+        max_h < 0.28,
+        "hero pad spike above bowl lip {:.3}",
         max_h
+    );
+    assert!(
+        max_h - min_h > 0.18,
+        "bowl bank should read from side: span {:.3}",
+        max_h - min_h
     );
 }
