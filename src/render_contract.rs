@@ -477,7 +477,9 @@ pub fn publish(
     };
     if let Some(dust) = dust {
         dust.write_air_velocity(&mut out.air_velocity);
-        dust.write_fog(&mut out.fog);
+        if dust.fog_air_m3() > 1.0e-12 {
+            dust.write_fog(&mut out.fog);
+        }
     } else if let Some(fluid) = fluid {
         fluid.write_air_velocity(&mut out.air_velocity);
         for iz in 0..AIR_RES {
@@ -576,7 +578,10 @@ pub fn publish(
         valid |= VALID_FLOW;
     }
     if dust_source != DUST_NONE {
-        valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR | VALID_FOG;
+        valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR;
+        if dust.is_some_and(|d| d.fog_air_m3() > 1.0e-12) {
+            valid |= VALID_FOG;
+        }
     }
 
     scrub(&mut out.ground_rut);

@@ -669,6 +669,13 @@ impl Dust {
         if dst.len() < n {
             return;
         }
+        if self.fog_air <= 1.0e-12 {
+            dst[..n].fill(0.0);
+            for v in dst.iter_mut().skip(n) {
+                *v = 0.0;
+            }
+            return;
+        }
         let inv = 1.0 / CELL_VOL_M3;
         for i in 0..n {
             let v = self.fog[i] * inv;
