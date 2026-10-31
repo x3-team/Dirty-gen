@@ -573,6 +573,7 @@ fn through_chase(world: &World) -> CameraPose {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn belly_chase(world: &World) -> CameraPose {
     let fwd = world.vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
@@ -586,6 +587,7 @@ fn belly_chase(world: &World) -> CameraPose {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     let media = PathBuf::from(MEDIA);
     std::fs::create_dir_all(&media).ok();
@@ -700,6 +702,7 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     println!("video {}", video.display());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     let mut world = silt::World::flat(0.4);
     let report = world.carve_belly_shelf();
@@ -722,6 +725,7 @@ fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     println!("belly {}", path.display());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture(args: &[String]) {
     let parsed = parse_capture(args);
     if parsed.software {

@@ -2,7 +2,7 @@ name: pages
 
 on:
   push:
-    branches: [cursor/silt-mud-demo-0663, main]
+    branches: [cursor/silt-mud-demo-0663, cursor/pages-meshopt-wasm-6d83, main]
   workflow_dispatch:
 
 permissions:

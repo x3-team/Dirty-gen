@@ -19,7 +19,10 @@ wgpu = "23"
 winit = "0.30"
 gltf = { version = "1.4.1", default-features = false, features = ["utils", "names", "extensions"] }
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
-meshopt = "0.7"
+# 0.7.0 fails on wasm32-unknown-unknown: opacitymap.cpp uses floorf/log2f,
+# and the crate's wasm math shim never declares them. No feature skips that file.
+# 0.6.2 decodes this glTF (index v1, vertex v0) the same.
+meshopt = "=0.6.2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.10"

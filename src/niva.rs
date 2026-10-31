@@ -615,7 +615,13 @@ fn decompress(doc: &gltf::Gltf, bin: &[u8]) -> Vec<u8> {
             ("ATTRIBUTES", 4, Some("OCTAHEDRAL")) => {
                 let mut verts =
                     meshopt::decode_vertex_buffer::<[i8; 4]>(src, count).expect("meshopt oct");
-                meshopt::decode_filter_oct(&mut verts);
+                unsafe {
+                    meshopt::ffi::meshopt_decodeFilterOct(
+                        verts.as_mut_ptr().cast(),
+                        verts.len(),
+                        std::mem::size_of::<[i8; 4]>(),
+                    );
+                }
                 bytes_of(&verts)
             }
             ("ATTRIBUTES", 4, _) => {
