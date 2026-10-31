@@ -4031,6 +4031,14 @@ pub struct FluidCore {
     sheet_times: SheetTimes,
     /// Reused by the integer window scroll. Not a second sheet.
     shift_scratch: Vec<f32>,
+    /// Scratch for [`Self::pond_ruts`]. Sized once so a step does not allocate.
+    pond_still: Vec<u8>,
+    pond_eta: Vec<f32>,
+    pond_mark: Vec<f32>,
+    pond_count_p: Vec<f32>,
+    pond_eta_p: Vec<f32>,
+    pond_needs: Vec<(usize, f32)>,
+    pond_donors: Vec<(usize, f32)>,
 }
 
 impl FluidCore {
@@ -4098,6 +4106,13 @@ impl FluidCore {
             fine_pace: 0,
             sheet_times: SheetTimes::default(),
             shift_scratch: Vec::new(),
+            pond_still: vec![0; n],
+            pond_eta: vec![0.0; n],
+            pond_mark: vec![0.0; n],
+            pond_count_p: vec![0.0; (n + 1) * (n + 1)],
+            pond_eta_p: vec![0.0; (n + 1) * (n + 1)],
+            pond_needs: Vec::new(),
+            pond_donors: Vec::new(),
         }
     }
 
@@ -4469,32 +4484,53 @@ impl FluidCore {
     /// so the pond is not refilled from nowhere. Berms (a raised bed) are
     /// left alone. Returns the cubic metres moved.
     pub fn pond_ruts(&mut self) -> f32 {
-        self.restrict_fine();
+        if self.fine_on {
+            self.restrict_fine();
+        }
         let n = WINDOW_RES;
+        let nn = n * n;
         let area = COARSE_CELL_M * COARSE_CELL_M;
-        let mut still = vec![false; n * n];
-        let mut eta_of = vec![0.0_f32; n * n];
-        for idx in 0..n * n {
+        let mut any_rut = false;
+        for idx in 0..nn {
+            let bed = self.bed[idx];
+            if bed.is_finite() && bed < -0.012 {
+                any_rut = true;
+                break;
+            }
+        }
+        if !any_rut {
+            return 0.0;
+        }
+        let still = &mut self.pond_still[..nn];
+        let eta_of = &mut self.pond_eta[..nn];
+        still.fill(0);
+        eta_of.fill(0.0);
+        for idx in 0..nn {
             let bed = self.bed[idx];
             let water = self.water[idx];
             if bed.is_finite() && water.is_finite() && bed > -0.008 && bed < 0.03 && water > 0.018 {
-                still[idx] = true;
+                still[idx] = 1;
                 eta_of[idx] = bed + water;
             }
         }
         let rad = 10i32;
-        let mut mark = vec![0.0f32; n * n];
-        for idx in 0..n * n {
-            if still[idx] {
+        let mark = &mut self.pond_mark[..nn];
+        mark.fill(0.0);
+        for idx in 0..nn {
+            if still[idx] != 0 {
                 mark[idx] = 1.0;
             }
         }
         let stride = n + 1;
-        let mut count_p = vec![0.0f32; stride * stride];
-        let mut eta_p = vec![0.0f32; stride * stride];
-        prefix_plane(&mark, n, &mut count_p);
-        prefix_plane(&eta_of, n, &mut eta_p);
-        let mut needs: Vec<(usize, f32)> = Vec::new();
+        let plane = stride * stride;
+        let count_p = &mut self.pond_count_p[..plane];
+        let eta_p = &mut self.pond_eta_p[..plane];
+        count_p.fill(0.0);
+        eta_p.fill(0.0);
+        prefix_plane(mark, n, count_p);
+        prefix_plane(eta_of, n, eta_p);
+        self.pond_needs.clear();
+        let needs = &mut self.pond_needs;
         let mut total_need = 0.0_f32;
         for j in 0..n {
             for i in 0..n {
@@ -4523,10 +4559,11 @@ impl FluidCore {
         if total_need <= 1.0e-8 {
             return 0.0;
         }
-        let mut donors: Vec<(usize, f32)> = Vec::new();
+        self.pond_donors.clear();
+        let donors = &mut self.pond_donors;
         let mut total_room = 0.0_f32;
-        for idx in 0..n * n {
-            if !still[idx] {
+        for idx in 0..nn {
+            if still[idx] == 0 {
                 continue;
             }
             let room = (self.water[idx] - 0.012).max(0.0);
@@ -4540,10 +4577,10 @@ impl FluidCore {
         }
         let scale = (total_room / total_need).min(1.0);
         let moved = total_need * scale;
-        for (idx, extra) in &needs {
+        for (idx, extra) in needs.iter() {
             self.water[*idx] += extra * scale;
         }
-        for (idx, room) in &donors {
+        for (idx, room) in donors.iter() {
             let give = moved * (*room * area) / total_room;
             self.water[*idx] = (self.water[*idx] - give / area).max(0.0);
         }

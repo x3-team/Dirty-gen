@@ -4244,6 +4244,9 @@ pub struct ThroughDrive {
     sheet_opened_m3: f64,
     /// Breakdown of the step that just finished.
     pub last_parts: DriveParts,
+    /// Reused by [`Self::stamp_puddle_tires`]; avoids allocating each step.
+    stamp_slurry_snap: Vec<f32>,
+    stamp_placed_snap: Vec<f32>,
 }
 
 /// Frames of the gravity sheet that let a pour find the bank. Init only.
@@ -4305,6 +4308,7 @@ impl ThroughDrive {
         world.vehicle.yaw = 0.0;
         let mut dust = crate::dust::Dust::new();
         dust.set_wind(1.5, -0.9);
+        let soil_cells = world.soil.slurry.len();
         Self {
             world,
             fluid,
@@ -4341,6 +4345,8 @@ impl ThroughDrive {
             shore_before_water,
             sheet_opened_m3,
             last_parts: DriveParts::default(),
+            stamp_slurry_snap: vec![0.0; soil_cells],
+            stamp_placed_snap: vec![0.0; soil_cells],
         }
     }
 
@@ -4378,18 +4384,12 @@ impl ThroughDrive {
             .items
             .retain(|p| p.kind != KIND_DUST_MARK);
         other_ms += tick.ms();
-        let mut left = dt.max(0.0);
-        let sub = 1.0 / 60.0;
-        while left > 1.0e-6 {
-            let h = left.min(sub);
-            let tick = ProfTick::start();
-            self.advance_dust(h);
-            let wall = tick.ms();
-            let air = self.dust.last_air_ms() as f64;
-            air_ms += air;
-            dust_ms += (wall - air).max(0.0);
-            left -= h;
-        }
+        let tick = ProfTick::start();
+        self.advance_dust(dt);
+        let wall = tick.ms();
+        let air = self.dust.last_air_ms() as f64;
+        air_ms += air;
+        dust_ms += (wall - air).max(0.0);
         let tick = ProfTick::start();
         let z = self.chassis_z;
         self.world.vehicle.pos.x = 0.0;
@@ -4811,8 +4811,10 @@ impl ThroughDrive {
             }
         }
         pin_rut_samples(&mut self.world.soil, &self.fluid);
-        let slurry_before = self.world.soil.slurry.clone();
-        let placed_before = self.world.soil.placed.clone();
+        self.stamp_slurry_snap
+            .copy_from_slice(&self.world.soil.slurry);
+        self.stamp_placed_snap
+            .copy_from_slice(&self.world.soil.placed);
         let contacts = self
             .world
             .vehicle
@@ -4866,7 +4868,11 @@ impl ThroughDrive {
             );
             self.world.soil.tread_profile = false;
         }
-        restore_berm_slump(&mut self.world.soil, &slurry_before, &placed_before);
+        restore_berm_slump(
+            &mut self.world.soil,
+            &self.stamp_slurry_snap,
+            &self.stamp_placed_snap,
+        );
     }
 
     /// Drop each wet tire onto the cut it just made. The chassis stays at the
