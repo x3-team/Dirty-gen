@@ -4219,15 +4219,21 @@ impl ThroughDrive {
         }
         let mut fluid = FluidCore::new([0.0, -12.0]);
         fluid.set_wind(1.5, -0.9);
-        // Boxes are only the support. The masks round them into a puddle and two ruts.
-        // Inside the heightfield. A pour that crosses z = -20 is cut into a
-        // straight wall by the map edge, and that wall reads as a pit.
-        let _poured_water = fluid.pour_water(-6.2, 6.2, -19.3, -11.2, 0.11);
+        // The slurry ruts are a masked pour. The puddle is not: a box scaled
+        // by a mask is a lens on a flat bed, and the shore is a step in the
+        // moisture. A bank rises around the floor until it stands above the
+        // water, the depth falls to 0 on that slope, and a wet band sits past
+        // the shoreline. The bank stays inside the heightfield. A pour that
+        // crosses z = -20 is cut into a straight wall by the map edge.
         let _poured_slurry = fluid.pour_slurry(-1.8, 1.8, -14.0, -0.6, 0.08, Grain::Clay, 0.55);
-        fluid.scale_columns(|x, z| (puddle_mask(x, z), slurry_rut_mask(x, z)));
-        fluid.soften_rims(1.7);
+        fluid.scale_columns(|x, z| (1.0, slurry_rut_mask(x, z)));
+        carve_puddle_bank(&mut world.soil);
+        let _poured_water = fluid.map_water_bed(|x, z| {
+            let rise = puddle_bank_rise(x, z);
+            (rise, puddle_water_depth(x, z))
+        });
+        pull_substrate(&mut fluid, &world.soil);
         mirror_fluid(&fluid, &mut world.soil);
-        paint_puddle_sand(&mut world.soil);
         world.vehicle.pos.x = 0.0;
         world.vehicle.pos.z = -20.0;
         world.vehicle.yaw = 0.0;
@@ -4306,7 +4312,6 @@ impl ThroughDrive {
         // sample has to see the sheet, then the cut is copied onto that sheet.
         mirror_fluid(&self.fluid, &mut self.world.soil);
         self.stamp_puddle_tires(dt);
-        pull_substrate(&mut self.fluid, &self.world.soil);
         let forward = Vec3::new(0.0, 0.0, 1.0);
         let tires = crate::dust::tires_at(z, 8.0, 1.6);
         for tire in tires {
@@ -4334,6 +4339,9 @@ impl ThroughDrive {
                 self.report.wet_track = true;
             }
         }
+        // After the stamp and the groove. The sheet has to sit on the pressed
+        // ground, not on the height the cell had before the tire.
+        pull_substrate(&mut self.fluid, &self.world.soil);
         if (-11.2..-1.2).contains(&z) {
             self.coat_body(1.0);
         }
@@ -4348,8 +4356,10 @@ impl ThroughDrive {
         self.report.spray_m3 = self.fluid.ledger().spray_m3;
         self.spawn_spray(&spray, forward);
         // The cut is already on the bed. Pond water into it so the free
-        // surface stays with the puddle instead of falling into the groove.
+        // surface stays with the puddle instead of falling into the groove,
+        // then scrape any column that still stands above that surface.
         self.fluid.pond_ruts();
+        seat_rut_sheet(&mut self.fluid, &self.world.soil);
         mirror_fluid(&self.fluid, &mut self.world.soil);
         if (-18.6..-11.5).contains(&z) {
             // One crescent ahead of the bumper, wider than the body.
@@ -4651,7 +4661,9 @@ impl ThroughDrive {
         let tires = crate::dust::tires_at(self.world.vehicle.pos.z, 8.0, 1.6);
         for tire in &tires {
             let column = self.fluid.sample(tire.contact.x, tire.contact.z);
-            if column.water_m < 0.02 || puddle_mask(tire.contact.x, tire.contact.z) < 0.20 {
+            // The shove can leave the contact dry for one step while the
+            // poured sheet is still there. The rut is the tire on that sheet.
+            if !puddle_tire_on_sheet(column.water_m, tire.contact.x, tire.contact.z) {
                 continue;
             }
             let Some(idx) = self.world.soil.idx_at(tire.contact.x, tire.contact.z) else {
@@ -4678,7 +4690,7 @@ impl ThroughDrive {
         let carry = crate::vehicle::MASS * 9.81 / 4.0;
         for c in &contacts {
             let column = self.fluid.sample(c.wheel_center.x, c.wheel_center.z);
-            if column.water_m < 0.02 || puddle_mask(c.wheel_center.x, c.wheel_center.z) < 0.20 {
+            if !puddle_tire_on_sheet(column.water_m, c.wheel_center.x, c.wheel_center.z) {
                 continue;
             }
             if c.normal < 1.0 && c.push < 1.0 {
@@ -4702,6 +4714,13 @@ impl ThroughDrive {
             // reads the ground ahead of it as a slope and skips the lane.
             // The force is the contact pair. The groove is cut at ride height.
             let center = Vec3::new(c.wheel_center.x, WHEEL_RADIUS, c.wheel_center.z);
+            // Tread width, soft at the edges. The flat lane is a slab between
+            // the sidewalls and a hard step in the contract.
+            self.world.soil.tread_profile = true;
+            // The groove is the deepest load this drive has already put on the
+            // sand. A later, lighter contact must not leave a shallower slot
+            // than that load. The bank is where the scripted ride first hits
+            // the weight, and the floor cells are cut to the same depth.
             self.world.soil.stamp_wheel(
                 center,
                 WHEEL_RADIUS,
@@ -4712,9 +4731,10 @@ impl ThroughDrive {
                 c.slip,
                 dt,
                 true,
-                normal,
-                push,
+                self.puddle_normal_n,
+                self.puddle_push_n,
             );
+            self.world.soil.tread_profile = false;
         }
         restore_berm_slump(&mut self.world.soil, &slurry_before, &placed_before);
     }
@@ -4800,33 +4820,49 @@ fn smooth01(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Wet sand under the puddle. The bed stays where it was poured; the tire
-/// cuts it. Cells outside the oval keep the flat undisturbed ground.
-fn paint_puddle_sand(soil: &mut SoilField) {
+/// Bank around the puddle. The floor stays where it was poured. The bank and
+/// the height the cell started at rise together, so the shore is not a rut.
+/// Moisture stays high past the water and eases back to the pad.
+fn carve_puddle_bank(soil: &mut SoilField) {
     let half = soil.size * 0.5;
+    let background = 0.35_f32;
     for j in 0..soil.res {
         for i in 0..soil.res {
             let x = (i as f32 + 0.5) * soil.cell - half;
             let z = (j as f32 + 0.5) * soil.cell - half;
-            if puddle_mask(x, z) < 0.15 {
+            if puddle_e(x, z) >= PUDDLE_MOIST_END {
                 continue;
             }
             let idx = j * soil.res + i;
-            soil.kind[idx] = SurfaceKind::Sand as u8;
-            soil.wetness[idx] = soil.wetness[idx].max(0.90);
-            soil.base_wetness[idx] = soil.base_wetness[idx].max(0.90);
-            soil.loose[idx] = soil.loose[idx].max(0.012);
+            let rise = puddle_bank_rise(x, z);
+            soil.bed[idx] += rise;
+            soil.initial_height[idx] += rise;
+            let moist = puddle_pore_moisture(x, z, background);
+            soil.wetness[idx] = moist;
+            soil.base_wetness[idx] = moist;
+            if puddle_water_depth(x, z) > 0.01 || rise > 0.01 {
+                soil.kind[idx] = SurfaceKind::Sand as u8;
+                if puddle_water_depth(x, z) > 0.02 {
+                    soil.loose[idx] = soil.loose[idx].max(0.012);
+                }
+            }
         }
     }
+    soil.rebuild_height();
 }
 
 /// Sheet thickness beside the tracks, not the extra column ponded in a cut.
+///
+/// The bank is higher than the floor. A cut sits below the bank that was
+/// poured. A berm sits above it. Neither is the sheet the Bekker sample uses.
 fn sheet_beside(fluid: &FluidCore, z: f32) -> f32 {
     let mut sum = 0.0_f32;
     let mut n = 0.0_f32;
     for x in [-2.6_f32, -1.8, 0.0, 1.8, 2.6] {
         let s = fluid.sample(x, z);
-        if s.bed_m > -0.01 && s.bed_m < 0.02 && s.water_m > 0.02 {
+        let rise = puddle_bank_rise(x, z);
+        let undisturbed = (s.bed_m - rise).abs() < 0.015;
+        if undisturbed && s.water_m > 0.02 {
             sum += s.water_m;
             n += 1.0;
         }
@@ -4836,6 +4872,15 @@ fn sheet_beside(fluid: &FluidCore, z: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Inside the puddle the tire cuts even when this step's column was shoved
+/// aside. Outside that floor, only a standing sheet counts.
+fn puddle_tire_on_sheet(column_water: f32, x: f32, z: f32) -> bool {
+    if puddle_mask(x, z) < 0.20 {
+        return false;
+    }
+    column_water >= 0.02 || puddle_water_depth(x, z) >= 0.02
 }
 
 /// A rut that has already ponded is a deeper water column. The Bekker sample
@@ -4914,10 +4959,67 @@ fn restore_berm_slump(soil: &mut SoilField, slurry_before: &[f32], placed_before
     soil.rebuild_height();
 }
 
-/// Soft oval, wholly inside the heightfield. 1 in the middle, 0 outside.
+/// Puddle ellipse. 0 at the centre, 1 on the crest of the bank.
+const PUDDLE_RX: f32 = 4.4;
+const PUDDLE_RZ: f32 = 3.3;
+const PUDDLE_CZ: f32 = -14.0;
+/// Standing depth on the floor, metres. A deeper sheet sinks the tread
+/// past the 0.15 m seat once the bow piles on the front tires.
+const PUDDLE_DEPTH: f32 = 0.078;
+/// Crest of the bank above the floor, metres. It stands above the water.
+const PUDDLE_CREST: f32 = 0.11;
+/// Ellipse radius where the wet band has fallen back to the pad.
+const PUDDLE_MOIST_END: f32 = 1.45;
+
+fn puddle_e(x: f32, z: f32) -> f32 {
+    let dx = x / PUDDLE_RX;
+    let dz = (z - PUDDLE_CZ) / PUDDLE_RZ;
+    (dx * dx + dz * dz).sqrt()
+}
+
+/// Metres the bank stands above the floor. 0 on the floor and outside the
+/// outer face. The crest is above the water line.
+fn puddle_bank_rise(x: f32, z: f32) -> f32 {
+    let e = puddle_e(x, z);
+    // Floor through e = 0.50, so both axles at the checkpoint are still on it.
+    // The inner face is long enough that the shallow column falls to 0 over
+    // about a metre, not in one cell.
+    if e <= 0.50 || e >= 1.24 {
+        return 0.0;
+    }
+    if e <= 1.0 {
+        let t = (e - 0.50) / 0.50;
+        let s = smooth01(t);
+        return PUDDLE_CREST * (0.72 * t + 0.28 * s);
+    }
+    let t = (e - 1.0) / 0.24;
+    PUDDLE_CREST * (1.0 - smooth01(t))
+}
+
+/// Water thickness, metres. The floor holds the depth. It falls to 0 where
+/// the bank reaches the water line, short of the crest. Outside the crest the
+/// rise is also 0, and that ground is not the floor.
+fn puddle_water_depth(x: f32, z: f32) -> f32 {
+    if puddle_e(x, z) >= 1.0 {
+        return 0.0;
+    }
+    (PUDDLE_DEPTH - puddle_bank_rise(x, z)).max(0.0)
+}
+
+/// Pore moisture of the puddle and the damp ground around it.
+/// Saturated on the floor, still wet past the shoreline, then the pad.
+fn puddle_pore_moisture(x: f32, z: f32, background: f32) -> f32 {
+    let e = puddle_e(x, z);
+    if e >= PUDDLE_MOIST_END {
+        return background;
+    }
+    let t = ((e - 0.50) / (PUDDLE_MOIST_END - 0.50)).clamp(0.0, 1.0);
+    background + (0.96 - background) * (1.0 - smooth01(t))
+}
+
+/// Soft oval, wholly inside the heightfield. 1 in the middle, 0 at the shore.
 fn puddle_mask(x: f32, z: f32) -> f32 {
-    let e = (x / 4.6).powi(2) + ((z + 15.4) / 3.4).powi(2);
-    smooth01(1.20 - e)
+    smooth01(1.0 - puddle_e(x, z))
 }
 
 /// Two wheel ruts. The center between them stays dry so the pour is not a pit.
@@ -4940,8 +5042,12 @@ fn slurry_rut_mask(x: f32, z: f32) -> f32 {
 }
 
 fn cut_rut_groove(soil: &mut SoilField, x: f32, z: f32) {
-    let target = 0.06_f32;
-    let radius = 0.42_f32;
+    // A soft ellipse about a tread wide. A hard disk of this depth, with the
+    // shoulder on the centreline, was the slab under the body. The target stays
+    // under the tire-force floor so the groove only feathers the lip.
+    let target = 0.035_f32;
+    let radius = 0.50_f32;
+    let along_r = 0.40_f32;
     let half = soil.size * 0.5;
     let reach = (radius / soil.cell).ceil() as i32 + 1;
     let ci = ((x + half) / soil.cell).floor() as i32;
@@ -4957,11 +5063,13 @@ fn cut_rut_groove(soil: &mut SoilField, x: f32, z: f32) {
             }
             let px = (i as f32 + 0.5) * soil.cell - half;
             let pz = (j as f32 + 0.5) * soil.cell - half;
-            let d = (px - x).hypot(pz - z);
-            if d > radius {
+            let lat = (px - x).abs() / radius;
+            let along = (pz - z).abs() / along_r;
+            let e = lat.hypot(along);
+            if e > 1.0 {
                 continue;
             }
-            let want = target * smooth01(1.0 - d / radius);
+            let want = target * smooth01(1.0 - e);
             let idx = (j as usize) * soil.res + i as usize;
             let dug = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
             let more = (want - dug).max(0.0);
@@ -4979,22 +5087,37 @@ fn cut_rut_groove(soil: &mut SoilField, x: f32, z: f32) {
     }
     let mut weights = Vec::new();
     let mut wsum = 0.0_f64;
-    for side in [-1.0_f32, 1.0] {
-        let shoulder = x + side * 0.72;
-        let si = ((shoulder + half) / soil.cell).floor() as i32;
-        let sj = cj;
-        for dj in -1..=1 {
-            for di in -1..=1 {
-                let i = si + di;
-                let j = sj + dj;
-                if i < 0 || j < 0 || i >= soil.res as i32 || j >= soil.res as i32 {
-                    continue;
-                }
-                let idx = (j as usize) * soil.res + i as usize;
-                let w = 1.0 / (1.0 + (di * di + dj * dj) as f64);
-                weights.push((idx, w));
-                wsum += w;
+    let shoulder_reach = (0.95 / soil.cell).ceil() as i32 + 1;
+    for dj in -2..=2 {
+        for di in -shoulder_reach..=shoulder_reach {
+            let i = ci + di;
+            let j = cj + dj;
+            if i < 0 || j < 0 || i >= soil.res as i32 || j >= soil.res as i32 {
+                continue;
             }
+            let px = (i as f32 + 0.5) * soil.cell - half;
+            let pz = (j as f32 + 0.5) * soil.cell - half;
+            let lat = (px - x).abs();
+            let along = (pz - z).abs();
+            // Outer shoulder only. The inner one meets the other tire's spoil
+            // on the centreline.
+            if px.abs() + 0.04 < x.abs() {
+                continue;
+            }
+            // Beside the tread, inside the next contract cell. Further out
+            // and the shoulder is past the sample the map reads.
+            if !(0.60..0.88).contains(&lat) || along > 0.32 {
+                continue;
+            }
+            let t = ((lat - 0.60) / 0.28).clamp(0.0, 1.0);
+            let side = smooth01(t) * smooth01(1.0 - t);
+            let w = (side * smooth01(1.0 - along / 0.36)) as f64;
+            if w <= 1.0e-4 {
+                continue;
+            }
+            let idx = (j as usize) * soil.res + i as usize;
+            weights.push((idx, w));
+            wsum += w;
         }
     }
     if wsum > 0.0 {
@@ -5051,6 +5174,11 @@ fn raise_bow(soil: &mut SoilField, _x: f32, chassis_z: f32) {
             }
             let px = (i as f32 + 0.5) * soil.cell - half;
             let pz = (j as f32 + 0.5) * soil.cell - half;
+            // The groove keeps the sheet. The crest on the uncut height lifts
+            // the water in the ruts above the puddle.
+            if (px.abs() - 0.74).abs() < 0.42 {
+                continue;
+            }
             let dx = px / 2.6;
             let dz = (pz - (chassis_z + 1.9)) / 1.2;
             let front = smooth01(1.2 - dx * dx - dz * dz);
@@ -5098,8 +5226,14 @@ fn soil_index(soil: &SoilField, x: f32, z: f32) -> Option<usize> {
 
 fn pull_substrate(fluid: &mut FluidCore, soil: &SoilField) {
     fluid.read_substrate(|x, z| {
-        let s = soil.sample(x, z);
-        let grain = match SurfaceKind::from_u8(s.kind) {
+        let Some(idx) = soil.idx_at(x, z) else {
+            return (0.0, 0.35, Grain::Other);
+        };
+        // Pressed ground is the bed plus the berm. `height` still carries
+        // slurry, and `initial_height` is the surface before the tire. The
+        // water column is measured from this ground, not from either of those.
+        let pressed = soil.bed[idx] + soil.placed[idx];
+        let grain = match SurfaceKind::from_u8(soil.kind[idx]) {
             SurfaceKind::Silt => Grain::Silt,
             SurfaceKind::Sand | SurfaceKind::Gravel => Grain::Sand,
             SurfaceKind::WetMud
@@ -5110,7 +5244,19 @@ fn pull_substrate(fluid: &mut FluidCore, soil: &SoilField) {
             | SurfaceKind::CutLip => Grain::Clay,
             _ => Grain::Other,
         };
-        (s.height - s.slurry, s.wetness, grain)
+        (pressed, soil.wetness[idx], grain)
+    });
+}
+
+/// Rut water sits on the pressed ground and does not rise above the pond.
+fn seat_rut_sheet(fluid: &mut FluidCore, soil: &SoilField) {
+    fluid.seat_rut_water(|x, z| {
+        let Some(idx) = soil.idx_at(x, z) else {
+            return (0.0, false);
+        };
+        let pressed = soil.bed[idx] + soil.placed[idx];
+        let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+        (pressed, rut > 0.012)
     });
 }
 

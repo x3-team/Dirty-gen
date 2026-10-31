@@ -1820,6 +1820,129 @@ impl FluidCore {
         moved
     }
 
+    /// Seat the water column on the pressed ground of a rut that opens into the pond.
+    ///
+    /// `classify` returns that ground (bed + placed, not the height the cell
+    /// started at) and whether the cell is a tire cut. The free surface is
+    /// pressed ground plus the water column. Hanging the same column from the
+    /// original height stands the rut above the pond by the depth of the cut.
+    /// Water above the pond surface is poured back onto the still floor.
+    /// Slurry left standing above that surface is scraped back to it. Returns
+    /// the pond surface, metres, when the floor has a sheet.
+    pub fn seat_rut_water(
+        &mut self,
+        mut classify: impl FnMut(f32, f32) -> (f32, bool),
+    ) -> Option<f32> {
+        self.restrict_fine();
+        let n = WINDOW_RES;
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut pressed = vec![0.0_f32; n * n];
+        let mut is_rut = vec![false; n * n];
+        let mut floor = vec![false; n * n];
+        let mut etas = Vec::new();
+        for j in 0..n {
+            for i in 0..n {
+                let idx = j * n + i;
+                let (x, z) = self.coarse_xz(i, j);
+                let (ground, rut) = classify(x, z);
+                let ground = if ground.is_finite() { ground } else { 0.0 };
+                pressed[idx] = ground;
+                is_rut[idx] = rut;
+                let water = self.water[idx];
+                // A floor the tires have drained still counts. Otherwise the
+                // pond disappears, the rut is no longer "connected", and the
+                // column left in the cut stands above a dry bed.
+                if !rut
+                    && (-0.02..0.04).contains(&ground)
+                    && (water > 0.008 || self.moisture[idx] > 0.55)
+                {
+                    floor[idx] = true;
+                    etas.push(ground + water);
+                }
+            }
+        }
+        if etas.len() < 8 {
+            return None;
+        }
+        etas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let eta = etas[etas.len() / 2];
+        let mut excess = 0.0_f32;
+        let rad = 8i32;
+        for idx in 0..n * n {
+            if !is_rut[idx] || self.water[idx] < 0.012 {
+                continue;
+            }
+            let i = idx % n;
+            let j = idx / n;
+            let mut near = false;
+            for dj in -rad..=rad {
+                for di in -rad..=rad {
+                    let ii = i as i32 + di;
+                    let jj = j as i32 + dj;
+                    if ii < 0 || jj < 0 || ii >= n as i32 || jj >= n as i32 {
+                        continue;
+                    }
+                    if floor[(jj as usize) * n + ii as usize] {
+                        near = true;
+                        break;
+                    }
+                }
+                if near {
+                    break;
+                }
+            }
+            if !near {
+                continue;
+            }
+            // The column is measured from the pressed ground. The original
+            // height is that ground plus the rut, and it is not the datum.
+            let limit = (eta - pressed[idx]).max(0.0);
+            if self.water[idx] > limit + 0.004 {
+                let drop = self.water[idx] - limit;
+                self.water[idx] = limit;
+                excess += drop * area;
+            }
+            let slurry_room = (eta - pressed[idx] - self.water[idx]).max(0.0);
+            if self.slurry[idx] > slurry_room + 0.004 {
+                self.slurry[idx] = slurry_room;
+            }
+        }
+        // Water the tires pushed up the bank. The free surface there is the
+        // same pond: a column that stands above it is poured back onto the floor.
+        // Leaving it makes one cell on the shore a wall of water.
+        for idx in 0..n * n {
+            if is_rut[idx] || pressed[idx] < 0.02 {
+                continue;
+            }
+            let limit = (eta - pressed[idx]).max(0.0);
+            if self.water[idx] > limit + 0.004 {
+                let drop = self.water[idx] - limit;
+                self.water[idx] = limit;
+                excess += drop * area;
+            }
+            let slurry_room = (eta - pressed[idx] - self.water[idx]).max(0.0);
+            if self.slurry[idx] > slurry_room + 0.004 {
+                self.slurry[idx] = slurry_room;
+            }
+        }
+        if excess > 1.0e-8 {
+            let mut room = 0.0_f32;
+            for idx in 0..n * n {
+                if floor[idx] {
+                    room += self.water[idx].max(0.0);
+                }
+            }
+            if room > 1.0e-6 {
+                for idx in 0..n * n {
+                    if floor[idx] && self.water[idx] > 0.0 {
+                        self.water[idx] += excess / area * (self.water[idx] / room);
+                    }
+                }
+            }
+        }
+        Some(eta)
+    }
+
     fn take_column(&mut self, x: f32, z: f32, volume: f32, water: bool) -> f32 {
         if volume <= 0.0 {
             return 0.0;
