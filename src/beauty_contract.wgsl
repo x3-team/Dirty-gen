@@ -534,3 +534,13 @@ fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(c.rgb / c.a, c.a);
 }
+
+// Solid ground (bed + placed), metres, from binding 1; the caller's height
+// outside the window. The water sheet stands on this, not on the drawn
+// terrain, which lifts a pad under the carcass.
+fn bc_ground(xz: vec2<f32>, fallback: f32) -> f32 {
+    if (!bc_has(BC_VALID_GROUND)) {
+        return fallback;
+    }
+    return mix(fallback, bc_bilinear(bc_ground_rut, xz).r, bc_inside(xz));
+}
