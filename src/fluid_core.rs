@@ -5983,14 +5983,9 @@ impl FluidCore {
                 if depth <= 1.0e-12 || !depth.is_finite() {
                     continue;
                 }
-                let (u, v) = film_uv(
-                    self.water[idx],
-                    self.slurry[idx],
-                    self.uw[idx],
-                    self.vw[idx],
-                    self.us[idx],
-                    self.vs[idx],
-                );
+                // The column is solids in the water. Clay in the same cell is a
+                // second sheet; blending its velocity would drag the plume.
+                let (u, v) = film_uv(self.water[idx], 0.0, self.uw[idx], self.vw[idx], 0.0, 0.0);
                 let ax = (u * dt / cell).abs().min(1.0);
                 let az = (v * dt / cell).abs().min(1.0);
                 let scale = if ax + az > 1.0 {
