@@ -58,6 +58,9 @@ struct Model {
 @group(1) @binding(8) var imprint_tex: texture_2d<f32>;
 // R: crust thickness / 0.04 m. G: crack opening / 0.02 m. Not a color.
 @group(1) @binding(9) var crust_tex: texture_2d<f32>;
+@group(1) @binding(10) var scene_color: texture_2d<f32>;
+@group(1) @binding(11) var scene_depth: texture_2d<f32>;
+@group(1) @binding(12) var scene_samp: sampler;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -840,7 +843,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let wet_amt = select(0.12, 0.32, muddy);
     albedo = mix(albedo, albedo * vec3<f32>(0.66, 0.58, 0.48), smoothstep(0.18, 0.92, wet) * wet_amt * (1.0 - pool_sheet));
     // Dark bed under the rim only — the sheet is the water pass, not a beige wet patch.
-    albedo = mix(albedo, albedo * vec3<f32>(0.14, 0.10, 0.07), pool_shore * 1.0);
+    albedo = mix(albedo, albedo * vec3<f32>(0.10, 0.07, 0.05), pool_shore * 1.0);
     albedo = mix(albedo, albedo * vec3<f32>(0.14, 0.11, 0.08), pool_fill * 0.35);
     if (kind == 9u) {
         albedo *= mix(1.0, 0.8, smoothstep(0.35, 0.9, darken));
@@ -1056,6 +1059,34 @@ fn water_surface_lift(column: f32) -> f32 {
 fn sky_reflect(dir: vec3<f32>) -> vec3<f32> {
     let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
     return mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, pow(t, 0.62));
+}
+
+fn scene_ssr(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
+    if (!puddle_beauty_on()) {
+        return vec3<f32>(0.0);
+    }
+    let refl = reflect(-view, nrm);
+    var p = world + nrm * 0.012;
+    var hit_uv = vec2<f32>(0.0);
+    var found = false;
+    for (var step: u32 = 0u; step < 6u; step = step + 1u) {
+        p = p + refl * 0.26;
+        let clip = frame.view_proj * vec4<f32>(p, 1.0);
+        if (clip.w <= 0.02) {
+            break;
+        }
+        var uv = clip.xy / clip.w;
+        uv = vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
+        if (uv.x > 0.012 && uv.x < 0.988 && uv.y > 0.012 && uv.y < 0.988) {
+            hit_uv = uv;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return sky_reflect(refl);
+    }
+    return textureSampleLevel(scene_color, scene_samp, hit_uv, 0.0).rgb;
 }
 
 fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
@@ -1336,8 +1367,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             let refl_dir = reflect(-view, nrm);
             let ibl = sky_reflect(refl_dir);
             let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 112.0);
+            let ssr = scene_ssr(in.world, nrm, view);
             let veh = niva_water_reflect(in.world, refl_dir);
-            let ibl_lit = ibl * 1.18 + frame.sun_color.rgb * sun_disk * 0.55 + veh * 0.92;
+            let ibl_lit = mix(
+                ibl * 1.18 + frame.sun_color.rgb * sun_disk * 0.55 + veh * 0.55,
+                ssr,
+                0.72,
+            );
             let rim = smoothstep(0.16, 0.012, column_here) * (1.0 - smoothstep(0.001, 0.008, column_here));
             col = mix(col, vec3<f32>(0.014, 0.010, 0.008), rim * 0.88);
             let shallow = 1.0 - smoothstep(0.008, 0.095, column_here);

@@ -78,6 +78,12 @@ pub struct Renderer {
     crust_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    scene_color: wgpu::Texture,
+    scene_color_view: wgpu::TextureView,
+    scene_depth: wgpu::Texture,
+    scene_depth_view: wgpu::TextureView,
+    scene_samp: wgpu::Sampler,
+    tex_bgl: wgpu::BindGroupLayout,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     #[allow(dead_code)]
@@ -147,6 +153,8 @@ pub struct Renderer {
     pub puddle_beauty: bool,
     /// Slurry drops and dust cards. Off for win-demo stills (water carries splash).
     pub show_mud_particles: bool,
+    /// Round slurry drops. Off when solver sheets carry the splash read.
+    pub show_mud_drops: bool,
     /// Paint the snow layer. Compaction in the darken channel tints the blanket.
     pub snow: bool,
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
@@ -354,6 +362,18 @@ impl Renderer {
                     },
                     count: None,
                 },
+                filter_tex(10, wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                filter_samp(12, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -601,60 +621,6 @@ impl Renderer {
             niva_nor,
             niva_mr,
         ];
-        let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tex-bg"),
-            layout: &tex_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &height_tex.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &mat_tex.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&ground_diff_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&ground_nor_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&ground_pack_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::Sampler(&ground_samp),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(
-                        &imprint_tex.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(
-                        &crust_tex.create_view(&Default::default()),
-                    ),
-                },
-            ],
-        });
         let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("paint-bg"),
             layout: &paint_bgl,
@@ -714,6 +680,32 @@ impl Renderer {
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
             make_targets(&device, width, height, formats.depth);
+        let (scene_color, scene_color_view, scene_depth, scene_depth_view) =
+            make_scene_targets(&device, width, height);
+        let scene_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene-samp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let tex_bg = build_tex_bg(
+            &device,
+            &tex_bgl,
+            &height_tex,
+            &mat_tex,
+            &nearest,
+            &shadow_view,
+            &ground_diff_view,
+            &ground_nor_view,
+            &ground_pack_view,
+            &ground_samp,
+            &imprint_tex,
+            &crust_tex,
+            &scene_color_view,
+            &scene_depth_view,
+            &scene_samp,
+        );
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
             layout: &blit_bgl,
@@ -1079,6 +1071,12 @@ impl Renderer {
             crust_tex,
             color,
             color_view,
+            scene_color,
+            scene_color_view,
+            scene_depth,
+            scene_depth_view,
+            scene_samp,
+            tex_bgl,
             depth,
             depth_view,
             shadow,
@@ -1136,6 +1134,7 @@ impl Renderer {
             water_column: false,
             puddle_beauty: false,
             show_mud_particles: true,
+            show_mud_drops: true,
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
@@ -1343,7 +1342,11 @@ impl Renderer {
         self.write_bike_models(&world.bike);
 
         let (chunk_count, dust_count) = if self.show_mud_particles {
-            let chunks = mud_chunks_with_ground(&world.particles.items, Some(&world.soil));
+            let chunks = mud_chunks_with_ground(
+                &world.particles.items,
+                Some(&world.soil),
+                self.show_mud_drops,
+            );
             let chunk_count = chunks.indices.len() as u32;
             if chunk_count > 0 {
                 self.queue.write_buffer(
@@ -1422,6 +1425,7 @@ impl Renderer {
             }
         }
 
+        let water_ssr = self.puddle_beauty;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -1448,7 +1452,6 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_sky);
             pass.draw(0..3, 0..1);
 
-            // Floor outside the heightfield, under the terrain so the rim stays the field.
             pass.set_bind_group(1, &self.tex_bg, &[]);
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -1479,22 +1482,81 @@ impl Renderer {
                 draw_indexed(&mut pass, &self.props);
             }
 
+            if !water_ssr {
+                pass.set_pipeline(&self.pipe_water);
+                draw_indexed(&mut pass, &self.terrain);
+                pass.set_pipeline(&self.pipe_mesh_double);
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                if chunk_count > 0 {
+                    self.draw_chunks(&mut pass, chunk_count);
+                }
+                pass.set_pipeline(&self.pipe_dust);
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                if dust_count > 0 {
+                    self.draw_dust(&mut pass, dust_count);
+                }
+                pass.set_pipeline(&self.pipe_mesh_blend);
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                self.draw_glass(&mut pass);
+            }
+        }
+        if water_ssr {
+            let extent = wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            };
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.scene_color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent,
+            );
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main-water"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
-
-            // Sheets are thin. Back-face cull hides the side the camera sees.
             pass.set_pipeline(&self.pipe_mesh_double);
             pass.set_bind_group(3, &self.paint_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if chunk_count > 0 {
                 self.draw_chunks(&mut pass, chunk_count);
             }
-
             pass.set_pipeline(&self.pipe_dust);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             if dust_count > 0 {
                 self.draw_dust(&mut pass, dust_count);
             }
-
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
@@ -2345,7 +2407,7 @@ fn make_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&Default::default());
@@ -2358,6 +2420,132 @@ fn make_targets(
         mapped_at_creation: false,
     });
     (color, color_view, depth, depth_view, readback, padded_row)
+}
+
+fn make_scene_targets(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let scene_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-color"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let scene_color_view = scene_color.create_view(&Default::default());
+    let scene_depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let scene_depth_view = scene_depth.create_view(&Default::default());
+    (scene_color, scene_color_view, scene_depth, scene_depth_view)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tex_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    height_tex: &wgpu::Texture,
+    mat_tex: &wgpu::Texture,
+    nearest: &wgpu::Sampler,
+    shadow_view: &wgpu::TextureView,
+    ground_diff_view: &wgpu::TextureView,
+    ground_nor_view: &wgpu::TextureView,
+    ground_pack_view: &wgpu::TextureView,
+    ground_samp: &wgpu::Sampler,
+    imprint_tex: &wgpu::Texture,
+    crust_tex: &wgpu::Texture,
+    scene_color_view: &wgpu::TextureView,
+    scene_depth_view: &wgpu::TextureView,
+    scene_samp: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tex-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &height_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(
+                    &mat_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(nearest),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(ground_diff_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(ground_nor_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(ground_pack_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(ground_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(
+                    &imprint_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(
+                    &crust_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(scene_color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(scene_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::Sampler(scene_samp),
+            },
+        ],
+    })
 }
 
 fn uniform_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {

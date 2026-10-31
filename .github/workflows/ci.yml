@@ -48,3 +48,28 @@ jobs:
           export CXX=g++ CC=gcc
           unset DISPLAY
           cargo test --release --test e2e_niva --test frame_bench -- --nocapture
+
+  win-demo-zip:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: Build release
+        run: cargo build --release
+      - name: Smoke launch
+        shell: pwsh
+        run: |
+          .\target\release\silt.exe --win-demo-smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item target\release\silt.exe pkg\
+          Compress-Archive -Path pkg\* -DestinationPath silt-win-demo.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silt-win-demo
+          path: silt-win-demo.zip

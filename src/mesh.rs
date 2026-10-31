@@ -1779,13 +1779,14 @@ mod slurry_shapes {
 /// smaller lumps. Ledger soil is not in this mesh once it has landed: that
 /// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
-    mud_chunks_with_ground(items, None)
+    mud_chunks_with_ground(items, None, true)
 }
 
 /// Same chunks, with picture ribbons laid on the heightfield instead of a flat y.
 pub fn mud_chunks_with_ground(
     items: &[silt::particles::Particle],
     ground: Option<&silt::soil::SoilField>,
+    include_drops: bool,
 ) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
@@ -1807,7 +1808,7 @@ pub fn mud_chunks_with_ground(
                 continue;
             }
             if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 || p.kind == 9 {
-                if mesh.vertices.len() + 200 < MAX_VERTS {
+                if include_drops && mesh.vertices.len() + 200 < MAX_VERTS {
                     add_mud_drop(&mut mesh, p);
                 }
                 continue;

@@ -7,10 +7,6 @@ on:
         description: Branch or tag to build
         required: false
         default: main
-  push:
-    branches:
-      - cursor/win-niva-demo-f4f9
-
 permissions:
   contents: write
 
