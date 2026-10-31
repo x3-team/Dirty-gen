@@ -136,9 +136,9 @@ Valid: `VALID_AIR` when `dust_source` is 1 or 2, the same publishes as `dust_fog
 
 Crust thickness and crack opening, both metres. Opening is the gap in the crust, not a second height and not a colour.
 
-Writer: the soil crust state. This sheet has no thickness or opening arrays, so both channels are 0 and `VALID_CRUST` is still set. A dry-crust soil kind is not a stand-in for either channel. When those arrays exist, the same binding carries them in metres. That fill does not bump the version.
+Writer: the soil `crust` and `crack` arrays, copied at the texel centre. R is thickness. G is opening. They are separate fields from the dry spell: opening is not a copy of thickness, and neither channel is added to ground height. Off the soil square both channels are 0, because the fluid sheet has no thickness or opening arrays of its own and does not replace the soil sample. A dry-crust soil kind is not a stand-in for either channel. Cells that have not dried stay 0. This fill does not bump the version.
 
-Valid: every publish, including the zeros.
+Valid: every publish. A zero cell is a valid sample of ground that has no skin.
 
 ### Wet / dry edge — binding 8
 
@@ -265,3 +265,5 @@ The wet tire track does not bump this version either. Binding 2, pore moisture, 
 The rut's water surface does not bump this version either. Binding 1 R stays the pressed ground, bed plus placed. Binding 3 R is the water column on that ground. A rut connected to the puddle is filled up to the puddle surface and no higher. The original height is not the datum. Same channels, same units, same resolution.
 
 Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is set where the sheet is a wave or a tire footprint, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.
+
+Filling binding 7 from the soil drying arrays does not bump this version. R is crust thickness in metres. G is crack opening in metres. The dry spell writes those arrays on clay. The bed, the placed pile, and the cloud stay put, so the skin is not extra solid mass and a fissure is not a cut. Sand and silt stay at 0. A dry-crust kind with empty arrays stays at 0. Same channels, same units, same resolution.
