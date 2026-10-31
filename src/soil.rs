@@ -7496,6 +7496,7 @@ impl SoilField {
             }
         }
         field.win_demo_seam_pan();
+        field.win_demo_left_view_lip();
         field.rebuild_height();
         field
     }
@@ -7523,13 +7524,18 @@ impl SoilField {
                 let dz = (z - sz) / srz;
                 let r = (dx * dx + dz * dz).sqrt();
                 let idx = j * res + i;
-                let edge = ux.max(uz);
-                let flat_w = (1.0 - edge).max(0.0);
-                let flat_w = flat_w * flat_w * (3.0 - 2.0 * flat_w);
-                self.bed[idx] = bed;
                 self.placed[idx] = 0.0;
                 self.loose[idx] = 0.0;
-                self.initial_height[idx] = bed;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                let in_core = r <= 1.08;
+                if in_core {
+                    self.bed[idx] = bed;
+                    self.initial_height[idx] = bed;
+                }
                 let seam_water = if r <= 1.0 {
                     let core = (1.0 - r).max(0.0);
                     0.045 + core * 0.155
@@ -7537,16 +7543,53 @@ impl SoilField {
                     0.0
                 };
                 if seam_water > 0.0 {
-                    self.water[idx] = self.water[idx].max(seam_water);
+                    self.water[idx] = seam_water.max(self.water[idx]);
                 }
                 let film = 0.0015 + seam_water * 0.006;
-                self.slurry[idx] = lerp(self.slurry[idx], film, flat_w);
+                if in_core {
+                    self.slurry[idx] = film;
+                } else {
+                    self.slurry[idx] = self.slurry[idx].min(self.slurry[idx].max(film));
+                }
                 if seam_water > 0.02 {
                     self.kind[idx] = SurfaceKind::WetMud as u8;
                     self.wetness[idx] = 1.0;
                     self.darken[idx] = self.darken[idx].max(0.24);
                     self.roughness[idx] = self.roughness[idx].min(0.08);
                 }
+                self.sync(idx);
+            }
+        }
+    }
+
+    /// Sand–mud lip and berm left of the hero pool in the side camera. Does not
+    /// touch the far playground puddles at −2.35.
+    pub fn win_demo_left_view_lip(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if x > 0.48 || x < -1.82 || z < -1.08 || z > 1.52 {
+                    continue;
+                }
+                let idx = j * res + i;
+                self.placed[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                let blend = smooth01(0.42, -2.05, x);
+                if blend < 0.04 {
+                    continue;
+                }
+                let target = 0.22_f32;
+                self.bed[idx] = lerp(self.bed[idx], target, blend * 0.94);
+                self.slurry[idx] = self.slurry[idx].min(0.0035);
+                self.initial_height[idx] = self.bed[idx];
                 self.sync(idx);
             }
         }
