@@ -1847,6 +1847,20 @@ fn sand_variety(xz: vec2<f32>, albedo_in: vec3<f32>, n_in: vec3<f32>, rough_in: 
         let cg = bw_vnoise2d(cq) * 0.65 + bw_vnoise2d(cq * 2.7 + vec2<f32>(3.0, 1.0)) * 0.35;
         albedo *= 1.0 + (cg - 0.5) * 0.22 * cfade;
     }
+    // Coarse ripples, 25-40 cm, that still read across the pool.
+    let cr_fade = 1.0 - smoothstep(0.05, 0.25, fw);
+    if (cr_fade > 0.0) {
+        let cdir = normalize(vec2<f32>(0.75, 0.66));
+        let cwarp = noise(xz * 0.9) * 6.0 + noise(xz * 2.7) * 2.0;
+        let cph = dot(xz, cdir) * mix(16.0, 25.0, noise(xz * 0.3 + vec2<f32>(2.0, 5.0))) + cwarp;
+        let cpatch = smoothstep(0.3, 0.7, noise(xz * 0.45 + vec2<f32>(-7.0, 3.0)));
+        n = normalize(n + vec3<f32>(cdir.x, 0.0, cdir.y) * cos(cph) * 0.3 * cpatch * cr_fade);
+        albedo *= 1.0 - 0.06 * smoothstep(0.4, 1.0, sin(cph)) * cpatch * cr_fade;
+    }
+    // Speckle that holds at distance: dark and light grains in a fine net.
+    let sp_fade = 1.0 - smoothstep(0.02, 0.15, fw);
+    let sp = hash12(floor(xz * 45.0)) * 0.6 + hash12(floor(xz * 23.0) + vec2<f32>(7.0, 1.0)) * 0.4;
+    albedo *= 1.0 + (sp - 0.5) * 0.16 * sp_fade;
     // Mottling and pocks that hold at distance: the far field is not a flat card.
     let pq = xz * 9.0;
     let pm = noise(pq) * 0.5 + noise(pq * 2.3 + vec2<f32>(4.0, 7.0)) * 0.3 + noise(pq * 5.1) * 0.2;
@@ -2152,7 +2166,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // with depth, so by 5-10 cm the column is murky.
     var collar_t = 0.0;
     for (var i: i32 = 0; i < 4; i = i + 1) {
-        collar_t = max(collar_t, 1.0 - smoothstep(0.42, 0.8, length(xz - frame.tires[i * 2].xz)));
+        collar_t = max(collar_t, 1.0 - smoothstep(0.4, 0.55, length(xz - frame.tires[i * 2].xz)));
     }
     // Round a tire the stirred silt hides the rubber within a few cm.
     let sigma = mix(vec3<f32>(13.0, 17.0, 23.0) * mix(0.25, 1.25, smoothstep(0.008, 0.07, depth)) * mix(1.0, 4.0, near_tire),
@@ -2178,9 +2192,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let clear_sc = mix(vec3<f32>(0.27, 0.22, 0.15), vec3<f32>(0.24, 0.18, 0.11), smoothstep(0.01, 0.08, depth));
     // Shallow water shows the sand's own warmth; deep water the teal.
     silt = mix(mix(bed * vec3<f32>(0.5, 0.42, 0.3), clear_sc, smoothstep(0.015, 0.1, depth)), silt, 0.2);
-    silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), max(slurry_frac, max(stir * 0.7, collar_t * 0.6)));
+    silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), max(slurry_frac, max(stir * 0.35, collar_t * 0.35)));
     // The middle of the pool is deeper and murkier than the clear rim.
-    silt = mix(silt, vec3<f32>(0.15, 0.13, 0.1), deep_t * 0.7) * mix(1.0, 0.7, deep_t);
+    // Deeper reads murkier and greyer, not black: a dark centre was taken
+    // for the car's shadow.
+    silt = mix(silt, vec3<f32>(0.2, 0.17, 0.13), deep_t * 0.6) * mix(1.0, 0.88, deep_t);
     let ndl = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
     // Silt in the shade still glows with sky light scattered sideways in the
     // column: the car's shadow on turbid water is softer than on dry sand.
@@ -2199,7 +2215,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Near the lens the sheet is looked into, not along: the bed shows and
     // the sky mirror fades. The muddy collar at a tire is matte.
     let cam_d = length(in.world - frame.cam_pos.xyz);
-    let fres = min(0.02 * w_ab.x + w_ab.y, 0.45) * mix(0.12, 1.0, smoothstep(2.5, 8.0, cam_d)) * (1.0 - 0.6 * collar_t)
+    // Far end of the pool, seen at a grazing angle, mirrors sky and car
+    // like the sea's edge; the near shallows are looked into.
+    let far_k = smoothstep(2.5, 6.5, cam_d);
+    let fres = min(0.02 * w_ab.x + w_ab.y, mix(0.3, 0.75, far_k)) * mix(0.12, 1.0, far_k) * (1.0 - 0.6 * collar_t)
         * mix(0.35, 1.0, smoothstep(0.006, 0.04, depth));
     let refl_dir = reflect(-view, nrm);
     // The sky the water mirrors is the sky drawn behind it, at full radiance.
@@ -2213,7 +2232,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // The sun sits in the HDRI too; its blurred lobe smeared a silver sheet
     // over the backlit pool. The sun's own glint is drawn below as a sharp
     // GGX term, so clamp the env lobe to the bright sky round it.
-    refl = refl * min(1.0, 0.55 / max(dot(refl, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-4));
+    refl = refl * min(1.0, mix(0.55, 0.95, smoothstep(2.5, 6.5, length(in.world - frame.cam_pos.xyz))) / max(dot(refl, vec3<f32>(0.2126, 0.7152, 0.0722)), 1e-4));
     // A rut is a trench: a grazing reflection meets the bank before the sky.
     // March the heightfield a short way along the ray and show the soil it hits.
     var p = in.world + refl_dir * 0.04;
@@ -2330,7 +2349,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // millimetres wide that catches the sky as a thin bright line.
     // Only on the edge line itself: over a broad shallow rim the thin-film
     // band covered whole metres and lit them up as white streaks.
-    let meniscus = edge_line * smoothstep(0.0015, 0.003, depth) * (1.0 - smoothstep(0.003, 0.006, depth));
+    let meniscus = min(edge_line * 1.6, 1.0) * smoothstep(0.0015, 0.003, depth) * (1.0 - smoothstep(0.003, 0.006, depth));
     lit = lit * (1.0 + meniscus * 0.6);
     alpha = max(max(alpha, meniscus * 0.6) * smoothstep(0.0012, 0.003, depth), foam * 0.85 * smoothstep(0.0012, 0.003, depth));
     lit = atmosphere(in.world, lit);
@@ -2345,7 +2364,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let ssr_a = (s0.a + s1.a + s2.a) / 3.0;
     let ssr = vec4<f32>((s0.rgb * s0.a + s1.rgb * s1.a + s2.rgb * s2.a) / max(s0.a + s1.a + s2.a, 1e-4), ssr_a);
     if (ssr.a > 0.0) {
-        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth) * mix(0.05, 0.1, smoothstep(0.01, 0.08, depth)) * (1.0 - 0.4 * near_tire);
+        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth) * mix(0.05, 0.1, smoothstep(0.01, 0.08, depth)) * (1.0 - 0.4 * near_tire)
+            * mix(1.0, 6.0, far_k);
         out_rgb = mix(out_rgb, ssr.rgb * 0.92, clamp(k / max(alpha, 0.05), 0.0, 1.0));
         alpha = max(alpha, k);
     }
