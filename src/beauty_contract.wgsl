@@ -544,3 +544,42 @@ fn bc_ground(xz: vec2<f32>, fallback: f32) -> f32 {
     }
     return mix(fallback, bc_bilinear(bc_ground_rut, xz).r, bc_inside(xz));
 }
+
+// The 0.20 m cells low-passed with a 3 x 3 binomial at one cell: the picture
+// reads the same maps, but a cut or a ponded cell no longer prints as a
+// rectangle with straight walls.
+fn bc_film_soft(xz: vec2<f32>) -> vec2<f32> {
+    let e = max(bc_header.cell_m, 0.05) * 1.6;
+    var acc = vec2<f32>(0.0);
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            let w = (2.0 - abs(f32(i))) * (2.0 - abs(f32(j)));
+            acc += bc_film(xz + vec2<f32>(f32(i), f32(j)) * e) * w;
+        }
+    }
+    return acc / 16.0;
+}
+
+fn bc_ground_soft(xz: vec2<f32>, fallback: f32) -> f32 {
+    let e = max(bc_header.cell_m, 0.05);
+    var acc = 0.0;
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            let w = (2.0 - abs(f32(i))) * (2.0 - abs(f32(j)));
+            acc += bc_ground(xz + vec2<f32>(f32(i), f32(j)) * e, fallback) * w;
+        }
+    }
+    return acc / 16.0;
+}
+
+fn bc_rut_soft(xz: vec2<f32>) -> vec2<f32> {
+    let e = max(bc_header.cell_m, 0.05);
+    var acc = vec2<f32>(0.0);
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            let w = (2.0 - abs(f32(i))) * (2.0 - abs(f32(j)));
+            acc += bc_rut(xz + vec2<f32>(f32(i), f32(j)) * e) * w;
+        }
+    }
+    return acc / 16.0;
+}
