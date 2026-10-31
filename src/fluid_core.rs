@@ -5798,10 +5798,6 @@ impl FluidCore {
             plane.fit(n);
             for layer in 0..AIR_LAYERS {
                 let start = layer * n;
-                let h = &self.dust[start..start + n];
-                if h.iter().all(|&c| c <= 1.0e-8) {
-                    continue;
-                }
                 let h = &mut self.dust[start..start + n];
                 let u = &mut self.dust_u[start..start + n];
                 let v = &mut self.dust_v[start..start + n];
