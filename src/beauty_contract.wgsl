@@ -85,8 +85,11 @@ fn bc_load(tex: texture_2d<f32>, ij: vec2<i32>) -> vec4<f32> {
 // comparison, so it never passes the range test. The fluid sheet publishes
 // NaN velocity and crest in some dry cells (contract v1), and one NaN tap
 // would blank the whole blend.
+// WGSL lets a compiler assume floats are finite, so the NaN/Inf test is on
+// the exponent bits, which no optimiser can fold away.
 fn bc_finite(v: vec4<f32>) -> vec4<f32> {
-    let ok = abs(v) < vec4<f32>(1.0e4);
+    let e = bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u);
+    let ok = (e != vec4<u32>(0x7f800000u)) & (abs(v) < vec4<f32>(1.0e4));
     return select(vec4<f32>(0.0), v, ok);
 }
 
