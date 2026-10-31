@@ -5310,11 +5310,49 @@ fn soil_index(soil: &SoilField, x: f32, z: f32) -> Option<usize> {
     }
 }
 
+fn soil_index_axis(soil: &SoilField, p: f32) -> Option<usize> {
+    let half = soil.size * 0.5;
+    if p < -half || p >= half {
+        return None;
+    }
+    let i = ((p + half) / soil.cell).floor();
+    if i < 0.0 {
+        return None;
+    }
+    let i = i as usize;
+    if i >= soil.res {
+        None
+    } else {
+        Some(i)
+    }
+}
+
+fn coarse_soil_axes(
+    fluid: &FluidCore,
+    soil: &SoilField,
+) -> ([Option<usize>; WINDOW_RES], [Option<usize>; WINDOW_RES]) {
+    let (x0, z0, _) = fluid.window_bounds();
+    let mut col = [None; WINDOW_RES];
+    let mut row = [None; WINDOW_RES];
+    for i in 0..WINDOW_RES {
+        let x = x0 + (i as f32 + 0.5) * COARSE_CELL_M;
+        col[i] = soil_index_axis(soil, x);
+    }
+    for j in 0..WINDOW_RES {
+        let z = z0 + (j as f32 + 0.5) * COARSE_CELL_M;
+        row[j] = soil_index_axis(soil, z);
+    }
+    (col, row)
+}
+
 fn pull_substrate(fluid: &mut FluidCore, soil: &SoilField) {
-    fluid.read_substrate(|x, z| {
-        let Some(idx) = soil.idx_at(x, z) else {
+    let (col, row) = coarse_soil_axes(fluid, soil);
+    let res = soil.res;
+    fluid.read_substrate_grid(|i, j, _x, _z| {
+        let (Some(si), Some(sj)) = (col[i], row[j]) else {
             return (0.0, 0.35, Grain::Other);
         };
+        let idx = sj * res + si;
         // Pressed ground is the bed plus the berm. `height` still carries
         // slurry, and `initial_height` is the surface before the tire. The
         // water column is measured from this ground, not from either of those.
@@ -5343,10 +5381,13 @@ fn seat_rut_sheet(fluid: &mut FluidCore, soil: &SoilField) {
     if fluid.coarse_sheet_is_dry() && !window_has_rut(fluid, soil) {
         return;
     }
-    fluid.seat_rut_water(|x, z| {
-        let Some(idx) = soil.idx_at(x, z) else {
+    let (col, row) = coarse_soil_axes(fluid, soil);
+    let res = soil.res;
+    fluid.seat_rut_water(|i, j, _x, _z| {
+        let (Some(si), Some(sj)) = (col[i], row[j]) else {
             return (0.0, false);
         };
+        let idx = sj * res + si;
         let pressed = soil.bed[idx] + soil.placed[idx];
         let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
         (pressed, rut > 0.012)
@@ -5375,6 +5416,60 @@ fn window_has_rut(fluid: &FluidCore, soil: &SoilField) -> bool {
 fn mirror_fluid(fluid: &FluidCore, soil: &mut SoilField) {
     let (x0, z0, extent) = fluid.window_bounds();
     let half = soil.size * 0.5;
+    // The packed sheet is the coarse grid. One floor per soil row and column
+    // is the same index `film_depth` would compute, without a division per cell.
+    if !fluid.fine_active() && soil.res <= 256 {
+        let mut in_i = [false; 256];
+        let mut in_j = [false; 256];
+        let mut ci = [0u16; 256];
+        let mut cj = [0u16; 256];
+        let mut ci_ok = [false; 256];
+        let mut cj_ok = [false; 256];
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            if x < x0 || x >= x0 + extent {
+                continue;
+            }
+            in_i[i] = true;
+            if let Some(c) = fluid.coarse_i_of(x) {
+                ci[i] = c as u16;
+                ci_ok[i] = true;
+            }
+        }
+        for j in 0..soil.res {
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            if z < z0 || z >= z0 + extent {
+                continue;
+            }
+            in_j[j] = true;
+            if let Some(c) = fluid.coarse_j_of(z) {
+                cj[j] = c as u16;
+                cj_ok[j] = true;
+            }
+        }
+        for j in 0..soil.res {
+            if !in_j[j] {
+                continue;
+            }
+            for i in 0..soil.res {
+                if !in_i[i] {
+                    continue;
+                }
+                let idx = j * soil.res + i;
+                let (water_m, slurry_m) = if ci_ok[i] && cj_ok[j] {
+                    fluid.coarse_depth(ci[i] as usize, cj[j] as usize)
+                } else {
+                    let x = (i as f32 + 0.5) * soil.cell - half;
+                    let z = (j as f32 + 0.5) * soil.cell - half;
+                    fluid.film_depth(x, z)
+                };
+                soil.water[idx] = water_m;
+                soil.slurry[idx] = slurry_m;
+                soil.height[idx] = soil.bed[idx] + soil.placed[idx] + slurry_m;
+            }
+        }
+        return;
+    }
     for j in 0..soil.res {
         for i in 0..soil.res {
             let x = (i as f32 + 0.5) * soil.cell - half;
@@ -5383,10 +5478,10 @@ fn mirror_fluid(fluid: &FluidCore, soil: &mut SoilField) {
                 continue;
             }
             let idx = j * soil.res + i;
-            let sample = fluid.sample(x, z);
-            soil.water[idx] = sample.water_m;
-            soil.slurry[idx] = sample.slurry_m;
-            soil.height[idx] = soil.bed[idx] + soil.placed[idx] + sample.slurry_m;
+            let (water_m, slurry_m) = fluid.film_depth(x, z);
+            soil.water[idx] = water_m;
+            soil.slurry[idx] = slurry_m;
+            soil.height[idx] = soil.bed[idx] + soil.placed[idx] + slurry_m;
         }
     }
 }
