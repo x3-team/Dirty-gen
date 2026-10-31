@@ -564,13 +564,16 @@ fn bc_ground_soft(xz: vec2<f32>, fallback: f32) -> f32 {
 }
 
 fn bc_rut_soft(xz: vec2<f32>) -> vec2<f32> {
-    let e = max(bc_header.cell_m, 0.05);
+    // 5 x 5 binomial (1 4 6 4 1) over 0.75-cell steps of bilinear taps: about
+    // a 1.5-cell Gaussian, so the 0.20 m cells of G/A no longer step.
+    let e = max(bc_header.cell_m, 0.05) * 0.75;
     var acc = vec2<f32>(0.0);
-    for (var j: i32 = -1; j <= 1; j = j + 1) {
-        for (var i: i32 = -1; i <= 1; i = i + 1) {
-            let w = (2.0 - abs(f32(i))) * (2.0 - abs(f32(j)));
-            acc += bc_rut(xz + vec2<f32>(f32(i), f32(j)) * e) * w;
+    for (var j: i32 = -2; j <= 2; j = j + 1) {
+        for (var i: i32 = -2; i <= 2; i = i + 1) {
+            let wi = select(select(1.0, 4.0, abs(i) == 1), 6.0, i == 0);
+            let wj = select(select(1.0, 4.0, abs(j) == 1), 6.0, j == 0);
+            acc += bc_rut(xz + vec2<f32>(f32(i), f32(j)) * e) * (wi * wj);
         }
     }
-    return acc / 16.0;
+    return acc / 256.0;
 }
