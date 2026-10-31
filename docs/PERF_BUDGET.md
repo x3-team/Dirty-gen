@@ -67,3 +67,11 @@ Base is `main` at 5eee5fa (merge of #97), not the #97 branch. Intel(R) Xeon(R) P
 The open 2 cm sheet takes one CFL pass and lets flat, slow tiles sleep. It skips the small divergence projection; a wall, the coarse sheet, and gravity keep that projection. Confinement on that open sheet is the same snapshot Jacobi the row workers run, on the calling thread, with the vorticity stored once per cell. Open wind does not build the pressure field the wind force never reads. The halved dust volume steps one layer per worker; each layer starts from a zero scratch, and the ground-sheet scratch is restored when the step returns. The body in the e2e and the creek stays on the forward Gauss–Seidel sweep. A Jacobi sweep there moved standing slurry to 0.0503 m, outside 0.0536 ± 0.003, and it is not restored.
 
 Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger gap 0.000492 m³. Step mean 16.509 ms (budget 33.004), p95 31.104 ms, air 0.235 ms (budget 1.5). Drive p95 8.104 ms. Solver frame 2.505 ms (budget 7). A second timing of the same 96 steps read solver sum 5.695 ms.
+
+## Fog on the shared air grid
+
+Base is `main` at 396af7e. Intel(R) Xeon(R) Processor, 4 cores. Caps are unchanged: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, e2e step mean ≤ 33.004 ms, air ≤ 1.5 ms. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer.
+
+Release `e2e_niva` on this machine: step mean 14.041 ms, p95 28.049 ms, air 0.247 ms. `ThroughDrive::step` at dt = 1/30, 96 steps after warmup: water 0.823, slurry 0.541, soil 0.974, air 0.296, dust 1.034, restrict_fine 0.206, window 0.360, prep 0.209, sheet rest 0.301, solver sum 4.745 ms. Drive mean 5.010 ms, drive p95 6.117 ms. Solver frame 2.438 ms.
+
+Release `fog_air`, Niva, dt = 1/60, 78 timed steps with water lofted into fog: step mean 0.976 ms, step max 1.688 ms. An earlier pass of the same binary read 1.015 ms mean and 2.156 ms max. That mean is the fog step, and it stays under the 7 ms solver-frame cap. The fluid-sheet fog case closed the water ledger to 8.55e-6 m³.

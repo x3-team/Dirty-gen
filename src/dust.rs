@@ -5,7 +5,9 @@
 //! the shared upwind flux, pressure filter, and vorticity confinement.
 //! The same grid carries air velocity. `step_vehicle_air` injects the Niva
 //! body and wheels, confines the wake, and `advect_density_by_air` moves
-//! dust on that residual. There is no second dust solver and no second ledger.
+//! dust on that residual. Fog is a second scalar on this grid. It is advected
+//! by `advect_dust_density` and by that same air velocity. There is no second
+//! dust solver, no second air grid, and no second ledger.
 
 use std::collections::HashMap;
 
@@ -25,6 +27,7 @@ pub const SLOW_STRIDE: u32 = 6;
 pub const DUST_OFFER_K: f32 = 1.4e-3;
 /// Fall speed applied on the slow stride, metres per second.
 pub const SETTLE_M_S: f32 = 0.24;
+pub use crate::fluid_core::{fog_may_lift, FogInject, FOG_MIN_WATER_M, FOG_SETTLE_M_S};
 /// Dust frame budget, milliseconds. Offer, advection, settle, and texture publish.
 pub const FRAME_BUDGET_MS: f32 = 1.5;
 
@@ -273,6 +276,14 @@ pub struct Dust {
     row_hi: Vec<u32>,
     /// Settled dust on the ground, 0.5 m cells, world metres. Not a second sheet.
     settled_cells: HashMap<(i32, i32), f64>,
+    /// Fog cubic metres. Same index as `vol`. Not dust, and not a second velocity.
+    fog: Vec<f32>,
+    fog_emitted: f64,
+    fog_air: f64,
+    fog_settled: f64,
+    fog_occupied: Vec<u32>,
+    /// Fog that fell back out of the air, 0.5 m cells. The caller owns the water.
+    fog_settled_cells: HashMap<(i32, i32), f64>,
 }
 
 impl Dust {
@@ -316,6 +327,12 @@ impl Dust {
             row_lo: vec![1; AIR_RES as usize],
             row_hi: vec![0; AIR_RES as usize],
             settled_cells: HashMap::new(),
+            fog: vec![0.0; n],
+            fog_emitted: 0.0,
+            fog_air: 0.0,
+            fog_settled: 0.0,
+            fog_occupied: Vec::new(),
+            fog_settled_cells: HashMap::new(),
         }
     }
 
@@ -623,6 +640,45 @@ impl Dust {
         &self.vel
     }
 
+    /// Airborne fog, cubic metres, same index as the dust volume.
+    pub fn fog_volume(&self) -> &[f32] {
+        &self.fog
+    }
+
+    pub fn fog_emitted_m3(&self) -> f32 {
+        self.fog_emitted as f32
+    }
+
+    pub fn fog_air_m3(&self) -> f32 {
+        self.fog_air as f32
+    }
+
+    pub fn fog_settled_m3(&self) -> f32 {
+        self.fog_settled as f32
+    }
+
+    /// Settled fog, cubic metres, on 0.5 m ground cells. Does not move mass.
+    pub fn fog_settled_cells(&self) -> &HashMap<(i32, i32), f64> {
+        &self.fog_settled_cells
+    }
+
+    /// Pack fog as a volume fraction, cubic metres of water per cubic metre of air.
+    /// Same index and cell as `publish` of the dust volume. A is not used.
+    pub fn write_fog(&self, dst: &mut [f32]) {
+        let n = self.fog.len();
+        if dst.len() < n {
+            return;
+        }
+        let inv = 1.0 / CELL_VOL_M3;
+        for i in 0..n {
+            let v = self.fog[i] * inv;
+            dst[i] = if v.is_finite() { v } else { 0.0 };
+        }
+        for v in dst.iter_mut().skip(n) {
+            *v = 0.0;
+        }
+    }
+
     /// Pack world velocity into rgba: R +X, G +Y, B +Z, A 0. Metres per second.
     pub fn write_air_velocity(&self, dst: &mut [f32]) {
         let n = self.vol.len();
@@ -718,6 +774,9 @@ impl Dust {
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
         self.solve_air(dt);
+        if self.fog_air > 1.0e-12 {
+            self.transport_fog(dt);
+        }
         self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
@@ -725,6 +784,9 @@ impl Dust {
             let elapsed = self.settle_dt;
             self.settle_dt = 0.0;
             self.settle_bottom(elapsed);
+            if self.fog_air > 1.0e-12 {
+                self.settle_fog(elapsed);
+            }
         }
     }
 
@@ -939,6 +1001,239 @@ impl Dust {
         }
     }
 
+    /// Same wind step and the same wake residual as dust. No second velocity solve.
+    fn transport_fog(&mut self, dt: f32) {
+        if dt <= 0.0 || self.fog_air <= 1.0e-12 {
+            return;
+        }
+        let _outflow = crate::fluid_core::advect_dust_density(
+            &mut self.fog,
+            self.wind_x,
+            self.wind_z,
+            self.speed,
+            self.forward,
+            self.right,
+            dt,
+        );
+        self.shed_fog_face(dt);
+        self.rebuild_fog_columns();
+        let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
+        if !self.fog_occupied.is_empty() && self.frame % stride == 0 {
+            let n = self.fog.len();
+            let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
+            let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
+            let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
+            let (drive, solids) = crate::fluid_core::niva_air(
+                [self.chassis_x, CHASSIS_Y, self.chassis_z],
+                [self.forward.x, self.forward.y, self.forward.z],
+                [self.right.x, self.right.y, self.right.z],
+                self.speed,
+                self.wheel_slip,
+                self.wind_x,
+                self.wind_z,
+            );
+            let _gap = crate::fluid_core::advect_density_by_air(
+                &mut self.fog,
+                &mut self.vel_scratch[..n],
+                &self.vel,
+                origin,
+                cell,
+                res,
+                &drive,
+                &solids,
+                dt * stride as f32,
+                &self.fog_occupied,
+            );
+            self.rebuild_fog_columns();
+        }
+        self.sync_fog_air();
+    }
+
+    fn shed_fog_face(&mut self, dt: f32) {
+        let forward = if self.forward.length_squared() > 1.0e-8 {
+            self.forward.normalize()
+        } else {
+            Vec3::Z
+        };
+        let right = if self.right.length_squared() > 1.0e-8 {
+            self.right.normalize()
+        } else {
+            Vec3::X
+        };
+        let rel = Vec3::new(self.wind_x, 0.0, self.wind_z) - forward * self.speed.max(0.0);
+        let gu = rel.dot(right);
+        let gv = rel.dot(forward);
+        let depth_x = gu.abs() * dt / AIR_DX_M;
+        if gu > 0.0 {
+            self.shed_fog_rows(depth_x, true, false);
+        } else if gu < 0.0 {
+            self.shed_fog_rows(depth_x, false, false);
+        }
+        if gv.abs() <= 1.0e-8 {
+            return;
+        }
+        let positive = gv > 0.0;
+        let mut n = 0u32;
+        let mut left_depth = Vec::with_capacity(AIR_RES as usize);
+        for ix in 0..AIR_RES {
+            let x = AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M;
+            left_depth.push(gv.abs() * crate::fluid_core::dust_stream_hold(x) * dt / AIR_DZ_M);
+        }
+        let max_depth = left_depth.iter().copied().fold(0.0f32, f32::max);
+        let mut remaining = left_depth;
+        while n < AIR_RES && remaining.iter().any(|d| *d > 1.0e-6) && n as f32 <= max_depth {
+            let index = if positive { AIR_RES - 1 - n } else { n };
+            for ix in 0..AIR_RES {
+                let frac = remaining[ix as usize].min(1.0);
+                if frac <= 0.0 {
+                    continue;
+                }
+                remaining[ix as usize] -= frac;
+                let dropped = self.take_fog_column(ix, index, frac);
+                if dropped <= 0.0 {
+                    continue;
+                }
+                let x = AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M;
+                let z = if positive {
+                    self.chassis_z + AIR_Z1_M + 0.5 * AIR_DZ_M
+                } else {
+                    self.chassis_z + AIR_Z0_M - 0.5 * AIR_DZ_M
+                };
+                self.note_fog(x, z, dropped);
+            }
+            n += 1;
+        }
+    }
+
+    fn shed_fog_rows(&mut self, depth: f32, positive: bool, along_z: bool) {
+        let mut left = depth;
+        let mut n = 0u32;
+        while left > 1.0e-6 && n < AIR_RES {
+            let frac = left.min(1.0);
+            left -= frac;
+            let index = if positive { AIR_RES - 1 - n } else { n };
+            for cross in 0..AIR_RES {
+                let (ix, iz) = if along_z {
+                    (cross, index)
+                } else {
+                    (index, cross)
+                };
+                let dropped = self.take_fog_column(ix, iz, frac);
+                if dropped <= 0.0 {
+                    continue;
+                }
+                let p = cell_center(self.chassis_z, ix, 0, iz);
+                self.note_fog(p.x, p.z, dropped);
+            }
+            n += 1;
+        }
+    }
+
+    fn take_fog_column(&mut self, ix: u32, iz: u32, frac: f32) -> f64 {
+        let mut dropped = 0.0f64;
+        for iy in 0..AIR_LAYERS {
+            let i = at(ix, iy, iz);
+            let take = self.fog[i] * frac;
+            if take <= 0.0 {
+                continue;
+            }
+            self.fog[i] -= take;
+            dropped += take as f64;
+        }
+        if dropped > 0.0 {
+            self.fog_air -= dropped;
+            self.fog_settled += dropped;
+        }
+        dropped
+    }
+
+    fn note_fog(&mut self, world_x: f32, world_z: f32, volume: f64) {
+        if volume <= 0.0 {
+            return;
+        }
+        let ix = (world_x / SETTLED_CELL_M).floor() as i32;
+        let iz = (world_z / SETTLED_CELL_M).floor() as i32;
+        *self.fog_settled_cells.entry((ix, iz)).or_insert(0.0) += volume;
+    }
+
+    fn rebuild_fog_columns(&mut self) {
+        self.fog_occupied.clear();
+        for iz in 0..AIR_RES {
+            for ix in 0..AIR_RES {
+                if (0..AIR_LAYERS).any(|iy| self.fog[at(ix, iy, iz)] > 0.0) {
+                    self.fog_occupied.push(ix | (iz << 16));
+                }
+            }
+        }
+    }
+
+    fn sync_fog_air(&mut self) {
+        let grid: f64 = self.fog.iter().map(|v| *v as f64).sum();
+        let residual = self.fog_air - grid;
+        if residual.abs() > 1.0e-9 {
+            self.fog_settled += residual;
+        }
+        self.fog_air = grid.max(0.0);
+        if self.fog_settled < 0.0 {
+            self.fog_settled = 0.0;
+        }
+    }
+
+    fn settle_fog(&mut self, elapsed: f32) {
+        if elapsed <= 0.0 || self.fog_air <= 1.0e-12 {
+            return;
+        }
+        self.rebuild_fog_columns();
+        let mut remaining = FOG_SETTLE_M_S * elapsed;
+        while remaining > 1.0e-8 {
+            let step = remaining.min(AIR_DY_M);
+            self.shift_fog_down(step / AIR_DY_M);
+            remaining -= step;
+        }
+        self.rebuild_fog_columns();
+        self.sync_fog_air();
+    }
+
+    fn shift_fog_down(&mut self, f: f32) {
+        let cols = self.fog_occupied.clone();
+        for col in cols {
+            let ix = col & 0xffff;
+            let iz = col >> 16;
+            let mut column = [0.0f32; AIR_LAYERS as usize];
+            for iy in 0..AIR_LAYERS {
+                column[iy as usize] = self.fog[at(ix, iy, iz)];
+            }
+            let before: f64 = column.iter().map(|v| *v as f64).sum();
+            let mut leave = [0.0f32; AIR_LAYERS as usize];
+            for iy in 0..AIR_LAYERS as usize {
+                let mut dropped = column[iy] * f;
+                if dropped > column[iy] {
+                    dropped = column[iy];
+                }
+                leave[iy] = dropped;
+            }
+            for iy in 0..AIR_LAYERS as usize {
+                let from_above = if iy + 1 < AIR_LAYERS as usize {
+                    leave[iy + 1]
+                } else {
+                    0.0
+                };
+                column[iy] = column[iy] - leave[iy] + from_above;
+            }
+            let after: f64 = column.iter().map(|v| *v as f64).sum();
+            let settled = before - after;
+            if settled > 0.0 {
+                self.fog_settled += settled;
+                self.fog_air -= settled;
+                let p = cell_center(self.chassis_z, ix, 0, iz);
+                self.note_fog(p.x, p.z, settled);
+            }
+            for iy in 0..AIR_LAYERS {
+                self.fog[at(ix, iy, iz)] = column[iy as usize];
+            }
+        }
+    }
+
     fn touch(&mut self, ix: u32, iz: u32) {
         let row = iz as usize;
         if self.row_lo[row] > self.row_hi[row] {
@@ -1018,6 +1313,57 @@ pub fn inject_dust(air: &mut Dust, inject: DustInject, dt: f32) -> f32 {
     if let Some(stock) = air.soil.as_mut() {
         *stock -= added;
     }
+    added as f32
+}
+
+/// Lift `inject.offer_m3_s * dt` of standing water into the fog scalar.
+///
+/// Returns the cubic metres that entered the air. A film under
+/// [`FOG_MIN_WATER_M`] returns 0. Dust volume, the dust ledger, and the air
+/// velocity are left alone. The caller removes the returned volume from the
+/// water sheet.
+pub fn inject_fog(air: &mut Dust, inject: FogInject, dt: f32) -> f32 {
+    if dt <= 0.0 || inject.offer_m3_s <= 0.0 || !fog_may_lift(inject.water_m) {
+        return 0.0;
+    }
+    let Some((ix0, ix1, mut iy0, mut iy1, iz0, iz1)) = kernel_bounds(air, inject.x, inject.z)
+    else {
+        return 0.0;
+    };
+    iy0 = iy0.max(1);
+    iy1 = iy1.min(3);
+    if iy0 > iy1 {
+        return 0.0;
+    }
+    let mut wsum = 0.0f64;
+    for iz in iz0..=iz1 {
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                wsum += weight_at(air, inject.x, inject.z, ix, iy, iz) as f64;
+            }
+        }
+    }
+    if wsum <= 0.0 {
+        return 0.0;
+    }
+    let budget = (inject.offer_m3_s * dt) as f64;
+    let mut added = 0.0f64;
+    for iz in iz0..=iz1 {
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let w = weight_at(air, inject.x, inject.z, ix, iy, iz) as f64;
+                if w <= 0.0 {
+                    continue;
+                }
+                let dm = (budget * w / wsum) as f32;
+                let i = at(ix, iy, iz);
+                air.fog[i] += dm;
+                added += dm as f64;
+            }
+        }
+    }
+    air.fog_emitted += added;
+    air.fog_air += added;
     added as f32
 }
 
