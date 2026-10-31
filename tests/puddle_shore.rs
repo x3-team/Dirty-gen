@@ -513,19 +513,21 @@ fn cfl_split(dt: f32, speed: f32, cell: f32, cap: f32) -> (f32, u32) {
     (courant, nsub)
 }
 
-fn copy_chassis(dst: &mut ThroughDrive, src: &ThroughDrive) {
-    let s = &src.world.vehicle;
-    let d = &mut dst.world.vehicle;
-    d.pos = s.pos;
-    d.vel = s.vel;
-    d.yaw = s.yaw;
-    d.pitch = s.pitch;
-    d.roll = s.roll;
-    d.yaw_rate = s.yaw_rate;
-    d.pitch_rate = s.pitch_rate;
-    d.roll_rate = s.roll_rate;
-    d.jump_hold = s.jump_hold;
-    d.wheels = s.wheels;
+struct DriveFrame {
+    soil: silt::soil::SoilField,
+    vehicle: silt::vehicle::Vehicle,
+}
+
+fn snap_drive_frame(drive: &ThroughDrive) -> DriveFrame {
+    DriveFrame {
+        soil: drive.world.soil.clone(),
+        vehicle: drive.world.vehicle.clone(),
+    }
+}
+
+fn restore_drive_frame(drive: &mut ThroughDrive, frame: &DriveFrame) {
+    drive.world.soil = frame.soil.clone();
+    drive.world.vehicle = frame.vehicle.clone();
 }
 
 fn rel_vol(a: f32, b: f32) -> f32 {
@@ -589,11 +591,12 @@ fn one_fine_substep_matches_eight() {
     let mut peak_p = 0.0f32;
     let mut peak_f = 0.0f32;
     for _ in 0..48 {
-        // Same chassis at the start of the step. The sheet is what differs.
-        // Leaving the second car to wander makes a 4 mm tongue depend on the
-        // libm of the host, not on the Courant split.
-        copy_chassis(&mut full, &prod);
+        // Same soil and chassis at the start of each step. Only the fine
+        // sheet integrator differs; divergent rut state was flipping tongues
+        // on CI when only the vehicle was copied.
+        let frame = snap_drive_frame(&prod);
         prod.step(dt);
+        restore_drive_frame(&mut full, &frame);
         full.step(dt);
         peak_p = peak_p.max(peak_sheet_mps(&prod.fluid));
         peak_f = peak_f.max(peak_sheet_mps(&full.fluid));
