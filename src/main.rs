@@ -761,7 +761,7 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
                     )
                     .expect("readback");
                 if std::env::var_os("SILT_BEAUTY_PROBE").is_some() {
-                    probe_waterline(&drive);
+                    probe_waterline(&drive, cam(&drive.world), width, height);
                 }
                 let path = dir.join(format!("{tag}{name}.png"));
                 write_png(&path, width, height, &rgba).expect("still");
@@ -861,12 +861,30 @@ fn capture_beauty_crust(renderer: &mut Renderer, width: u32, height: u32, dir: &
 
 /// Prints, per wheel, the carcass bottom against the soil and the solved
 /// film round it, so the waterline on the rubber can be checked in numbers.
-fn probe_waterline(drive: &silt::ThroughDrive) {
+fn probe_waterline(drive: &silt::ThroughDrive, cam: CameraPose, width: u32, height: u32) {
     let v = &drive.world.vehicle;
     let ori = v.orientation();
+    // Same projection as the renderer, so the rows can be checked on the still.
+    let view = glam::Mat4::look_at_rh(cam.eye, cam.target, Vec3::Y);
+    let proj = glam::Mat4::perspective_rh(46f32.to_radians(), width as f32 / height as f32, 0.15, 180.0);
+    let vp = proj * view;
+    let row = |p: Vec3| {
+        let c = vp * p.extend(1.0);
+        ((c.x / c.w * 0.5 + 0.5) * width as f32, (0.5 - c.y / c.w * 0.5) * height as f32)
+    };
+    let wl = render::tire_waterlines(&drive.world, &drive.fluid);
     for i in 0..4 {
         let c = v.pos + ori * v.wheel_center_local(i);
         let bottom = c.y - silt::vehicle::WHEEL_RADIUS;
+        // Outer face of the tire, toward the camera side.
+        let side = (cam.eye - c).with_y(0.0).normalize() * 0.1;
+        let (bx, by) = row(Vec3::new(c.x, bottom, c.z) + side);
+        let (_, wy) = row(Vec3::new(c.x, wl[i], c.z) + side);
+        let (_, cy) = row(c + side);
+        println!(
+            "wheel {i} px: centre y {cy:.0}, waterline y {wy:.0} (y={:.3}), bottom x {bx:.0} y {by:.0}",
+            wl[i]
+        );
         let mut line = format!("wheel {i}: bottom {bottom:.3} sink {:.3}", v.wheels[i].sinkage);
         for (lbl, dx, dz) in [("c", 0.0, 0.0), ("out", 0.3, 0.0), ("in", -0.3, 0.0), ("fw", 0.0, 0.45), ("bk", 0.0, -0.45)] {
             let (x, z) = (c.x + dx, c.z + dz);

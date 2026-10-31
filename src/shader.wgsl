@@ -412,6 +412,34 @@ fn niva_box_hit(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> bool {
     return tn <= tf && tf > 0.0 && tn < t_max;
 }
 
+// Distance along a ray to the nearest tire, as a cylinder round the axle
+// 22 cm wide; -1 on a miss. The mirror image of the rubber in the water.
+fn tire_ray_hit(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> f32 {
+    var best = -1.0;
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let c = frame.tires[i * 2];
+        let f = frame.tires[i * 2 + 1];
+        let fwd = normalize(vec2<f32>(f.x, f.y) + vec2<f32>(1e-5, 0.0));
+        let axis = vec3<f32>(-fwd.y, 0.0, fwd.x);
+        let rel = o - c.xyz;
+        // Project out the axle: a circle problem in the wheel plane.
+        let rp = rel - axis * dot(rel, axis);
+        let dp = d - axis * dot(d, axis);
+        let a = dot(dp, dp);
+        let b = dot(rp, dp);
+        let cc = dot(rp, rp) - c.w * c.w;
+        let disc = b * b - a * cc;
+        if (a < 1e-6 || disc < 0.0) {
+            continue;
+        }
+        let t = (-b - sqrt(disc)) / a;
+        if (t > 0.0 && t < t_max && abs(dot(rel + d * t, axis)) < 0.11 && (best < 0.0 || t < best)) {
+            best = t;
+        }
+    }
+    return best;
+}
+
 // Sky occlusion on the ground under the vehicle: the body hides most of the
 // sky from the soil below it and each tire hides it round its contact patch.
 // This is what seats the car; the sun shadow alone reads as a decal.
@@ -1786,18 +1814,17 @@ fn wheel_ripples(xz: vec2<f32>, surf: f32, t: f32) -> vec3<f32> {
         if (r < 0.12 || r > 2.5) {
             continue;
         }
-        let k = 70.0;
-        // Rings die out fast and unevenly: the front breaks on the ripples
-        // already on the water, so the phase wanders and whole arcs drop out.
-        let ang = atan2(d.y, d.x);
-        let arcs = smoothstep(0.25, 0.75, noise(vec2<f32>(ang * 2.2 + f32(i) * 5.0, r * 2.5 - t * 0.6)));
-        let amp = exp(-r / 0.42) * smoothstep(0.12, 0.3, r) * mix(0.15, 1.0, arcs);
-        let wob = (noise(xz * 3.5 + vec2<f32>(f32(i) * 3.0, t * 0.5)) - 0.5) * 7.0
-            + (noise(xz * 11.0 - vec2<f32>(t * 0.7, f32(i))) - 0.5) * 2.5;
-        let dir = normalize(d / r + vec2<f32>(noise(xz * 4.0) - 0.5, noise(xz * 4.0 + 9.0) - 0.5) * 0.6);
-        g += dir * cos(r * k * (0.85 + 0.3 * noise(xz * 1.7)) - t * 24.0 + f32(i) * 1.7 + wob) * amp;
+        // No rings: the water the tire stirs is a patch of short chop that
+        // dies out within half a metre, plus the slope of the low swell
+        // pushed up against the rubber.
+        let amp = exp(-r / 0.3) * smoothstep(0.1, 0.22, r);
+        let q = xz * 17.0 + vec2<f32>(f32(i) * 5.0, 0.0);
+        let chop = vec2<f32>(noise(q + vec2<f32>(t * 1.3, 0.0)) - noise(q * 1.9 - vec2<f32>(0.0, t * 1.7)),
+            noise(q + vec2<f32>(7.0, t * 1.1)) - noise(q * 2.3 + vec2<f32>(t * 1.5, 3.0)));
+        let swell = d / r * exp(-pow((r - 0.25) / 0.1, 2.0)) * 0.6;
+        g += (chop * 1.6 + swell) * amp;
     }
-    return vec3<f32>(g.x, 0.0, g.y) * 0.15;
+    return vec3<f32>(g.x, 0.0, g.y) * 0.25;
 }
 
 // x = waterline at this point of a tire standing in the solved sheet
@@ -2037,7 +2064,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // while the shallow rim stays the colour of the sand under it.
     // The thin rim is a clear film over the sand; the silt load builds
     // with depth, so by 5-10 cm the column is murky.
-    let sigma = mix(vec3<f32>(13.0, 17.0, 23.0) * mix(0.4, 1.25, smoothstep(0.008, 0.07, depth)),
+    // Round a tire the stirred silt hides the rubber within a few cm.
+    let sigma = mix(vec3<f32>(13.0, 17.0, 23.0) * mix(0.25, 1.25, smoothstep(0.008, 0.07, depth)) * mix(1.0, 4.0, near_tire),
         vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
     let trans = exp(-sigma * path);
     // Light scattered by the silt in the column, lit by sun and sky.
@@ -2064,7 +2092,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let ndl = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
     // Silt in the shade still glows with sky light scattered sideways in the
     // column: the car's shadow on turbid water is softer than on dry sand.
-    let light = frame.sun_color.rgb * ndl * mix(0.4, 1.0, shadow) * 1.25 * 0.45 + sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * frame.env.y * 1.15;
+    let light = frame.sun_color.rgb * ndl * mix(0.55, 1.0, shadow) * 1.25 * 0.45 + sh_irradiance(vec3<f32>(0.0, 1.0, 0.0)) * frame.env.y * 1.15;
     let body = silt * light;
 
     // Fresnel reflection of the sky, and a tight GGX sun glint on the ripples.
@@ -2072,7 +2100,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Rippled water is a rough mirror: its sky reflectance is the split-sum
     // F_AB of bevy_pbr at that roughness, which falls well under the smooth
     // Schlick value at a grazing look.
-    let w_rough = mix(0.32, 0.2, smoothstep(0.01, 0.08, depth)) * mix(0.8, 1.2, gust);
+    let w_rough = mix(0.32, 0.2, smoothstep(0.01, 0.08, depth)) * mix(0.8, 1.2, gust) + near_tire * 0.15;
     let w_ab = F_AB(w_rough, ndv);
     let fres = 0.02 * w_ab.x + w_ab.y;
     let refl_dir = reflect(-view, nrm);
@@ -2081,7 +2109,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // the sky it mirrors.
     var refl = env_radiance(refl_dir, w_rough);
     let rl = dot(refl, vec3<f32>(0.2126, 0.7152, 0.0722));
-    refl = max(mix(vec3<f32>(rl), refl, 1.35) * vec3<f32>(0.88, 0.95, 1.08), vec3<f32>(0.0)) * 0.62;
+    // A turbid sheet mirrors the sky a little muted and warm; the cool
+    // grade of the backdrop turned it into lavender tin.
+    refl = max(mix(vec3<f32>(rl), refl, 0.9) * vec3<f32>(0.98, 0.95, 0.9), vec3<f32>(0.0)) * 0.55;
     // The sun sits in the HDRI too; its blurred lobe smeared a silver sheet
     // over the backlit pool. The sun's own glint is drawn below as a sharp
     // GGX term, so clamp the env lobe to the bright sky round it.
@@ -2110,6 +2140,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         // Blend, do not replace: the underside reflection is a dim layer
         // over the water, the shadow lives on the bed beneath it.
         refl = mix(refl, sh_irradiance(vec3<f32>(0.0, -1.0, 0.0)) * frame.env.y * 0.25, 0.15);
+    }
+    // The tire in the mirror: dark rubber from the waterline down, broken
+    // by the ripples, since the ray leaves from the rippled surface.
+    let th = tire_ray_hit(in.world + nrm * 0.003, refl_dir, 0.9);
+    if (th > 0.0) {
+        let rubber = sh_irradiance(vec3<f32>(0.0, -0.3, 1.0)) * frame.env.y * vec3<f32>(0.05, 0.045, 0.04);
+        refl = mix(refl, rubber, 0.6 * (1.0 - smoothstep(0.4, 0.9, th)));
     }
     let halfv = normalize(sun + view);
     let ndh = clamp(dot(nrm, halfv), 0.0, 1.0);
@@ -2158,12 +2195,12 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         * smoothstep(0.003, 0.008, nmax - depth) * (1.0 - smoothstep(0.0008, 0.002, nmin)) * inside;
     let torn = smoothstep(0.3, 0.55, noise(xz * 14.0 + vec2<f32>(t_now * 0.2, 0.0)) * 0.7 + noise(xz * 41.0) * 0.3);
     let shore = max(shore_band * (1.0 - smoothstep(0.008, 0.016, depth)) * clumps, edge_line * torn);
-    let foam_amt = clamp(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), max(shore, contact * 0.9)), 0.0, 1.0);
+    let foam_amt = clamp(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), max(shore, contact * 0.5)), 0.0, 1.0);
     // Foam is a net of bubble walls, not a blotch: cell borders of a
     // drifting Voronoi, gated by the lace.
     let bubbles = 1.0 - smoothstep(0.0, 0.12, cell_border(lace_p * 2.2));
     let lace_f = smoothstep(1.0 - foam_amt * 0.9, 1.05 - foam_amt * 0.6, lace);
-    let foam = clamp(lace_f * (0.55 + 0.45 * bubbles) + bubbles * foam_amt * 0.35, 0.0, 1.0)
+    let foam = clamp(lace_f * (0.75 + 0.25 * bubbles) + bubbles * foam_amt * 0.12, 0.0, 1.0)
         * smoothstep(0.002, 0.005, depth);
     // Foam on silty water is dirty beige, never white.
     let foam_col = mix(vec3<f32>(0.36, 0.28, 0.19), vec3<f32>(0.5, 0.42, 0.31), 1.0 - slurry_frac) * light;
@@ -2192,14 +2229,14 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // The car and anything else standing in the frame mirror in the sheet.
     // Three rays spread by the ripples: the car's mirror image breaks up
     // instead of sitting under it like glass.
-    let jit = vec3<f32>(noise(xz * 23.0 + vec2<f32>(t_now, 0.0)) - 0.5, 0.0, noise(xz * 23.0 + vec2<f32>(5.0, t_now)) - 0.5) * 0.12;
+    let jit = vec3<f32>(noise(xz * 23.0 + vec2<f32>(t_now, 0.0)) - 0.5, 0.0, noise(xz * 23.0 + vec2<f32>(5.0, t_now)) - 0.5) * 0.28;
     let s0 = water_ssr(in.world + nrm * 0.005, refl_dir);
     let s1 = water_ssr(in.world + nrm * 0.005, normalize(refl_dir + jit));
     let s2 = water_ssr(in.world + nrm * 0.005, normalize(refl_dir - jit));
     let ssr_a = (s0.a + s1.a + s2.a) / 3.0;
     let ssr = vec4<f32>((s0.rgb * s0.a + s1.rgb * s1.a + s2.rgb * s2.a) / max(s0.a + s1.a + s2.a, 1e-4), ssr_a);
     if (ssr.a > 0.0) {
-        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth) * mix(0.08, 0.16, smoothstep(0.01, 0.08, depth));
+        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth) * mix(0.05, 0.1, smoothstep(0.01, 0.08, depth)) * (1.0 - 0.4 * near_tire);
         out_rgb = mix(out_rgb, ssr.rgb * 0.92, clamp(k / max(alpha, 0.05), 0.0, 1.0));
         alpha = max(alpha, k);
     }
@@ -2235,7 +2272,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             mix(vec3<f32>(0.0, 0.9, 0.1), vec3<f32>(1.0, 0.05, 0.0), r * 2.0 - 1.0), r > 0.5);
         let cm = abs(fract(dd * 100.0 + 0.5) - 0.5) / max(fwidth(dd * 100.0), 1e-4);
         let line = 1.0 - smoothstep(0.5, 1.5, cm);
-        return vec4<f32>(mix(dst * 0.45 + ramp * 0.55, vec3<f32>(0.0), line * 0.6), 1.0);
+        return vec4<f32>(mix(dst * 0.7 + ramp * 0.3, vec3<f32>(0.0), line * 0.6), 1.0);
     }
     return vec4<f32>(dst * tint * (1.0 - a_out) + out_rgb * a_out, 1.0);
 }
@@ -2995,22 +3032,23 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     // silt within a few centimetres; at the line a bright meniscus and a
     // broken collar of dirty foam ring the tire.
     let tw = tire_waterline(in.world);
-    if (sand_field() && tw.y > 0.5) {
+    if (sand_field() && tw.y > 0.5 && frame.debug.x < 0.5) {
         let up = vec3<f32>(0.0, 1.0, 0.0);
         let sun_d = normalize(frame.sun_dir.xyz);
         let sky = sh_irradiance(up) * frame.env.y;
         let sun_l = frame.sun_color.rgb * max(sun_d.y, 0.0) * 0.45;
         let dz = in.world.y - tw.x;
         let silt_l = vec3<f32>(0.3, 0.225, 0.12) * (sun_l * 0.7 + sky * 1.1);
-        lit = mix(lit, silt_l, 1.0 - exp(min(dz, 0.0) * 55.0));
+        lit = mix(lit, silt_l * 0.75, 1.0 - exp(min(dz, 0.0) * 110.0));
         let foam_n = noise(in.world.xz * 14.0 + vec2<f32>(in.world.y * 60.0, 0.0)) * 0.6
             + noise(in.world.xz * 37.0 + vec2<f32>(in.world.y * 50.0, 0.0)) * 0.4;
-        let collar = smoothstep(-0.004, 0.0, dz) * (1.0 - smoothstep(0.008, 0.022 + 0.01 * foam_n, dz))
-            * smoothstep(0.42, 0.62, foam_n);
+        let collar = smoothstep(-0.006, 0.0, dz) * (1.0 - smoothstep(0.012, 0.03 + 0.015 * foam_n, dz))
+            * smoothstep(0.36, 0.58, foam_n);
         let foam_l = vec3<f32>(0.52, 0.44, 0.33) * (sun_l * 1.4 + sky * 1.2);
         lit = mix(lit, foam_l, collar * 0.85);
-        let men = exp(-pow((dz - 0.002) / 0.0025, 2.0));
-        lit = mix(lit, (sky * 1.2 + sun_l * 0.8) * vec3<f32>(0.62, 0.56, 0.47), men * 0.6);
+        // A meniscus 1-2 cm tall where the water climbs the rubber.
+        let men = smoothstep(-0.002, 0.002, dz) * (1.0 - smoothstep(0.008, 0.016, dz));
+        lit = mix(lit, (sky * 1.1 + sun_l * 0.7) * vec3<f32>(0.58, 0.5, 0.4), men * 0.5);
     }
     var mapped = present(lit);
     if (frame.debug.x > 0.5 && tw.y > 0.5) {
