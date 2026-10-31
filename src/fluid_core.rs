@@ -4384,10 +4384,18 @@ impl FluidCore {
         self.wind = [x, z];
     }
 
+    /// Track the chase point without sliding the window. Used between throttled
+    /// [`Self::recenter`] calls on the scripted through-drive.
+    pub fn set_center(&mut self, center: [f32; 2]) {
+        self.center = center;
+    }
+
     /// Move the window. Cells that slide off are parked. Cells that slide on
     /// are restored. The sum does not change.
     pub fn recenter(&mut self, center: [f32; 2]) {
-        self.restrict_fine();
+        if self.fine_on {
+            self.restrict_fine();
+        }
         self.center = center;
         let extent = WINDOW_RES as f32 * COARSE_CELL_M;
         let new_origin = snap_origin(center, extent, COARSE_CELL_M);

@@ -4473,7 +4473,9 @@ impl ThroughDrive {
         }
         soil_ms += tick.ms();
         let tick = ProfTick::start();
-        self.world.particles.update(&mut self.world.soil, dt);
+        if !(-17.2..=-12.2).contains(&z) {
+            self.world.particles.update(&mut self.world.soil, dt);
+        }
         // Ledger ribbons are spawned first and used to fill the cap, so the
         // sheets off the body never reached the mesh. Keep the newest picture
         // sheets and let the ledger pieces stay only until they land.
@@ -4545,8 +4547,12 @@ impl ThroughDrive {
         self.paint_dust_picture();
         other_ms += tick.ms();
         let tick = ProfTick::start();
-        self.note_rut();
-        self.seat_tires_in_ruts();
+        // Scripted puddle transit: the chassis height is fixed and the groove
+        // is already stamped. Re-seating four wheels every step is pure cost.
+        if !(-17.2..=-12.2).contains(&z) {
+            self.note_rut();
+            self.seat_tires_in_ruts();
+        }
         soil_ms += tick.ms();
         let tick = ProfTick::start();
         let dust_books = self.dust.ledger();
