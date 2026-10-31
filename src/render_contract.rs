@@ -1,4 +1,4 @@
-//! Physics → render contract, version 3.
+//! Physics → render contract. The version is [`RENDER_CONTRACT_VERSION`].
 //!
 //! The solver publishes these maps at the end of a frame. The debug view
 //! reads only this contract. Picture shading (materials, light, HDRI, fog,
@@ -15,7 +15,7 @@ use crate::particles::Particle;
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 3;
+pub const RENDER_CONTRACT_VERSION: u32 = 5;
 
 /// Coarse ground window. 200 × 0.20 m = 40 m. The 2 cm tire patch is restricted
 /// back into this window before publish. It is not a second map.
@@ -66,7 +66,7 @@ pub const VALID_WET_EDGE: u32 = 1 << 7;
 pub const VALID_FOAM: u32 = 1 << 8;
 pub const VALID_SPRAY: u32 = 1 << 9;
 pub const VALID_AIR: u32 = 1 << 10;
-pub const VALID_FOG: u32 = 1 << 11;
+pub const VALID_FOG: u32 = 1 << 13;
 
 pub const BIND_HEADER: u32 = 0;
 pub const BIND_GROUND: u32 = 1;
@@ -1117,6 +1117,10 @@ mod tests {
         assert!(wgsl.contains("@group(0) @binding(12)"));
         assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
         assert!(wgsl.contains("var fog_mist: texture_3d<f32>"));
+        assert_eq!(VALID_FOG, 1 << 13);
+        assert_eq!(BIND_FOG, 12);
+        assert_ne!(VALID_FOG, 1 << 11);
+        assert_ne!(VALID_FOG, 1 << 12);
         let air_row = padded_row_bytes(AIR_CELLS, 4);
         assert_eq!(air_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
         assert!(!wgsl.contains("height_tex"));
@@ -1329,7 +1333,6 @@ mod tests {
             None,
         );
         assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-        assert_eq!(RENDER_CONTRACT_VERSION, 3);
         let res = frame.header.window_res as usize;
         let mut moist = 0.0_f32;
         let mut n = 0.0_f32;

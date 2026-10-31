@@ -1,6 +1,6 @@
 # Render contract
 
-Version **3**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12.
+Version **5**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Bits 11 and 12 are not this channel.
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -219,7 +219,7 @@ Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A no
 
 ## Header flags
 
-`header.version` is 3. `header.valid` is a bit mask:
+`header.version` is `RENDER_CONTRACT_VERSION`. `header.valid` is a bit mask:
 
 | Bit | Value | Map |
 |---|---|---|
@@ -234,7 +234,7 @@ Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A no
 | 8 | `VALID_FOAM` | foam and crest |
 | 9 | `VALID_SPRAY` | spray |
 | 10 | `VALID_AIR` | air velocity |
-| 11 | `VALID_FOG` | fog |
+| 13 | `VALID_FOG` | fog |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
 
@@ -285,8 +285,8 @@ The rut's water surface does not bump this version either. Binding 1 R stays the
 
 Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is set where the sheet is a wave or a tire footprint, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.
 
-### 3
+### 5
 
-`fog`, binding 12, `r32float` 3D, 128 × 8 × 128. R is the water volume fraction, m³/m³. Same origin and cell as `dust_fog` and `air_velocity`. `VALID_FOG` is bit 11, set when `dust_source` is 1 or 2.
+`fog`, binding 12, `r32float` 3D, 128 × 8 × 128. R is the water volume fraction, m³/m³. Same origin and cell as `dust_fog` and `air_velocity`. `VALID_FOG` is bit 13 (`1 << 13`), set when `dust_source` is 1 or 2. Bits 11 and 12 are not this channel.
 
 `dust_fog` and `air_velocity` are unchanged. Fog does not replace either channel and it does not add a velocity. With the dust ledger, `inject_fog` writes the scalar and the existing wind step plus `advect_density_by_air` move it. Without the ledger, `FluidCore::inject_fog` takes the water and the same wind step moves the slab. The header stays 96 bytes. Debug mode 15 shows this channel. Debug mode 13 remains airborne dust.

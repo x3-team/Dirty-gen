@@ -70,8 +70,4 @@ Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger g
 
 ## Fog on the shared air grid
 
-Base is `main` at 396af7e. Intel(R) Xeon(R) Processor, 4 cores. Caps are unchanged: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, e2e step mean ≤ 33.004 ms, air ≤ 1.5 ms. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer.
-
-Release `e2e_niva` on this machine: step mean 14.041 ms, p95 28.049 ms, air 0.247 ms. `ThroughDrive::step` at dt = 1/30, 96 steps after warmup: water 0.823, slurry 0.541, soil 0.974, air 0.296, dust 1.034, restrict_fine 0.206, window 0.360, prep 0.209, sheet rest 0.301, solver sum 4.745 ms. Drive mean 5.010 ms, drive p95 6.117 ms. Solver frame 2.438 ms.
-
-Release `fog_air`, Niva, dt = 1/60, 78 timed steps with water lofted into fog: step mean 0.976 ms, step max 1.688 ms. An earlier pass of the same binary read 1.015 ms mean and 2.156 ms max. That mean is the fog step, and it stays under the 7 ms solver-frame cap. The fluid-sheet fog case closed the water ledger to 8.55e-6 m³.
+Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.

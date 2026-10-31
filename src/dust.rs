@@ -777,7 +777,6 @@ impl Dust {
         if self.fog_air > 1.0e-12 {
             self.transport_fog(dt);
         }
-        self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {

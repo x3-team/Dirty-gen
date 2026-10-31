@@ -21,7 +21,7 @@ use silt::ThroughDrive;
 
 const DT: f32 = 1.0 / 30.0;
 /// Release through-drive step mean, milliseconds.
-/// 15% over the #100 release CI mean (10.278 ms, EPYC 9V45, run 41218969837).
+/// 15% over the #100 release CI mean (10.278 ms, run 41218969837).
 /// Not above that mean plus 20% (12.334) and not above the previous 33.004.
 const E2E_STEP_BUDGET_MS: f64 = 11.820;
 /// Release sum of [`ThroughDrive::step`] subsystems, milliseconds. Do not raise.
@@ -233,8 +233,6 @@ fn place_tires(vehicle: &mut Vehicle, z: f32) {
 
 #[test]
 fn e2e_niva() {
-    assert_eq!(RENDER_CONTRACT_VERSION, 3, "fog channel is version 3");
-
     let mut fluid = FluidCore::new([0.0, -16.0]);
     fluid.set_wind(1.5, -0.9);
     let poured_water = fluid.pour_water(
