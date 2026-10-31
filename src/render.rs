@@ -13,8 +13,8 @@ use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
 use crate::mesh::{
-    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_with_ground,
-    terrain_mesh,
+    bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_split,
+    spray_from_contract, terrain_mesh,
     wheel_mesh, CpuMesh,
     MeshVertex, ParticleVertex, TerrainVertex,
 };
@@ -42,6 +42,25 @@ struct FrameData {
     snow_arc: [f32; 4],
     snow_arc2: [f32; 4],
     snow_profile: [[f32; 4]; 8],
+    /// Irradiance / pi of the environment map, nine RGB SH terms.
+    sh: [[f32; 4]; 9],
+    /// x: env mip count, y: IBL gain, z: 1 when the sky is an HDRI, w: exposure.
+    env: [f32; 4],
+    /// Niva headlights: left lamp xyz + intensity, right lamp xyz, beam
+    /// direction xyz + cosine of the outer cone. Intensity 0 is off.
+    lamps: [[f32; 4]; 3],
+    /// Air for the dust and fog volume, picture only. 0: wind xyz (m/s),
+    /// ground fog extinction (1/m, 0 off). 1: Niva position xyz, fog scale
+    /// height (m). 2: Niva velocity xyz, yaw.
+    air: [[f32; 4]; 3],
+    /// Near shadow cascade: a tight ortho round the Niva, drawn into the
+    /// right half of the shadow atlas. The far cascade is `light_vp`.
+    light_vp_near: [[f32; 4]; 4],
+    /// Water surface height at each tire, metres: soil plus the solved film
+    /// round the carcass. Below -100 when no sheet was given.
+    tire_water: [f32; 4],
+    /// x: 1 draws the depth debug (water by depth, tire bottoms marked).
+    debug: [f32; 4],
 }
 
 #[repr(C)]
@@ -68,6 +87,16 @@ pub struct Renderer {
     model_stride: u32,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
+    /// The frame with `light_vp` swapped for the near cascade, for its
+    /// shadow pass only.
+    frame_near_buf: wgpu::Buffer,
+    frame_near_bg: wgpu::BindGroup,
+    env_tex: wgpu::Texture,
+    env_sh: [[f32; 4]; 9],
+    env_from_file: bool,
+    /// Which sky the env map was baked for. None until the first frame.
+    env_baked: Option<(bool, [u32; 3])>,
+    hdri: Option<Vec<u8>>,
     model_buf: wgpu::Buffer,
     model_bg: wgpu::BindGroup,
     tex_bg: wgpu::BindGroup,
@@ -108,6 +137,8 @@ pub struct Renderer {
     chunk_i: wgpu::Buffer,
     dust_v: wgpu::Buffer,
     dust_i: wgpu::Buffer,
+    spray_v: wgpu::Buffer,
+    spray_i: wgpu::Buffer,
     pipe_sky: wgpu::RenderPipeline,
     pipe_terrain: wgpu::RenderPipeline,
     pipe_water: wgpu::RenderPipeline,
@@ -133,6 +164,19 @@ pub struct Renderer {
     depth_format: wgpu::TextureFormat,
     /// Midday sun and sky. The window keeps the low sun unless a still asks.
     pub daylight: bool,
+    /// Lay the undisturbed field (kind 0) and the skirt as sand. Picture only.
+    pub sand_field: bool,
+    /// Ground fog for the picture: extinction at the ground (1/m, 0 off) and
+    /// scale height (m). It drifts with `wind` and parts round the Niva.
+    pub fog: f32,
+    pub fog_height: f32,
+    /// A still can place the sun (unit vector toward it); None keeps the
+    /// day or dusk sun.
+    pub sun_override: Option<Vec3>,
+    /// Depth debug: water coloured by depth, tire bottoms marked.
+    pub debug_depth: f32,
+    tire_water: [f32; 4],
+    pub wind: Vec3,
     pub show_props: bool,
     /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
     pub show_environment: bool,
@@ -155,6 +199,19 @@ pub struct Renderer {
     contract: Option<silt::render_contract::ContractGpu>,
     contract_cpu: silt::render_contract::ContractFrame,
     pipe_debug: Option<wgpu::RenderPipeline>,
+    pipe_fog: Option<wgpu::RenderPipeline>,
+    post_bgl: wgpu::BindGroupLayout,
+    post_bg: wgpu::BindGroup,
+    air_noise_view: wgpu::TextureView,
+    air_samp: wgpu::Sampler,
+    scene_copy: wgpu::Texture,
+    scene_copy_view: wgpu::TextureView,
+    /// The dust and fog march runs at half resolution into this target and
+    /// is upsampled over the frame (`pipe_fog_up`): a quarter of the pixels.
+    fog_half_view: wgpu::TextureView,
+    fog_up_bgl: wgpu::BindGroupLayout,
+    fog_up_bg: wgpu::BindGroup,
+    pipe_fog_up: Option<wgpu::RenderPipeline>,
     /// Top-down debug view of the render contract. Off for the Niva picture.
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
@@ -268,9 +325,20 @@ impl Renderer {
         formats: GpuFormats,
         cc0: crate::cc0::Cc0Scene,
     ) -> Self {
+        // The picture reads the render contract at group 4 of the terrain and
+        // water pipelines. A device without storage buffers or a fifth bind
+        // group (WebGL2) gets the stand-in readers and keeps its soil cache.
+        let contract = silt::render_contract::ContractGpu::try_new(&device)
+            .filter(|_| device.limits().max_bind_groups >= 5);
+        let readers = if contract.is_some() {
+            include_str!("beauty_contract.wgsl")
+        } else {
+            include_str!("beauty_nocontract.wgsl")
+        };
+        let source = format!("{}\n{}", include_str!("shader.wgsl"), readers);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -279,11 +347,11 @@ impl Renderer {
 
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[uniform_entry(
-                0,
-                false,
-                std::mem::size_of::<FrameData>() as u64,
-            )],
+            entries: &[
+                uniform_entry(0, false, std::mem::size_of::<FrameData>() as u64),
+                filter_tex(1, wgpu::ShaderStages::FRAGMENT),
+                filter_samp(2, wgpu::ShaderStages::FRAGMENT),
+            ],
         });
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-tex"),
@@ -425,13 +493,74 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let env_levels = crate::env::ENV_W.max(crate::env::ENV_H).ilog2() + 1;
+        let env_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("env"),
+            size: wgpu::Extent3d {
+                width: crate::env::ENV_W,
+                height: crate::env::ENV_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: env_levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let env_view = env_tex.create_view(&Default::default());
+        // Wraps around the horizon, clamps at the poles. Trilinear so a rough
+        // reflection blends between the box-filtered levels.
+        let env_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("env"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame-bg"),
             layout: &frame_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&env_samp),
+                },
+            ],
+        });
+        let frame_near_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame-near"),
+            size: std::mem::size_of::<FrameData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_near_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame-near-bg"),
+            layout: &frame_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_near_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&env_samp),
+                },
+            ],
         });
         let model_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model-bg"),
@@ -505,7 +634,7 @@ impl Renderer {
         let shadow = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow"),
             size: wgpu::Extent3d {
-                width: SHADOW,
+                width: SHADOW * 2,
                 height: SHADOW,
                 depth_or_array_layers: 1,
             },
@@ -520,7 +649,7 @@ impl Renderer {
         let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow-depth"),
             size: wgpu::Extent3d {
-                width: SHADOW,
+                width: SHADOW * 2,
                 height: SHADOW,
                 depth_or_array_layers: 1,
             },
@@ -725,11 +854,99 @@ impl Renderer {
             ],
         });
 
+        let terrain_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
+            Some(gpu) => vec![&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl, &gpu.layout],
+            None => vec![&frame_bgl, &tex_bgl],
+        };
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain-layout"),
-            bind_group_layouts: &[&frame_bgl, &tex_bgl],
+            bind_group_layouts: &terrain_groups,
             push_constant_ranges: &[],
         });
+        // Scene depth and a copy of the opaque frame, for the water's screen
+        // reflections and the dust volume's march.
+        let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let water_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
+            Some(gpu) => vec![&frame_bgl, &tex_bgl, &post_bgl, &paint_bgl, &gpu.layout],
+            None => vec![&frame_bgl, &tex_bgl, &post_bgl],
+        };
+        let water_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("water-layout"),
+            bind_group_layouts: &water_groups,
+            push_constant_ranges: &[],
+        });
+        let (scene_copy, scene_copy_view) = make_scene_copy(&device, width, height);
+        let fog_up_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fog-up"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 21,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let (fog_half_view, fog_up_bg) = make_fog_half(&device, &fog_up_bgl, width, height);
+        let (air_noise_view, air_samp) = make_air_noise(&device, &queue);
+        let post_bg = make_post_bg(
+            &device,
+            &post_bgl,
+            &depth_view,
+            &scene_copy_view,
+            &air_noise_view,
+            &air_samp,
+        );
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
             bind_group_layouts: &[&frame_bgl, &tex_bgl, &model_bgl, &paint_bgl],
@@ -755,7 +972,6 @@ impl Renderer {
         let terrain_layout_ref = &terrain_layout;
         let mesh_layout_ref = &mesh_layout;
 
-        let contract = silt::render_contract::ContractGpu::try_new(&device);
 
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pipe_terrain = pipeline(
@@ -777,7 +993,7 @@ impl Renderer {
         let pipe_water = pipeline(
             &device,
             &shader,
-            terrain_layout_ref,
+            &water_layout,
             "vs_water",
             Some("fs_water"),
             terrain_buffers(),
@@ -934,6 +1150,46 @@ impl Renderer {
             false,
             None,
         );
+        // Dust volume. Only with the contract: it marches the dust_fog grid.
+        let pipe_fog = contract.as_ref().map(|contract_gpu| {
+            let fog_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fog-layout"),
+                bind_group_layouts: &[&frame_bgl, &tex_bgl, &post_bgl, &paint_bgl, &contract_gpu.layout],
+                push_constant_ranges: &[],
+            });
+            pipeline(
+                &device,
+                &shader,
+                &fog_layout,
+                "vs_fog",
+                Some("fs_fog"),
+                &[],
+                color_format,
+                None,
+                false,
+                None,
+            )
+        });
+        let pipe_fog_up = contract.as_ref().map(|_| {
+            let up_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fog-up-layout"),
+                bind_group_layouts: &[&fog_up_bgl],
+                push_constant_ranges: &[],
+            });
+            pipeline(
+                &device,
+                &shader,
+                &up_layout,
+                "vs_fog",
+                Some("fs_fog_up"),
+                &[],
+                color_format,
+                None,
+                true,
+                None,
+            )
+        });
+
         // Debug view. It reads only the render contract. Compiling it here
         // keeps a contract edit from landing with a shader that does not match.
         let debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1055,6 +1311,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let spray_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spray-v"),
+            size: (24000 * std::mem::size_of::<MeshVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let spray_i = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spray-i"),
+            size: (72000 * 4) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
@@ -1065,6 +1333,13 @@ impl Renderer {
             model_stride,
             frame_buf,
             frame_bg,
+            frame_near_buf,
+            frame_near_bg,
+            env_tex,
+            env_sh: [[0.0; 4]; 9],
+            env_from_file: false,
+            env_baked: None,
+            hdri: crate::env::find_hdri(),
             model_buf,
             model_bg,
             tex_bg,
@@ -1101,6 +1376,8 @@ impl Renderer {
             chunk_i,
             dust_v,
             dust_i,
+            spray_v,
+            spray_i,
             pipe_sky,
             pipe_terrain,
             pipe_water,
@@ -1124,6 +1401,13 @@ impl Renderer {
             height_packed: formats.height_packed,
             depth_format: formats.depth,
             daylight: false,
+            sand_field: false,
+            fog: 0.0,
+            fog_height: 1.4,
+            sun_override: None,
+            debug_depth: 0.0,
+            tire_water: [-1000.0; 4],
+            wind: Vec3::new(1.1, 0.0, -0.65),
             show_props: true,
             show_environment: true,
             show_hills: true,
@@ -1139,6 +1423,17 @@ impl Renderer {
             contract,
             contract_cpu: silt::render_contract::ContractFrame::new(),
             pipe_debug,
+            pipe_fog,
+            pipe_fog_up,
+            fog_half_view,
+            fog_up_bgl,
+            fog_up_bg,
+            post_bgl,
+            post_bg,
+            air_noise_view,
+            air_samp,
+            scene_copy,
+            scene_copy_view,
             debug_contract: false,
             debug_mode: 0,
         }
@@ -1193,6 +1488,20 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let (scene_copy, scene_copy_view) = make_scene_copy(&self.device, width, height);
+        let (fog_half_view, fog_up_bg) = make_fog_half(&self.device, &self.fog_up_bgl, width, height);
+        self.fog_half_view = fog_half_view;
+        self.fog_up_bg = fog_up_bg;
+        self.scene_copy = scene_copy;
+        self.scene_copy_view = scene_copy_view;
+        self.post_bg = make_post_bg(
+            &self.device,
+            &self.post_bgl,
+            &self.depth_view,
+            &self.scene_copy_view,
+            &self.air_noise_view,
+            &self.air_samp,
+        );
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
         self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1209,6 +1518,60 @@ impl Renderer {
                 },
             ],
         });
+    }
+
+    /// Fill the env map for this sky: the HDRI when one was found, else the
+    /// analytic sky. Every mip is written; the shader picks one by roughness.
+    fn bake_env(&mut self, sky: &crate::env::SkyLight) {
+        // The HDRI is a midday sky; the low dusk sun keeps the analytic sky
+        // it was tuned under.
+        let map = self
+            .hdri
+            .as_deref()
+            .filter(|_| sky.physical)
+            .and_then(|bytes| crate::env::from_hdr(bytes, sky))
+            .unwrap_or_else(|| crate::env::procedural(sky));
+        for (level, (w, h, px)) in map.levels.iter().enumerate() {
+            if level as u32 >= self.env_tex.mip_level_count() {
+                break;
+            }
+            let stride = w * 8;
+            let padded = stride.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let mut bytes = vec![0u8; (padded * h) as usize];
+            for y in 0..*h {
+                for x in 0..*w {
+                    let c = px[(y * w + x) as usize];
+                    let at = (y * padded + x * 8) as usize;
+                    for k in 0..4 {
+                        let b = crate::env::f16_bits(c[k]).to_le_bytes();
+                        bytes[at + k * 2] = b[0];
+                        bytes[at + k * 2 + 1] = b[1];
+                    }
+                }
+            }
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.env_tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(*h),
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.env_sh = map.sh;
+        self.env_from_file = map.from_file;
     }
 
     pub fn draw(
@@ -1242,6 +1605,10 @@ impl Renderer {
             fluid,
             dust,
         );
+        self.tire_water = match fluid {
+            Some(fluid) => tire_waterlines(world, fluid),
+            None => [-1000.0; 4],
+        };
         if let Some(gpu) = &self.contract {
             gpu.upload(&self.queue, &self.contract_cpu);
         }
@@ -1264,8 +1631,11 @@ impl Renderer {
         };
         let view_proj = proj * view;
         // The window keeps the low sun. Persist stills ask for daylight.
-        let sun = if self.daylight {
-            Vec3::new(0.38, 0.88, 0.18).normalize()
+        let sun = if let Some(s) = self.sun_override {
+            s.normalize()
+        } else if self.daylight {
+            // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
+            Vec3::new(0.593, 0.755, 0.281).normalize()
         } else {
             Vec3::new(0.88, 0.32, 0.24).normalize()
         };
@@ -1274,10 +1644,27 @@ impl Renderer {
         } else {
             Vec3::new(0.0, 0.0, 2.0)
         };
-        let extent = if self.daylight { 14.0 } else { 36.0 };
+        let mut extent = if self.daylight { 14.0 } else { 36.0 };
+        // The beauty drive keeps the shadow map on the Niva: a 36 m low-sun
+        // map saws the body's shadow edge into teeth.
+        let light_target = if self.sand_field {
+            extent = 16.0;
+            Vec3::new(world.vehicle.pos.x, 0.0, world.vehicle.pos.z)
+        } else {
+            light_target
+        };
         let light_view = Mat4::look_at_rh(light_target + sun * 48.0, light_target, Vec3::Y);
         let light_proj = Mat4::orthographic_rh(-extent, extent, -extent, extent, 1.0, 130.0);
         let light_vp = light_proj * light_view;
+        // Near cascade: 7 m round the Niva at ~3 mm a texel, so the tires
+        // and sills print a sharp contact shadow where they meet the ground.
+        let near_target = Vec3::new(
+            world.vehicle.pos.x,
+            world.vehicle.pos.y - 0.4,
+            world.vehicle.pos.z,
+        );
+        let light_vp_near = Mat4::orthographic_rh(-3.5, 3.5, -3.5, 3.5, 1.0, 24.0)
+            * Mat4::look_at_rh(near_target + sun * 12.0, near_target, Vec3::Y);
         let (sun_color, sky_zenith, sky_horizon, amb) = if self.daylight {
             (
                 [1.70, 1.78, 1.90, 1.0],
@@ -1293,6 +1680,18 @@ impl Renderer {
                 [0.10, 0.062, 0.038, 1.0],
             )
         };
+        // The HDRI is turned to the sun, so a moved sun rebakes it.
+        let env_key = (self.daylight, sun.to_array().map(f32::to_bits));
+        if self.env_baked != Some(env_key) {
+            self.bake_env(&crate::env::SkyLight {
+                sun,
+                sun_color: Vec3::from_slice(&sun_color[..3]),
+                zenith: Vec3::from_slice(&sky_zenith[..3]),
+                horizon: Vec3::from_slice(&sky_horizon[..3]),
+                physical: self.daylight,
+            });
+            self.env_baked = Some(env_key);
+        }
         let frame = FrameData {
             view_proj: view_proj.to_cols_array_2d(),
             light_vp: light_vp.to_cols_array_2d(),
@@ -1319,6 +1718,41 @@ impl Renderer {
             snow_arc: [0.0; 4],
             snow_arc2: [1.0, 0.0, 0.0, 0.0],
             snow_profile: [[0.0; 4]; 8],
+            sh: self.env_sh,
+            env: [
+                self.env_tex.mip_level_count() as f32,
+                if self.daylight { 0.42 } else { 0.55 },
+                if self.env_from_file { 1.0 } else { 0.0 },
+                if self.daylight { 0.86 } else { 1.0 },
+            ],
+            lamps: headlamps(
+                &world.vehicle,
+                if !self.niva_picture { 0.0 } else if self.daylight { 0.6 } else { 1.0 },
+                self.sand_field,
+            ),
+            air: [
+                [self.wind.x, self.wind.y, self.wind.z, self.fog],
+                [
+                    world.vehicle.pos.x,
+                    world.vehicle.pos.y,
+                    world.vehicle.pos.z,
+                    self.fog_height,
+                ],
+                [
+                    world.vehicle.vel.x,
+                    world.vehicle.vel.y,
+                    world.vehicle.vel.z,
+                    world.vehicle.yaw,
+                ],
+            ],
+            light_vp_near: if self.niva_picture {
+                light_vp_near.to_cols_array_2d()
+            } else {
+                // No near cascade: a matrix that maps everything off the map.
+                Mat4::from_translation(Vec3::new(9.0, 9.0, 0.0)).to_cols_array_2d()
+            },
+            tire_water: self.tire_water,
+            debug: [self.debug_depth, 0.0, 0.0, 0.0],
         };
         let mut frame = frame;
         if self.snow {
@@ -1332,10 +1766,34 @@ impl Renderer {
         }
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
+        let mut frame_near = frame;
+        frame_near.light_vp = frame.light_vp_near;
+        self.queue
+            .write_buffer(&self.frame_near_buf, 0, bytemuck::bytes_of(&frame_near));
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
-        let chunks = mud_chunks_with_ground(&world.particles.items, Some(&world.soil));
+        // Liquid in flight comes from the contract's spray slots; the chunk
+        // mesh keeps clods and what lies on the ground.
+        let spray_valid = self.contract_cpu.header.version == 1
+            && self.contract_cpu.header.valid & silt::render_contract::VALID_SPRAY != 0;
+        let chunks = mud_chunks_split(&world.particles.items, Some(&world.soil), spray_valid);
+        let spray = if spray_valid {
+            spray_from_contract(
+                &self.contract_cpu.spray,
+                self.contract_cpu.header.spray_count as usize,
+                cam.eye,
+            )
+        } else {
+            CpuMesh::new()
+        };
+        let spray_count = spray.indices.len() as u32;
+        if spray_count > 0 {
+            self.queue
+                .write_buffer(&self.spray_v, 0, bytemuck::cast_slice(&spray.vertices));
+            self.queue
+                .write_buffer(&self.spray_i, 0, bytemuck::cast_slice(&spray.indices));
+        }
         let chunk_count = chunks.indices.len() as u32;
         if chunk_count > 0 {
             self.queue
@@ -1343,7 +1801,15 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
         }
-        let dust = dust_cloud(&world.particles.items);
+        // With the volume pass the airborne dust is the published grid; the
+        // picture cards would draw the same dust twice.
+        let fog_volume = self.pipe_fog.is_some()
+            && self.contract_cpu.header.valid & silt::render_contract::VALID_DUST_FOG != 0;
+        let dust = if fog_volume {
+            CpuMesh::new()
+        } else {
+            dust_cloud(&world.particles.items)
+        };
         let dust_count = dust.indices.len() as u32;
         if dust_count > 0 {
             self.queue
@@ -1407,6 +1873,40 @@ impl Renderer {
             }
         }
 
+        if self.niva_picture {
+            // Near cascade, right half of the atlas: the ground under the
+            // Niva and the Niva itself.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow-near"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.shadow_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_viewport(SHADOW as f32, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
+            pass.set_bind_group(0, &self.frame_near_bg, &[]);
+            pass.set_bind_group(1, &self.height_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[0]);
+            pass.set_pipeline(&self.pipe_shadow_terrain);
+            draw_indexed(&mut pass, &self.terrain);
+            pass.set_pipeline(&self.pipe_shadow_mesh);
+            self.draw_vehicle(&mut pass);
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -1443,6 +1943,11 @@ impl Renderer {
             }
 
             pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+            pass.set_bind_group(3, &self.paint_bg, &[]);
+            if let Some(gpu) = &self.contract {
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+            }
             pass.set_pipeline(&self.pipe_terrain);
             draw_indexed(&mut pass, &self.terrain);
 
@@ -1464,8 +1969,83 @@ impl Renderer {
                 draw_indexed(&mut pass, &self.props);
             }
 
+        }
+
+        // The water reflects the opaque frame: copy it, then draw the water
+        // with the depth read-only so the same depth can be sampled.
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self.scene_copy,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("water"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.post_bg, &[]);
+            if let Some(gpu) = &self.contract {
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+            }
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("after-water"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
 
             // Sheets are thin. Back-face cull hides the side the camera sees.
             pass.set_pipeline(&self.pipe_mesh_double);
@@ -1479,10 +2059,62 @@ impl Renderer {
             if dust_count > 0 {
                 self.draw_dust(&mut pass, dust_count);
             }
+            if spray_count > 0 {
+                pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+                pass.set_vertex_buffer(0, self.spray_v.slice(..));
+                pass.set_index_buffer(self.spray_i.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..spray_count, 0, 0..1);
+            }
 
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+        }
+
+        let air_pass = fog_volume || self.fog > 0.0;
+        if let (true, Some(pipe), Some(up), Some(gpu)) =
+            (air_pass, &self.pipe_fog, &self.pipe_fog_up, &self.contract)
+        {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("dust-volume"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.fog_half_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, &self.frame_bg, &[]);
+                pass.set_bind_group(1, &self.tex_bg, &[]);
+                pass.set_bind_group(2, &self.post_bg, &[]);
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("dust-volume-up"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(up);
+            pass.set_bind_group(0, &self.fog_up_bg, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         if self.debug_contract {
@@ -1845,6 +2477,33 @@ impl Renderer {
     }
 }
 
+/// Mean water surface on a ring just outside each carcass: soil height plus
+/// the solved water and slurry. Read only; the sheet is the solver's.
+pub fn tire_waterlines(world: &World, fluid: &silt::fluid_core::FluidCore) -> [f32; 4] {
+    let v = &world.vehicle;
+    let ori = v.orientation();
+    let mut out = [-1000.0; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        let c = v.pos + ori * v.wheel_center_local(i);
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let (x, z) = (c.x + a.cos() * 0.32, c.z + a.sin() * 0.45);
+            let g = fluid.sample(x, z);
+            let film = g.water_m + g.slurry_m;
+            if film > 0.004 {
+                sum += world.soil.sample(x, z).height + film;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            *o = sum / n;
+        }
+    }
+    out
+}
+
 fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
     use glam::Quat;
     let mut out = [[0.0; 4]; 8];
@@ -2006,7 +2665,7 @@ fn upload_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &str,
-    layers: &[crate::cc0::RgbaTex; 5],
+    layers: &[crate::cc0::RgbaTex],
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let width = layers[0].width;
     let height = layers[0].height;
@@ -2019,7 +2678,7 @@ fn upload_array(
         size: wgpu::Extent3d {
             width,
             height,
-            depth_or_array_layers: 5,
+            depth_or_array_layers: layers.len() as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -2324,7 +2983,8 @@ fn make_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // The dust volume pass reads scene depth to stop its march.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&Default::default());
@@ -2692,4 +3352,164 @@ fn debug_contract_view_reads_the_published_maps() {
     assert_ne!(px, [255, 0, 255, 255], "version mismatch magenta");
     assert!(px[3] == 255, "debug view did not cover the centre {px:?}");
     assert!(px[0] > 0, "ground ramp was empty {px:?}");
+}
+
+/// Niva headlamps in world space. The body is fitted with the hubs at
+/// y -0.20 and the front axle at z 1.08 (niva.rs); the lamps sit 0.40 m above
+/// the hubs and 0.74 m ahead of the axle, 0.56 m either side.
+/// The right lamp's w carries the sand-field flag for the ground shader.
+fn headlamps(vehicle: &Vehicle, on: f32, sand: bool) -> [[f32; 4]; 3] {
+    let ori = vehicle.orientation();
+    let left = vehicle.pos + ori * Vec3::new(-0.56, 0.20, 1.82);
+    let right = vehicle.pos + ori * Vec3::new(0.56, 0.20, 1.82);
+    // Dipped beam: a few degrees down the road.
+    let dir = (ori * Vec3::new(0.0, -0.05, 1.0)).normalize_or_zero();
+    [
+        [left.x, left.y, left.z, on],
+        [right.x, right.y, right.z, if sand { 1.0 } else { 0.0 }],
+        [dir.x, dir.y, dir.z, 0.86],
+    ]
+}
+
+fn make_scene_copy(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-copy"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+/// Half-resolution target for the dust and fog march, and the bind group the
+/// upsample reads it through. RGB is premultiplied by A.
+fn make_fog_half(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+) -> (wgpu::TextureView, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("fog-half"),
+        size: wgpu::Extent3d {
+            width: width.div_ceil(2),
+            height: height.div_ceil(2),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("fog-half"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fog-up"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::Sampler(&samp),
+            },
+        ],
+    });
+    (view, bg)
+}
+
+/// The curl and billow volume the dust and fog march warps its detail with.
+fn make_air_noise(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, wgpu::Sampler) {
+    let n = crate::air_noise::AIR_NOISE;
+    let size = wgpu::Extent3d {
+        width: n,
+        height: n,
+        depth_or_array_layers: n,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("air-noise"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Snorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let texels = crate::air_noise::curl_volume();
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&texels),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(n * 4),
+            rows_per_image: Some(n),
+        },
+        size,
+    );
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("air-noise"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    (tex.create_view(&wgpu::TextureViewDescriptor::default()), samp)
+}
+
+fn make_post_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    depth_view: &wgpu::TextureView,
+    scene_view: &wgpu::TextureView,
+    air_noise: &wgpu::TextureView,
+    air_samp: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("post"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(scene_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(air_noise),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(air_samp),
+            },
+        ],
+    })
 }
