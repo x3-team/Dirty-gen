@@ -1617,10 +1617,7 @@ mod tests {
             "wake vorticity {peak} below {}",
             crate::fluid_core::WAKE_VORTICITY_MIN
         );
-        assert!(
-            wake_cells >= 1,
-            "wake cells {wake_cells} on the coarse solve grid"
-        );
+        assert!(wake_cells > 8, "wake cells {wake_cells}");
         assert_eq!(nan, 0, "nan {nan}");
         assert!(
             air_mean < crate::fluid_core::AIR_STEP_BUDGET_MS as f64,
