@@ -932,7 +932,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let mut parked = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut parked, px + 0.36, pz + 0.04, parked_yaw);
     win_demo_calm_wheels_in_pool(&mut parked);
-    parked.soil.win_demo_still_touchup();
+    win_demo_still_touchup(&mut parked);
     parked.time = 1.2;
     let pose = win_demo_low_pose(&parked);
 
@@ -955,7 +955,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let mut driven = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut driven, px + 0.52, pz + 0.30, parked_yaw);
     win_demo_stage_bow_in_pool(&mut driven);
-    driven.soil.win_demo_still_touchup();
+    win_demo_still_touchup(&mut driven);
     driven.time = 12.6;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
@@ -970,7 +970,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     let mut wheel = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut wheel, px + 0.36, pz + 0.06, parked_yaw);
-    wheel.soil.win_demo_still_touchup();
+    win_demo_still_touchup(&mut wheel);
     wheel.time = 2.2;
     let pose = win_demo_low_pose(&wheel);
 
@@ -995,7 +995,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.show_mud_particles = false;
     win_demo_stage_bow_in_pool(&mut wheel);
     wheel.time = 9.2;
-    wheel.soil.win_demo_still_touchup();
+    win_demo_still_touchup(&mut wheel);
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
         &media.join("puddle-wheel.png"),
@@ -1030,7 +1030,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let mut drive = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut drive, px + 0.42, pz + 0.18, -2.58);
     win_demo_stage_bow_in_pool(&mut drive);
-    drive.soil.win_demo_still_touchup();
+    win_demo_still_touchup(&mut drive);
     drive.time = 11.4;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
@@ -1107,6 +1107,20 @@ fn win_demo_calm_wheels_in_pool(world: &mut World) {
         wh.compression = 0.08;
         wh.in_water = true;
     }
+}
+
+fn win_demo_rear_hubs_xz(world: &World) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(2);
+    for i in [2_usize, 3] {
+        let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
+        out.push((hub.x, hub.z));
+    }
+    out
+}
+
+fn win_demo_still_touchup(world: &mut World) {
+    let hubs = win_demo_rear_hubs_xz(world);
+    world.soil.win_demo_still_touchup(&hubs);
 }
 
 fn win_demo_stage_bow_in_pool(world: &mut World) {

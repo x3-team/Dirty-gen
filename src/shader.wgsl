@@ -715,10 +715,7 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
     if (win_demo_flat_terrain()) {
-        let h = win_demo_clamp_surface_y(
-            in.xz,
-            height_bilinear(in.xz) + win_demo_pool_bowl_offset(in.xz),
-        );
+        let h = win_demo_clamp_surface_y(in.xz, height_bilinear(in.xz));
         var o: TerrOut;
         o.clip = frame.view_proj * vec4<f32>(in.xz.x, h, in.xz.y, 1.0);
         o.world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -1117,39 +1114,6 @@ fn beauty_seam_center() -> vec2<f32> {
 }
 
 // CPU seam pan ellipse — one continuous column for the hero pool (not per-tire pads).
-// Visual bowl on the hero pad (vertex offset; soil grid stays flat for bounds).
-fn win_demo_pool_bowl_offset(xz: vec2<f32>) -> f32 {
-    if (!win_demo_flat_terrain()) {
-        return 0.0;
-    }
-    let c = beauty_seam_center();
-    let dx = (xz.x - c.x) / 1.32;
-    let dz = (xz.y - c.y) / 1.02;
-    let r = sqrt(dx * dx + dz * dz);
-    if (r > 1.18) {
-        return 0.0;
-    }
-    let core = clamp(1.0 - r / 1.12, 0.0, 1.0);
-    let rim = smoothstep(1.18, 0.72, r);
-    return 0.0;
-}
-
-fn win_demo_pool_column(xz: vec2<f32>) -> f32 {
-    if (!win_demo_flat_terrain()) {
-        return water_column(xz);
-    }
-    let c = beauty_seam_center();
-    let dx = (xz.x - c.x) / 1.32;
-    let dz = (xz.y - c.y) / 1.02;
-    let r = sqrt(dx * dx + dz * dz);
-    let fade = smoothstep(1.16, 0.62, r);
-    var col = water_column(xz) * fade * fade;
-    if (water_near_tire_hub(xz, 0.48)) {
-        col = max(col, 0.014 * fade);
-    }
-    return col;
-}
-
 fn win_demo_seam_column(xz: vec2<f32>) -> f32 {
     if (!win_demo_flat_terrain()) {
         return 0.0;
@@ -1568,19 +1532,20 @@ fn water_bed(xz: vec2<f32>) -> f32 {
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
     if (win_demo_flat_terrain()) {
-        let column = win_demo_pool_column(in.xz);
-        let bed = height_bilinear(in.xz) + win_demo_pool_bowl_offset(in.xz);
-        let rip = ripple_height(in.xz, frame.misc.x) * 0.003;
-        var y = bed + rip;
-        if (column > 0.003) {
-            y = bed + water_surface_lift(column) + rip;
-        }
+        let t = frame.misc.x;
+        let column = max(water_column(in.xz), win_demo_seam_column(in.xz));
+        let bed = height_bilinear(in.xz);
+        let rip = ripple_height(in.xz, t) * 0.004;
+        let bow = max(beauty_bow_wave(in.xz, t), 0.0);
+        let driven = smoothstep(4.0, 5.5, t);
+        let film = max(water_surface_lift(column), 0.0045);
+        var y = bed + film + rip + bow * driven * 0.38;
         y = win_demo_clamp_surface_y(in.xz, y);
         var o: WaterOut;
         o.clip = frame.view_proj * vec4<f32>(in.xz.x, y, in.xz.y, 1.0);
         o.world = vec3<f32>(in.xz.x, y, in.xz.y);
         o.ij = in.ij;
-        o.depth = max(column, 0.004);
+        o.depth = max(column, covered_depth(in.xz) * 0.34);
         return o;
     }
     let local = height_bilinear(in.xz);
@@ -1626,9 +1591,6 @@ fn vs_water(in: TerrIn) -> WaterOut {
     if (beauty && (distance(in.xz, beauty_seam_center()) < seam_span || column > 0.0008)) {
         y = flat_pool;
     }
-    if (win_demo_flat_terrain() && distance(in.xz, beauty_seam_center()) < seam_span && column > 0.0004) {
-        y = flat_pool;
-    }
     y = win_demo_clamp_surface_y(in.xz, y);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
@@ -1652,7 +1614,7 @@ fn shade_seam_pool(
     if (win_demo_flat_terrain()) {
         let bow = beauty_bow_wave(xz, t);
         let driven = smoothstep(4.0, 5.5, t);
-        let ripple_mix = clamp(0.22 + (1.0 - driven) * 0.12 + max(bow, 0.0) * 5.2 * driven, 0.22, 0.82);
+        let ripple_mix = clamp(0.32 + (1.0 - driven) * 0.08 + max(bow, 0.0) * 4.8 * driven, 0.32, 0.78);
         nrm = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), nrm, ripple_mix));
     }
     let view = normalize(frame.cam_pos.xyz - in.world);
@@ -1665,47 +1627,37 @@ fn shade_seam_pool(
     let water_tint = vec3<f32>(0.05, 0.34, 0.52);
     let water_deep = vec3<f32>(0.02, 0.16, 0.30);
     var body = mix(water_tint, water_deep, deep);
-    body = mix(mix(bed * vec3<f32>(0.42, 0.34, 0.26), water_tint * 0.62, 0.55), body, 1.0 - shallow * select(0.35, 0.18, win_demo_flat_terrain()));
-    body *= select(0.22 + 0.88 * ndl, 0.12 + 0.42 * ndl, win_demo_flat_terrain());
+    body = mix(mix(bed * vec3<f32>(0.42, 0.34, 0.26), water_tint * 0.62, 0.55), body, 1.0 - shallow * 0.35);
+    body *= 0.22 + 0.88 * ndl;
     let refl_dir = reflect(-view, nrm);
-    var reflect_col = vec3<f32>(0.0);
-    if (win_demo_flat_terrain()) {
-        reflect_col = sky_reflect(refl_dir);
-    } else {
-        reflect_col = pool_scene_reflect(in.world, nrm, view);
-    }
+    var reflect_col = pool_scene_reflect(in.world, nrm, view);
     let ibl = sky_reflect(refl_dir);
     let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 96.0);
-    let ibl_mix = select(select(0.62, 0.45, ultra), 0.68, win_demo_flat_terrain());
-    let ibl_gain = select(1.55, 2.05, win_demo_flat_terrain());
-    reflect_col = mix(reflect_col, ibl * ibl_gain + frame.sun_color.rgb * sun_disk * 0.82, ibl_mix);
+    let ibl_mix = select(0.52, 0.38, win_demo_flat_terrain());
+    reflect_col = mix(reflect_col, ibl * 1.38 + frame.sun_color.rgb * sun_disk * 0.72, ibl_mix);
     let veh_scene = reflect_vehicle_scene(in.world, nrm, view);
     let planar = niva_planar_reflect(in.world, nrm, view);
-    let veh_mix = select(select(0.72, 0.88, ultra), 0.82, win_demo_flat_terrain());
     if (length(veh_scene) > 0.03) {
-        reflect_col = mix(reflect_col, veh_scene, veh_mix);
+        reflect_col = mix(reflect_col, veh_scene, select(0.62, 0.78, ultra));
     }
     if (length(planar) > 0.02) {
-        reflect_col = mix(reflect_col, planar, select(0.62, 0.78, ultra));
+        reflect_col = mix(reflect_col, planar, select(0.48, 0.62, ultra));
     }
-    let fres_bias = select(select(0.32, 0.42, ultra), 0.48, win_demo_flat_terrain());
-    let fres_w = clamp(fres * select(0.88, 0.96, ultra) + fres_bias, 0.0, 1.0);
+    let fres_w = clamp(fres * select(0.82, 0.95, ultra) + select(0.38, 0.52, ultra), 0.0, 1.0);
     var col = mix(body, reflect_col, fres_w);
     let shore_wet = smoothstep(0.11, 0.018, column_here) * (1.0 - smoothstep(0.0, 0.012, column_here));
     col = mix(col, mix(bed * vec3<f32>(0.28, 0.22, 0.16), col, 0.55), shore_wet * 0.45);
     // Ripples and bow live in puddle_normal only — emissive rings read as red/black bands.
     let halfv = normalize(sun + view);
     let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), select(64.0, 128.0, ultra));
-    col += vec3<f32>(0.82, 0.88, 0.96) * sheen * select(select(0.06, 0.12, ultra), 0.028, win_demo_flat_terrain());
-    if (win_demo_flat_terrain()) {
-        let driven = smoothstep(4.0, 5.5, t);
-        let bow_h = beauty_bow_wave(xz, t);
-        col += vec3<f32>(0.08, 0.22, 0.32) * max(bow_h, 0.0) * driven * 4.5;
+    col += vec3<f32>(0.82, 0.88, 0.96) * sheen * select(select(0.22, 0.38, ultra), 0.16, win_demo_flat_terrain());
+    let edge_a = smoothstep(0.0, 0.016, column_here);
+    col = mix(mix(bed * vec3<f32>(0.36, 0.30, 0.24), col, 0.65), col, edge_a);
+    var alpha = mix(0.76, 0.91, deep) * edge_a;
+    alpha = max(alpha, select(0.74, 0.82, ultra) * edge_a);
+    if (win_demo_flat_terrain() && column_here > 0.008) {
+        alpha = max(alpha, 0.84);
     }
-    let edge_a = smoothstep(0.0, select(0.022, 0.048, win_demo_flat_terrain()), column_here);
-    col = mix(mix(bed * vec3<f32>(0.36, 0.30, 0.24), col, 0.55), col, edge_a);
-    var alpha = mix(0.68, 0.88, deep) * edge_a;
-    alpha = max(alpha, select(0.62, 0.74, ultra) * edge_a);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
@@ -1740,10 +1692,14 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz - e) > 0.02
         || -stamp_bilinear(xz + ez) > 0.02
         || -stamp_bilinear(xz - ez) > 0.02;
-    let column_here = select(water_column(xz), win_demo_pool_column(xz), win_demo_flat_terrain());
+    var column_here = water_column(xz);
+    let demo_column = win_demo_seam_column(xz);
+    if (win_demo_flat_terrain()) {
+        column_here = max(column_here, demo_column);
+    }
     let seam_still = win_demo_flat_terrain() && distance(xz, beauty_seam_center()) < 3.25;
     let free = water_column_on() && in.depth > 0.004;
-    let tire_pad = water_near_tire_hub(xz, select(0.32, 0.52, win_demo_flat_terrain()));
+    let tire_pad = water_near_tire_hub(xz, 0.32);
     let seam_flat = beauty_seam_weight(xz);
     let in_seam_pan = (beauty || win_demo_flat_terrain()) && distance(xz, beauty_seam_center()) < 3.25;
     let pool_here = column_here > 0.0035
@@ -1752,14 +1708,15 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || (beauty && seam_flat > 0.12)
         || (in_seam_pan && column_here > 0.0008);
     let beauty_pool = beauty && pool_here;
+    let demo_pool = win_demo_flat_terrain() && demo_column > 0.00045;
     let keep_water = free
         || pool_here
+        || demo_pool
         || (beauty && tire_pad)
         || (beauty && in_seam_pan)
-        || (seam_still && column_here > 0.0005)
-        || (win_demo_flat_terrain() && column_here > 0.003);
+        || (seam_still && column_here > 0.0005);
     if (win_demo_flat_terrain()) {
-        if (column_here < 0.0018 && !tire_pad) {
+        if (!keep_water) {
             discard;
         }
     } else if (!keep_water && (near_cut || own < 0.008 || in.depth < 0.008)) {
@@ -1767,7 +1724,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     }
     let seam_pool = select(
         (beauty || win_demo_flat_terrain()) && (in_seam_pan || tire_pad || column_here > 0.0008),
-        win_demo_flat_terrain() && (column_here > 0.0028 || tire_pad),
+        win_demo_flat_terrain() && demo_column > 0.00035,
         win_demo_flat_terrain(),
     );
     if (seam_pool) {
