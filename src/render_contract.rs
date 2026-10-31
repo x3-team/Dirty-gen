@@ -1194,7 +1194,6 @@ mod tests {
         let mut frame = ContractFrame::new();
         publish(&mut frame, &soil, &[], [0.0, 0.0], 2.0, 7, None, None);
         assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-        assert_eq!(RENDER_CONTRACT_VERSION, 2);
         assert_eq!(frame.header.valid & VALID_CRUST, VALID_CRUST);
         assert_published_crust(&soil, &frame);
 
@@ -1211,7 +1210,7 @@ mod tests {
             Some(&fluid),
             None,
         );
-        assert_eq!(with_sheet.header.version, 2);
+        assert_eq!(with_sheet.header.version, RENDER_CONTRACT_VERSION);
         assert_published_crust(&soil, &with_sheet);
     }
 

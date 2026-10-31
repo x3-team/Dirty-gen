@@ -7,33 +7,29 @@ use std::path::Path;
 
 use silt::fluid_core::FluidCore;
 use silt::render_contract::{publish, ContractFrame, RENDER_CONTRACT_VERSION, VALID_CRUST};
-use silt::soil::{CRACK_SHADER_METRES, CRUST_SHADER_METRES};
+use silt::soil::{CRACK_SHADER_METRES, CRUST_CAP_M, CRUST_SHADER_METRES};
 use silt::World;
 
 const DUMP: &str = "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/crust-cracks";
 
 #[test]
 fn drying_publishes_crust_and_cracks_without_moving_mass() {
-    assert_eq!(
-        RENDER_CONTRACT_VERSION, 2,
-        "binding 7 is already in version 2"
-    );
-
     let mut world = World::flat(0.45);
     let stats = world.drying_crust_frame();
     let solid_before = world.soil.mix_volumes();
-    let area = world.soil.cell * world.soil.cell;
-    let mut column = 0.0f32;
-    let mut skin = 0.0f32;
-    let mut fissure = 0.0f32;
-    for idx in 0..world.soil.bed.len() {
-        column += world.soil.bed[idx] + world.soil.placed[idx] + world.soil.cloud[idx];
-        skin += world.soil.crust[idx];
-        fissure += world.soil.crack[idx];
+    let book = world.soil.crust_book();
+    for idx in 0..world.soil.crust.len() {
+        let thickness = world.soil.crust[idx];
+        let opening = world.soil.crack[idx];
+        assert!(
+            thickness <= CRUST_CAP_M,
+            "thickness {thickness} over {CRUST_CAP_M}"
+        );
+        assert!(
+            opening <= thickness,
+            "opening {opening} over thickness {thickness}"
+        );
     }
-    column *= area;
-    skin *= area;
-    fissure *= area;
 
     let center = [world.vehicle.pos.x, world.vehicle.pos.z];
     let mut frame = ContractFrame::new();
@@ -64,18 +60,39 @@ fn drying_publishes_crust_and_cracks_without_moving_mass() {
 
     let report = map_report(&world.soil, &frame);
     let sheet_report = map_report(&world.soil, &sheet);
+    let (win_t, map_t, win_o, map_o) = window_crust(&world.soil, &frame);
+    let (sheet_win_t, sheet_map_t, sheet_win_o, sheet_map_o) = window_crust(&world.soil, &sheet);
+    let map_gap = (win_t - map_t).abs();
+    let open_gap = (win_o - map_o).abs();
+    let sheet_gap = (sheet_win_t - sheet_map_t).abs();
+    let sheet_open_gap = (sheet_win_o - sheet_map_o).abs();
 
     eprintln!(
+        "CRUST_BOOK version={} thickness_m3={:.6} opening_m3={:.6} grown_m3={:.6} \
+         lost_m3={:.6} gap={:.8} window_m3={:.6} map_m3={:.6} map_gap={:.8} \
+         open_window_m3={:.6} open_map_m3={:.6} open_gap={:.8} sheet_gap={:.8}",
+        frame.header.version,
+        book.thickness_m3,
+        book.opening_m3,
+        book.grown_m3,
+        book.lost_m3,
+        book.gap(),
+        win_t,
+        map_t,
+        map_gap,
+        win_o,
+        map_o,
+        open_gap,
+        sheet_gap
+    );
+    eprintln!(
         "CRUST_MASS solid_m3={:.6} cut_m3={:.4} placed_m3={:.4} water_m3={:.6} slurry_m3={:.6} \
-         skin_m3={:.6} opening_m3={:.6} bed_gap={:.8} placed_gap={:.8} \
-         cloud_gap={:.8} slurry_gap={:.8}",
+         bed_gap={:.8} placed_gap={:.8} cloud_gap={:.8} slurry_gap={:.8}",
         solid_before.soil,
         stats.cut,
         stats.placed,
         solid_before.water,
         solid_before.slurry,
-        skin,
-        fissure,
         stats.bed_gap,
         stats.placed_gap,
         stats.cloud_gap,
@@ -111,8 +128,10 @@ fn drying_publishes_crust_and_cracks_without_moving_mass() {
         &frame,
         &format!(
             "version {RENDER_CONTRACT_VERSION}\n\
+         thickness_m3 {:.6}\nopening_m3 {:.6}\ngrown_m3 {:.6}\nlost_m3 {:.6}\n\
+         gap {:.8}\nwindow_m3 {:.6}\nmap_m3 {:.6}\nmap_gap {:.8}\n\
+         open_window_m3 {:.6}\nopen_map_m3 {:.6}\nopen_gap {:.8}\n\
          solid_m3 {:.6}\ncut_m3 {:.4}\nplaced_m3 {:.4}\nwater_m3 {:.6}\nslurry_m3 {:.6}\n\
-         skin_m3 {:.6}\nopening_m3 {:.6}\n\
          bed_gap {:.8}\nplaced_gap {:.8}\ncloud_gap {:.8}\nslurry_gap {:.8}\n\
          thickness_max {:.5}\nopening_max {:.5}\n\
          thick_cells {}\nopen_cells {}\ncopied {}\nground_err {:.8}\n\
@@ -120,13 +139,22 @@ fn drying_publishes_crust_and_cracks_without_moving_mass() {
          sand_thick {:.6}\nsilt_thick {:.6}\n\
          lane_thick {:.5}\nlane_open {:.5}\nlane_open_max {:.5}\n\
          sheet_thickness_max {:.5}\nsheet_opening_max {:.5}\n",
+            book.thickness_m3,
+            book.opening_m3,
+            book.grown_m3,
+            book.lost_m3,
+            book.gap(),
+            win_t,
+            map_t,
+            map_gap,
+            win_o,
+            map_o,
+            open_gap,
             solid_before.soil,
             stats.cut,
             stats.placed,
             solid_before.water,
             solid_before.slurry,
-            skin,
-            fissure,
             stats.bed_gap,
             stats.placed_gap,
             stats.cloud_gap,
@@ -150,25 +178,43 @@ fn drying_publishes_crust_and_cracks_without_moving_mass() {
         ),
     );
 
-    assert_eq!(frame.header.version, 2);
+    assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
     assert_eq!(frame.header.valid & VALID_CRUST, VALID_CRUST);
     assert!(
-        (column - solid_before.soil).abs() < 1.0e-3,
-        "solid column {column:.6} ledger {:.6}",
-        solid_before.soil
+        book.thickness_m3 > 1.0,
+        "crust book stayed empty, {:.6}",
+        book.thickness_m3
+    );
+    assert!(
+        book.opening_m3 > 0.05,
+        "opening book stayed empty, {:.6}",
+        book.opening_m3
+    );
+    assert!(
+        book.gap() < 1.0e-3,
+        "crust book gap {:.6} grown {:.6} lost {:.6} still {:.6}",
+        book.gap(),
+        book.grown_m3,
+        book.lost_m3,
+        book.thickness_m3
+    );
+    assert!(win_t > 1.0, "window crust book stayed empty, {win_t:.6}");
+    assert!(map_gap < 1.0e-3, "thickness map gap {map_gap:.6}");
+    assert!(open_gap < 1.0e-3, "opening map gap {open_gap:.6}");
+    assert!(sheet_gap < 1.0e-3, "sheet thickness gap {sheet_gap:.6}");
+    assert!(
+        sheet_open_gap < 1.0e-3,
+        "sheet opening gap {sheet_open_gap:.6}"
     );
     assert!(
         (solid_after.soil - solid_before.soil).abs() < 1.0e-6,
         "publish moved solid mass"
     );
-    assert!(skin > 0.05, "the skin volume stayed empty, {skin:.6} m3");
     assert!(
-        fissure > 0.005,
-        "the fissure volume stayed empty, {fissure:.6} m3"
-    );
-    assert!(
-        (column + skin - solid_before.soil).abs() > 0.05,
-        "the skin was folded into the solid ledger"
+        (f64::from(solid_before.soil) - book.thickness_m3).abs() > 1.0,
+        "the skin was folded into the solid ledger, solid {:.6} skin {:.6}",
+        solid_before.soil,
+        book.thickness_m3
     );
     assert!(
         stats.bed_gap < 1.0e-5,
@@ -238,7 +284,7 @@ fn drying_publishes_crust_and_cracks_without_moving_mass() {
         "silt crusted, {:.6}",
         report.silt_thick
     );
-    assert_eq!(sheet.header.version, 2);
+    assert_eq!(sheet.header.version, RENDER_CONTRACT_VERSION);
     assert_eq!(sheet_report.mismatch, 0);
     assert!(sheet_report.thickness_max > 0.015);
     assert!(sheet_report.opening_max > 0.004);
@@ -262,6 +308,61 @@ struct MapReport {
     sand_cells: u32,
     silt_thick: f32,
     silt_cells: u32,
+}
+
+/// Soil cells the window hits, each once, against the published sample.
+/// Both sides use the soil cell area, so a copied channel balances.
+fn window_crust(soil: &silt::soil::SoilField, frame: &ContractFrame) -> (f64, f64, f64, f64) {
+    let res = frame.header.window_res as usize;
+    let area = f64::from(soil.cell) * f64::from(soil.cell);
+    let mut seen = vec![false; soil.crust.len()];
+    let mut soil_t = 0.0f64;
+    let mut soil_o = 0.0f64;
+    let mut map_t = 0.0f64;
+    let mut map_o = 0.0f64;
+    for j in 0..res {
+        for i in 0..res {
+            let x = frame.header.origin_x + (i as f32 + 0.5) * frame.header.cell_m;
+            let z = frame.header.origin_z + (j as f32 + 0.5) * frame.header.cell_m;
+            let cidx = j * res + i;
+            let thickness = frame.crust[cidx * 2];
+            let opening = frame.crust[cidx * 2 + 1];
+            assert!(
+                thickness <= CRUST_CAP_M,
+                "map thickness {thickness} over {CRUST_CAP_M}"
+            );
+            assert!(
+                opening <= thickness,
+                "map opening {opening} over thickness {thickness}"
+            );
+            let Some(sidx) = soil.idx_at(x, z) else {
+                continue;
+            };
+            if seen[sidx] {
+                continue;
+            }
+            seen[sidx] = true;
+            let st = soil.crust[sidx];
+            let so = soil.crack[sidx];
+            let st = if st.is_finite() { st.max(0.0) } else { 0.0 };
+            let so = if so.is_finite() { so.max(0.0) } else { 0.0 };
+            let mt = if thickness.is_finite() {
+                thickness.max(0.0)
+            } else {
+                0.0
+            };
+            let mo = if opening.is_finite() {
+                opening.max(0.0)
+            } else {
+                0.0
+            };
+            soil_t += f64::from(st);
+            soil_o += f64::from(so);
+            map_t += f64::from(mt);
+            map_o += f64::from(mo);
+        }
+    }
+    (soil_t * area, map_t * area, soil_o * area, map_o * area)
 }
 
 fn map_report(soil: &silt::soil::SoilField, frame: &ContractFrame) -> MapReport {
