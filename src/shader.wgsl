@@ -1336,7 +1336,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // The tire-force cut under the puddle is wet sand that dropped (contract
     // binding 1); the kind map re-labels those cells as packed mud, which
     // printed the two tracks as dark tiles with straight cell edges.
-    if (sand_field() && kind != 0u && kind != 10u && film_w.r + film_w.g > 0.01) {
+    // Same for the dry tracks behind the wheels: damp sand, not mud holes.
+    if (sand_field() && kind != 0u && kind != 10u) {
         kind = 0u;
     }
     let wet = max(mix(wet_ring / 6.0, bc_moisture(xz, mat.r), 0.35), smoothstep(0.002, 0.012, film_w.r + film_w.g));
@@ -1706,7 +1707,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         n = normalize(n + vec3<f32>(-hx / re, 0.0, -hz / re) * 2.5);
         // Packed and a little damper than the loose top: the floor goes darker,
         // so the lane reads from a distance.
-        albedo *= mix(1.0, 0.55, rut_k);
+        albedo *= mix(1.0, select(0.55, 0.82, sand_field()), rut_k);
         // A pressed floor is smoother and holds water.
         rough_out = mix(rough_out, 0.35, rut_k);
         n = normalize(mix(n, n_geo, rut_k * 0.3));
@@ -2216,7 +2217,6 @@ fn vs_water(in: TerrIn) -> WaterOut {
             if (wl > -100.0 && wl > c.y - c.w + 0.004) {
                 let k = (1.0 - smoothstep(0.3, 0.55, length(in.xz - c.xz))) * inside;
                 y = mix(y, wl + rip * 0.2, k);
-                d_out = mix(d_out, max(wl - ground_c, d_out), k);
             }
         }
     }
@@ -2590,7 +2590,6 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // path, so the round bottom of the tire shows through the murk and the
     // wheel does not read as cut flat at the waterline.
     // The stirred collar round each tire is opaque mud, not a window.
-    opacity = max(opacity, collar_t * 0.35 * (1.0 - over_tire));
     var alpha = 1.0 - (1.0 - opacity) * (1.0 - fres);
     // The body and the tires hide the sky from the water under them too.
     let w_ao = niva_ground_ao(in.world);
@@ -2613,8 +2612,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // band covered whole metres and lit them up as white streaks.
     let meniscus = min(edge_line * 1.6, 1.0) * smoothstep(0.0015, 0.003, depth) * (1.0 - smoothstep(0.003, 0.006, depth));
     // The film runs out clear over the sand: no bright line at the edge.
-    lit = lit * (1.0 + meniscus * 0.15);
-    alpha = max(max(alpha, meniscus * 0.12) * smoothstep(0.0012, 0.003, depth), foam * 0.85 * smoothstep(0.0012, 0.003, depth));
+    // A thin light lip where the film runs out: the meniscus catches the sky
+    // and a little of the sun.
+    lit = lit * (1.0 + meniscus * 0.6) + frame.sun_color.rgb * meniscus * 0.04;
+    alpha = max(max(alpha, meniscus * 0.35) * smoothstep(0.0012, 0.003, depth), foam * 0.85 * smoothstep(0.0012, 0.003, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
     // The car and anything else standing in the frame mirror in the sheet.
@@ -2637,9 +2638,12 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     }
     let ssr = vec4<f32>(ssr_sum / max(ssr_w, 1e-4), ssr_w / 5.0);
     if (ssr.a > 0.0) {
-        let k = ssr.a * fres * (1.0 - foam) * calm_or_film(depth) * mix(0.05, 0.1, smoothstep(0.01, 0.08, depth)) * (1.0 - 0.4 * near_tire)
-            * mix(2.2, 6.0, far_k);
-        out_rgb = mix(out_rgb, ssr.rgb * 0.92 * w_ao, clamp(k / max(alpha, 0.05), 0.0, 1.0));
+        // Near the Niva the sheet mirrors the sills, body and tires with its
+        // Fresnel weight, blurred by the stretched rays; elsewhere a trace.
+        let near_car = 1.0 - smoothstep(0.4, 2.2, max(length(xz - frame.air[1].xz) - 1.2, 0.0));
+        let k = ssr.a * (1.0 - foam) * calm_or_film(depth)
+            * max(fres * mix(0.05, 0.1, smoothstep(0.01, 0.08, depth)) * mix(2.2, 6.0, far_k), fres * 0.9 * near_car);
+        out_rgb = mix(out_rgb, ssr.rgb * 0.92 * mix(1.0, w_ao, 0.35), clamp(k / max(alpha, 0.05), 0.0, 1.0));
         alpha = max(alpha, k);
     }
     // The car standing in the water mirrors in it: the tire's inverted image
@@ -2697,7 +2701,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let front = textureLoad(scene_depth, rpix, 0) < here_c.z / here_c.w;
     let off_screen = any(ruv < vec2<f32>(0.0)) || any(ruv > vec2<f32>(1.0));
     let dst = textureLoad(scene_color, select(rpix, hpix, front || over_tire > 0.5 || off_screen), 0).rgb;
-    let a_out = clamp(alpha, 0.0, 1.0) * max(smoothstep(edge_t, edge_t + 0.006, depth), near_tire);
+    let a_out = clamp(alpha, 0.0, 1.0) * max(smoothstep(edge_t, edge_t + 0.014, depth), near_tire);
     // Beer-Lambert per channel on the bed seen through the water: the red
     // goes first, so shallow stays the sand's warm colour and the deeper
     // middle turns teal.
@@ -2883,6 +2887,14 @@ fn vs_shadow_mesh(in: MeshIn) -> ShadowOut {
     let pos = displace_mesh(in.pos, in.nrm, in.uv, in.panel);
     let world = model.world * vec4<f32>(pos, 1.0);
     let clip = frame.light_vp * world;
+    // Slurry patches lying on the beauty sand are a few millimetres thick;
+    // in the shadow map they printed blocky dark blotches beside them.
+    if (sand_field() && in.panel > 48.5 && in.panel < 49.5) {
+        var q: ShadowOut;
+        q.clip = vec4<f32>(9.0, 9.0, 9.0, 1.0);
+        q.depth = 1.0;
+        return q;
+    }
     var o: ShadowOut;
     o.clip = clip;
     o.depth = clip.z / max(clip.w, 1e-5);
@@ -3412,7 +3424,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
                 tread = smoothstep(tc.w - 0.07, tc.w - 0.025, rad);
             }
         }
-        let wet_top = wl + 0.025 + 0.008 * tread + 0.008 * noise(in.world.xz * 17.0 + vec2<f32>(in.world.y * 9.0, 0.0));
+        let wet_top = wl + 0.02 + 0.004 * tread + 0.008 * noise(in.world.xz * 17.0 + vec2<f32>(in.world.y * 9.0, 0.0));
         let soaked = (1.0 - smoothstep(wet_top - 0.008, wet_top + 0.004, in.world.y)) * smoothstep(0.003, 0.01, wd);
         albedo = mix(albedo, albedo * vec3<f32>(0.3, 0.27, 0.23), soaked);
         rough = mix(rough, 0.28, soaked);
@@ -3420,7 +3432,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let bead_z = in.world.y - wet_top;
         let beads = smoothstep(0.82, 0.9, noise(in.world.xz * 90.0 + vec2<f32>(in.world.y * 110.0, 3.0)))
             * (1.0 - smoothstep(0.0, 0.06, bead_z)) * step(0.0, bead_z) * smoothstep(0.003, 0.01, wd);
-        rough = mix(rough, 0.06, beads);
+        rough = mix(rough, 0.06, beads * 0.0);
         // A rim of silt dried on above the waterline, in patches.
         let splash = (1.0 - smoothstep(wl + 0.08, wl + 0.2, in.world.y)) * (1.0 - soaked)
             * smoothstep(0.4, 0.65, noise(in.world.xz * 9.0 + vec2<f32>(in.world.y * 14.0, 0.0)))
@@ -3496,6 +3508,26 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let mapped_spray = present(vec3<f32>(0.72, 0.82, 0.88));
         return vec4<f32>(mapped_spray.rgb, 0.92);
     }
+    if (in.panel > 48.5 && in.panel < 49.5 && sand_field()) {
+        // Thrown wet sand on the dry field: damp sand, not a clay slab. The
+        // rim feathers into the ground it lies on, broken by the grain.
+        let xz = in.world.xz;
+        let uv6 = layer_uv(6, xz);
+        let diff = textureSample(ground_diff, ground_samp, uv6, 6).rgb;
+        let pack6 = textureSample(ground_pack, ground_samp, uv6, 6);
+        var sand = diff * mix(1.0, clamp(pack6.g, 0.0, 1.0), 0.75) * vec3<f32>(0.5, 0.44, 0.34);
+        let up = vec3<f32>(0.0, 1.0, 0.0);
+        let sv = sand_variety(xz, sand, up, 0.9, 0.0, mesh_fw);
+        let edge = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y)) * 2.0;
+        let rag = noise(xz * 9.0) * 0.6 + noise(xz * 23.0) * 0.4;
+        let core = smoothstep(0.0, 0.9, edge * (0.6 + 0.8 * rag));
+        let wet_lum = dot(sv.albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let damp_col = max(mix(vec3<f32>(wet_lum), sv.albedo, 1.08), vec3<f32>(0.0)) * vec3<f32>(0.66, 0.6, 0.52);
+        let alb = mix(sv.albedo, damp_col, core * 0.85);
+        let rough_p = mix(sv.rough, 0.6, core);
+        let lit_p = shade(in.world, sv.n, alb, rough_p, vec3<f32>(0.0));
+        return vec4<f32>(present(lit_p).rgb, 1.0);
+    }
     if (in.panel > 48.5 && in.panel < 49.5) {
         let g = noise(in.world.xz * 7.5 + vec2<f32>(in.world.y * 2.0, 0.2));
         let blot = noise(in.world.xz * 1.6 + vec2<f32>(2.0, 0.4));
@@ -3535,7 +3567,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let collar = smoothstep(-0.004, 0.0, dz) * (1.0 - smoothstep(0.008, 0.02, dz))
             * smoothstep(0.62, 0.78, foam_n) * lee;
         let foam_l = vec3<f32>(0.52, 0.44, 0.33) * (sun_l * 1.4 + sky * 1.2);
-        lit = mix(lit, foam_l * 0.8, collar * 0.8);
+        lit = mix(lit, foam_l * 0.8, collar * 0.0);
         // A meniscus 1-2 cm tall where the water climbs the rubber.
         let men = smoothstep(-0.002, 0.001, dz) * (1.0 - smoothstep(0.005, 0.01, dz));
         // The contact reads as a thin dark line: the meniscus is wet silt,
@@ -3554,8 +3586,10 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         // catching the sky; the soaked band above it stays dark.
         // A small meniscus: the water climbs a few mm and wets the rubber
         // darker, no light line.
-        let men_w = smoothstep(-0.002, 0.0, dz) * (1.0 - smoothstep(0.004, 0.009, dz + wav * 0.3));
-        lit = lit * (1.0 - 0.3 * men_w);
+        // A thin light line where the water climbs the rubber, catching the
+        // sky; the soaked band above it is the dark wet rubber.
+        let men_w = smoothstep(-0.0015, 0.0, dz) * (1.0 - smoothstep(0.002, 0.004, dz + wav * 0.15));
+        lit = mix(lit, sky * vec3<f32>(0.42, 0.41, 0.4) + sun_l * 0.08, men_w * 0.6);
     }
     // The rim's centre bore is open in the mesh and showed as a black hole:
     // close it with a dished steel cap, lit by sky and sun.
@@ -3573,9 +3607,16 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         if (rad < c.w * 0.24 && abs(ax) < 0.16) {
             let cap_n = normalize(axis * sign(dot(frame.cam_pos.xyz - c.xyz, axis)) + (rel - axis * ax) * 1.5);
             let sun_d = normalize(frame.sun_dir.xyz);
+            let cap_v = normalize(frame.cam_pos.xyz - in.world);
             let cap_l = frame.sun_color.rgb * max(dot(cap_n, sun_d), 0.0) * 0.45 + sh_irradiance(cap_n) * frame.env.y;
             let ring = smoothstep(c.w * 0.17, c.w * 0.22, rad);
-            lit = vec3<f32>(0.32, 0.31, 0.3) * mix(0.8, 1.15, ring) * cap_l;
+            // Brushed steel: mostly the environment it mirrors (the same HDRI
+            // as the rim), a little diffuse, a tight sun lobe.
+            let cap_r = reflect(-cap_v, cap_n);
+            let cap_f = vec3<f32>(0.56, 0.57, 0.58);
+            let cap_spec = env_radiance(cap_r, 0.22) * frame.env.y * 2.2 * cap_f
+                + frame.sun_color.rgb * pow(max(dot(cap_r, sun_d), 0.0), 60.0) * 0.6;
+            lit = (vec3<f32>(0.06) * cap_l + cap_spec) * mix(0.75, 1.1, ring);
         }
     }
     var mapped = present(lit);

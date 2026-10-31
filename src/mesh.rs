@@ -1322,8 +1322,13 @@ fn add_torn_patch(
             let a10 = rows[s][a + 1];
             let a01 = rows[s + 1][a];
             let a11 = rows[s + 1][a + 1];
-            add_quad(mesh, [a00, a10, a11, a01], panel);
-            add_quad(mesh, [a00, a01, a11, a10], panel);
+            // uv: across, along. The shader feathers the torn rim from it.
+            let u0 = a as f32 / (across - 1) as f32;
+            let u1 = (a + 1) as f32 / (across - 1) as f32;
+            let t0 = s as f32 / segs as f32;
+            let t1 = (s + 1) as f32 / segs as f32;
+            add_quad_uv(mesh, [a00, a10, a11, a01], [[u0, t0], [u1, t0], [u1, t1], [u0, t1]], panel);
+            add_quad_uv(mesh, [a00, a01, a11, a10], [[u0, t0], [u0, t1], [u1, t1], [u1, t0]], panel);
         }
     }
 }
