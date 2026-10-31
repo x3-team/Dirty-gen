@@ -992,7 +992,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
     renderer.show_mud_drops = false;
-    renderer.show_mud_particles = true;
+    renderer.show_mud_particles = false;
     wheel.time = 8.35;
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
@@ -1033,7 +1033,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     drive.time = 8.6;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
-    renderer.show_mud_particles = true;
+    // Shader rings/bow/splash only — particle ribbons cut holes in the flat pool mesh.
+    renderer.show_mud_particles = false;
     renderer.show_mud_drops = false;
     let rgba = renderer
         .draw(&drive, pose, None, true)
@@ -1116,7 +1117,7 @@ fn win_demo_seat_wheel_in_puddle(world: &mut World, wheel: usize, yaw: f32) {
         wh.in_water = in_pool;
     }
     let pad = world.soil.sample(tx, tz);
-    let hub_y = pad.height + pad.water.max(0.08) + WHEEL_RADIUS * 0.28;
+    let hub_y = pad.height + 0.008 + WHEEL_RADIUS * 0.42;
     for _ in 0..18 {
         let local = world.vehicle.wheel_center_local(wheel);
         let ori = world.vehicle.orientation();

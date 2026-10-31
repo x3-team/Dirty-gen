@@ -7430,8 +7430,6 @@ impl SoilField {
         let puddles = [
             (-2.35_f32, -0.95_f32, 1.05_f32, 0.72_f32, 0.11_f32),
             (-2.35_f32, 1.30_f32, 1.05_f32, 0.72_f32, 0.11_f32),
-            // Near the sand/mud seam so one frame can read sand, mud, and standing water.
-            (-1.05_f32, 0.15_f32, 1.28_f32, 0.95_f32, 0.22_f32),
         ];
         for j in 0..res {
             for i in 0..res {
@@ -7495,6 +7493,30 @@ impl SoilField {
                     field.darken[idx] = 0.05;
                 }
                 let _ = z;
+            }
+        }
+        // Seam pan: standing water on flat ground (no carved bowl under the hero camera).
+        let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.32_f32, 1.02_f32);
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let dx = (x - sx) / srx;
+                let dz = (z - sz) / srz;
+                let r2 = dx * dx + dz * dz;
+                if r2 > 1.0 {
+                    continue;
+                }
+                let idx = j * res + i;
+                let w = (1.0 - r2.sqrt()).max(0.0);
+                let seam_water = 0.045 + w * 0.155;
+                field.water[idx] = field.water[idx].max(seam_water);
+                field.slurry[idx] = field.slurry[idx].max((seam_water * 1.25).min(0.14));
+                if seam_water > 0.02 {
+                    field.wetness[idx] = 1.0;
+                    field.darken[idx] = field.darken[idx].max(0.24);
+                    field.roughness[idx] = field.roughness[idx].min(0.08);
+                }
             }
         }
         field.rebuild_height();
