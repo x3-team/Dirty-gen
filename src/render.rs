@@ -1957,12 +1957,7 @@ impl Renderer {
                 view: &self.reflect_rt_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.06,
-                        g: 0.10,
-                        b: 0.16,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1978,6 +1973,8 @@ impl Renderer {
             occlusion_query_set: None,
         });
         pass.set_bind_group(0, &self.frame_bg, &[]);
+        pass.set_pipeline(&self.pipe_sky);
+        pass.draw(0..3, 0..1);
         pass.set_bind_group(1, &self.tex_bg, &[]);
         pass.set_pipeline(&self.pipe_mesh);
         pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -2081,7 +2078,6 @@ fn win_demo_reflect_view_proj(cam: CameraPose, proj: Mat4) -> Mat4 {
     let plane = 0.22_f32;
     let flip = |p: Vec3| Vec3::new(p.x, 2.0 * plane - p.y, p.z);
     let eye = flip(cam.eye);
-    // Bias the reflected view toward door height so body glass reads beside the wheels.
     let door_aim = Vec3::new(cam.target.x - 0.08, cam.target.y + 0.62, cam.target.z + 0.12);
     let target = flip(door_aim);
     let view = Mat4::look_at_rh(eye, target, Vec3::new(0.0, -1.0, 0.0));
