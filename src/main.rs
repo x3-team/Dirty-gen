@@ -880,6 +880,7 @@ fn capture_win_demo_stills() {
     renderer.daylight = true;
     renderer.water_column = true;
     renderer.puddle_beauty = true;
+    renderer.win_demo_still = true;
     renderer.show_mud_particles = false;
     renderer.show_mud_drops = false;
     let media = PathBuf::from(MEDIA).join("win-demo");
@@ -965,7 +966,6 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     // Front-left hub in the intact seam pool (no sim — keeps the bowl mesh whole).
     let mut wheel = World::win_demo();
     win_demo_seat_wheel_in_puddle(&mut wheel, 0, -2.58);
-    win_demo_seed_pool_splashes(&mut wheel);
     wheel.time = 7.2;
     let pose = win_demo_low_pose(&wheel);
 
@@ -1023,7 +1023,6 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     let mut drive = World::win_demo();
     win_demo_place_vehicle_on_seam(&mut drive, px, pz - 0.05, -2.58);
-    win_demo_seed_pool_splashes(&mut drive);
     drive.time = 8.6;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;

@@ -151,6 +151,8 @@ pub struct Renderer {
     pub water_column: bool,
     /// Win-demo standing puddles: readable depth, sky reflection, tire ripples.
     pub puddle_beauty: bool,
+    /// Win-demo PNG stills: skip tire seat on the heightfield (avoids spikes/holes).
+    pub win_demo_still: bool,
     /// Slurry drops and dust cards. Off for win-demo stills (water carries splash).
     pub show_mud_particles: bool,
     /// Round slurry drops. Off when solver sheets carry the splash read.
@@ -1133,6 +1135,7 @@ impl Renderer {
             niva_picture: false,
             water_column: false,
             puddle_beauty: false,
+            win_demo_still: false,
             show_mud_particles: true,
             show_mud_drops: true,
             snow: false,
@@ -1319,7 +1322,8 @@ impl Renderer {
                 SHADOW as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
                 (if self.water_column { 1.0 } else { 0.0 })
-                    + (if self.puddle_beauty { 2.0 } else { 0.0 }),
+                    + (if self.puddle_beauty { 2.0 } else { 0.0 })
+                    + (if self.win_demo_still { 4.0 } else { 0.0 }),
             ],
             tires: tire_frame(&world.vehicle),
             snow_arc: [0.0; 4],

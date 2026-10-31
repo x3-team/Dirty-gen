@@ -52,3 +52,30 @@ fn win_demo_seam_water_under_wheel_patch() {
         );
     }
 }
+
+#[test]
+fn win_demo_seam_heights_stay_bounded() {
+    let world = World::win_demo();
+    let (cx, cz) = (-1.05_f32, 0.15_f32);
+    let mut max_h = f32::MIN;
+    let mut min_h = f32::MAX;
+    for j in -12..=12 {
+        for i in -12..=12 {
+            let x = cx + i as f32 * 0.2;
+            let z = cz + j as f32 * 0.2;
+            let s = world.soil.sample(x, z);
+            max_h = max_h.max(s.height);
+            min_h = min_h.min(s.height);
+            assert!(
+                s.height.is_finite() && s.height.abs() < 0.55,
+                "height out of range at ({x:.2},{z:.2}): {}",
+                s.height
+            );
+        }
+    }
+    assert!(
+        max_h - min_h < 0.6,
+        "seam pad too rough: span {:.3}",
+        max_h - min_h
+    );
+}

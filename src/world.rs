@@ -310,6 +310,8 @@ impl World {
     /// Playable Windows demo: sand, mud, and puddles on a small pad.
     pub fn win_demo() -> Self {
         let mut world = Self::rest_after(SoilField::win_playground(), 90);
+        world.soil.win_demo_seam_pan();
+        world.soil.rebuild_height();
         world.bike.pos = Vec3::new(120.0, 0.5, 120.0);
         world.bike.vel = Vec3::ZERO;
         world.vehicle.yaw = 0.92;

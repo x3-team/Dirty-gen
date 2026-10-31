@@ -7495,8 +7495,19 @@ impl SoilField {
                 let _ = z;
             }
         }
-        // Seam pan: standing water on flat ground (no carved bowl under the hero camera).
+        field.win_demo_seam_pan();
+        field.rebuild_height();
+        field
+    }
+
+    /// Hero seam pool for Windows stills: flat bed + standing water. Re-applied
+    /// after `rest_after` so settle ruts do not spike the mesh under the camera.
+    pub fn win_demo_seam_pan(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
         let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.32_f32, 1.02_f32);
+        let bed = 0.22_f32;
         for j in 0..res {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
@@ -7509,18 +7520,23 @@ impl SoilField {
                 }
                 let idx = j * res + i;
                 let w = (1.0 - r2.sqrt()).max(0.0);
+                let flat_w = w * w * (3.0 - 2.0 * w);
+                self.height[idx] = lerp(self.height[idx], bed, flat_w);
+                self.bed[idx] = self.height[idx];
+                self.initial_height[idx] = self.height[idx];
+                self.placed[idx] = 0.0;
                 let seam_water = 0.045 + w * 0.155;
-                field.water[idx] = field.water[idx].max(seam_water);
-                field.slurry[idx] = field.slurry[idx].max(slurry_soil_depth(seam_water, 1.0));
+                self.water[idx] = self.water[idx].max(seam_water);
+                self.slurry[idx] = self
+                    .slurry[idx]
+                    .max(slurry_soil_depth(seam_water, 1.0));
                 if seam_water > 0.02 {
-                    field.wetness[idx] = 1.0;
-                    field.darken[idx] = field.darken[idx].max(0.24);
-                    field.roughness[idx] = field.roughness[idx].min(0.08);
+                    self.wetness[idx] = 1.0;
+                    self.darken[idx] = self.darken[idx].max(0.24);
+                    self.roughness[idx] = self.roughness[idx].min(0.08);
                 }
             }
         }
-        field.rebuild_height();
-        field
     }
 
     /// Flat pad with clay, silt, and sand strips. Each strip holds four moisture

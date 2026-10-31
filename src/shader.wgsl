@@ -548,8 +548,8 @@ fn body_cover(xz: vec2<f32>) -> f32 {
 // Put the pad back under the carcass. The stamp stays in the field.
 // x = drawn height, y = bowl weight, z = how fully this column is covered.
 fn apply_seat(xz: vec2<f32>, base_h: f32) -> vec3<f32> {
-    // Tire seat under the carcass tears the flat seam pool in win-demo stills.
-    if (puddle_beauty_on() && distance(xz, beauty_seam_center()) < 1.55) {
+    // Win-demo stills: tire seat on the heightfield reads as spikes and holes.
+    if (skip_tire_seat()) {
         return vec3<f32>(base_h, 0.0, 0.0);
     }
     let seated = tire_seat(xz, base_h);
@@ -595,6 +595,9 @@ fn mat_bilinear(xz: vec2<f32>) -> vec4<f32> {
 // Continuous slope of the real displaced height. Not the triangle normal,
 // which is constant across a 20 cm cell and flattens a 14 cm groove.
 fn sample_h(xz: vec2<f32>, torn: bool) -> f32 {
+    if (win_demo_flat_terrain()) {
+        return height_bilinear(xz);
+    }
     if (torn) {
         return height_sharp(xz);
     }
@@ -617,7 +620,7 @@ fn track_near(xz: vec2<f32>) -> bool {
 }
 
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
-    let torn = lip_near(xz) && !track_near(xz);
+    let torn = !win_demo_flat_terrain() && lip_near(xz) && !track_near(xz);
     // Short step. A wider sample flattens a tyre-width cut into the lane slope.
     let e = max(frame.params.z * select(0.28, 0.16, torn), 0.04);
     let h_l = sample_h(xz - vec2<f32>(e, 0.0), torn);
@@ -647,7 +650,7 @@ fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
     // The live bowl is a vertex displacement. Shade that slope too, or the
     // patch stays a flat card under the carcass.
     let live = frame.tires[1].w + frame.tires[3].w + frame.tires[5].w + frame.tires[7].w;
-    if (live > 0.5) {
+    if (live > 0.5 && !skip_tire_seat()) {
         let se_t = 0.03;
         let hx1 = apply_seat(xz + vec2<f32>(se_t, 0.0), height_bilinear(xz + vec2<f32>(se_t, 0.0))).x;
         let hx0 = apply_seat(xz - vec2<f32>(se_t, 0.0), height_bilinear(xz - vec2<f32>(se_t, 0.0))).x;
@@ -696,6 +699,9 @@ fn ripple_normal(xz: vec2<f32>, t: f32) -> vec3<f32> {
 }
 
 fn terrain_height(xz: vec2<f32>) -> f32 {
+    if (win_demo_flat_terrain()) {
+        return height_bilinear(xz);
+    }
     if (track_near(xz)) {
         return height_bilinear(xz);
     }
@@ -708,6 +714,14 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
 
 @vertex
 fn vs_terrain(in: TerrIn) -> TerrOut {
+    if (win_demo_flat_terrain()) {
+        let h = win_demo_clamp_surface_y(in.xz, height_bilinear(in.xz));
+        var o: TerrOut;
+        o.clip = frame.view_proj * vec4<f32>(in.xz.x, h, in.xz.y, 1.0);
+        o.world = vec3<f32>(in.xz.x, h, in.xz.y);
+        o.ij = in.ij;
+        return o;
+    }
     let kind = kind_nearest(in.xz);
     // Every layer is sampled. The lip is mud_forest, and only that lip is loud.
     let d0 = textureSampleLevel(ground_pack, ground_samp, in.xz / 3.2, 0, 0.0).b;
@@ -748,6 +762,7 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     // The heightfield ends. Ease the map relief down so the rim is not a lip.
     let rim = smoothstep(15.5, 19.2, max(abs(in.xz.x), abs(in.xz.y)));
     h = mix(h, base, rim);
+    h = win_demo_clamp_surface_y(in.xz, h);
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -1006,7 +1021,7 @@ fn water_column(xz: vec2<f32>) -> f32 {
         // Mat.g is 0..1 over 0.28 m (see upload_soil liquid_scale).
         return raw * 0.28;
     }
-    let scale = select(0.34, 0.90, frame.misc.w > 0.5);
+    let scale = select(0.34, 0.90, water_column_on());
     return raw * scale;
 }
 
@@ -1036,8 +1051,34 @@ fn shallow_water(column: f32) -> f32 {
     return 0.003 + film + wave;
 }
 
+fn render_flags() -> u32 {
+    return u32(frame.misc.w + 0.5);
+}
+
+fn water_column_on() -> bool {
+    return (render_flags() & 1u) != 0u;
+}
+
 fn puddle_beauty_on() -> bool {
-    return frame.misc.w >= 1.5;
+    return (render_flags() & 2u) != 0u;
+}
+
+fn win_demo_flat_terrain() -> bool {
+    return (render_flags() & 4u) != 0u;
+}
+
+fn skip_tire_seat() -> bool {
+    return puddle_beauty_on() || win_demo_flat_terrain();
+}
+
+// Win-demo stills share one terrain grid with the water sheet. One hot
+// vertex in vs_water was stretching whole triangles into sky spikes.
+fn win_demo_clamp_surface_y(xz: vec2<f32>, y: f32) -> f32 {
+    if (!win_demo_flat_terrain()) {
+        return y;
+    }
+    let bed = height_bilinear(xz);
+    return clamp(y, bed - 0.04, bed + 0.11);
 }
 
 // Windows win-demo seam pool: one flat plane, not a carved bowl mesh.
@@ -1356,14 +1397,32 @@ fn water_bed(xz: vec2<f32>) -> f32 {
 
 @vertex
 fn vs_water(in: TerrIn) -> WaterOut {
+    if (win_demo_flat_terrain()) {
+        let column = water_column(in.xz);
+        let bed = height_bilinear(in.xz);
+        let rip = ripple_height(in.xz, frame.misc.x) * 0.004;
+        var y = bed + 0.008 + rip;
+        let seam_span = 3.25;
+        if (distance(in.xz, beauty_seam_center()) < seam_span && column > 0.0004) {
+            y = beauty_seam_plane_y(in.xz) + rip;
+        }
+        if (water_near_tire_hub(in.xz, 0.32)) {
+            y = max(y, bed + 0.006 + rip);
+        }
+        y = win_demo_clamp_surface_y(in.xz, y);
+        var o: WaterOut;
+        o.clip = frame.view_proj * vec4<f32>(in.xz.x, y, in.xz.y, 1.0);
+        o.world = vec3<f32>(in.xz.x, y, in.xz.y);
+        o.ij = in.ij;
+        o.depth = max(column, covered_depth(in.xz) * 0.34);
+        return o;
+    }
     let local = height_bilinear(in.xz);
     let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
     let column = water_column(in.xz);
-    let water_mode = frame.misc.w;
     let beauty = puddle_beauty_on();
-    let tire_pad = beauty && water_near_tire_hub(in.xz, 0.36);
-    let free = water_mode >= 0.5 && (column > 0.004 || tire_pad);
+    let free = water_column_on() && column > 0.004;
     let rip_scale = select(1.0, 1.0, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
     // Wake ripples stay in the normal on beauty pools; lifting the sheet here
@@ -1387,7 +1446,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
     let seam_flat = beauty_seam_weight(in.xz);
-    let in_beauty_pool = beauty && (column > 0.001 || seam_flat > 0.08 || tire_pad);
+    let in_beauty_pool = beauty && (column > 0.001 || seam_flat > 0.08);
     let lift = max(column, column * 0.14);
     let rip_vert = rip * select(0.45, 0.0, beauty);
     let flat_pool = mix(
@@ -1396,13 +1455,21 @@ fn vs_water(in: TerrIn) -> WaterOut {
         seam_flat,
     );
     let surface = base + water_surface_lift(lift) + rip_vert + wake + swell * swell_amp;
-    let y = select(select(y_sheet, surface, free), flat_pool, in_beauty_pool);
+    var y = select(select(y_sheet, surface, free), flat_pool, in_beauty_pool);
+    let seam_span = select(1.42, 3.25, win_demo_flat_terrain());
+    if (beauty && (distance(in.xz, beauty_seam_center()) < seam_span || column > 0.0008)) {
+        y = flat_pool;
+    }
+    if (win_demo_flat_terrain() && distance(in.xz, beauty_seam_center()) < seam_span && column > 0.0004) {
+        y = flat_pool;
+    }
+    y = win_demo_clamp_surface_y(in.xz, y);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
     o.world = world;
     o.ij = in.ij;
-    o.depth = select(depth, max(column, max(column * 0.18, select(0.0, 0.012, tire_pad))), free);
+    o.depth = select(depth, max(column, column * 0.18), free);
     return o;
 }
 
@@ -1436,7 +1503,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz + ez) > 0.02
         || -stamp_bilinear(xz - ez) > 0.02;
     let column_here = water_column(xz);
-    let free = frame.misc.w > 0.5 && in.depth > 0.004;
+    let free = water_column_on() && in.depth > 0.004;
     let tire_pad = water_near_tire_hub(xz, 0.32);
     let seam_flat = beauty_seam_weight(xz);
     let in_seam_pan = beauty && distance(xz, beauty_seam_center()) < 1.38;
@@ -1446,8 +1513,17 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || (beauty && seam_flat > 0.12)
         || (in_seam_pan && column_here > 0.0008);
     let beauty_pool = beauty && pool_here;
-    let keep_water = free || pool_here || tire_pad || (beauty && in_seam_pan);
-    if (!keep_water && (near_cut || own < 0.008 || in.depth < 0.008)) {
+    let seam_still = win_demo_flat_terrain() && distance(xz, beauty_seam_center()) < 3.25;
+    let keep_water = free
+        || pool_here
+        || tire_pad
+        || (beauty && in_seam_pan)
+        || (seam_still && column_here > 0.0005);
+    if (win_demo_flat_terrain()) {
+        if (!keep_water) {
+            discard;
+        }
+    } else if (!keep_water && (near_cut || own < 0.008 || in.depth < 0.008)) {
         discard;
     }
     let free_water = free || beauty_pool;
@@ -1708,7 +1784,8 @@ struct ShadowOut {
 
 @vertex
 fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
-    let h = apply_seat(in.xz, height_bilinear(in.xz)).x;
+    let base = height_bilinear(in.xz);
+    let h = select(apply_seat(in.xz, base).x, base, skip_tire_seat());
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     let clip = frame.light_vp * vec4<f32>(world, 1.0);
     var o: ShadowOut;
