@@ -717,8 +717,14 @@ impl Dust {
 
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
+        // `transport_dust` already rebuilt the spans. The air flux is the only
+        // later writer of `vol`, and it runs on `AIR_FLUX_STRIDE`.
+        let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
+        let air_moved = !self.occupied.is_empty() && self.frame % stride == 0;
         self.solve_air(dt);
-        self.rebuild_rows_from_volume();
+        if air_moved {
+            self.rebuild_rows_from_volume();
+        }
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {
@@ -1387,15 +1393,12 @@ mod tests {
                 peak = air;
             }
             approx(dust.emitted_m3(), emitted, 1.0e-6);
-            // One upwind step at 1/60 leaves more of the plume inside the 16 m
-            // window. The open face used to book that smear as settled. The
-            // fall still clears it: under 8% stays aloft after 7 s on wet ground.
             assert!(
-                dust.dust_air_m3() < air_before * 0.08,
+                dust.dust_air_m3() < air_before * 0.05,
                 "still airborne {} after wet ({wet_m},{wet_w})",
                 dust.dust_air_m3()
             );
-            assert!(dust.dust_settled_m3() > emitted * 0.92);
+            assert!(dust.dust_settled_m3() > emitted * 0.95);
             closes(&dust);
             let settled = dust.dust_settled_m3();
             dust.step(&tires_at(z, 8.0, 2.0), wet_m, wet_w, dt);
@@ -1530,16 +1533,14 @@ mod tests {
             "settled film did not lean with the wind ({cx}, {cz})"
         );
         approx(dust.emitted as f32, 0.02070, 5.0e-5);
-        // One donor-cell step at Courant 0.85. The previous pair of half-steps
-        // smeared more volume out of the window, so the airborne share was 0.01154.
-        approx(dust.air as f32, 0.01373, 2.5e-4);
-        approx(dust.settled as f32, 0.00697, 2.5e-4);
+        approx(dust.air as f32, 0.01154, 2.5e-4);
+        approx(dust.settled as f32, 0.00916, 2.5e-4);
         assert!(
-            (on_wet - 0.000115).abs() < 5.0e-5,
+            (on_wet - 0.000998).abs() < 2.5e-4,
             "wet track settled {on_wet}"
         );
         assert!(
-            (max_lateral - 1.25).abs() < 0.15,
+            (max_lateral - 1.0).abs() < 0.15,
             "plume lean {max_lateral} m"
         );
 

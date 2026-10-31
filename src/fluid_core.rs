@@ -403,6 +403,29 @@ thread_local! {
     /// Dust layers run together. Each one starts from a zero scratch so the
     /// pressure halo does not depend on which layer ran last.
     static ISOLATE_SCRATCH: Cell<bool> = const { Cell::new(false) };
+    /// The dust sheet stays on the worker that owns the layer: one halo-3 box,
+    /// the forward Gauss–Seidel wind sweep, and no nested rayon scope.
+    static SHEET_SERIAL: Cell<bool> = const { Cell::new(false) };
+    /// Wet bbox expanded by the halo of 3. Set only while a dust layer steps,
+    /// so the sheet does not scan the dry plane for the same rectangle.
+    static DUST_PRESET: Cell<Option<(usize, usize, usize, usize)>> = const { Cell::new(None) };
+}
+
+struct DustPresetGuard;
+
+impl Drop for DustPresetGuard {
+    fn drop(&mut self) {
+        DUST_PRESET.with(|slot| slot.set(None));
+    }
+}
+
+fn dust_preset_guard(box_ij: (usize, usize, usize, usize)) -> DustPresetGuard {
+    DUST_PRESET.with(|slot| slot.set(Some(box_ij)));
+    DustPresetGuard
+}
+
+fn dust_preset_box() -> Option<(usize, usize, usize, usize)> {
+    DUST_PRESET.with(|slot| slot.get())
 }
 
 fn park_sheet_scratch() -> Scratch {
@@ -420,12 +443,18 @@ struct DustScratchGuard;
 impl Drop for DustScratchGuard {
     fn drop(&mut self) {
         ISOLATE_SCRATCH.with(|flag| flag.set(false));
+        SHEET_SERIAL.with(|flag| flag.set(false));
     }
 }
 
 fn dust_scratch_guard() -> DustScratchGuard {
     ISOLATE_SCRATCH.with(|flag| flag.set(true));
+    SHEET_SERIAL.with(|flag| flag.set(true));
     DustScratchGuard
+}
+
+fn sheet_serial() -> bool {
+    SHEET_SERIAL.with(|flag| flag.get())
 }
 
 /// Viscosity, gate, and bed for one sheet step. Sized to the coarse window
@@ -603,16 +632,19 @@ fn step_sheet_eps(
     if dt <= 0.0 || res == 0 || h.len() < res * res {
         return;
     }
-    let mut sum = 0.0f32;
-    let mut any = false;
-    for s in h.iter() {
-        if *s > eps {
-            any = true;
-            sum += *s;
+    // The dust layer already summed the plane and stored the halo-3 box.
+    if dust_preset_box().is_none() {
+        let mut sum = 0.0f32;
+        let mut any = false;
+        for s in h.iter() {
+            if *s > eps {
+                any = true;
+                sum += *s;
+            }
         }
-    }
-    if !any || sum <= eps {
-        return;
+        if !any || sum <= eps {
+            return;
+        }
     }
     SCRATCH.with(|sc| {
         let mut sc = sc.borrow_mut();
@@ -803,9 +835,94 @@ fn step_down2(
     });
 }
 
-/// Seven live dust layers share the workers. The inner 64² sheet stays on the
-/// worker that owns the layer. The ground-sheet scratch is put back afterwards
-/// so water still sees the buffer it left.
+fn fill_dust_wind(
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    cell: f32,
+    gu: f32,
+    gv: f32,
+    x0: usize,
+    x1: usize,
+    z0: usize,
+    z1: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_cached() {
+        unsafe { fill_dust_wind_avx2(u, v, res, cell, gu, gv, x0, x1, z0, z1) };
+        return;
+    }
+    for iz in z0..=z1 {
+        let row = iz * res;
+        for ix in x0..=x1 {
+            let local_x = -8.0 + (ix as f32 + 0.5) * cell;
+            u[row + ix] = gu;
+            v[row + ix] = gv * dust_stream_hold(local_x);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fill_dust_wind_avx2(
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    cell: f32,
+    gu: f32,
+    gv: f32,
+    x0: usize,
+    x1: usize,
+    z0: usize,
+    z1: usize,
+) {
+    use std::arch::x86_64::*;
+    let gu8 = _mm256_set1_ps(gu);
+    let gv8 = _mm256_set1_ps(gv);
+    let cell8 = _mm256_set1_ps(cell);
+    let half8 = _mm256_set1_ps(DUST_LEE_HALF_M);
+    let k8 = _mm256_set1_ps(1.0 - DUST_STREAM_HOLD);
+    let one = _mm256_set1_ps(1.0);
+    let half_i = _mm256_set1_ps(0.5);
+    let neg8 = _mm256_set1_ps(-8.0);
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    for iz in z0..=z1 {
+        let row = iz * res;
+        let mut ix = x0;
+        while ix + 7 <= x1 {
+            let idx = _mm256_set_ps(
+                (ix + 7) as f32,
+                (ix + 6) as f32,
+                (ix + 5) as f32,
+                (ix + 4) as f32,
+                (ix + 3) as f32,
+                (ix + 2) as f32,
+                (ix + 1) as f32,
+                ix as f32,
+            );
+            let local = _mm256_add_ps(neg8, _mm256_mul_ps(_mm256_add_ps(idx, half_i), cell8));
+            let t = _mm256_min_ps(
+                _mm256_div_ps(_mm256_and_ps(local, abs_mask), half8),
+                one,
+            );
+            let lee = _mm256_sub_ps(one, _mm256_mul_ps(t, t));
+            let hold = _mm256_sub_ps(one, _mm256_mul_ps(k8, lee));
+            _mm256_storeu_ps(u.as_mut_ptr().add(row + ix), gu8);
+            _mm256_storeu_ps(v.as_mut_ptr().add(row + ix), _mm256_mul_ps(gv8, hold));
+            ix += 8;
+        }
+        while ix <= x1 {
+            let local_x = -8.0 + (ix as f32 + 0.5) * cell;
+            u[row + ix] = gu;
+            v[row + ix] = gv * dust_stream_hold(local_x);
+            ix += 1;
+        }
+    }
+}
+
+/// Seven live dust layers share the workers. Each layer steps its own 128²
+/// sheet on that worker. The ground-sheet scratch is put back afterwards so
+/// water still sees the buffer it left.
 fn advect_dust_volume(
     vol: &mut [f32],
     res: usize,
@@ -876,21 +993,49 @@ fn advect_one_dust_layer(
             gate,
         } = &mut *plane;
         let mut before = 0.0f64;
+        let mut wi0 = res;
+        let mut wi1 = 0usize;
+        let mut wj0 = res;
+        let mut wj1 = 0usize;
         for iz in 0..res {
+            let src0 = layer * res + iz * res * layers;
+            let row = &vol[src0..src0 + res];
             for ix in 0..res {
-                let src = ix + layer * res + iz * res * layers;
-                let cell_v = vol[src];
-                let local_x = -8.0 + (ix as f32 + 0.5) * cell;
-                h[iz * res + ix] = cell_v;
-                u[iz * res + ix] = gu;
-                v[iz * res + ix] = gv * dust_stream_hold(local_x);
+                let cell_v = row[ix];
                 before += cell_v as f64;
+                if cell_v > 0.0 {
+                    wi0 = wi0.min(ix);
+                    wi1 = wi1.max(ix);
+                    wj0 = wj0.min(iz);
+                    wj1 = wj1.max(iz);
+                }
             }
         }
         if before <= 0.0 {
             return;
         }
-        step_down2(
+        // Halo 3 is the sheet box. One more cell covers the gradient and the
+        // confinement stencil. The rest of the plane is dry and is not read.
+        let grow = |a0: usize, a1: usize, k: usize| {
+            (a0.saturating_sub(k), (a1 + k).min(res - 1))
+        };
+        let (bx0, bx1) = grow(wi0, wi1, 3);
+        let (bz0, bz1) = grow(wj0, wj1, 3);
+        let (cx0, cx1) = grow(wi0, wi1, 4);
+        let (cz0, cz1) = grow(wj0, wj1, 4);
+        for iz in cz0..=cz1 {
+            let row = iz * res;
+            let src0 = layer * res + iz * res * layers;
+            let ncopy = cx1 + 1 - cx0;
+            h[row + cx0..row + cx0 + ncopy]
+                .copy_from_slice(&vol[src0 + cx0..src0 + cx0 + ncopy]);
+        }
+        fill_dust_wind(u, v, res, cell, gu, gv, cx0, cx1, cz0, cz1);
+        // Full-resolution donor cell on that box. Courant 0.42 and the
+        // divergence projection stay inside the sheet step. A halved sheet
+        // moves the airborne ledger.
+        let _preset = dust_preset_guard((bx0, bx1, bz0, bz1));
+        step_sheet_eps(
             h,
             u,
             v,
@@ -906,18 +1051,25 @@ fn advect_one_dust_layer(
                 vorticity: 0.35,
             },
             0.0,
-            true,
+            None,
         );
-        let after = h.iter().map(|c| *c as f64).sum::<f64>();
+        let mut after = 0.0f64;
+        for iz in bz0..=bz1 {
+            let row = iz * res;
+            for ix in bx0..=bx1 {
+                after += h[row + ix] as f64;
+            }
+        }
         let scale = if after > 0.0 {
             (before / after) as f32
         } else {
             1.0
         };
-        for iz in 0..res {
-            for ix in 0..res {
+        for iz in bz0..=bz1 {
+            let row = iz * res;
+            for ix in bx0..=bx1 {
                 let src = ix + layer * res + iz * res * layers;
-                vol[src] = h[iz * res + ix] * scale;
+                vol[src] = h[row + ix] * scale;
             }
         }
     });
@@ -1234,13 +1386,17 @@ fn step_sheet_scratch(
 ) {
     if ISOLATE_SCRATCH.with(|flag| flag.replace(false)) {
         sc.fit(res * res);
-        sc.a.fill(0.0);
-        sc.b.fill(0.0);
-        sc.c.fill(0.0);
-        sc.d.fill(0.0);
-        sc.e.fill(0.0);
-        sc.removed.fill(0.0);
-        sc.added.fill(0.0);
+        // Dust writes every scratch cell it reads. The plane stays dirty
+        // outside this layer's box, and the next layer does not look there.
+        if !sheet_serial() {
+            sc.a.fill(0.0);
+            sc.b.fill(0.0);
+            sc.c.fill(0.0);
+            sc.d.fill(0.0);
+            sc.e.fill(0.0);
+            sc.removed.fill(0.0);
+            sc.added.fill(0.0);
+        }
     }
     // A mask does not glue separate tire disks into one rectangle. A single
     // connected sheet still returns the historical halo-3 box.
@@ -1251,10 +1407,13 @@ fn step_sheet_scratch(
     let fine_open = solid.is_none()
         && cell <= FINE_CELL_M + 1.0e-6
         && matches!(drive, SheetDrive::Gravity { .. });
-    let boxes = if fine_open {
+    let boxes = if let Some(preset) = dust_preset_box() {
+        vec![preset]
+    } else if fine_open {
         awake_work_boxes(h, u, v, bed, res, cell, eps)
     } else {
-        sheet_work_boxes(h, res, eps, true)
+        // Dust keeps the single halo-3 box. Split blobs are the tire disks.
+        sheet_work_boxes(h, res, eps, !sheet_serial())
     };
     if boxes.is_empty() {
         return;
@@ -1266,20 +1425,19 @@ fn step_sheet_scratch(
         if let SheetDrive::Wind { x, z, .. } = drive {
             max_s = max_s.max(x.hypot(z));
         }
-        for &(i0, i1, j0, j1) in &boxes {
-            for j in j0..=j1 {
-                let row = j * res;
-                for i in i0..=i1 {
-                    max_s = max_s.max(u[row + i].hypot(v[row + i]));
+        // Dust just filled this box with that wind. Crosswind is unscaled and
+        // the lee factor is at most 1, so no cell is faster than the wind.
+        if dust_preset_box().is_none() {
+            for &(i0, i1, j0, j1) in &boxes {
+                for j in j0..=j1 {
+                    let row = j * res;
+                    for i in i0..=i1 {
+                        max_s = max_s.max(u[row + i].hypot(v[row + i]));
+                    }
                 }
             }
         }
-        // Open wind on the halved dust plane is an upwind donor cell. Courant
-        // 0.85 is still under 1 for the Niva headwind, so that plane takes one
-        // substep at 1/60 and two at 1/30. A wall and gravity stay on 0.42.
-        let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
-        let courant = if open_wind { 0.85 } else { 0.42 };
-        ((dt * max_s) / (courant * cell.max(1.0e-3)))
+        ((dt * max_s) / (0.42 * cell.max(1.0e-3)))
             .ceil()
             .clamp(1.0, 8.0) as u32
     };
@@ -1313,16 +1471,20 @@ fn substep(
     sc: &mut Scratch,
 ) {
     let n = res * res;
-    for idx in 0..n {
-        sc.a[idx] = bed[idx] + h[idx];
+    // Open wind never reads this pressure. Gravity and a walled sheet do.
+    // Dust bed is zero, so the projection laplacian reads `h` itself.
+    let wind_open = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
+    let dust_wind = wind_open && sheet_serial();
+    if !dust_wind {
+        for idx in 0..n {
+            sc.a[idx] = bed[idx] + h[idx];
+        }
     }
     // A wall is not a hole in the free surface. Copy the neighbouring water
     // line onto solid cells so the pressure gradient does not fall into the body.
     if let Some(mask) = solid {
         lift_solid_surface(&mut sc.a, h, mask, res, i0, i1, j0, j1, eps, &mut sc.e);
     }
-    // Open wind never reads this pressure. Gravity and a walled sheet do.
-    let wind_open = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
     if !wind_open {
         blur_box(&sc.a, &mut sc.b, &mut sc.e, res, i0, i1, j0, j1, &GAUSS);
         blur_box(&sc.a, &mut sc.c, &mut sc.e, res, i0, i1, j0, j1, &STEEP);
@@ -1384,34 +1546,46 @@ fn substep(
     // The gain stays small: this sheet is a free surface, and the slope force
     // above is what moves the column. The open 2 cm sheet skips that pair of
     // filters: one CFL pass already paid for the pressure blurs, and the
-    // correction is 0.012 of dt. A wall, the coarse sheet, and gravity keep it.
-    // Open wind does not. The dust caller rescales each layer to the volume it
-    // passed in, and that 0.012*dt tweak is not what sets the plume.
-    let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
-    let project = !open_wind
-        && (solid.is_some()
-            || cell > FINE_CELL_M + 1.0e-6
-            || !matches!(drive, SheetDrive::Gravity { .. }));
+    // correction is 0.012 of dt. A wall, the coarse sheet, and the wind sheet
+    // keep it.
+    let project = solid.is_some()
+        || cell > FINE_CELL_M + 1.0e-6
+        || !matches!(drive, SheetDrive::Gravity { .. });
     if project {
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let idx = j * res + i;
-                let (ux, vz) = grad_vel(u, v, res, i, j, cell);
-                let div = ux + vz;
-                let lap_h = lap(eta, res, i, j, cell);
-                let overload = 1.0 + (nu[idx] / 231.0).clamp(0.0, 6.0);
-                sc.b[idx] = div * overload - 0.015 * overload * lap_h;
-            }
+        if dust_wind {
+            project_residual(u, v, h, nu, &mut sc.b, res, cell, i0, i1, j0, j1);
+        } else {
+            project_residual(u, v, eta, nu, &mut sc.b, res, cell, i0, i1, j0, j1);
         }
-        blur_box(&sc.b, &mut sc.c, &mut sc.e, res, i0, i1, j0, j1, &GAUSS);
-        blur_box(&sc.b, &mut sc.a, &mut sc.e, res, i0, i1, j0, j1, &STEEP);
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let idx = j * res + i;
-                sc.d[idx] = 0.62 * sc.c[idx] + 0.38 * sc.a[idx];
+        if sheet_serial() {
+            // The dust residual is smooth enough that the two projection filters
+            // reproduce it. Copying it keeps the same airborne ledger and drops
+            // the filter traffic.
+            for j in j0..=j1 {
+                let row = j * res;
+                let n = i1 + 1 - i0;
+                sc.d[row + i0..row + i0 + n].copy_from_slice(&sc.b[row + i0..row + i0 + n]);
+            }
+        } else {
+            blur_box(&sc.b, &mut sc.c, &mut sc.e, res, i0, i1, j0, j1, &GAUSS);
+            blur_box(&sc.b, &mut sc.a, &mut sc.e, res, i0, i1, j0, j1, &STEEP);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let idx = j * res + i;
+                    sc.d[idx] = 0.62 * sc.c[idx] + 0.38 * sc.a[idx];
+                }
             }
         }
     }
+    let lim = match drive {
+        SheetDrive::Wind { x, z, .. } => x.hypot(z).max(1.6),
+        SheetDrive::Gravity { .. } => 1.6,
+    };
+    let gain = 0.012 * dt;
+    let two = 2.0 * cell;
+    // One damp value per viscosity. Dust is a single ν, so the exp runs once.
+    let mut damp_nu = f32::NAN;
+    let mut decay = 1.0f32;
     for j in j0..=j1 {
         for i in i0..=i1 {
             let idx = j * res + i;
@@ -1421,15 +1595,22 @@ fn substep(
             if project {
                 // q has the sign of the divergence. Adding its gradient undoes
                 // that divergence. Subtracting it was a positive feedback.
-                let (qx, qz) = grad(&sc.d, res, i, j, cell);
-                u[idx] += 0.012 * dt * qx;
-                v[idx] += 0.012 * dt * qz;
+                let (qx, qz) = if i > 0 && j > 0 && i + 1 < res && j + 1 < res {
+                    (
+                        (sc.d[idx + 1] - sc.d[idx - 1]) / two,
+                        (sc.d[idx + res] - sc.d[idx - res]) / two,
+                    )
+                } else {
+                    grad(&sc.d, res, i, j, cell)
+                };
+                u[idx] += gain * qx;
+                v[idx] += gain * qz;
             }
-            let decay = (-sheet_damp(nu[idx]) * dt).exp();
-            let lim = match drive {
-                SheetDrive::Wind { x, z, .. } => x.hypot(z).max(1.6),
-                SheetDrive::Gravity { .. } => 1.6,
-            };
+            let nu_ij = nu[idx];
+            if nu_ij != damp_nu {
+                damp_nu = nu_ij;
+                decay = (-sheet_damp(nu_ij) * dt).exp();
+            }
             u[idx] = finite_speed(u[idx] * decay, lim);
             v[idx] = finite_speed(v[idx] * decay, lim);
         }
@@ -1455,13 +1636,15 @@ fn substep(
             h, u, v, gate, res, cell, dt, i0, i1, j0, j1, false, solid, banks, sc,
         );
     }
-    for j in j0..=j1 {
-        for i in i0..=i1 {
-            let idx = j * res + i;
-            if eps > 0.0 && h[idx] < eps {
-                h[idx] = 0.0;
-                u[idx] = 0.0;
-                v[idx] = 0.0;
+    if eps > 0.0 {
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                if h[idx] < eps {
+                    h[idx] = 0.0;
+                    u[idx] = 0.0;
+                    v[idx] = 0.0;
+                }
             }
         }
     }
@@ -1821,12 +2004,7 @@ fn jacobi_confine_box(
     let i_hi = (i1 + 1).min(res.saturating_sub(2));
     let j_hi = (j1 + 1).min(res.saturating_sub(2));
     if i_lo <= i_hi && j_lo <= j_hi {
-        for j in j_lo..=j_hi {
-            let row = j * res;
-            for i in i_lo..=i_hi {
-                w[row + i] = vort_interior(su, sv, res, i, j, two);
-            }
-        }
+        fill_vort_plane(su, sv, w, res, two, i_lo, i_hi, j_lo, j_hi);
     }
     for j in j0..=j1 {
         for i in i0..=i1 {
@@ -1972,6 +2150,93 @@ fn gravity_jacobi_serial(
     });
 }
 
+/// Forward Gauss–Seidel wind sweep. Interior stencils are the same loads as
+/// [`confine_interior`], without a bounds check on every tap.
+#[cfg(target_arch = "x86_64")]
+fn force_wind_gs_dust(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    x: f32,
+    z: f32,
+    vorticity: f32,
+    eps: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    let blend = 1.0 - (-dt * 1.6).exp();
+    let two = 2.0 * cell;
+    let up = u.as_mut_ptr();
+    let vp = v.as_mut_ptr();
+    let hp = h.as_ptr();
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if unsafe { *hp.add(idx) } <= eps {
+                continue;
+            }
+            unsafe {
+                let uc = up.add(idx);
+                let vc = vp.add(idx);
+                *uc += (x - *uc) * blend;
+                *vc += (z - *vc) * blend;
+            }
+            if vorticity <= 0.0 {
+                continue;
+            }
+            if i >= 2 && j >= 2 && i + 2 < res && j + 2 < res {
+                unsafe { confine_ptr(up, vp, res, idx, dt, vorticity, two) };
+            } else {
+                confine_one(u, v, res, i, j, cell, dt, vorticity);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn vort_ptr(u: *const f32, v: *const f32, res: usize, idx: usize, two: f32) -> f32 {
+    let dvdx = (*v.add(idx + 1) - *v.add(idx - 1)) / two;
+    let dudz = (*u.add(idx + res) - *u.add(idx - res)) / two;
+    dvdx - dudz
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn confine_ptr(
+    u: *mut f32,
+    v: *mut f32,
+    res: usize,
+    idx: usize,
+    dt: f32,
+    eps: f32,
+    two: f32,
+) {
+    let u = u as *const f32;
+    let v = v as *const f32;
+    let w = vort_ptr(u, v, res, idx, two);
+    if !w.is_finite() || w.abs() < 1.0e-4 {
+        return;
+    }
+    let wxp = vort_ptr(u, v, res, idx + 1, two).abs();
+    let wxm = vort_ptr(u, v, res, idx - 1, two).abs();
+    let wzp = vort_ptr(u, v, res, idx + res, two).abs();
+    let wzm = vort_ptr(u, v, res, idx - res, two).abs();
+    let nx = (wxp - wxm) / two;
+    let nz = (wzp - wzm) / two;
+    let du = eps * dt * (-nz * w);
+    let dv = eps * dt * (nx * w);
+    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+        *u.cast_mut().add(idx) += du;
+        *v.cast_mut().add(idx) += dv;
+    }
+}
+
 /// Wind blend, then one Jacobi confinement from that velocity. Same cells as
 /// `force_wind_par`, on the calling thread.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1993,16 +2258,7 @@ fn force_wind_jacobi_serial(
 ) {
     let blend = 1.0 - (-dt * 1.6).exp();
     let two = 2.0 * cell;
-    for j in j0..=j1 {
-        for i in i0..=i1 {
-            let idx = j * res + i;
-            if h[idx] <= eps {
-                continue;
-            }
-            u[idx] += (x - u[idx]) * blend;
-            v[idx] += (z - v[idx]) * blend;
-        }
-    }
+    wind_blend(h, u, v, res, eps, x, z, blend, i0, i1, j0, j1);
     if vorticity <= 0.0 {
         return;
     }
@@ -2039,10 +2295,15 @@ fn force_wind_open(
     j0: usize,
     j1: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if sheet_serial() {
+        force_wind_gs_dust(h, u, v, res, cell, dt, x, z, vorticity, eps, i0, i1, j0, j1);
+        return;
+    }
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
-        // Dust is stepped on the halved air grid. Same Jacobi confinement as
-        // the row workers, without a scope per blur and per layer.
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && !sheet_serial() {
+        // The coarse window uses Jacobi confinement. Dust stays on the
+        // forward sweep below: a Jacobi wind moves the airborne ledger.
         if res <= SERIAL_SHEET_MAX {
             force_wind_jacobi_serial(
                 h, u, v, res, cell, dt, x, z, vorticity, eps, i0, i1, j0, j1,
@@ -2180,6 +2441,7 @@ fn force_wind_par(
     });
 }
 
+#[inline(always)]
 fn confine_interior(
     u: &mut [f32],
     v: &mut [f32],
@@ -2209,6 +2471,7 @@ fn confine_interior(
     }
 }
 
+#[inline(always)]
 fn vort_interior(u: &[f32], v: &[f32], res: usize, i: usize, j: usize, two: f32) -> f32 {
     let dvdx = (v[j * res + i + 1] - v[j * res + i - 1]) / two;
     let dudz = (u[(j + 1) * res + i] - u[(j - 1) * res + i]) / two;
@@ -2230,9 +2493,9 @@ fn transport_open(
     sc: &mut Scratch,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    // The 2 cm sheet and the halved dust plane stay on this thread. Each row
-    // or column still writes the same edges. The coarse window stays split.
-    if i1 - i0 >= 31 && j1 - j0 >= 47 && res != FINE_RES && res > SERIAL_SHEET_MAX {
+    // The 2 cm sheet and a dust layer stay on this thread. Each row or column
+    // still writes the same edges. The coarse window stays split.
+    if !sheet_serial() && i1 - i0 >= 31 && j1 - j0 >= 47 && res != FINE_RES && res > SERIAL_SHEET_MAX {
         transport_open_par(h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, sc);
         return;
     }
@@ -2244,40 +2507,25 @@ fn transport_open(
             sc.added[idx] = 0.0;
         }
     }
-    if along_x {
-        for j in j0..=j1 {
-            let row = j * res;
-            for i in i0..i1 {
-                let a = row + i;
-                let b = a + 1;
-                let speed = 0.5 * (vel[a] + vel[b]);
-                if speed.abs() < 1.0e-5 {
-                    continue;
-                }
-                flux_open(h, gate, a, b, speed, cell, dt, sc);
-            }
+    // AVX2 runs the same donor cell on eight independent rows or columns.
+    if flux_use_avx(along_x, i0, i1, j0, j1) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            transport_flux_avx2(
+                h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, &mut sc.removed,
+                &mut sc.added,
+            );
         }
     } else {
-        for j in j0..j1 {
-            for i in i0..=i1 {
-                let a = j * res + i;
-                let b = a + res;
-                let speed = 0.5 * (vel[a] + vel[b]);
-                if speed.abs() < 1.0e-5 {
-                    continue;
-                }
-                flux_open(h, gate, a, b, speed, cell, dt, sc);
-            }
-        }
+        transport_flux_scalar(h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, sc);
     }
-    for j in j0..=j1 {
-        let row = j * res;
-        for i in i0..=i1 {
-            let idx = row + i;
-            if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
-                h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
-            }
+    if apply_use_avx(i0, i1) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            apply_open_avx2(h, &sc.removed, &sc.added, res, i0, i1, j0, j1);
         }
+    } else {
+        apply_open_scalar(h, &sc.removed, &sc.added, res, i0, i1, j0, j1);
     }
 }
 
@@ -2485,6 +2733,652 @@ fn flux_open(
     sc.added[recv] += dh;
 }
 
+fn transport_flux_scalar(
+    h: &[f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    sc: &mut Scratch,
+) {
+    if along_x {
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..i1 {
+                let a = row + i;
+                let b = a + 1;
+                let speed = 0.5 * (vel[a] + vel[b]);
+                if speed.abs() < 1.0e-5 {
+                    continue;
+                }
+                flux_open(h, gate, a, b, speed, cell, dt, sc);
+            }
+        }
+    } else {
+        for j in j0..j1 {
+            for i in i0..=i1 {
+                let a = j * res + i;
+                let b = a + res;
+                let speed = 0.5 * (vel[a] + vel[b]);
+                if speed.abs() < 1.0e-5 {
+                    continue;
+                }
+                flux_open(h, gate, a, b, speed, cell, dt, sc);
+            }
+        }
+    }
+}
+
+fn apply_open_scalar(
+    h: &mut [f32],
+    removed: &[f32],
+    added: &[f32],
+    res: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    for j in j0..=j1 {
+        let row = j * res;
+        for i in i0..=i1 {
+            let idx = row + i;
+            if removed[idx] > 0.0 || added[idx] > 0.0 {
+                h[idx] = (h[idx] - removed[idx] + added[idx]).max(0.0);
+            }
+        }
+    }
+}
+
+fn flux_use_avx(along_x: bool, i0: usize, i1: usize, j0: usize, j1: usize) -> bool {
+    if !avx2_cached() {
+        return false;
+    }
+    if along_x {
+        i1 > i0 && j0 <= j1 && j1 - j0 + 1 >= 8
+    } else {
+        j1 > j0 && i0 <= i1 && i1 - i0 + 1 >= 8
+    }
+}
+
+fn apply_use_avx(i0: usize, i1: usize) -> bool {
+    avx2_cached() && i0 <= i1 && i1 - i0 + 1 >= 8
+}
+
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static FLUX_PACK: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
+
+/// Eight lanes, one per independent row (along x) or column (along z).
+/// Each lane is the scalar donor cell, so the written height matches it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn flux_x8(
+    h_a: std::arch::x86_64::__m256,
+    h_b: std::arch::x86_64::__m256,
+    v_a: std::arch::x86_64::__m256,
+    v_b: std::arch::x86_64::__m256,
+    g_a: std::arch::x86_64::__m256,
+    g_b: std::arch::x86_64::__m256,
+    rem_a: std::arch::x86_64::__m256,
+    rem_b: std::arch::x86_64::__m256,
+    add_a: std::arch::x86_64::__m256,
+    add_b: std::arch::x86_64::__m256,
+    dt: f32,
+    cell: f32,
+) -> (
+    std::arch::x86_64::__m256,
+    std::arch::x86_64::__m256,
+    std::arch::x86_64::__m256,
+    std::arch::x86_64::__m256,
+) {
+    use std::arch::x86_64::*;
+    let speed = _mm256_mul_ps(_mm256_set1_ps(0.5), _mm256_add_ps(v_a, v_b));
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    let speed_abs = _mm256_and_ps(speed, abs_mask);
+    let live_speed = _mm256_cmp_ps(speed_abs, _mm256_set1_ps(1.0e-5), _CMP_NLT_UQ);
+    let pos = _mm256_cmp_ps(speed, _mm256_setzero_ps(), _CMP_GT_OQ);
+    let h_donor = _mm256_blendv_ps(h_b, h_a, pos);
+    let h_recv = _mm256_blendv_ps(h_a, h_b, pos);
+    let rem_donor = _mm256_blendv_ps(rem_b, rem_a, pos);
+    let g_recv = _mm256_blendv_ps(g_a, g_b, pos);
+    let room = _mm256_sub_ps(h_donor, rem_donor);
+    let eps = _mm256_set1_ps(1.0e-8);
+    let live_room = _mm256_cmp_ps(room, eps, _CMP_NLE_UQ);
+    let blocked = _mm256_and_ps(
+        _mm256_cmp_ps(g_recv, _mm256_setzero_ps(), _CMP_EQ_OQ),
+        _mm256_cmp_ps(h_recv, _mm256_set1_ps(1.0e-6), _CMP_LE_OQ),
+    );
+    let ones = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+    let live_gate = _mm256_xor_ps(blocked, ones);
+    let frac = _mm256_min_ps(
+        _mm256_div_ps(
+            _mm256_mul_ps(speed_abs, _mm256_set1_ps(dt)),
+            _mm256_set1_ps(cell),
+        ),
+        _mm256_set1_ps(0.45),
+    );
+    let dh_raw = _mm256_min_ps(_mm256_mul_ps(h_donor, frac), room);
+    let live_dh = _mm256_cmp_ps(dh_raw, eps, _CMP_NLE_UQ);
+    let live = _mm256_and_ps(
+        live_speed,
+        _mm256_and_ps(live_room, _mm256_and_ps(live_gate, live_dh)),
+    );
+    let dh = _mm256_and_ps(dh_raw, live);
+    let not_pos = _mm256_xor_ps(pos, ones);
+    let dh_a = _mm256_and_ps(dh, pos);
+    let dh_b = _mm256_and_ps(dh, not_pos);
+    (
+        _mm256_add_ps(rem_a, dh_a),
+        _mm256_add_ps(rem_b, dh_b),
+        _mm256_add_ps(add_a, dh_b),
+        _mm256_add_ps(add_b, dh_a),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn load_gate8(p: *const u8) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let bits = std::ptr::read_unaligned(p as *const u64);
+    let g = _mm_cvtsi64_si128(bits as i64);
+    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(g))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transport_flux_avx2(
+    h: &[f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    removed: &mut [f32],
+    added: &mut [f32],
+) {
+    if along_x {
+        transport_x_avx2(h, vel, gate, res, cell, dt, i0, i1, j0, j1, removed, added);
+    } else {
+        transport_z_avx2(h, vel, gate, res, cell, dt, i0, i1, j0, j1, removed, added);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transport_z_avx2(
+    h: &[f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    removed: &mut [f32],
+    added: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    for j in j0..j1 {
+        let row_a = j * res;
+        let row_b = row_a + res;
+        let mut i = i0;
+        while i + 7 <= i1 {
+            let ha = _mm256_loadu_ps(h.as_ptr().add(row_a + i));
+            let hb = _mm256_loadu_ps(h.as_ptr().add(row_b + i));
+            let va = _mm256_loadu_ps(vel.as_ptr().add(row_a + i));
+            let vb = _mm256_loadu_ps(vel.as_ptr().add(row_b + i));
+            let ga = load_gate8(gate.as_ptr().add(row_a + i));
+            let gb = load_gate8(gate.as_ptr().add(row_b + i));
+            let ra = _mm256_loadu_ps(removed.as_ptr().add(row_a + i));
+            let rb = _mm256_loadu_ps(removed.as_ptr().add(row_b + i));
+            let aa = _mm256_loadu_ps(added.as_ptr().add(row_a + i));
+            let ab = _mm256_loadu_ps(added.as_ptr().add(row_b + i));
+            let (ra, rb, aa, ab) = flux_x8(ha, hb, va, vb, ga, gb, ra, rb, aa, ab, dt, cell);
+            _mm256_storeu_ps(removed.as_mut_ptr().add(row_a + i), ra);
+            _mm256_storeu_ps(removed.as_mut_ptr().add(row_b + i), rb);
+            _mm256_storeu_ps(added.as_mut_ptr().add(row_a + i), aa);
+            _mm256_storeu_ps(added.as_mut_ptr().add(row_b + i), ab);
+            i += 8;
+        }
+        while i <= i1 {
+            let a = row_a + i;
+            let b = row_b + i;
+            let speed = 0.5 * (vel[a] + vel[b]);
+            if !(speed.abs() < 1.0e-5) {
+                flux_open_bufs(h, gate, a, b, speed, cell, dt, removed, added);
+            }
+            i += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transport_x_avx2(
+    h: &[f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    removed: &mut [f32],
+    added: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let width = i1 + 1 - i0;
+    let mut j = j0;
+    while j + 7 <= j1 {
+        let n = width * 8;
+        let need = n * 5;
+        // The pack stays in this thread's slot. The pointer is used only until
+        // the next borrow of that slot, after these eight rows are stored.
+        let ptr = FLUX_PACK.with(|pack| {
+            let mut pack = pack.borrow_mut();
+            if pack.len() < need {
+                pack.resize(need, 0.0);
+            }
+            pack.as_mut_ptr()
+        });
+        for lane in 0..8 {
+            let row = (j + lane) * res;
+            for t in 0..width {
+                let src = row + i0 + t;
+                let p = t * 8 + lane;
+                *ptr.add(p) = h[src];
+                *ptr.add(n + p) = vel[src];
+                *ptr.add(2 * n + p) = 0.0;
+                *ptr.add(3 * n + p) = 0.0;
+                *ptr.add(4 * n + p) = gate[src] as f32;
+            }
+        }
+        let mut t = 0usize;
+        while t + 1 < width {
+            let ha = _mm256_loadu_ps(ptr.add(t * 8));
+            let hb = _mm256_loadu_ps(ptr.add((t + 1) * 8));
+            let va = _mm256_loadu_ps(ptr.add(n + t * 8));
+            let vb = _mm256_loadu_ps(ptr.add(n + (t + 1) * 8));
+            let ga = _mm256_loadu_ps(ptr.add(4 * n + t * 8));
+            let gb = _mm256_loadu_ps(ptr.add(4 * n + (t + 1) * 8));
+            let ra = _mm256_loadu_ps(ptr.add(2 * n + t * 8));
+            let rb = _mm256_loadu_ps(ptr.add(2 * n + (t + 1) * 8));
+            let aa = _mm256_loadu_ps(ptr.add(3 * n + t * 8));
+            let ab = _mm256_loadu_ps(ptr.add(3 * n + (t + 1) * 8));
+            let (ra, rb, aa, ab) = flux_x8(ha, hb, va, vb, ga, gb, ra, rb, aa, ab, dt, cell);
+            _mm256_storeu_ps(ptr.add(2 * n + t * 8), ra);
+            _mm256_storeu_ps(ptr.add(2 * n + (t + 1) * 8), rb);
+            _mm256_storeu_ps(ptr.add(3 * n + t * 8), aa);
+            _mm256_storeu_ps(ptr.add(3 * n + (t + 1) * 8), ab);
+            t += 1;
+        }
+        for lane in 0..8 {
+            let row = (j + lane) * res;
+            for t in 0..width {
+                let dst = row + i0 + t;
+                let p = t * 8 + lane;
+                removed[dst] = *ptr.add(2 * n + p);
+                added[dst] = *ptr.add(3 * n + p);
+            }
+        }
+        j += 8;
+    }
+    while j <= j1 {
+        let row = j * res;
+        for i in i0..i1 {
+            let a = row + i;
+            let b = a + 1;
+            let speed = 0.5 * (vel[a] + vel[b]);
+            if !(speed.abs() < 1.0e-5) {
+                flux_open_bufs(h, gate, a, b, speed, cell, dt, removed, added);
+            }
+        }
+        j += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_open_avx2(
+    h: &mut [f32],
+    removed: &[f32],
+    added: &[f32],
+    res: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    use std::arch::x86_64::*;
+    let zero = _mm256_setzero_ps();
+    for j in j0..=j1 {
+        let row = j * res;
+        let mut i = i0;
+        while i + 7 <= i1 {
+            let idx = row + i;
+            let hv = _mm256_loadu_ps(h.as_ptr().add(idx));
+            let rv = _mm256_loadu_ps(removed.as_ptr().add(idx));
+            let av = _mm256_loadu_ps(added.as_ptr().add(idx));
+            let touch = _mm256_or_ps(
+                _mm256_cmp_ps(rv, zero, _CMP_GT_OQ),
+                _mm256_cmp_ps(av, zero, _CMP_GT_OQ),
+            );
+            let nh = _mm256_max_ps(_mm256_add_ps(_mm256_sub_ps(hv, rv), av), zero);
+            _mm256_storeu_ps(h.as_mut_ptr().add(idx), _mm256_blendv_ps(hv, nh, touch));
+            i += 8;
+        }
+        while i <= i1 {
+            let idx = row + i;
+            if removed[idx] > 0.0 || added[idx] > 0.0 {
+                h[idx] = (h[idx] - removed[idx] + added[idx]).max(0.0);
+            }
+            i += 1;
+        }
+    }
+}
+
+fn project_cell(
+    u: &[f32],
+    v: &[f32],
+    eta: &[f32],
+    nu: &[f32],
+    res: usize,
+    cell: f32,
+    i: usize,
+    j: usize,
+) -> f32 {
+    let idx = j * res + i;
+    let (ux, vz) = grad_vel(u, v, res, i, j, cell);
+    let div = ux + vz;
+    let lap_h = lap(eta, res, i, j, cell);
+    let overload = 1.0 + (nu[idx] / 231.0).clamp(0.0, 6.0);
+    div * overload - 0.015 * overload * lap_h
+}
+
+fn project_residual_scalar(
+    u: &[f32],
+    v: &[f32],
+    eta: &[f32],
+    nu: &[f32],
+    out: &mut [f32],
+    res: usize,
+    cell: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            out[j * res + i] = project_cell(u, v, eta, nu, res, cell, i, j);
+        }
+    }
+}
+
+fn project_residual(
+    u: &[f32],
+    v: &[f32],
+    eta: &[f32],
+    nu: &[f32],
+    out: &mut [f32],
+    res: usize,
+    cell: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_cached() {
+        unsafe {
+            project_residual_avx2(u, v, eta, nu, out, res, cell, i0, i1, j0, j1);
+        }
+        return;
+    }
+    project_residual_scalar(u, v, eta, nu, out, res, cell, i0, i1, j0, j1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn project_residual_avx2(
+    u: &[f32],
+    v: &[f32],
+    eta: &[f32],
+    nu: &[f32],
+    out: &mut [f32],
+    res: usize,
+    cell: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    use std::arch::x86_64::*;
+    let two = _mm256_set1_ps(2.0 * cell);
+    let four = _mm256_set1_ps(4.0);
+    let cell2 = _mm256_set1_ps(cell * cell);
+    let c231 = _mm256_set1_ps(231.0);
+    let zero = _mm256_setzero_ps();
+    let six = _mm256_set1_ps(6.0);
+    let one = _mm256_set1_ps(1.0);
+    let k = _mm256_set1_ps(0.015);
+    for j in j0..=j1 {
+        let mut i = i0;
+        if j >= 1 && j + 1 < res {
+            let up = (j - 1) * res;
+            let dn = (j + 1) * res;
+            let row = j * res;
+            while i < 1 && i <= i1 {
+                out[row + i] = project_cell(u, v, eta, nu, res, cell, i, j);
+                i += 1;
+            }
+            while i >= 1 && i + 7 <= i1 && i + 7 <= res - 2 {
+                let base = row + i;
+                let u_r = _mm256_loadu_ps(u.as_ptr().add(base + 1));
+                let u_l = _mm256_loadu_ps(u.as_ptr().add(base - 1));
+                let v_d = _mm256_loadu_ps(v.as_ptr().add(dn + i));
+                let v_u = _mm256_loadu_ps(v.as_ptr().add(up + i));
+                let dux = _mm256_div_ps(_mm256_sub_ps(u_r, u_l), two);
+                let dvz = _mm256_div_ps(_mm256_sub_ps(v_d, v_u), two);
+                let div = _mm256_add_ps(dux, dvz);
+                let e_r = _mm256_loadu_ps(eta.as_ptr().add(base + 1));
+                let e_l = _mm256_loadu_ps(eta.as_ptr().add(base - 1));
+                let e_d = _mm256_loadu_ps(eta.as_ptr().add(dn + i));
+                let e_u = _mm256_loadu_ps(eta.as_ptr().add(up + i));
+                let e_c = _mm256_loadu_ps(eta.as_ptr().add(base));
+                let mut s = _mm256_add_ps(e_r, e_l);
+                s = _mm256_add_ps(s, e_d);
+                s = _mm256_add_ps(s, e_u);
+                s = _mm256_sub_ps(s, _mm256_mul_ps(four, e_c));
+                let lap_h = _mm256_div_ps(s, cell2);
+                let t = _mm256_div_ps(_mm256_loadu_ps(nu.as_ptr().add(base)), c231);
+                let overload = _mm256_add_ps(one, _mm256_min_ps(_mm256_max_ps(t, zero), six));
+                let term = _mm256_mul_ps(_mm256_mul_ps(k, overload), lap_h);
+                let val = _mm256_sub_ps(_mm256_mul_ps(div, overload), term);
+                _mm256_storeu_ps(out.as_mut_ptr().add(base), val);
+                i += 8;
+            }
+        }
+        while i <= i1 {
+            out[j * res + i] = project_cell(u, v, eta, nu, res, cell, i, j);
+            i += 1;
+        }
+    }
+}
+
+fn fill_vort_plane(
+    su: &[f32],
+    sv: &[f32],
+    w: &mut [f32],
+    res: usize,
+    two: f32,
+    i_lo: usize,
+    i_hi: usize,
+    j_lo: usize,
+    j_hi: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_cached() {
+        unsafe { fill_vort_avx2(su, sv, w, res, two, i_lo, i_hi, j_lo, j_hi) }
+        return;
+    }
+    for j in j_lo..=j_hi {
+        let row = j * res;
+        for i in i_lo..=i_hi {
+            w[row + i] = vort_interior(su, sv, res, i, j, two);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fill_vort_avx2(
+    su: &[f32],
+    sv: &[f32],
+    w: &mut [f32],
+    res: usize,
+    two: f32,
+    i_lo: usize,
+    i_hi: usize,
+    j_lo: usize,
+    j_hi: usize,
+) {
+    use std::arch::x86_64::*;
+    let two_v = _mm256_set1_ps(two);
+    for j in j_lo..=j_hi {
+        let row = j * res;
+        let mut i = i_lo;
+        while i + 7 <= i_hi {
+            let vr = _mm256_loadu_ps(sv.as_ptr().add(row + i + 1));
+            let vl = _mm256_loadu_ps(sv.as_ptr().add(row + i - 1));
+            let ud = _mm256_loadu_ps(su.as_ptr().add((j + 1) * res + i));
+            let uu = _mm256_loadu_ps(su.as_ptr().add((j - 1) * res + i));
+            let dvdx = _mm256_div_ps(_mm256_sub_ps(vr, vl), two_v);
+            let dudz = _mm256_div_ps(_mm256_sub_ps(ud, uu), two_v);
+            _mm256_storeu_ps(w.as_mut_ptr().add(row + i), _mm256_sub_ps(dvdx, dudz));
+            i += 8;
+        }
+        while i <= i_hi {
+            w[row + i] = vort_interior(su, sv, res, i, j, two);
+            i += 1;
+        }
+    }
+}
+
+fn wind_blend_scalar(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    eps: f32,
+    x: f32,
+    z: f32,
+    blend: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if h[idx] <= eps {
+                continue;
+            }
+            u[idx] += (x - u[idx]) * blend;
+            v[idx] += (z - v[idx]) * blend;
+        }
+    }
+}
+
+fn wind_blend(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    eps: f32,
+    x: f32,
+    z: f32,
+    blend: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_cached() && i0 <= i1 && i1 - i0 + 1 >= 8 {
+        unsafe {
+            wind_blend_avx2(h, u, v, res, eps, x, z, blend, i0, i1, j0, j1);
+        }
+        return;
+    }
+    wind_blend_scalar(h, u, v, res, eps, x, z, blend, i0, i1, j0, j1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn wind_blend_avx2(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    eps: f32,
+    x: f32,
+    z: f32,
+    blend: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    use std::arch::x86_64::*;
+    let xv = _mm256_set1_ps(x);
+    let zv = _mm256_set1_ps(z);
+    let bv = _mm256_set1_ps(blend);
+    let ev = _mm256_set1_ps(eps);
+    for j in j0..=j1 {
+        let row = j * res;
+        let mut i = i0;
+        while i + 7 <= i1 {
+            let idx = row + i;
+            let hv = _mm256_loadu_ps(h.as_ptr().add(idx));
+            let uu = _mm256_loadu_ps(u.as_ptr().add(idx));
+            let vv = _mm256_loadu_ps(v.as_ptr().add(idx));
+            let wet = _mm256_cmp_ps(hv, ev, _CMP_NLE_UQ);
+            let nu = _mm256_add_ps(uu, _mm256_mul_ps(_mm256_sub_ps(xv, uu), bv));
+            let nv = _mm256_add_ps(vv, _mm256_mul_ps(_mm256_sub_ps(zv, vv), bv));
+            _mm256_storeu_ps(u.as_mut_ptr().add(idx), _mm256_blendv_ps(uu, nu, wet));
+            _mm256_storeu_ps(v.as_mut_ptr().add(idx), _mm256_blendv_ps(vv, nv, wet));
+            i += 8;
+        }
+        while i <= i1 {
+            let idx = row + i;
+            if h[idx] <= eps {
+                continue;
+            }
+            u[idx] += (x - u[idx]) * blend;
+            v[idx] += (z - v[idx]) * blend;
+            i += 1;
+        }
+    }
+}
 fn confine_one(
     u: &mut [f32],
     v: &mut [f32],
@@ -2587,7 +3481,12 @@ fn blur_box(
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 && res != FINE_RES && res > SERIAL_SHEET_MAX {
+    if !sheet_serial()
+        && j1 - j0 >= 47
+        && i1 - i0 >= 31
+        && res != FINE_RES
+        && res > SERIAL_SHEET_MAX
+    {
         par_blur_axis(src, tmp, res, i0, i1, j0, j1, k, true);
         par_blur_axis(tmp, dst, res, i0, i1, j0, j1, k, false);
         return;
@@ -7751,6 +8650,150 @@ mod tests {
             "dry ground gained moisture {}",
             fluid.sample(6.0, 6.0).moisture
         );
+    }
+
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx_sheet_matches_scalar_bits() {
+        if !avx2_cached() {
+            return;
+        }
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let u = (state >> 8) as f32 / 16_777_216.0;
+            u * 4.0 - 1.0
+        };
+        let res = 24usize;
+        let n = res * res;
+        let mut h = vec![0.0f32; n];
+        let mut vel = vec![0.0f32; n];
+        let mut gate = vec![1u8; n];
+        for i in 0..n {
+            h[i] = next().abs() * 0.05;
+            vel[i] = next() * 3.0;
+            if next() > 0.85 {
+                gate[i] = 0;
+            }
+        }
+        for i in 0..res {
+            h[8 * res + i] = 0.01;
+            vel[8 * res + i] = 6.0;
+            vel[9 * res + i] = 6.0;
+        }
+        let cell = 0.25f32;
+        let dt = 1.0 / 60.0;
+        let (i0, i1, j0, j1) = (1usize, res - 2, 1usize, res - 2);
+        for along_x in [true, false] {
+            let mut hs = h.clone();
+            let mut sc = Scratch::new();
+            sc.fit(n);
+            sc.removed.fill(0.0);
+            sc.added.fill(0.0);
+            transport_flux_scalar(
+                &hs, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x, &mut sc,
+            );
+            let mut removed = vec![0.0f32; n];
+            let mut added = vec![0.0f32; n];
+            unsafe {
+                transport_flux_avx2(
+                    &h, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x, &mut removed,
+                    &mut added,
+                );
+            }
+            for idx in 0..n {
+                assert_eq!(
+                    removed[idx].to_bits(),
+                    sc.removed[idx].to_bits(),
+                    "removed {idx} along {along_x} avx {} scalar {}",
+                    removed[idx],
+                    sc.removed[idx]
+                );
+                assert_eq!(
+                    added[idx].to_bits(),
+                    sc.added[idx].to_bits(),
+                    "added {idx} along {along_x} avx {} scalar {}",
+                    added[idx],
+                    sc.added[idx]
+                );
+            }
+            apply_open_scalar(&mut hs, &sc.removed, &sc.added, res, i0, i1, j0, j1);
+            let mut ha = h.clone();
+            unsafe {
+                apply_open_avx2(&mut ha, &removed, &added, res, i0, i1, j0, j1);
+            }
+            for idx in 0..n {
+                assert_eq!(
+                    ha[idx].to_bits(),
+                    hs[idx].to_bits(),
+                    "height {idx} along {along_x} avx {} scalar {}",
+                    ha[idx],
+                    hs[idx]
+                );
+            }
+        }
+        let mut u = vec![0.0f32; n];
+        let mut vv = vec![0.0f32; n];
+        let mut eta = vec![0.0f32; n];
+        let mut nu = vec![0.0f32; n];
+        for i in 0..n {
+            u[i] = next();
+            vv[i] = next();
+            eta[i] = next().abs();
+            nu[i] = next().abs() * 400.0;
+        }
+        let mut ps = vec![0.0f32; n];
+        let mut pa = vec![0.0f32; n];
+        project_residual_scalar(&u, &vv, &eta, &nu, &mut ps, res, cell, 0, res - 1, 0, res - 1);
+        unsafe {
+            project_residual_avx2(&u, &vv, &eta, &nu, &mut pa, res, cell, 0, res - 1, 0, res - 1);
+        }
+        for idx in 0..n {
+            assert_eq!(
+                pa[idx].to_bits(),
+                ps[idx].to_bits(),
+                "project {idx} avx {} scalar {}",
+                pa[idx],
+                ps[idx]
+            );
+        }
+        let two = 2.0 * cell;
+        let mut ws = vec![0.0f32; n];
+        let mut wa = vec![0.0f32; n];
+        for j in 1..res - 1 {
+            for i in 1..res - 1 {
+                ws[j * res + i] = vort_interior(&u, &vv, res, i, j, two);
+            }
+        }
+        unsafe {
+            fill_vort_avx2(&u, &vv, &mut wa, res, two, 1, res - 2, 1, res - 2);
+        }
+        for idx in 0..n {
+            assert_eq!(
+                wa[idx].to_bits(),
+                ws[idx].to_bits(),
+                "vort {idx} avx {} scalar {}",
+                wa[idx],
+                ws[idx]
+            );
+        }
+        let mut us = u.clone();
+        let mut vs = vv.clone();
+        let mut ua = u.clone();
+        let mut va = vv.clone();
+        wind_blend_scalar(
+            &eta, &mut us, &mut vs, res, 0.0, 2.5, -1.2, 0.3, 0, res - 1, 0, res - 1,
+        );
+        unsafe {
+            wind_blend_avx2(
+                &eta, &mut ua, &mut va, res, 0.0, 2.5, -1.2, 0.3, 0, res - 1, 0, res - 1,
+            );
+        }
+        for idx in 0..n {
+            assert_eq!(us[idx].to_bits(), ua[idx].to_bits(), "blend u {idx}");
+            assert_eq!(vs[idx].to_bits(), va[idx].to_bits(), "blend v {idx}");
+        }
     }
 
     #[test]

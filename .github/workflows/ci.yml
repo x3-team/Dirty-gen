@@ -20,6 +20,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
+      - name: Library tests
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --lib
       - name: Niva creek crossing
         run: |
           # rustc links meshopt with lld, which does not search gcc's lib dir

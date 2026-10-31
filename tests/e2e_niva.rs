@@ -20,10 +20,6 @@ use silt::DriveParts;
 use silt::ThroughDrive;
 
 const DT: f32 = 1.0 / 30.0;
-/// Release through-drive step mean, milliseconds.
-/// 15% over the #100 release CI mean (10.278 ms, EPYC 9V45, run 41218969837).
-/// Not above that mean plus 20% (12.334) and not above the previous 33.004.
-const E2E_STEP_BUDGET_MS: f64 = 11.820;
 /// Release sum of [`ThroughDrive::step`] subsystems, milliseconds. Do not raise.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 const DRIVE_SOLVER_BUDGET_MS: f64 = 7.0;
@@ -652,6 +648,8 @@ fn e2e_niva() {
     let air_mean = if timed > 0.0 { air_ms / timed } else { 0.0 };
     let step_p95 = percentile_95(&mut step_samples);
     let hardware = hardware_line();
+    let e2e_cal = e2e_calibration_ms(&hardware);
+    let e2e_budget = e2e_step_budget_ms(&hardware);
     let dust_gap = (dust.emitted_m3() as f64
         - dust.dust_air_m3() as f64
         - dust.dust_settled_m3() as f64)
@@ -670,7 +668,8 @@ fn e2e_niva() {
          E2E_STEPS n={timed:.0} dt={DT:.6}\n\
          E2E_MEAN ms={step_mean:.3}\n\
          E2E_P95 ms={step_p95:.3}\n\
-         E2E_BUDGET ms={E2E_STEP_BUDGET_MS:.3}\n\
+         E2E_CALIBRATION ms={e2e_cal:.3}\n\
+         E2E_BUDGET ms={e2e_budget:.3}\n\
          E2E_AIR ms={air_mean:.3}\n\
          E2E_AIR_BUDGET ms={AIR_RELEASE_BUDGET_MS:.3}\n\
          E2E_HARDWARE {hardware}",
@@ -685,7 +684,6 @@ fn e2e_niva() {
         max_gap
     );
 
-    #[cfg(not(debug_assertions))]
     print_through_drive();
 
     assert!(
@@ -813,8 +811,8 @@ fn e2e_niva() {
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        step_mean <= E2E_STEP_BUDGET_MS,
-        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the CI mean"
+        step_mean <= e2e_budget,
+        "e2e step {step_mean:.3} ms over {e2e_budget:.3} calibration {e2e_cal:.3} on {hardware}"
     );
     #[cfg(not(debug_assertions))]
     assert!(
@@ -854,6 +852,7 @@ fn print_through_drive() {
     let mean = acc.total_ms / k;
     let p95 = percentile_95(&mut totals);
     let solver = acc.solver_ms() / k;
+    let dust = acc.dust_ms / k;
     let hardware = hardware_line();
     println!(
         "DRIVE_STEPS n={n} dt={dt:.6}\n\
@@ -864,7 +863,7 @@ fn print_through_drive() {
          DRIVE_SLURRY ms={:.3}\n\
          DRIVE_SOIL ms={:.3}\n\
          DRIVE_AIR ms={:.3}\n\
-         DRIVE_DUST ms={:.3}\n\
+         DRIVE_DUST ms={dust:.3}\n\
          DRIVE_RESTRICT ms={:.3}\n\
          DRIVE_WINDOW ms={:.3}\n\
          DRIVE_WINDOW_HASH n={}\n\
@@ -879,7 +878,6 @@ fn print_through_drive() {
         acc.slurry_ms / k,
         acc.soil_ms / k,
         acc.air_ms / k,
-        acc.dust_ms / k,
         acc.restrict_ms / k,
         acc.window_ms / k,
         acc.window_hash,
@@ -887,7 +885,6 @@ fn print_through_drive() {
         acc.sheet_rest_ms / k,
         acc.other_ms / k,
     );
-    let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
     assert!(
         solver <= DRIVE_SOLVER_BUDGET_MS,
@@ -1063,6 +1060,27 @@ fn assert_plausible_speed(u: &[f32], v: &[f32], lim: f32) {
     }
 }
 
+#[test]
+fn e2e_budget_follows_the_runner() {
+    assert_eq!(
+        e2e_step_budget_ms("AMD EPYC 9V45 96-Core Processor, 4 cores"),
+        11.820
+    );
+    assert_eq!(
+        e2e_step_budget_ms("AMD EPYC 7763 64-Core Processor, 4 cores"),
+        21.390
+    );
+    assert_eq!(
+        e2e_step_budget_ms("AMD EPYC 9V74 80-Core Processor, 4 cores"),
+        17.425
+    );
+    assert_eq!(
+        e2e_step_budget_ms("Intel(R) Xeon(R) Processor, 4 cores"),
+        21.390
+    );
+    assert!(e2e_step_budget_ms("unknown cpu, 4 cores") <= 33.004);
+}
+
 fn percentile_95(samples: &mut [f64]) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -1070,6 +1088,28 @@ fn percentile_95(samples: &mut [f64]) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = ((samples.len() as f64) * 0.95).ceil() as usize;
     samples[(idx.saturating_sub(1)).min(samples.len() - 1)]
+}
+
+/// Release e2e mean, milliseconds, measured on this CPU.
+/// An unrecognized model uses the slowest calibration (EPYC 7763).
+fn e2e_calibration_ms(model: &str) -> f64 {
+    if model.contains("7763") {
+        18.6
+    } else if model.contains("9V45") {
+        // Run 41218969837, commit 0cf4957, 4 cores.
+        10.278
+    } else if model.contains("9V74") {
+        // Run 41216401571, commit a172a1b, 4 cores.
+        15.152
+    } else {
+        18.6
+    }
+}
+
+/// 15% over [`e2e_calibration_ms`], and not above 33.004 ms.
+fn e2e_step_budget_ms(model: &str) -> f64 {
+    let raw = (e2e_calibration_ms(model) * 1.15).min(33.004);
+    (raw * 1000.0).round() / 1000.0
 }
 
 fn hardware_line() -> String {
