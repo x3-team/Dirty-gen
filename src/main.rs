@@ -928,8 +928,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     let mut parked = World::win_demo();
     // Parked across the pool from the fixed side camera so the flank reflects in water.
-    parked.vehicle.pos = Vec3::new(-0.58, 0.8, 0.08);
-    parked.vehicle.yaw = -1.72;
+    parked.vehicle.pos = Vec3::new(-0.42, 0.8, 0.02);
+    parked.vehicle.yaw = -1.88;
     let pad = parked.soil.sample(parked.vehicle.pos.x, parked.vehicle.pos.z);
     parked.vehicle.pos.y = pad.height + 0.62;
     parked.time = 4.6;
@@ -993,7 +993,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.water_column = saved_column;
     renderer.show_mud_drops = false;
     renderer.show_mud_particles = true;
-    wheel.time = 7.85;
+    wheel.time = 8.35;
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
         &media.join("puddle-wheel.png"),
@@ -1089,8 +1089,15 @@ fn win_demo_seed_pool_splashes(world: &mut World) {
         if liq < 0.035 {
             continue;
         }
-        let origin = hub + Vec3::Y * (WHEEL_RADIUS * 0.35);
-        let _ = world.particles.throw_slurry(origin, forward, right, 0.011 + i as f32 * 0.0015);
+        let origin = hub + forward * 0.28 + Vec3::Y * (WHEEL_RADIUS * 0.42);
+        let vol = 0.022 + i as f32 * 0.003;
+        let _ = world.particles.throw_slurry(origin, forward, right, vol);
+        let _ = world.particles.throw_slurry(
+            hub + Vec3::Y * (WHEEL_RADIUS * 0.55),
+            forward,
+            right,
+            vol * 0.65,
+        );
     }
 }
 
