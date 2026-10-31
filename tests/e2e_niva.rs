@@ -9,7 +9,8 @@ use std::time::Instant;
 use glam::Vec3;
 use silt::dust::{dust_may_lift, tires_at, Dust};
 use silt::fluid_core::{
-    FluidCore, Grain, TirePush, AIR_STEP_BUDGET_MS, COARSE_CELL_M,
+    step_sheet, FluidCore, Grain, SheetDrive, TirePush, AIR_RES, AIR_STEP_BUDGET_MS,
+    COARSE_CELL_M, FINE_CELL_M, FINE_RES, WINDOW_RES,
 };
 use silt::particles::Particle;
 use silt::render_contract::{publish, ContractFrame, RENDER_CONTRACT_VERSION};
@@ -23,6 +24,9 @@ const DT: f32 = 1.0 / 30.0;
 /// The release CI mean on EPYC 7763 (4 cores), not a pad on the Xeon measurement.
 /// The log has that mean; it does not print a sample median. Not the 7 ms frame budget.
 const E2E_STEP_BUDGET_MS: f64 = 33.004;
+/// Release sum of [`ThroughDrive::step`] subsystems, milliseconds. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_SOLVER_BUDGET_MS: f64 = 7.0;
 /// Release air step. Debug still uses [`AIR_STEP_BUDGET_MS`] (4 ms).
 const AIR_RELEASE_BUDGET_MS: f64 = 1.5;
 const SPEED: f32 = 8.0;
@@ -861,7 +865,8 @@ fn print_through_drive() {
          DRIVE_PREP ms={:.3}\n\
          DRIVE_SHEET_REST ms={:.3}\n\
          DRIVE_OTHER ms={:.3}\n\
-         DRIVE_SOLVER ms={solver:.3}",
+         DRIVE_SOLVER ms={solver:.3}\n\
+         DRIVE_SOLVER_BUDGET ms={DRIVE_SOLVER_BUDGET_MS:.3}",
         acc.water_ms / k,
         acc.slurry_ms / k,
         acc.soil_ms / k,
@@ -874,6 +879,169 @@ fn print_through_drive() {
         acc.sheet_rest_ms / k,
         acc.other_ms / k,
     );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        solver <= DRIVE_SOLVER_BUDGET_MS,
+        "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
+    );
+}
+
+/// Open 2 cm sheet and open wind, the trimmed branch.
+///
+/// Gravity at [`FINE_CELL_M`] with no wall is one CFL pass, no divergence
+/// projection, and flat slow tiles left asleep. Open wind does not build the
+/// pressure filters. Volume stays inside 1e-3, nothing is NaN, and the
+/// limiter keeps the speed.
+#[test]
+fn fine_open() {
+    let res = FINE_RES;
+    let cell = FINE_CELL_M;
+    let n = res * res;
+    let mut h = vec![0.02f32; n];
+    let mut u = vec![0.02f32; n];
+    let mut v = vec![0.0f32; n];
+    let mut bed = vec![0.0f32; n];
+    let nu = vec![1.0f32; n];
+    let gate = vec![1u8; n];
+    for j in 24..48 {
+        for i in 24..48 {
+            let idx = j * res + i;
+            bed[idx] = -0.008 * j as f32;
+            h[idx] = 0.06;
+        }
+    }
+    // Far tile of the flat film. The pond does not reach it in this run, so a
+    // sleeping tile keeps the warm start.
+    let mut sleep = Vec::new();
+    for j in 152..160 {
+        for i in 152..160 {
+            sleep.push(j * res + i);
+        }
+    }
+    let before = sheet_volume(&h, cell);
+    let sleep_h: Vec<f32> = sleep.iter().map(|&idx| h[idx]).collect();
+    let sleep_u: Vec<f32> = sleep.iter().map(|&idx| u[idx]).collect();
+    let dt = 1.0 / 30.0;
+    for _ in 0..12 {
+        step_sheet(
+            &mut h,
+            &mut u,
+            &mut v,
+            &bed,
+            &nu,
+            &gate,
+            res,
+            cell,
+            dt,
+            SheetDrive::Gravity { vorticity: 0.02 },
+        );
+    }
+    let after = sheet_volume(&h, cell);
+    let gap = (after - before).abs();
+    assert!(before > 1.0e-4, "gravity volume {before}");
+    assert!(
+        gap / before < 1.0e-3,
+        "gravity volume {before} -> {after} gap {gap}"
+    );
+    let mut nan = non_finite(&h) + non_finite(&u) + non_finite(&v);
+    assert_eq!(nan, 0, "gravity nan {nan}");
+    assert_plausible_speed(&u, &v, 1.6);
+    let mut downhill = 0.0f32;
+    for j in 24..80 {
+        for i in 16..64 {
+            let idx = j * res + i;
+            if h[idx] > 1.0e-4 {
+                downhill = downhill.max(v[idx]);
+            }
+        }
+    }
+    assert!(downhill > 0.02, "downhill v {downhill}");
+    for (k, &idx) in sleep.iter().enumerate() {
+        assert_eq!(h[idx], sleep_h[k], "sleeping depth moved at {idx}");
+        assert_eq!(u[idx], sleep_u[k], "sleeping speed moved at {idx}");
+        assert_eq!(v[idx], 0.0, "sleeping cross speed at {idx}");
+    }
+
+    let wres = AIR_RES / 2;
+    let wcell = 2.0 * (WINDOW_RES as f32 * COARSE_CELL_M / AIR_RES as f32);
+    let wn = wres * wres;
+    let mut wh = vec![0.0f32; wn];
+    let mut wu = vec![0.0f32; wn];
+    let mut wv = vec![0.0f32; wn];
+    let wbed = vec![0.0f32; wn];
+    let wnu = vec![0.4f32; wn];
+    let wgate = vec![1u8; wn];
+    for j in 24..36 {
+        for i in 12..24 {
+            wh[j * wres + i] = 0.04;
+        }
+    }
+    let wbefore = sheet_volume(&wh, wcell);
+    let wind_x = 1.2f32;
+    let wind_z = -0.3f32;
+    for _ in 0..40 {
+        step_sheet(
+            &mut wh,
+            &mut wu,
+            &mut wv,
+            &wbed,
+            &wnu,
+            &wgate,
+            wres,
+            wcell,
+            dt,
+            SheetDrive::Wind {
+                x: wind_x,
+                z: wind_z,
+                vorticity: 0.35,
+            },
+        );
+    }
+    let wafter = sheet_volume(&wh, wcell);
+    let wgap = (wafter - wbefore).abs();
+    assert!(wbefore > 1.0e-4, "wind volume {wbefore}");
+    assert!(
+        wgap / wbefore < 1.0e-3,
+        "wind volume {wbefore} -> {wafter} gap {wgap}"
+    );
+    nan = non_finite(&wh) + non_finite(&wu) + non_finite(&wv);
+    assert_eq!(nan, 0, "wind nan {nan}");
+    let lim = wind_x.hypot(wind_z).max(1.6);
+    assert_plausible_speed(&wu, &wv, lim);
+    let mut mass = 0.0f64;
+    let mut mass_u = 0.0f64;
+    for j in 0..wres {
+        for i in 0..wres {
+            let s = f64::from(wh[j * wres + i].max(0.0));
+            mass += s;
+            mass_u += s * f64::from(wu[j * wres + i]);
+        }
+    }
+    let mean_u = if mass > 0.0 { mass_u / mass } else { 0.0 };
+    assert!(mean_u > 0.05, "wind mean u {mean_u}");
+}
+
+fn sheet_volume(h: &[f32], cell: f32) -> f64 {
+    let area = f64::from(cell) * f64::from(cell);
+    h.iter().map(|s| f64::from((*s).max(0.0))).sum::<f64>() * area
+}
+
+fn non_finite(xs: &[f32]) -> u32 {
+    xs.iter().filter(|v| !v.is_finite()).count() as u32
+}
+
+fn assert_plausible_speed(u: &[f32], v: &[f32], lim: f32) {
+    let cap = lim + 1.0e-3;
+    for (uu, vv) in u.iter().zip(v) {
+        assert!(
+            uu.is_finite() && uu.abs() <= cap,
+            "u {uu} over {lim}"
+        );
+        assert!(
+            vv.is_finite() && vv.abs() <= cap,
+            "v {vv} over {lim}"
+        );
+    }
 }
 
 fn percentile_95(samples: &mut [f64]) -> f64 {

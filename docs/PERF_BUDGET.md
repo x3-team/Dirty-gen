@@ -5,6 +5,7 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 | Budget | Cap | Assert |
 | --- | --- | --- |
 | Solver frame | ≤ 7 ms | `tests/frame_bench.rs`, `World::demo` at 1/60, release |
+| ThroughDrive solver sum | ≤ 7 ms | `tests/e2e_niva.rs` `DRIVE_SOLVER`, release. Subsystems of `ThroughDrive::step` at dt = 1/30, except the picture |
 | E2e step mean | ≤ 33.004 ms | `tests/e2e_niva.rs`, `dust.step_pads` then `fluid.step` at dt = 1/30, release |
 | Air step | ≤ 1.5 ms | same e2e air mean, release. Every build still requires `< 4` ms (`AIR_STEP_BUDGET_MS`) |
 
