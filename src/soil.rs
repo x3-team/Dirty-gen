@@ -7508,33 +7508,46 @@ impl SoilField {
         let half = self.size * 0.5;
         let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.32_f32, 1.02_f32);
         let bed = 0.22_f32;
+        let pad_x = 1.58_f32;
+        let pad_z = 1.28_f32;
         for j in 0..res {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
                 let z = (j as f32 + 0.5) * cell - half;
-                let dx = (x - sx) / srx;
-                let dz = (z - sz) / srz;
-                let r2 = dx * dx + dz * dz;
-                if r2 > 1.0 {
+                let ux = (x - sx).abs() / pad_x;
+                let uz = (z - sz).abs() / pad_z;
+                if ux > 1.0 || uz > 1.0 {
                     continue;
                 }
+                let dx = (x - sx) / srx;
+                let dz = (z - sz) / srz;
+                let r = (dx * dx + dz * dz).sqrt();
                 let idx = j * res + i;
-                let w = (1.0 - r2.sqrt()).max(0.0);
-                let flat_w = w * w * (3.0 - 2.0 * w);
-                self.height[idx] = lerp(self.height[idx], bed, flat_w);
-                self.bed[idx] = self.height[idx];
-                self.initial_height[idx] = self.height[idx];
+                let edge = ux.max(uz);
+                let flat_w = (1.0 - edge).max(0.0);
+                let flat_w = flat_w * flat_w * (3.0 - 2.0 * flat_w);
+                self.bed[idx] = bed;
                 self.placed[idx] = 0.0;
-                let seam_water = 0.045 + w * 0.155;
-                self.water[idx] = self.water[idx].max(seam_water);
-                self.slurry[idx] = self
-                    .slurry[idx]
-                    .max(slurry_soil_depth(seam_water, 1.0));
+                self.loose[idx] = 0.0;
+                self.initial_height[idx] = bed;
+                let seam_water = if r <= 1.0 {
+                    let core = (1.0 - r).max(0.0);
+                    0.045 + core * 0.155
+                } else {
+                    0.0
+                };
+                if seam_water > 0.0 {
+                    self.water[idx] = self.water[idx].max(seam_water);
+                }
+                let film = 0.0015 + seam_water * 0.006;
+                self.slurry[idx] = lerp(self.slurry[idx], film, flat_w);
                 if seam_water > 0.02 {
+                    self.kind[idx] = SurfaceKind::WetMud as u8;
                     self.wetness[idx] = 1.0;
                     self.darken[idx] = self.darken[idx].max(0.24);
                     self.roughness[idx] = self.roughness[idx].min(0.08);
                 }
+                self.sync(idx);
             }
         }
     }

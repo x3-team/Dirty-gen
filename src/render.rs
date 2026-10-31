@@ -1429,7 +1429,7 @@ impl Renderer {
             }
         }
 
-        let water_ssr = self.puddle_beauty;
+        let water_ssr = self.puddle_beauty || self.win_demo_still;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),

@@ -74,8 +74,14 @@ fn win_demo_seam_heights_stay_bounded() {
         }
     }
     assert!(
-        max_h - min_h < 0.6,
+        max_h - min_h < 0.35,
         "seam pad too rough: span {:.3}",
         max_h - min_h
+    );
+    let hub = world.soil.sample(cx, cz);
+    assert!(
+        hub.height < 0.26,
+        "seam hub height pyramid {:.3}",
+        hub.height
     );
 }
