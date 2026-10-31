@@ -908,11 +908,11 @@ fn capture_win_demo_stills() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-const WIN_DEMO_LOW_YAW: f32 = 2.68;
+const WIN_DEMO_LOW_YAW: f32 = 2.58;
 #[cfg(not(target_arch = "wasm32"))]
-const WIN_DEMO_LOW_PITCH: f32 = 0.11;
+const WIN_DEMO_LOW_PITCH: f32 = 0.13;
 #[cfg(not(target_arch = "wasm32"))]
-const WIN_DEMO_LOW_DIST: f32 = 4.85;
+const WIN_DEMO_LOW_DIST: f32 = 4.65;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn win_demo_low_pose(world: &World) -> CameraPose {
@@ -930,10 +930,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let (px, pz) = WIN_DEMO_SEAM_PUDDLE;
     let parked_yaw = -1.88_f32;
     let mut parked = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut parked, px + 0.36, pz + 0.04, parked_yaw);
-    win_demo_calm_wheels_in_pool(&mut parked);
     win_demo_still_touchup(&mut parked);
-    win_demo_seat_vehicle_on_bowl(&mut parked);
+    win_demo_seat_still_vehicle(&mut parked, px + 0.36, pz + 0.04, parked_yaw);
+    win_demo_calm_wheels_in_pool(&mut parked);
     parked.time = 1.2;
     let pose = win_demo_low_pose(&parked);
 
@@ -954,11 +953,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     println!("win demo {}", media.join("puddle-low-before.png").display());
 
     let mut driven = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut driven, px + 0.52, pz + 0.30, parked_yaw);
-    win_demo_stage_bow_in_pool(&mut driven);
     win_demo_still_touchup(&mut driven);
-    win_demo_seat_vehicle_on_bowl(&mut driven);
-    driven.time = 12.6;
+    win_demo_seat_still_vehicle(&mut driven, px + 0.52, pz + 0.30, parked_yaw);
+    win_demo_stage_bow_in_pool(&mut driven);
+    driven.time = 13.8;
     renderer.puddle_beauty = true;
     renderer.water_column = true;
     let rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
@@ -971,8 +969,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let pose = win_demo_low_pose(&driven);
 
     let mut wheel = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut wheel, px + 0.36, pz + 0.06, parked_yaw);
     win_demo_still_touchup(&mut wheel);
+    win_demo_seat_still_vehicle(&mut wheel, px + 0.36, pz + 0.06, parked_yaw);
     wheel.time = 2.2;
     let pose = win_demo_low_pose(&wheel);
 
@@ -998,7 +996,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     win_demo_stage_bow_in_pool(&mut wheel);
     wheel.time = 9.2;
     win_demo_still_touchup(&mut wheel);
-    win_demo_seat_vehicle_on_bowl(&mut wheel);
+    win_demo_seat_still_vehicle(&mut wheel, px + 0.36, pz + 0.06, parked_yaw);
     renderer.puddle_beauty = true;
     renderer.water_column = true;
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
@@ -1033,10 +1031,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     println!("win demo {}", media.join("puddle-drive-before.png").display());
 
     let mut drive = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut drive, px + 0.42, pz + 0.18, -2.58);
-    win_demo_stage_bow_in_pool(&mut drive);
     win_demo_still_touchup(&mut drive);
-    win_demo_seat_vehicle_on_bowl(&mut drive);
+    win_demo_seat_still_vehicle(&mut drive, px + 0.42, pz + 0.18, -2.58);
+    win_demo_stage_bow_in_pool(&mut drive);
     drive.time = 11.4;
     renderer.puddle_beauty = true;
     renderer.water_column = true;
@@ -1074,10 +1071,53 @@ fn win_demo_pool_surface_y() -> f32 {
     silt::soil::SoilField::win_demo_pool_rim_height(0.22)
 }
 
-fn win_demo_hub_on_water(_sink: f32) -> f32 {
+const WIN_DEMO_TIRE_SINK: f32 = 0.052;
+
+fn win_demo_hub_on_water(sink: f32) -> f32 {
     use silt::vehicle::WHEEL_RADIUS;
-    // Hub height so the mesh contact patch meets the flat pool plane (not bowl bed).
-    win_demo_pool_surface_y() + WHEEL_RADIUS - 0.098
+    win_demo_pool_surface_y() + WHEEL_RADIUS - sink
+}
+
+fn win_demo_wheel_bottom_y(world: &World, wheel: usize) -> f32 {
+    use silt::vehicle::WHEEL_RADIUS;
+    let ori = world.vehicle.orientation();
+    let hub = world.vehicle.pos + ori * world.vehicle.wheel_center_local(wheel);
+    hub.y - WHEEL_RADIUS
+}
+
+fn win_demo_seat_still_vehicle(world: &mut World, x: f32, z: f32, yaw: f32) {
+    use silt::vehicle::WHEEL_RADIUS;
+    world.vehicle.yaw = yaw;
+    world.vehicle.pitch = 0.0;
+    world.vehicle.roll = 0.0;
+    let surface = win_demo_pool_surface_y();
+    for wh in world.vehicle.wheels.iter_mut() {
+        wh.sinkage = WIN_DEMO_TIRE_SINK;
+        wh.in_water = true;
+        wh.omega = 0.0;
+        wh.normal = 5200.0;
+        wh.compression = 0.08;
+    }
+    world.vehicle.pos = Vec3::new(x, surface + WHEEL_RADIUS, z);
+    win_demo_seat_tires_on_water(world);
+}
+
+fn win_demo_seat_tires_on_water(world: &mut World) {
+    const POOL_LEVEL: f32 = 0.22;
+    let target_bottom = POOL_LEVEL - WIN_DEMO_TIRE_SINK;
+    for _ in 0..20 {
+        let mut lift = 0.0_f32;
+        for i in 0..4 {
+            let err = win_demo_wheel_bottom_y(world, i) - target_bottom;
+            if err > lift {
+                lift = err;
+            }
+        }
+        if lift < 0.00035 {
+            break;
+        }
+        world.vehicle.pos.y -= lift;
+    }
 }
 
 fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
@@ -1086,7 +1126,7 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
     world.vehicle.pitch = 0.0;
     world.vehicle.roll = 0.0;
     let surface = win_demo_pool_surface_y();
-    let sink = 0.032_f32;
+    let sink = WIN_DEMO_TIRE_SINK;
     for wh in world.vehicle.wheels.iter_mut() {
         wh.sinkage = sink;
         wh.in_water = true;
@@ -1109,7 +1149,6 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
         }
         world.vehicle.pos.y += lift * 0.55;
     }
-    win_demo_clamp_hubs_on_water(world, sink);
 }
 
 fn win_demo_clamp_hubs_on_water(world: &mut World, sink: f32) {
@@ -1142,21 +1181,8 @@ fn win_demo_calm_wheels_in_pool(world: &mut World) {
     }
 }
 
-fn win_demo_seat_vehicle_on_bowl(world: &mut World) {
-    let sink = 0.032_f32;
-    for _ in 0..40 {
-        let mut lift = 0.0_f32;
-        for i in 0..4 {
-            let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
-            let target = win_demo_hub_on_water(sink);
-            lift = lift.max(target - hub.y);
-        }
-        if lift.abs() < 0.0006 {
-            break;
-        }
-        world.vehicle.pos.y += lift * 0.58;
-    }
-    win_demo_clamp_hubs_on_water(world, sink);
+fn win_demo_seat_vehicle_on_bowl(_world: &mut World) {
+    // Pool stills seat on the flat water plane in win_demo_seat_tires_on_water.
 }
 
 fn win_demo_still_touchup(world: &mut World) {
@@ -1220,7 +1246,13 @@ fn win_demo_seat_wheel_in_puddle(world: &mut World, wheel: usize, yaw: f32) {
 fn win_demo_puddle_look_at(world: &World) -> Vec3 {
     let (x, z) = WIN_DEMO_SEAM_PUDDLE;
     let h = world.soil.sample(x, z).height;
-    Vec3::new(x, h + 0.10, z)
+    let ori = world.vehicle.orientation();
+    let door = world.vehicle.pos + ori * Vec3::new(0.0, 0.55, 0.15);
+    Vec3::new(
+        x + (door.x - x) * 0.35,
+        h + 0.10,
+        z + (door.z - z) * 0.35,
+    )
 }
 
 /// Aim between dry sand and the seam puddle so overview/close read all three patches.
