@@ -15,11 +15,15 @@ use silt::particles::Particle;
 use silt::render_contract::{publish, ContractFrame, RENDER_CONTRACT_VERSION};
 use silt::soil::SoilField;
 use silt::vehicle::{Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
+use silt::DriveParts;
+use silt::ThroughDrive;
 
 const DT: f32 = 1.0 / 30.0;
 /// Release through-drive step mean, milliseconds.
 /// Locked at a measured 31.231 ms plus 20 percent. Not the 7 ms frame budget.
 const E2E_STEP_BUDGET_MS: f64 = 37.477;
+/// Release air step. Debug still uses [`AIR_STEP_BUDGET_MS`] (4 ms).
+const AIR_RELEASE_BUDGET_MS: f64 = 1.5;
 const SPEED: f32 = 8.0;
 const SLIP: f32 = 1.6;
 const PUDDLE_X: f32 = 3.2;
@@ -656,6 +660,8 @@ fn e2e_niva() {
          E2E_MEAN ms={step_mean:.3}\n\
          E2E_P95 ms={step_p95:.3}\n\
          E2E_BUDGET ms={E2E_STEP_BUDGET_MS:.3}\n\
+         E2E_AIR ms={air_mean:.3}\n\
+         E2E_AIR_BUDGET ms={AIR_RELEASE_BUDGET_MS:.3}\n\
          E2E_HARDWARE {hardware}",
         dust.dust_air_m3(),
         dust.dust_settled_m3(),
@@ -795,6 +801,76 @@ fn e2e_niva() {
     assert!(
         step_mean <= E2E_STEP_BUDGET_MS,
         "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the release measurement"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        air_mean <= AIR_RELEASE_BUDGET_MS,
+        "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
+    );
+    #[cfg(not(debug_assertions))]
+    print_through_drive();
+}
+
+/// Release breakdown of [`ThroughDrive::step`] at dt = 1/30. Printed for the CI log.
+fn print_through_drive() {
+    let mut drive = ThroughDrive::new();
+    let dt = 1.0 / 30.0;
+    for _ in 0..24 {
+        drive.step(dt);
+    }
+    let n = 96u32;
+    let mut totals = Vec::with_capacity(n as usize);
+    let mut acc = DriveParts::default();
+    for _ in 0..n {
+        drive.step(dt);
+        let p = drive.last_parts;
+        totals.push(p.total_ms);
+        acc.water_ms += p.water_ms;
+        acc.slurry_ms += p.slurry_ms;
+        acc.soil_ms += p.soil_ms;
+        acc.air_ms += p.air_ms;
+        acc.dust_ms += p.dust_ms;
+        acc.restrict_ms += p.restrict_ms;
+        acc.window_ms += p.window_ms;
+        acc.prep_ms += p.prep_ms;
+        acc.sheet_rest_ms += p.sheet_rest_ms;
+        acc.other_ms += p.other_ms;
+        acc.total_ms += p.total_ms;
+        acc.window_hash += p.window_hash;
+    }
+    let k = f64::from(n);
+    let mean = acc.total_ms / k;
+    let p95 = percentile_95(&mut totals);
+    let solver = acc.solver_ms() / k;
+    let hardware = hardware_line();
+    println!(
+        "DRIVE_STEPS n={n} dt={dt:.6}\n\
+         DRIVE_MEAN ms={mean:.3}\n\
+         DRIVE_P95 ms={p95:.3}\n\
+         DRIVE_HARDWARE {hardware}\n\
+         DRIVE_WATER ms={:.3}\n\
+         DRIVE_SLURRY ms={:.3}\n\
+         DRIVE_SOIL ms={:.3}\n\
+         DRIVE_AIR ms={:.3}\n\
+         DRIVE_DUST ms={:.3}\n\
+         DRIVE_RESTRICT ms={:.3}\n\
+         DRIVE_WINDOW ms={:.3}\n\
+         DRIVE_WINDOW_HASH n={}\n\
+         DRIVE_PREP ms={:.3}\n\
+         DRIVE_SHEET_REST ms={:.3}\n\
+         DRIVE_OTHER ms={:.3}\n\
+         DRIVE_SOLVER ms={solver:.3}",
+        acc.water_ms / k,
+        acc.slurry_ms / k,
+        acc.soil_ms / k,
+        acc.air_ms / k,
+        acc.dust_ms / k,
+        acc.restrict_ms / k,
+        acc.window_ms / k,
+        acc.window_hash,
+        acc.prep_ms / k,
+        acc.sheet_rest_ms / k,
+        acc.other_ms / k,
     );
 }
 

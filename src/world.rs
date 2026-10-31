@@ -5,7 +5,7 @@ use glam::Vec3;
 use crate::adhesion::{AdhereContact, AdhesionReport, PASS_OFFER_M3_S};
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::fluid_core::{
-    bow_height_m, dust_may_lift, FluidCore, Grain, SprayEvent, TirePush, COARSE_CELL_M,
+    bow_height_m, dust_may_lift, FluidCore, Grain, ProfTick, SprayEvent, TirePush, COARSE_CELL_M,
     WINDOW_RES,
 };
 use crate::particles::Particles;
@@ -4185,6 +4185,43 @@ struct DriveCoat {
 /// Visual sample of the air grid. Not a volume and not a second solver.
 const KIND_DUST_MARK: u8 = 8;
 
+/// Exclusive milliseconds of one [`ThroughDrive::step`].
+///
+/// `restrict_ms` and `window_ms` are the fine-grid scatter and the 40 m slide.
+/// They are not folded into water or soil. `other_ms` is the picture (particles,
+/// ribbons, paint) and is outside the solver sum.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DriveParts {
+    pub water_ms: f64,
+    pub slurry_ms: f64,
+    pub soil_ms: f64,
+    pub air_ms: f64,
+    pub dust_ms: f64,
+    pub restrict_ms: f64,
+    pub window_ms: f64,
+    pub prep_ms: f64,
+    pub sheet_rest_ms: f64,
+    pub other_ms: f64,
+    pub total_ms: f64,
+    /// Window moves that hashed the whole grid instead of scrolling.
+    pub window_hash: u64,
+}
+
+impl DriveParts {
+    /// Water, slurry, soil, air, dust, plus restrict, the 40 m window, sheet prep, and sheet rest.
+    pub fn solver_ms(&self) -> f64 {
+        self.water_ms
+            + self.slurry_ms
+            + self.soil_ms
+            + self.air_ms
+            + self.dust_ms
+            + self.restrict_ms
+            + self.window_ms
+            + self.prep_ms
+            + self.sheet_rest_ms
+    }
+}
+
 pub struct ThroughDrive {
     pub world: World,
     pub fluid: FluidCore,
@@ -4199,6 +4236,8 @@ pub struct ThroughDrive {
     /// the Bekker sinkage of this pair on the wet sand, not a painted groove.
     pub puddle_normal_n: f32,
     pub puddle_push_n: f32,
+    /// Breakdown of the step that just finished.
+    pub last_parts: DriveParts,
 }
 
 impl ThroughDrive {
@@ -4272,6 +4311,7 @@ impl ThroughDrive {
             ribbon_tick: 0,
             puddle_normal_n: 0.0,
             puddle_push_n: 0.0,
+            last_parts: DriveParts::default(),
         }
     }
 
@@ -4281,17 +4321,32 @@ impl ThroughDrive {
     }
 
     pub fn step(&mut self, dt: f32) {
+        let total = ProfTick::start();
+        self.fluid.reset_sheet_times();
+        let mut soil_ms = 0.0;
+        let mut other_ms = 0.0;
+        let mut air_ms = 0.0;
+        let mut dust_ms = 0.0;
+
+        let tick = ProfTick::start();
         self.world
             .particles
             .items
             .retain(|p| p.kind != KIND_DUST_MARK);
+        other_ms += tick.ms();
         let mut left = dt.max(0.0);
         let sub = 1.0 / 60.0;
         while left > 1.0e-6 {
             let h = left.min(sub);
+            let tick = ProfTick::start();
             self.advance_dust(h);
+            let wall = tick.ms();
+            let air = self.dust.last_air_ms() as f64;
+            air_ms += air;
+            dust_ms += (wall - air).max(0.0);
             left -= h;
         }
+        let tick = ProfTick::start();
         let z = self.chassis_z;
         self.world.vehicle.pos.x = 0.0;
         self.world.vehicle.pos.y = 0.56;
@@ -4308,9 +4363,11 @@ impl ThroughDrive {
         }
         self.report.speed_peak = self.report.speed_peak.max(8.0);
         self.report.end_z = z;
+        other_ms += tick.ms();
         self.fluid.recenter([0.0, z]);
         // The bow from the previous frame is a picture on the soil. The force
         // sample has to see the sheet, then the cut is copied onto that sheet.
+        let tick = ProfTick::start();
         mirror_fluid(&self.fluid, &mut self.world.soil);
         self.stamp_puddle_tires(dt);
         let forward = Vec3::new(0.0, 0.0, 1.0);
@@ -4343,6 +4400,8 @@ impl ThroughDrive {
         // After the stamp and the groove. The sheet has to sit on the pressed
         // ground, not on the height the cell had before the tire.
         pull_substrate(&mut self.fluid, &self.world.soil);
+        soil_ms += tick.ms();
+        let tick = ProfTick::start();
         if (-11.2..-1.2).contains(&z) {
             self.coat_body(1.0);
         }
@@ -4353,8 +4412,10 @@ impl ThroughDrive {
             }
         }
         self.ribbon_tick = self.ribbon_tick.wrapping_add(1);
+        other_ms += tick.ms();
         let spray = self.fluid.step(dt);
         self.report.spray_m3 = self.fluid.ledger().spray_m3;
+        let tick = ProfTick::start();
         self.spawn_spray(&spray, forward);
         // The cut is already on the bed. Pond water into it so the free
         // surface stays with the puddle instead of falling into the groove,
@@ -4366,6 +4427,8 @@ impl ThroughDrive {
             // One crescent ahead of the bumper, wider than the body.
             raise_bow(&mut self.world.soil, 0.0, z);
         }
+        soil_ms += tick.ms();
+        let tick = ProfTick::start();
         self.world.particles.update(&mut self.world.soil, dt);
         // Ledger ribbons are spawned first and used to fill the cap, so the
         // sheets off the body never reached the mesh. Keep the newest picture
@@ -4436,8 +4499,12 @@ impl ThroughDrive {
         });
         self.lay_rut_ribbons();
         self.paint_dust_picture();
+        other_ms += tick.ms();
+        let tick = ProfTick::start();
         self.note_rut();
         self.seat_tires_in_ruts();
+        soil_ms += tick.ms();
+        let tick = ProfTick::start();
         let dust_books = self.dust.ledger();
         self.report.dust_injected_m3 = dust_books.emitted_m3;
         self.report.dust_air_m3 = dust_books.dust_air_m3;
@@ -4446,6 +4513,24 @@ impl ThroughDrive {
         self.report.removed_m3 = self.coat.removed;
         self.report.stuck_m3 = self.coat.stuck;
         self.report.shed_m3 = self.coat.shed;
+        other_ms += tick.ms();
+        let sheets = self.fluid.sheet_times();
+        dust_ms += sheets.dust_ms;
+        let total_ms = total.ms();
+        self.last_parts = DriveParts {
+            water_ms: sheets.water_ms,
+            slurry_ms: sheets.slurry_ms,
+            soil_ms,
+            air_ms,
+            dust_ms,
+            restrict_ms: sheets.restrict_ms,
+            window_ms: sheets.window_ms,
+            prep_ms: sheets.prep_ms,
+            sheet_rest_ms: sheets.rest_ms,
+            other_ms,
+            total_ms,
+            window_hash: sheets.window_hash,
+        };
     }
 
     /// One ribbon in each rut. The head stays at the rear tire while the car
