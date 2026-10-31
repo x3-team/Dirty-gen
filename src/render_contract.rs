@@ -308,7 +308,7 @@ pub fn publish(
             out.ground_rut[idx * 4 + 2] = finite0(bed);
             out.ground_rut[idx * 4 + 3] = finite0(placed);
 
-            let (moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
+            let (sheet_moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
                 (
                     cell.moisture,
                     cell.water_m,
@@ -328,6 +328,14 @@ pub fn publish(
                 )
             } else {
                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            };
+            // Wet tire track: soil wetness under this texel is part of the same
+            // moisture channel. The drained film stays in the water channel.
+            // Neither fill adds a map, a unit, or a resolution.
+            let moisture = if let Some(sidx) = soil_idx {
+                sheet_moisture.max(soil.wetness[sidx])
+            } else {
+                sheet_moisture
             };
             let dry = !water_m.is_finite() || !slurry_m.is_finite() || water_m + slurry_m < 1.0e-5;
             let (u, v) = if dry {
@@ -1254,6 +1262,66 @@ mod tests {
         publish(&mut bare, &soil, &[], [0.0, 0.0], 0.0, 0, None, None);
         assert_eq!(bare.header.valid & VALID_AIR, 0);
         assert!(bare.air_velocity.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn wet_track_moisture_and_film_are_in_the_contract() {
+        let mut soil = SoilField::flat(0.08);
+        let half = soil.size * 0.5;
+        for j in 0..soil.res {
+            for i in 0..soil.res {
+                let x = (i as f32 + 0.5) * soil.cell - half;
+                let z = (j as f32 + 0.5) * soil.cell - half;
+                if (x - 0.74).abs() < 0.5 && z.abs() < 1.2 {
+                    soil.wetness[j * soil.res + i] = 0.78;
+                }
+            }
+        }
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        let poured = 0.004_f32;
+        fluid.add_water_at(0.74, 0.0, poured);
+        fluid.raise_moisture_disk(0.74, 0.0, 0.45, 0.78);
+        let mut frame = ContractFrame::new();
+        publish(
+            &mut frame,
+            &soil,
+            &[],
+            [0.0, 0.0],
+            1.0,
+            2,
+            Some(&fluid),
+            None,
+        );
+        assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
+        assert_eq!(RENDER_CONTRACT_VERSION, 2);
+        let res = frame.header.window_res as usize;
+        let mut moist = 0.0_f32;
+        let mut n = 0.0_f32;
+        let mut film = 0.0_f32;
+        let area = frame.header.cell_m * frame.header.cell_m;
+        for j in 0..res {
+            for i in 0..res {
+                let x = frame.header.origin_x + (i as f32 + 0.5) * frame.header.cell_m;
+                let z = frame.header.origin_z + (j as f32 + 0.5) * frame.header.cell_m;
+                let idx = j * res + i;
+                if (x - 0.74).abs() < 0.5 && z.abs() < 1.2 {
+                    moist += frame.moisture[idx];
+                    n += 1.0;
+                }
+                film += frame.film[idx * 2] * area;
+            }
+        }
+        let mean = moist / n.max(1.0);
+        assert!(
+            mean > 0.70,
+            "wet track moisture {mean:.3} over {n:.0} cells"
+        );
+        assert!(
+            (film - poured).abs() < 1.0e-4,
+            "drained film {film:.6} poured {poured:.6}"
+        );
+        assert!(frame.moisture.iter().all(|v| v.is_finite()));
+        assert!(frame.film.iter().all(|v| v.is_finite()));
     }
 
     #[test]

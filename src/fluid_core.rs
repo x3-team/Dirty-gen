@@ -1448,6 +1448,9 @@ struct Parked {
     us: f32,
     vs: f32,
     dust: f32,
+    /// Pore moisture, 0..1. Stays with the ground cell when the window moves,
+    /// so a wet tire track does not slide with the Niva.
+    moisture: f32,
 }
 
 /// The moving window. Coarse sheet, fine sheet under the tires, dust column.
@@ -1693,6 +1696,41 @@ impl FluidCore {
         let idx = j * WINDOW_RES + i;
         let area = COARSE_CELL_M * COARSE_CELL_M;
         self.water[idx] += volume / area;
+    }
+
+    /// Raise pore moisture on the coarse cells whose centres lie in the disk.
+    /// Does not add or remove water, slurry, or dust. A wet tire track uses this
+    /// so the moisture stays on the ground the Niva just left.
+    pub fn raise_moisture_disk(&mut self, x: f32, z: f32, radius: f32, moisture: f32) {
+        if !moisture.is_finite() || !x.is_finite() || !z.is_finite() {
+            return;
+        }
+        if self.fine_on {
+            self.restrict_fine();
+        }
+        let moisture = moisture.clamp(0.0, 1.0);
+        let radius = radius.max(0.0);
+        let reach = (radius / COARSE_CELL_M).ceil() as i32 + 1;
+        let Some((ci, cj)) = self.coarse_ij(x, z) else {
+            return;
+        };
+        for dj in -reach..=reach {
+            for di in -reach..=reach {
+                let i = ci as i32 + di;
+                let j = cj as i32 + dj;
+                if i < 0 || j < 0 || i >= WINDOW_RES as i32 || j >= WINDOW_RES as i32 {
+                    continue;
+                }
+                let (px, pz) = self.coarse_xz(i as usize, j as usize);
+                if (px - x).hypot(pz - z) > radius {
+                    continue;
+                }
+                let idx = j as usize * WINDOW_RES + i as usize;
+                if moisture > self.moisture[idx] {
+                    self.moisture[idx] = moisture;
+                }
+            }
+        }
     }
 
     /// Fill tire cuts up to the free surface of the pond beside them.
@@ -3153,8 +3191,13 @@ impl FluidCore {
                     us: self.us[idx],
                     vs: self.vs[idx],
                     dust: self.settled[idx],
+                    moisture: self.moisture[idx],
                 };
-                if slot.water > 1.0e-8 || slot.slurry > 1.0e-8 || slot.dust > 1.0e-8 {
+                if slot.water > 1.0e-8
+                    || slot.slurry > 1.0e-8
+                    || slot.dust > 1.0e-8
+                    || slot.moisture > 1.0e-4
+                {
                     self.parked.insert(key, slot);
                 } else {
                     self.parked.remove(&key);
@@ -3176,9 +3219,9 @@ impl FluidCore {
                     us[idx] = slot.us;
                     vs[idx] = slot.vs;
                     settled[idx] = slot.dust;
+                    moisture[idx] = slot.moisture;
                 }
                 bed[idx] = self.bed[idx];
-                moisture[idx] = self.moisture[idx];
                 grain[idx] = self.grain[idx];
             }
         }
@@ -3242,7 +3285,7 @@ impl FluidCore {
                     u: p.us,
                     v: p.vs,
                     settled_dust_m: p.dust,
-                    moisture: 0.0,
+                    moisture: p.moisture,
                     bed_m: 0.0,
                 };
             }
@@ -4689,6 +4732,34 @@ mod tests {
         );
         assert!(dry > 0.0, "dry ground took no dust");
         assert!(wet == 0.0, "wet ground lofted dust");
+    }
+
+    #[test]
+    fn moisture_stays_on_the_ground_when_the_window_moves() {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        fluid.raise_moisture_disk(0.2, -0.4, 0.45, 0.78);
+        assert!(
+            fluid.sample(0.2, -0.4).moisture > 0.7,
+            "disk {}",
+            fluid.sample(0.2, -0.4).moisture
+        );
+        fluid.recenter([30.0, 0.0]);
+        assert!(
+            fluid.sample(0.2, -0.4).moisture > 0.7,
+            "parked moisture dropped {}",
+            fluid.sample(0.2, -0.4).moisture
+        );
+        fluid.recenter([0.0, 0.0]);
+        assert!(
+            fluid.sample(0.2, -0.4).moisture > 0.7,
+            "restored moisture {}",
+            fluid.sample(0.2, -0.4).moisture
+        );
+        assert!(
+            fluid.sample(6.0, 6.0).moisture < 0.05,
+            "dry ground gained moisture {}",
+            fluid.sample(6.0, 6.0).moisture
+        );
     }
 
     #[test]
