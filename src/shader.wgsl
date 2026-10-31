@@ -1010,10 +1010,6 @@ fn water_column(xz: vec2<f32>) -> f32 {
     return raw * scale;
 }
 
-fn water_column_dilated(xz: vec2<f32>) -> f32 {
-    return water_column(xz);
-}
-
 // A dry patch with water on both sides is a hole in the sheet, not a shore.
 // The outer bank has water on only one side, so this does not grow the pond.
 fn covered_depth(xz: vec2<f32>) -> f32 {
@@ -1249,16 +1245,14 @@ fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
     return tan * (0.28 + 1.05 * ndl) * gloss;
 }
 
-fn beauty_tire_clearance(xz: vec2<f32>) -> f32 {
-    if (!puddle_beauty_on()) {
-        return 1.0;
-    }
-    var m = 1.0;
+fn water_near_tire_hub(xz: vec2<f32>, radius: f32) -> bool {
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
         let c = frame.tires[i * 2u].xyz.xz;
-        m = min(m, smoothstep(0.14, 0.58, distance(xz, c)));
+        if (distance(xz, c) < radius) {
+            return true;
+        }
     }
-    return m;
+    return false;
 }
 
 fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
@@ -1367,8 +1361,9 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let depth = covered_depth(in.xz);
     let column = water_column(in.xz);
     let water_mode = frame.misc.w;
-    let free = water_mode >= 0.5 && column > 0.004;
     let beauty = puddle_beauty_on();
+    let tire_pad = beauty && water_near_tire_hub(in.xz, 0.36);
+    let free = water_mode >= 0.5 && (column > 0.004 || tire_pad);
     let rip_scale = select(1.0, 1.0, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
     // Wake ripples stay in the normal on beauty pools; lifting the sheet here
@@ -1392,7 +1387,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
     let seam_flat = beauty_seam_weight(in.xz);
-    let in_beauty_pool = beauty && (column > 0.002 || seam_flat > 0.12);
+    let in_beauty_pool = beauty && (column > 0.001 || seam_flat > 0.08 || tire_pad);
     let lift = max(column, column * 0.14);
     let rip_vert = rip * select(0.45, 0.0, beauty);
     let flat_pool = mix(
@@ -1407,7 +1402,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
     o.world = world;
     o.ij = in.ij;
-    o.depth = select(depth, max(column, column * 0.18), free);
+    o.depth = select(depth, max(column, max(column * 0.18, select(0.0, 0.012, tire_pad))), free);
     return o;
 }
 
@@ -1442,27 +1437,17 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz - ez) > 0.02;
     let column_here = water_column(xz);
     let free = frame.misc.w > 0.5 && in.depth > 0.004;
-    var near_tire = false;
-    var under_tire = false;
-    for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
-        let c = frame.tires[ti * 2u].xyz;
-        let d = distance(xz, c.xz);
-        if (d < 1.05) {
-            near_tire = true;
-        }
-        if (d < 0.55) {
-            under_tire = true;
-        }
-    }
+    let tire_pad = water_near_tire_hub(xz, 0.32);
     let seam_flat = beauty_seam_weight(xz);
     let in_seam_pan = beauty && distance(xz, beauty_seam_center()) < 1.38;
     let pool_here = column_here > 0.0035
-        || (beauty && near_tire && column_here > 0.0012)
+        || (beauty && tire_pad)
         || (beauty && column_here > 0.0025)
-        || (beauty && seam_flat > 0.15)
+        || (beauty && seam_flat > 0.12)
         || (in_seam_pan && column_here > 0.0008);
     let beauty_pool = beauty && pool_here;
-    if (!free && !pool_here && !under_tire && (near_cut || own < 0.008 || in.depth < 0.008)) {
+    let keep_water = free || pool_here || tire_pad || (beauty && in_seam_pan);
+    if (!keep_water && (near_cut || own < 0.008 || in.depth < 0.008)) {
         discard;
     }
     let free_water = free || beauty_pool;
@@ -1584,6 +1569,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             alpha = mix(alpha, alpha * 0.55, shallow * 0.78);
             if (in_seam_pan) {
                 alpha = max(alpha, 0.74 * shore_fade);
+            }
+            if (tire_pad) {
+                alpha = max(alpha, 0.80 * shore_fade);
             }
         }
     }

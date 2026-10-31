@@ -41,4 +41,14 @@ fn win_demo_seam_water_under_wheel_patch() {
             s.water
         );
     }
+    // Shader must not discard within 0.32 m of the hub — ring at ~0.28 m.
+    let r = 0.28_f32;
+    for (dx, dz) in [(r, 0.0_f32), (-r * 0.7, r * 0.7), (0.0, -r)] {
+        let s = world.soil.sample(x + dx, z + dz);
+        assert!(
+            s.water > 0.012,
+            "water in 0.32 m tire pad at ({dx:.2},{dz:.2}) got {:.4}",
+            s.water
+        );
+    }
 }
