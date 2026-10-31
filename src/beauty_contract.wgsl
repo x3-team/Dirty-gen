@@ -43,6 +43,8 @@ struct BcHeader {
 @group(4) @binding(7) var bc_crust_tex: texture_2d<f32>;
 @group(4) @binding(8) var bc_wet_edge_tex: texture_2d<f32>;
 @group(4) @binding(9) var bc_foam_crest_tex: texture_2d<f32>;
+// Air velocity, m/s, same origin and cell as dust_fog (contract v2).
+@group(4) @binding(11) var bc_air_tex: texture_3d<f32>;
 
 const BC_VALID_MOISTURE: u32 = 2u;
 const BC_VALID_FILM: u32 = 4u;
@@ -172,7 +174,8 @@ fn bc_dust_settled(xz: vec2<f32>) -> f32 {
 // cannot see the far side of.
 const FOG_SIGMA: f32 = 60000.0;
 // Plumes look denser than the cell mean: the dust rides in clumps.
-const FOG_CLUMP: f32 = 1.2;
+// 0.45: the plume read as an opaque wall at 1.2.
+const FOG_CLUMP: f32 = 0.45;
 const FOG_STEPS: i32 = 40;
 // Ground fog past this distance is integrated in closed form, so the steps
 // stay where the swirls are.
@@ -224,10 +227,12 @@ fn bc_fog_near(p: vec3<f32>) -> f32 {
 // below and upwind hold, so dust lifts and trails downwind of where the
 // ledger counts it. Picture only; the ledger's volume is not changed.
 fn fog_plume(p: vec3<f32>) -> f32 {
-    let wind = vec3<f32>(0.85, 0.0, -0.52);
+    // Upwind along the published air (b11): what that air carried here
+    // in the last ~0.4 s and ~1 s.
+    let wind = air_velocity(p);
     let c = bc_fog_at(p);
-    var s = bc_fog_at(p - wind * 0.7 - vec3<f32>(0.0, 0.45, 0.0));
-    s += bc_fog_at(p - wind * 1.5 - vec3<f32>(0.0, 0.9, 0.0));
+    var s = bc_fog_at(p - wind * 0.4 - vec3<f32>(0.0, 0.3, 0.0));
+    s += bc_fog_at(p - wind * 1.0 - vec3<f32>(0.0, 0.6, 0.0));
     s += bc_fog_at(p + vec3<f32>(0.55, -0.35, 0.3));
     s += bc_fog_at(p + vec3<f32>(-0.4, -0.35, -0.55));
     return max(c, c * 0.5 + s * 0.2);
@@ -242,7 +247,24 @@ fn fog_plume(p: vec3<f32>) -> f32 {
 const BC_VALID_AIR_VELOCITY: u32 = 1024u;
 
 fn bc_air_published(p: vec3<f32>) -> vec4<f32> {
-    return vec4<f32>(0.0);
+    if (!bc_has(BC_VALID_AIR_VELOCITY)) {
+        return vec4<f32>(0.0);
+    }
+    let cell = vec3<f32>(bc_header.air_cell_x, bc_header.air_cell_y, bc_header.air_cell_z);
+    let origin = vec3<f32>(bc_header.air_origin_x, bc_header.air_origin_y, bc_header.air_origin_z);
+    let res = vec3<i32>(i32(bc_header.air_res), i32(bc_header.air_layers), i32(bc_header.air_res));
+    let t = (p - origin) / max(cell, vec3<f32>(1e-4)) - vec3<f32>(0.5);
+    let i0 = vec3<i32>(floor(t));
+    let f = t - floor(t);
+    var acc = vec3<f32>(0.0);
+    for (var k: i32 = 0; k < 8; k = k + 1) {
+        let o = vec3<i32>(k & 1, (k >> 1u) & 1, (k >> 2u) & 1);
+        let w = mix(1.0 - f.x, f.x, f32(o.x)) * mix(1.0 - f.y, f.y, f32(o.y)) * mix(1.0 - f.z, f.z, f32(o.z));
+        let c = clamp(i0 + o, vec3<i32>(0), res - vec3<i32>(1));
+        let v = textureLoad(bc_air_tex, c, 0).xyz;
+        acc += select(vec3<f32>(0.0), v, all(abs(v) < vec3<f32>(1e3))) * w;
+    }
+    return vec4<f32>(acc, 1.0);
 }
 
 // The Niva in its own frame: x right, z forward, metres from its centre.
@@ -442,7 +464,9 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         var dust = 0.0;
         if (has_dust && all(p >= bmin) && all(p <= bmax_l)) {
             let wall = min(min(p.x - bmin.x, bmax.x - p.x), min(p.z - bmin.z, bmax.z - p.z));
-            let fade = smoothstep(0.0, 3.5, wall) * (1.0 - smoothstep(bmax.y - 0.6, bmax_l.y, p.y));
+            // Thins out upward over the top two metres and at the walls, so
+            // the plume melts into the air instead of ending on a ruled edge.
+            let fade = smoothstep(0.0, 5.0, wall) * (1.0 - smoothstep(bmax.y - 2.0, bmax_l.y, p.y));
             dust = fog_plume(p) * FOG_SIGMA * FOG_CLUMP * fade;
         }
         let fog = ground_fog(p);
@@ -463,7 +487,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         var od = 0.0;
         if (dust > 0.0) {
             for (var j: i32 = 1; j <= 3; j = j + 1) {
-                od += bc_fog_near(p + sun * (f32(j) * 0.35)) * FOG_SIGMA * 0.35;
+                od += bc_fog_at(p + sun * (f32(j) * 0.35)) * FOG_SIGMA * FOG_CLUMP * 0.35;
             }
         }
         od += fog * fog_h / max(sun.y, 0.08);
@@ -593,28 +617,58 @@ fn bc_foam_soft(xz: vec2<f32>) -> vec2<f32> {
     return acc / 256.0;
 }
 
-// ---- Requested fields, not in contract v2 yet (docs/beauty/CONTRACT_REQUESTS.md).
-// The bits are reserved here so the readers below compile and stay dark:
-// until the header sets them, every reader returns 0 and nothing is drawn.
-const BC_VALID_SNOW: u32 = 2048u;      // bit 11, requested binding 12
-const BC_VALID_SOIL_MIX: u32 = 4096u;  // bit 12, requested binding 13
+// ---- Fields from Cursor's open contract PRs. Bits and bindings are theirs
+// (docs/beauty/CONTRACT_REQUESTS.md); every reader checks the header
+// version (RENDER_CONTRACT_VERSION) and its valid bit, and returns 0 until
+// the solver sets it. Bindings 12 and 13 are not in main's layout yet, so
+// their textures are declared when those PRs land; until then the readers
+// stay dark.
+const BC_VALID_TURBIDITY: u32 = 2048u; // 1 << 11, #99 (v3): binding 4 A
+const BC_VALID_MIX: u32 = 4096u;       // 1 << 12, #107 (v6): binding 13
+const BC_VALID_FOG: u32 = 8192u;       // 1 << 13, #106 (v5): binding 12, 3D
 
-// Requested binding 12, rgba32float on the ground grid: R snow depth (m),
-// G density (kg/m3), B compaction 0..1 (fresh 0, packed by a tire 1),
-// A belly scrape depth (m) where the underbody cut the blanket.
+// Suspended solids in the water, 0..1 (contract v3, binding 4 A).
+fn bc_turbidity(xz: vec2<f32>) -> f32 {
+    if (bc_header.version < 3u || !bc_has(BC_VALID_TURBIDITY)) {
+        return 0.0;
+    }
+    return clamp(bc_bilinear(bc_flow_tex, xz).a, 0.0, 1.0) * bc_inside(xz);
+}
+
+// Snow column (#105): height m, density kg/m3, compaction 0..1. That PR
+// still names binding 12 / bit 11, which fog (#106) and turbidity (#99)
+// hold; dark until #105 is rebased onto its own binding and bit.
 fn bc_snow(xz: vec2<f32>) -> vec4<f32> {
-    if (!bc_has(BC_VALID_SNOW)) {
+    return vec4<f32>(0.0);
+}
+
+// Material shares (#107, v6, binding 13): R mud, G sand, B gravel, A grass.
+fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
+    if (bc_header.version < 6u || !bc_has(BC_VALID_MIX)) {
         return vec4<f32>(0.0);
     }
     return vec4<f32>(0.0);
 }
 
-// Requested binding 13, rgba32float on the ground grid: fractions of mud,
-// grass, sand and gravel in the cell (sum <= 1). Fractions, not a kind id,
-// so a seam between two soils blends over the cells instead of stepping.
-fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
-    if (!bc_has(BC_VALID_SOIL_MIX)) {
-        return vec4<f32>(0.0);
+// Solver water fog (#106, v5, binding 12), volume fraction on the air grid.
+fn bc_fog_water(p: vec3<f32>) -> f32 {
+    if (bc_header.version < 5u || !bc_has(BC_VALID_FOG)) {
+        return 0.0;
     }
-    return vec4<f32>(0.0);
+    return 0.0;
+}
+
+// Free-surface height, ground + water + slurry, through one 3 x 3 binomial.
+fn bc_surface_soft(xz: vec2<f32>) -> f32 {
+    let e = max(bc_header.cell_m, 0.05) * 1.3;
+    var acc = 0.0;
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            let w = (2.0 - abs(f32(i))) * (2.0 - abs(f32(j)));
+            let q = xz + vec2<f32>(f32(i), f32(j)) * e;
+            let f = bc_film(q);
+            acc += (bc_ground(q, 0.0) + f.r + f.g) * w;
+        }
+    }
+    return acc / 16.0;
 }

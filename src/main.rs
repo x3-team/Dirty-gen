@@ -577,6 +577,7 @@ fn through_chase(world: &World) -> CameraPose {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn belly_chase(world: &World) -> CameraPose {
     let fwd = world.vehicle.forward();
     let right = Vec3::new(fwd.z, 0.0, -fwd.x);
@@ -590,6 +591,7 @@ fn belly_chase(world: &World) -> CameraPose {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     let media = PathBuf::from(MEDIA);
     std::fs::create_dir_all(&media).ok();
@@ -741,16 +743,24 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     // The scene stills (CPO, 2026-10-31) use the puddle-side pose at other
     // points of the same drive: mud and slurry in the slurry rut, wet and dry
     // sand leaving the pool, dust on the dry run out.
-    let stills: [(f32, &str, fn(&World) -> CameraPose); 7] = [
+    // puddle-niva (CPO, iter 37): the same side pose at the point of the run
+    // where the pool lies between the lens and the Niva, so the body's
+    // reflection and shadow are on the water. SILT_BEAUTY_NIVA_Z moves it.
+    let niva_z = std::env::var("SILT_BEAUTY_NIVA_Z")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-15.0f32);
+    let stills: [(f32, &str, fn(&World) -> CameraPose); 8] = [
         (-17.5, "puddle-wave", beauty_puddle_camera),
         (-16.5, "puddle-side", beauty_puddle_side_camera),
+        (niva_z, "puddle-niva", beauty_puddle_side_camera),
         (-12.0, "scene-sand", beauty_puddle_side_camera),
         (-6.5, "slurry-spray", beauty_spray_camera),
         (-6.0, "scene-mud", beauty_puddle_side_camera),
         (9.0, "dust-exit", beauty_dust_camera),
         (9.5, "scene-dust", beauty_puddle_side_camera),
     ];
-    let mut saved = [false; 7];
+    let mut saved = [false; 8];
     // SILT_BEAUTY_STILLS=puddle-wave,... renders only those stills and stops.
     let only = std::env::var("SILT_BEAUTY_STILLS").ok();
     if let Some(list) = &only {
@@ -767,7 +777,8 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
         let z = drive.world.vehicle.pos.z;
         for (k, (at, name, cam)) in stills.iter().enumerate() {
             if !saved[k] && z >= *at {
-                renderer.sun_override = (*name == "puddle-side" || name.starts_with("scene-"))
+                renderer.sun_override = (name.starts_with("puddle-") && *name != "puddle-wave"
+                    || name.starts_with("scene-"))
                     .then(|| beauty_puddle_side_sun(&drive.world));
                 let rgba = renderer
                     .draw_with_sheet(
@@ -876,15 +887,11 @@ fn capture_beauty_crust(renderer: &mut Renderer, width: u32, height: u32, dir: &
     let path = dir.join("drying-crust.png");
     write_png(&path, width, height, &rgba).expect("still");
     println!("beauty still {}", path.display());
-    // The drying field from the puddle still's low side height and pitch
-    // (lens ~0.75 m up, looking down ~6 degrees), aimed at the field.
+    // The same low side pose as the puddle and the other scene stills.
     renderer.sun_override = Some(beauty_puddle_side_sun(&world));
-    let low = CameraPose {
-        eye: Vec3::new(6.2, 0.76, -2.4),
-        target: Vec3::new(0.8, 0.1, 3.4),
-        ortho_width: None,
-    };
-    let rgba = renderer.draw(&world, low, None, true).expect("readback");
+    let rgba = renderer
+        .draw(&world, beauty_puddle_side_camera(&world), None, true)
+        .expect("readback");
     renderer.sun_override = None;
     let path = dir.join("scene-crust.png");
     write_png(&path, width, height, &rgba).expect("still");
@@ -1039,6 +1046,7 @@ fn beauty_chase(world: &World) -> CameraPose {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     let mut world = silt::World::flat(0.4);
     let report = world.carve_belly_shelf();
@@ -1061,6 +1069,7 @@ fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     println!("belly {}", path.display());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture(args: &[String]) {
     let parsed = parse_capture(args);
     if parsed.software {

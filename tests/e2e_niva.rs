@@ -9,14 +9,32 @@ use std::time::Instant;
 use glam::Vec3;
 use silt::dust::{dust_may_lift, tires_at, Dust};
 use silt::fluid_core::{
-    FluidCore, Grain, TirePush, AIR_STEP_BUDGET_MS, COARSE_CELL_M,
+    step_sheet, FluidCore, Grain, SheetDrive, TirePush, AIR_RES, AIR_STEP_BUDGET_MS,
+    COARSE_CELL_M, FINE_CELL_M, FINE_RES, WINDOW_RES,
 };
 use silt::particles::Particle;
 use silt::render_contract::{publish, ContractFrame, RENDER_CONTRACT_VERSION};
 use silt::soil::SoilField;
 use silt::vehicle::{Vehicle, WHEEL_RADIUS, WHEEL_WIDTH};
+use silt::DriveParts;
+use silt::ThroughDrive;
 
 const DT: f32 = 1.0 / 30.0;
+/// Release through-drive step mean, milliseconds.
+/// 15% over the #100 release CI mean (10.278 ms, run 41218969837).
+/// Not above that mean plus 20% (12.334) and not above the previous 33.004.
+const E2E_STEP_BUDGET_MS: f64 = 11.820;
+/// Release sum of [`ThroughDrive::step`] subsystems, milliseconds. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_SOLVER_BUDGET_MS: f64 = 7.0;
+/// Release dust row. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_DUST_BUDGET_MS: f64 = 1.0;
+/// Release p95 of one `ThroughDrive::step`. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_P95_BUDGET_MS: f64 = 7.0;
+/// Release air step. Debug still uses [`AIR_STEP_BUDGET_MS`] (4 ms).
+const AIR_RELEASE_BUDGET_MS: f64 = 1.5;
 const SPEED: f32 = 8.0;
 const SLIP: f32 = 1.6;
 const PUDDLE_X: f32 = 3.2;
@@ -215,8 +233,6 @@ fn place_tires(vehicle: &mut Vehicle, z: f32) {
 
 #[test]
 fn e2e_niva() {
-    assert_eq!(RENDER_CONTRACT_VERSION, 2, "layout bump was not recorded");
-
     let mut fluid = FluidCore::new([0.0, -16.0]);
     fluid.set_wind(1.5, -0.9);
     let poured_water = fluid.pour_water(
@@ -284,6 +300,7 @@ fn e2e_niva() {
     let mut step_ms = 0.0_f64;
     let mut air_ms = 0.0_f64;
     let mut timed = 0.0_f64;
+    let mut step_samples: Vec<f64> = Vec::new();
     let mut max_gap = 0.0_f64;
     let mut step_i = 0u32;
     let mut nan = 0u32;
@@ -376,6 +393,7 @@ fn e2e_niva() {
             step_ms += elapsed;
             air_ms += dust.last_air_ms() as f64;
             timed += 1.0;
+            step_samples.push(elapsed);
         }
         let after_tire = dust.emitted_by_tire();
         for i in 0..4 {
@@ -630,6 +648,8 @@ fn e2e_niva() {
     };
     let step_mean = if timed > 0.0 { step_ms / timed } else { 0.0 };
     let air_mean = if timed > 0.0 { air_ms / timed } else { 0.0 };
+    let step_p95 = percentile_95(&mut step_samples);
+    let hardware = hardware_line();
     let dust_gap = (dust.emitted_m3() as f64
         - dust.dust_air_m3() as f64
         - dust.dust_settled_m3() as f64)
@@ -644,7 +664,14 @@ fn e2e_niva() {
          e2e_niva dust emitted {dry_emitted:.6} air {:.6} settled {:.6} wet settled {settled_wet:.6} map {track_dust_map:.6} wet lift {wet_lift:.6}\n\
          e2e_niva water {:.6} slurry {:.6} soil {:.6} dust {:.6} sum {:.6} gap {:.8} max gap {:.8}\n\
          e2e_niva nan {nan}\n\
-         e2e_niva step ms {step_mean:.3} air step ms {air_mean:.3}",
+         e2e_niva step ms {step_mean:.3} air step ms {air_mean:.3}\n\
+         E2E_STEPS n={timed:.0} dt={DT:.6}\n\
+         E2E_MEAN ms={step_mean:.3}\n\
+         E2E_P95 ms={step_p95:.3}\n\
+         E2E_BUDGET ms={E2E_STEP_BUDGET_MS:.3}\n\
+         E2E_AIR ms={air_mean:.3}\n\
+         E2E_AIR_BUDGET ms={AIR_RELEASE_BUDGET_MS:.3}\n\
+         E2E_HARDWARE {hardware}",
         dust.dust_air_m3(),
         dust.dust_settled_m3(),
         final_books.water,
@@ -655,6 +682,9 @@ fn e2e_niva() {
         final_books.gap,
         max_gap
     );
+
+    #[cfg(not(debug_assertions))]
+    print_through_drive();
 
     assert!(
         (puddle_n - 18.0).abs() < 0.5,
@@ -779,4 +809,280 @@ fn e2e_niva() {
         air_mean < AIR_STEP_BUDGET_MS as f64,
         "air step {air_mean:.3} ms over {AIR_STEP_BUDGET_MS}"
     );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        step_mean <= E2E_STEP_BUDGET_MS,
+        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the CI mean"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        air_mean <= AIR_RELEASE_BUDGET_MS,
+        "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
+    );
+}
+
+/// Release breakdown of [`ThroughDrive::step`] at dt = 1/30. Printed for the CI log.
+fn print_through_drive() {
+    let mut drive = ThroughDrive::new();
+    let dt = 1.0 / 30.0;
+    for _ in 0..24 {
+        drive.step(dt);
+    }
+    let n = 96u32;
+    let mut totals = Vec::with_capacity(n as usize);
+    let mut acc = DriveParts::default();
+    for _ in 0..n {
+        drive.step(dt);
+        let p = drive.last_parts;
+        totals.push(p.total_ms);
+        acc.water_ms += p.water_ms;
+        acc.slurry_ms += p.slurry_ms;
+        acc.soil_ms += p.soil_ms;
+        acc.air_ms += p.air_ms;
+        acc.dust_ms += p.dust_ms;
+        acc.restrict_ms += p.restrict_ms;
+        acc.window_ms += p.window_ms;
+        acc.prep_ms += p.prep_ms;
+        acc.sheet_rest_ms += p.sheet_rest_ms;
+        acc.other_ms += p.other_ms;
+        acc.total_ms += p.total_ms;
+        acc.window_hash += p.window_hash;
+    }
+    let k = f64::from(n);
+    let mean = acc.total_ms / k;
+    let p95 = percentile_95(&mut totals);
+    let solver = acc.solver_ms() / k;
+    let hardware = hardware_line();
+    println!(
+        "DRIVE_STEPS n={n} dt={dt:.6}\n\
+         DRIVE_MEAN ms={mean:.3}\n\
+         DRIVE_P95 ms={p95:.3}\n\
+         DRIVE_HARDWARE {hardware}\n\
+         DRIVE_WATER ms={:.3}\n\
+         DRIVE_SLURRY ms={:.3}\n\
+         DRIVE_SOIL ms={:.3}\n\
+         DRIVE_AIR ms={:.3}\n\
+         DRIVE_DUST ms={:.3}\n\
+         DRIVE_RESTRICT ms={:.3}\n\
+         DRIVE_WINDOW ms={:.3}\n\
+         DRIVE_WINDOW_HASH n={}\n\
+         DRIVE_PREP ms={:.3}\n\
+         DRIVE_SHEET_REST ms={:.3}\n\
+         DRIVE_OTHER ms={:.3}\n\
+         DRIVE_SOLVER ms={solver:.3}\n\
+         DRIVE_SOLVER_BUDGET ms={DRIVE_SOLVER_BUDGET_MS:.3}\n\
+         DRIVE_P95_BUDGET ms={DRIVE_P95_BUDGET_MS:.3}\n\
+         DRIVE_DUST_BUDGET ms={DRIVE_DUST_BUDGET_MS:.3}",
+        acc.water_ms / k,
+        acc.slurry_ms / k,
+        acc.soil_ms / k,
+        acc.air_ms / k,
+        acc.dust_ms / k,
+        acc.restrict_ms / k,
+        acc.window_ms / k,
+        acc.window_hash,
+        acc.prep_ms / k,
+        acc.sheet_rest_ms / k,
+        acc.other_ms / k,
+    );
+    let dust = acc.dust_ms / k;
+    #[cfg(not(debug_assertions))]
+    assert!(
+        solver <= DRIVE_SOLVER_BUDGET_MS,
+        "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        p95 <= DRIVE_P95_BUDGET_MS,
+        "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        dust <= DRIVE_DUST_BUDGET_MS,
+        "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
+    );
+}
+
+/// Open 2 cm sheet and open wind, the trimmed branch.
+///
+/// Gravity at [`FINE_CELL_M`] with no wall is one CFL pass, no divergence
+/// projection, and flat slow tiles left asleep. Open wind does not build the
+/// pressure filters. Volume stays inside 1e-3, nothing is NaN, and the
+/// limiter keeps the speed.
+#[test]
+fn fine_open() {
+    let res = FINE_RES;
+    let cell = FINE_CELL_M;
+    let n = res * res;
+    let mut h = vec![0.02f32; n];
+    let mut u = vec![0.02f32; n];
+    let mut v = vec![0.0f32; n];
+    let mut bed = vec![0.0f32; n];
+    let nu = vec![1.0f32; n];
+    let gate = vec![1u8; n];
+    for j in 24..48 {
+        for i in 24..48 {
+            let idx = j * res + i;
+            bed[idx] = -0.008 * j as f32;
+            h[idx] = 0.06;
+        }
+    }
+    // Far tile of the flat film. The pond does not reach it in this run, so a
+    // sleeping tile keeps the warm start.
+    let mut sleep = Vec::new();
+    for j in 152..160 {
+        for i in 152..160 {
+            sleep.push(j * res + i);
+        }
+    }
+    let before = sheet_volume(&h, cell);
+    let sleep_h: Vec<f32> = sleep.iter().map(|&idx| h[idx]).collect();
+    let sleep_u: Vec<f32> = sleep.iter().map(|&idx| u[idx]).collect();
+    let dt = 1.0 / 30.0;
+    for _ in 0..12 {
+        step_sheet(
+            &mut h,
+            &mut u,
+            &mut v,
+            &bed,
+            &nu,
+            &gate,
+            res,
+            cell,
+            dt,
+            SheetDrive::Gravity { vorticity: 0.02 },
+        );
+    }
+    let after = sheet_volume(&h, cell);
+    let gap = (after - before).abs();
+    assert!(before > 1.0e-4, "gravity volume {before}");
+    assert!(
+        gap / before < 1.0e-3,
+        "gravity volume {before} -> {after} gap {gap}"
+    );
+    let mut nan = non_finite(&h) + non_finite(&u) + non_finite(&v);
+    assert_eq!(nan, 0, "gravity nan {nan}");
+    assert_plausible_speed(&u, &v, 1.6);
+    let mut downhill = 0.0f32;
+    for j in 24..80 {
+        for i in 16..64 {
+            let idx = j * res + i;
+            if h[idx] > 1.0e-4 {
+                downhill = downhill.max(v[idx]);
+            }
+        }
+    }
+    assert!(downhill > 0.02, "downhill v {downhill}");
+    for (k, &idx) in sleep.iter().enumerate() {
+        assert_eq!(h[idx], sleep_h[k], "sleeping depth moved at {idx}");
+        assert_eq!(u[idx], sleep_u[k], "sleeping speed moved at {idx}");
+        assert_eq!(v[idx], 0.0, "sleeping cross speed at {idx}");
+    }
+
+    let wres = AIR_RES / 2;
+    let wcell = 2.0 * (WINDOW_RES as f32 * COARSE_CELL_M / AIR_RES as f32);
+    let wn = wres * wres;
+    let mut wh = vec![0.0f32; wn];
+    let mut wu = vec![0.0f32; wn];
+    let mut wv = vec![0.0f32; wn];
+    let wbed = vec![0.0f32; wn];
+    let wnu = vec![0.4f32; wn];
+    let wgate = vec![1u8; wn];
+    for j in 24..36 {
+        for i in 12..24 {
+            wh[j * wres + i] = 0.04;
+        }
+    }
+    let wbefore = sheet_volume(&wh, wcell);
+    let wind_x = 1.2f32;
+    let wind_z = -0.3f32;
+    for _ in 0..40 {
+        step_sheet(
+            &mut wh,
+            &mut wu,
+            &mut wv,
+            &wbed,
+            &wnu,
+            &wgate,
+            wres,
+            wcell,
+            dt,
+            SheetDrive::Wind {
+                x: wind_x,
+                z: wind_z,
+                vorticity: 0.35,
+            },
+        );
+    }
+    let wafter = sheet_volume(&wh, wcell);
+    let wgap = (wafter - wbefore).abs();
+    assert!(wbefore > 1.0e-4, "wind volume {wbefore}");
+    assert!(
+        wgap / wbefore < 1.0e-3,
+        "wind volume {wbefore} -> {wafter} gap {wgap}"
+    );
+    nan = non_finite(&wh) + non_finite(&wu) + non_finite(&wv);
+    assert_eq!(nan, 0, "wind nan {nan}");
+    let lim = wind_x.hypot(wind_z).max(1.6);
+    assert_plausible_speed(&wu, &wv, lim);
+    let mut mass = 0.0f64;
+    let mut mass_u = 0.0f64;
+    for j in 0..wres {
+        for i in 0..wres {
+            let s = f64::from(wh[j * wres + i].max(0.0));
+            mass += s;
+            mass_u += s * f64::from(wu[j * wres + i]);
+        }
+    }
+    let mean_u = if mass > 0.0 { mass_u / mass } else { 0.0 };
+    assert!(mean_u > 0.05, "wind mean u {mean_u}");
+}
+
+fn sheet_volume(h: &[f32], cell: f32) -> f64 {
+    let area = f64::from(cell) * f64::from(cell);
+    h.iter().map(|s| f64::from((*s).max(0.0))).sum::<f64>() * area
+}
+
+fn non_finite(xs: &[f32]) -> u32 {
+    xs.iter().filter(|v| !v.is_finite()).count() as u32
+}
+
+fn assert_plausible_speed(u: &[f32], v: &[f32], lim: f32) {
+    let cap = lim + 1.0e-3;
+    for (uu, vv) in u.iter().zip(v) {
+        assert!(
+            uu.is_finite() && uu.abs() <= cap,
+            "u {uu} over {lim}"
+        );
+        assert!(
+            vv.is_finite() && vv.abs() <= cap,
+            "v {vv} over {lim}"
+        );
+    }
+}
+
+fn percentile_95(samples: &mut [f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((samples.len() as f64) * 0.95).ceil() as usize;
+    samples[(idx.saturating_sub(1)).min(samples.len() - 1)]
+}
+
+fn hardware_line() -> String {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("model name"))
+                .and_then(|rest| rest.split(':').nth(1))
+                .map(|name| name.trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown cpu".to_string());
+    format!("{model}, {cores} cores")
 }

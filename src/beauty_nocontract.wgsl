@@ -65,3 +65,19 @@ fn bc_snow(xz: vec2<f32>) -> vec4<f32> {
 fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
+
+fn bc_surface_soft(xz: vec2<f32>) -> f32 {
+    return 0.0;
+}
+
+fn bc_fog_at(p: vec3<f32>) -> f32 {
+    return 0.0;
+}
+
+fn bc_turbidity(xz: vec2<f32>) -> f32 {
+    return 0.0;
+}
+
+fn bc_fog_water(p: vec3<f32>) -> f32 {
+    return 0.0;
+}
