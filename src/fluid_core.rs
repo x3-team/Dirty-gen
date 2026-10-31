@@ -3983,6 +3983,11 @@ pub struct FluidCore {
     settled_suspended_m3: f32,
     /// True when any coarse cell still carries suspended depth.
     susp_live: bool,
+    /// Active coarse index box for suspended depth; invalid when `i0 > i1`.
+    susp_i0: usize,
+    susp_i1: usize,
+    susp_j0: usize,
+    susp_j1: usize,
     last_parts: StepParts,
     fine_origin: [f32; 2],
     fine_water: Vec<f32>,
@@ -4061,6 +4066,10 @@ impl FluidCore {
             entrained_m3: 0.0,
             settled_suspended_m3: 0.0,
             susp_live: false,
+            susp_i0: 1,
+            susp_i1: 0,
+            susp_j0: 1,
+            susp_j1: 0,
             last_parts: StepParts::default(),
             fine_origin: [0.0, 0.0],
             fine_water: vec![0.0; fine_n],
@@ -6181,6 +6190,9 @@ impl FluidCore {
             for layer in 0..AIR_LAYERS {
                 let start = layer * n;
                 let h = &mut self.dust[start..start + n];
+                if h.iter().all(|v| *v <= 1.0e-8) {
+                    continue;
+                }
                 let u = &mut self.dust_u[start..start + n];
                 let v = &mut self.dust_v[start..start + n];
                 soften_border(u, v, AIR_RES);
@@ -6254,12 +6266,51 @@ impl FluidCore {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
+        let may_entrain = self.susp_may_entrain(pushes);
+        if !self.susp_live && !may_entrain {
+            return;
+        }
         let before = self.entrained_m3;
-        self.entrain_wake(pushes, dt);
+        if may_entrain {
+            self.entrain_wake(pushes, dt);
+        }
         if self.entrained_m3 <= before && !self.susp_live {
             return;
         }
         self.advect_suspended(dt);
+    }
+
+    /// True when a tire sits on enough water to lift a suspension plume.
+    fn susp_may_entrain(&self, pushes: &[TirePush]) -> bool {
+        let res = WINDOW_RES as i32;
+        let cell = COARSE_CELL_M;
+        let origin = self.origin;
+        for p in pushes {
+            if p.speed < 0.3 {
+                continue;
+            }
+            let i = (((p.x - origin[0]) / cell).floor() as i32).clamp(0, res - 1);
+            let j = (((p.z - origin[1]) / cell).floor() as i32).clamp(0, res - 1);
+            let idx = j as usize * WINDOW_RES + i as usize;
+            if self.water[idx].is_finite() && self.water[idx] >= 0.004 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn note_susp_cell(&mut self, i: usize, j: usize) {
+        if self.susp_i0 > self.susp_i1 {
+            self.susp_i0 = i;
+            self.susp_i1 = i;
+            self.susp_j0 = j;
+            self.susp_j1 = j;
+        } else {
+            self.susp_i0 = self.susp_i0.min(i);
+            self.susp_i1 = self.susp_i1.max(i);
+            self.susp_j0 = self.susp_j0.min(j);
+            self.susp_j1 = self.susp_j1.max(j);
+        }
     }
 
     fn entrain_wake(&mut self, pushes: &[TirePush], dt: f32) {
@@ -6317,6 +6368,7 @@ impl FluidCore {
                     self.susp[idx] += add;
                     self.entrained_m3 += add * area;
                     self.susp_live = true;
+                    self.note_susp_cell(i as usize, j as usize);
                 }
             }
         }
@@ -6326,22 +6378,27 @@ impl FluidCore {
         let res = WINDOW_RES;
         let cell = COARSE_CELL_M;
         let area = cell * cell;
-        let mut i0 = res;
-        let mut i1 = 0usize;
-        let mut j0 = res;
-        let mut j1 = 0usize;
-        for j in 0..res {
-            for i in 0..res {
-                if self.susp[j * res + i] > 1.0e-8 {
-                    i0 = i0.min(i);
-                    i1 = i1.max(i);
-                    j0 = j0.min(j);
-                    j1 = j1.max(j);
+        let (mut i0, mut i1, mut j0, mut j1) = if self.susp_i0 <= self.susp_i1 {
+            (self.susp_i0, self.susp_i1, self.susp_j0, self.susp_j1)
+        } else {
+            (res, 0usize, res, 0usize)
+        };
+        if i0 > i1 {
+            for j in 0..res {
+                for i in 0..res {
+                    if self.susp[j * res + i] > 1.0e-8 {
+                        i0 = i0.min(i);
+                        i1 = i1.max(i);
+                        j0 = j0.min(j);
+                        j1 = j1.max(j);
+                    }
                 }
             }
         }
         if i0 > i1 {
             self.susp_live = false;
+            self.susp_i0 = 1;
+            self.susp_i1 = 0;
             return;
         }
         i0 = i0.saturating_sub(1);
@@ -6402,6 +6459,10 @@ impl FluidCore {
             }
         }
         let mut live = false;
+        let mut ni0 = res;
+        let mut ni1 = 0usize;
+        let mut nj0 = res;
+        let mut nj1 = 0usize;
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let idx = j * res + i;
@@ -6420,11 +6481,24 @@ impl FluidCore {
                 }
                 if s > 1.0e-8 {
                     live = true;
+                    ni0 = ni0.min(i);
+                    ni1 = ni1.max(i);
+                    nj0 = nj0.min(j);
+                    nj1 = nj1.max(j);
                 }
                 self.susp[idx] = s;
             }
         }
         self.susp_live = live;
+        if live {
+            self.susp_i0 = ni0;
+            self.susp_i1 = ni1;
+            self.susp_j0 = nj0;
+            self.susp_j1 = nj1;
+        } else {
+            self.susp_i0 = 1;
+            self.susp_i1 = 0;
+        }
     }
 
     fn shift_coarse(&mut self, new_origin: [f32; 2]) {
@@ -6535,6 +6609,8 @@ impl FluidCore {
         }
         self.shift_scratch = scratch;
         self.origin = new_origin;
+        self.susp_i0 = 1;
+        self.susp_i1 = 0;
         each_leaving(res, -di, -dj, |i, j| {
             let x = self.origin[0] + (i as f32 + 0.5) * cell;
             let z = self.origin[1] + (j as f32 + 0.5) * cell;
@@ -6629,6 +6705,8 @@ impl FluidCore {
         self.vs = vs;
         self.settled = settled;
         self.susp_live = susp.iter().any(|s| *s > 1.0e-8);
+        self.susp_i0 = 1;
+        self.susp_i1 = 0;
         self.susp = susp;
         self.bed = bed;
         self.moisture = moisture;
