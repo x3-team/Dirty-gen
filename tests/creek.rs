@@ -7,7 +7,8 @@ use glam::Vec3;
 use silt::fluid_core::{CoarseCell, FluidCore, StreamCycle, COARSE_CELL_M, WINDOW_RES};
 use silt::particles::Particle;
 use silt::render_contract::{
-    publish, ContractFrame, FLOW_FLUID_SHEET, RENDER_CONTRACT_VERSION, VALID_FLOW,
+    publish, ContractFrame, FLOW_CHANNELS, FLOW_FLUID_SHEET, RENDER_CONTRACT_VERSION,
+    VALID_FLOW,
 };
 use silt::soil::{SoilField, SurfaceKind};
 use silt::vehicle::Vehicle;
@@ -349,8 +350,8 @@ fn contract_head(frame: &ContractFrame, x: f32, z: f32) -> (f32, f32, f32) {
     }
     let idx = j as usize * WINDOW_RES + i as usize;
     let h = frame.film[idx * 2];
-    let u = frame.flow[idx * 2];
-    let v = frame.flow[idx * 2 + 1];
+    let u = frame.flow[idx * FLOW_CHANNELS];
+    let v = frame.flow[idx * FLOW_CHANNELS + 1];
     (h, u, v)
 }
 
