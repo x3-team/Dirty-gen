@@ -12,7 +12,7 @@ use bytemuck::Zeroable;
 use crate::dust::{DensityTexture, Dust, AIR_DY_M, SETTLED_CELL_M};
 use crate::fluid_core::{FluidCore, AIR_LAYERS, AIR_RES, COARSE_CELL_M, WINDOW_RES};
 use crate::particles::Particle;
-use crate::soil::{SoilField, SurfaceKind};
+use crate::soil::{mix_channel, SoilField, SurfaceKind, MIX_CHANNELS};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
 pub const RENDER_CONTRACT_VERSION: u32 = 6;
@@ -255,6 +255,214 @@ fn is_wet(moisture: f32, water_m: f32, slurry_m: f32) -> bool {
     moisture >= WET_MOISTURE || water_m + slurry_m >= WET_FILM_M
 }
 
+#[inline]
+fn write_soil_mix(out: &mut [f32], idx: usize, soil: &SoilField, sidx: usize) {
+    let base = idx * 4;
+    if soil.mix_ready && soil.mix.len() >= (sidx + 1) * MIX_CHANNELS {
+        let sb = sidx * MIX_CHANNELS;
+        out[base..base + 4].copy_from_slice(&soil.mix[sb..sb + 4]);
+    } else if let Some(ch) = mix_channel(SurfaceKind::from_u8(soil.kind[sidx])) {
+        out[base + ch] = 1.0;
+    }
+}
+
+/// Disjoint row stripes in the coarse window. The scope joins before `out` is read again.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Copy, Clone)]
+struct ShareMutF32(*mut f32);
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ShareMutF32 {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for ShareMutF32 {}
+#[cfg(not(target_arch = "wasm32"))]
+impl ShareMutF32 {
+    unsafe fn slice<'a>(self, n: usize) -> &'a mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0, n) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Copy, Clone)]
+struct ShareMutBool(*mut bool);
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ShareMutBool {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for ShareMutBool {}
+#[cfg(not(target_arch = "wasm32"))]
+impl ShareMutBool {
+    unsafe fn slice<'a>(self, n: usize) -> &'a mut [bool] {
+        unsafe { std::slice::from_raw_parts_mut(self.0, n) }
+    }
+}
+
+fn fill_coarse_row(
+    j: usize,
+    ground_rut: &mut [f32],
+    moisture_out: &mut [f32],
+    film: &mut [f32],
+    flow: &mut [f32],
+    dust_settled: &mut [f32],
+    soil_mix: &mut [f32],
+    wet: &mut [bool],
+    soil: &SoilField,
+    fluid: Option<&FluidCore>,
+    origin_x: f32,
+    origin_z: f32,
+    dust_settled_from_sheet: bool,
+) {
+    for i in 0..WINDOW_RES {
+        let idx = j * WINDOW_RES + i;
+        let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
+        let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
+        let sheet = fluid.and_then(|fluid| fluid.coarse_cell(i, j));
+        let soil_idx = soil.idx_at(x, z);
+
+        let (bed, placed, rut) = if let Some(sidx) = soil_idx {
+            (
+                soil.bed[sidx],
+                soil.placed[sidx],
+                (soil.initial_height[sidx] - soil.bed[sidx]).max(0.0),
+            )
+        } else if let Some(cell) = sheet {
+            (cell.bed_m, 0.0, 0.0)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        ground_rut[idx * 4] = finite0(bed + placed);
+        ground_rut[idx * 4 + 1] = finite0(rut);
+        ground_rut[idx * 4 + 2] = finite0(bed);
+        ground_rut[idx * 4 + 3] = finite0(placed);
+
+        let (sheet_moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
+            (
+                cell.moisture,
+                cell.water_m,
+                cell.slurry_m,
+                cell.u,
+                cell.v,
+                cell.settled_dust_m,
+            )
+        } else if let Some(sidx) = soil_idx {
+            (
+                soil.wetness[sidx],
+                soil.water[sidx],
+                soil.slurry[sidx],
+                0.0,
+                0.0,
+                0.0,
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        };
+        let wetness = if let Some(sidx) = soil_idx {
+            sheet_moisture.max(soil.wetness[sidx])
+        } else {
+            sheet_moisture
+        };
+        let dry = !water_m.is_finite() || !slurry_m.is_finite() || water_m + slurry_m < 1.0e-5;
+        let (u, v) = if dry {
+            (0.0, 0.0)
+        } else {
+            (finite0(u), finite0(v))
+        };
+        moisture_out[idx] = finite0(wetness);
+        film[idx * 2] = finite0(water_m);
+        film[idx * 2 + 1] = finite0(slurry_m);
+        if let Some(sidx) = soil_idx {
+            write_soil_mix(soil_mix, idx, soil, sidx);
+        }
+        flow[idx * 2] = u;
+        flow[idx * 2 + 1] = v;
+        if dust_settled_from_sheet {
+            dust_settled[idx] = settled;
+        }
+        wet[idx] = is_wet(wetness, water_m, slurry_m);
+    }
+}
+
+fn fill_coarse_window(
+    out: &mut ContractFrame,
+    wet: &mut [bool],
+    soil: &SoilField,
+    fluid: Option<&FluidCore>,
+    origin_x: f32,
+    origin_z: f32,
+    dust_settled_from_sheet: bool,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if rayon::current_num_threads() > 1 {
+        let ground = ShareMutF32(out.ground_rut.as_mut_ptr());
+        let moist = ShareMutF32(out.moisture.as_mut_ptr());
+        let film = ShareMutF32(out.film.as_mut_ptr());
+        let flow = ShareMutF32(out.flow.as_mut_ptr());
+        let settled = ShareMutF32(out.dust_settled.as_mut_ptr());
+        let mix = ShareMutF32(out.soil_mix.as_mut_ptr());
+        let wet_ptr = ShareMutBool(wet.as_mut_ptr());
+        let g_len = out.ground_rut.len();
+        let m_len = out.moisture.len();
+        let f_len = out.film.len();
+        let fl_len = out.flow.len();
+        let d_len = out.dust_settled.len();
+        let mix_len = out.soil_mix.len();
+        let w_len = wet.len();
+        let threads = rayon::current_num_threads().clamp(1, 4);
+        let chunk = WINDOW_RES.div_ceil(threads);
+        rayon::scope(|s| {
+            for t in 0..threads {
+                let j0 = t * chunk;
+                if j0 >= WINDOW_RES {
+                    break;
+                }
+                let j1 = (j0 + chunk).min(WINDOW_RES);
+                s.spawn(move |_| {
+                    let ground_rut = unsafe { ground.slice(g_len) };
+                    let moisture_out = unsafe { moist.slice(m_len) };
+                    let film = unsafe { film.slice(f_len) };
+                    let flow = unsafe { flow.slice(fl_len) };
+                    let dust_settled = unsafe { settled.slice(d_len) };
+                    let soil_mix = unsafe { mix.slice(mix_len) };
+                    let wet = unsafe { wet_ptr.slice(w_len) };
+                    for j in j0..j1 {
+                        fill_coarse_row(
+                            j,
+                            ground_rut,
+                            moisture_out,
+                            film,
+                            flow,
+                            dust_settled,
+                            soil_mix,
+                            wet,
+                            soil,
+                            fluid,
+                            origin_x,
+                            origin_z,
+                            dust_settled_from_sheet,
+                        );
+                    }
+                });
+            }
+        });
+        return;
+    }
+    for j in 0..WINDOW_RES {
+        fill_coarse_row(
+            j,
+            &mut out.ground_rut,
+            &mut out.moisture,
+            &mut out.film,
+            &mut out.flow,
+            &mut out.dust_settled,
+            &mut out.soil_mix,
+            wet,
+            soil,
+            fluid,
+            origin_x,
+            origin_z,
+            dust_settled_from_sheet,
+        );
+    }
+}
+
 /// Fill `out` from the soil heightfield, the live particles, and, when the
 /// through-drive sheet is attached, the fluid window and the dust ledger.
 ///
@@ -294,85 +502,15 @@ pub fn publish(
     };
 
     let mut wet = vec![false; WINDOW_RES * WINDOW_RES];
-    for j in 0..WINDOW_RES {
-        for i in 0..WINDOW_RES {
-            let idx = j * WINDOW_RES + i;
-            let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
-            let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
-            let sheet = fluid.and_then(|fluid| fluid.coarse_cell(i, j));
-            let soil_idx = soil.idx_at(x, z);
-
-            let (bed, placed, rut) = if let Some(sidx) = soil_idx {
-                (
-                    soil.bed[sidx],
-                    soil.placed[sidx],
-                    (soil.initial_height[sidx] - soil.bed[sidx]).max(0.0),
-                )
-            } else if let Some(cell) = sheet {
-                (cell.bed_m, 0.0, 0.0)
-            } else {
-                (0.0, 0.0, 0.0)
-            };
-            // Crust thickness and crack opening stay 0. [`SOIL_KIND_DRY_CRUST`]
-            // is not written into this map.
-            out.ground_rut[idx * 4] = finite0(bed + placed);
-            out.ground_rut[idx * 4 + 1] = finite0(rut);
-            out.ground_rut[idx * 4 + 2] = finite0(bed);
-            out.ground_rut[idx * 4 + 3] = finite0(placed);
-
-            let (sheet_moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
-                (
-                    cell.moisture,
-                    cell.water_m,
-                    cell.slurry_m,
-                    cell.u,
-                    cell.v,
-                    cell.settled_dust_m,
-                )
-            } else if let Some(sidx) = soil_idx {
-                (
-                    soil.wetness[sidx],
-                    soil.water[sidx],
-                    soil.slurry[sidx],
-                    0.0,
-                    0.0,
-                    0.0,
-                )
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            };
-            // Wet tire track: soil wetness under this texel is part of the same
-            // moisture channel. The drained film stays in the water channel.
-            // Neither fill adds a map, a unit, or a resolution.
-            let moisture = if let Some(sidx) = soil_idx {
-                sheet_moisture.max(soil.wetness[sidx])
-            } else {
-                sheet_moisture
-            };
-            let dry = !water_m.is_finite() || !slurry_m.is_finite() || water_m + slurry_m < 1.0e-5;
-            let (u, v) = if dry {
-                (0.0, 0.0)
-            } else {
-                (finite0(u), finite0(v))
-            };
-            out.moisture[idx] = finite0(moisture);
-            out.film[idx * 2] = finite0(water_m);
-            out.film[idx * 2 + 1] = finite0(slurry_m);
-            let mix = soil_idx
-                .map(|sidx| soil.mix_texel(sidx))
-                .unwrap_or([0.0; 4]);
-            out.soil_mix[idx * 4] = finite0(mix[0]);
-            out.soil_mix[idx * 4 + 1] = finite0(mix[1]);
-            out.soil_mix[idx * 4 + 2] = finite0(mix[2]);
-            out.soil_mix[idx * 4 + 3] = finite0(mix[3]);
-            out.flow[idx * 2] = u;
-            out.flow[idx * 2 + 1] = v;
-            if dust.is_none() {
-                out.dust_settled[idx] = settled;
-            }
-            wet[idx] = is_wet(moisture, water_m, slurry_m);
-        }
-    }
+    fill_coarse_window(
+        out,
+        &mut wet,
+        soil,
+        fluid,
+        origin_x,
+        origin_z,
+        dust.is_none(),
+    );
 
     if let Some(dust) = dust {
         let area = SETTLED_CELL_M * SETTLED_CELL_M;

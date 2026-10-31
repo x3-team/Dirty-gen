@@ -693,7 +693,13 @@ impl Dust {
         }
     }
 
-    fn solve_air(&mut self, dt: f32) {
+    fn air_layout(&self) -> (
+        crate::fluid_core::AirDrive,
+        [crate::fluid_core::AirSolid; 5],
+        [f32; 3],
+        [f32; 3],
+        [usize; 3],
+    ) {
         let (drive, solids) = crate::fluid_core::niva_air(
             [self.chassis_x, CHASSIS_Y, self.chassis_z],
             [self.forward.x, self.forward.y, self.forward.z],
@@ -706,6 +712,18 @@ impl Dust {
         let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
         let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
         let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
+        (drive, solids, origin, cell, res)
+    }
+
+    fn solve_air(
+        &mut self,
+        dt: f32,
+        drive: &crate::fluid_core::AirDrive,
+        solids: &[crate::fluid_core::AirSolid],
+        origin: [f32; 3],
+        cell: [f32; 3],
+        res: [usize; 3],
+    ) {
         let key = [
             self.wind_x.to_bits(),
             self.wind_z.to_bits(),
@@ -773,9 +791,10 @@ impl Dust {
 
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
-        self.solve_air(dt);
+        let (drive, solids, origin, cell, res) = self.air_layout();
+        self.solve_air(dt, &drive, &solids[..], origin, cell, res);
         if self.fog_air > 1.0e-12 {
-            self.transport_fog(dt);
+            self.transport_fog(dt, &drive, &solids[..], origin, cell, res);
         }
         self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
@@ -1002,7 +1021,15 @@ impl Dust {
     }
 
     /// Same wind step and the same wake residual as dust. No second velocity solve.
-    fn transport_fog(&mut self, dt: f32) {
+    fn transport_fog(
+        &mut self,
+        dt: f32,
+        drive: &crate::fluid_core::AirDrive,
+        solids: &[crate::fluid_core::AirSolid],
+        origin: [f32; 3],
+        cell: [f32; 3],
+        res: [usize; 3],
+    ) {
         if dt <= 0.0 || self.fog_air <= 1.0e-12 {
             return;
         }
@@ -1020,18 +1047,6 @@ impl Dust {
         let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
         if !self.fog_occupied.is_empty() && self.frame % stride == 0 {
             let n = self.fog.len();
-            let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
-            let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
-            let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
-            let (drive, solids) = crate::fluid_core::niva_air(
-                [self.chassis_x, CHASSIS_Y, self.chassis_z],
-                [self.forward.x, self.forward.y, self.forward.z],
-                [self.right.x, self.right.y, self.right.z],
-                self.speed,
-                self.wheel_slip,
-                self.wind_x,
-                self.wind_z,
-            );
             let _gap = crate::fluid_core::advect_density_by_air(
                 &mut self.fog,
                 &mut self.vel_scratch[..n],
@@ -1039,8 +1054,8 @@ impl Dust {
                 origin,
                 cell,
                 res,
-                &drive,
-                &solids,
+                drive,
+                solids,
                 dt * stride as f32,
                 &self.fog_occupied,
             );

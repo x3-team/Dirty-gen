@@ -1300,7 +1300,12 @@ fn step_sheet_scratch(
                 }
             }
         }
-        ((dt * max_s) / (0.42 * cell.max(1.0e-3)))
+        // Open wind on the halved dust plane is an upwind donor cell. Courant
+        // 0.85 is still under 1 for the Niva headwind, so that plane takes one
+        // substep at 1/60 and two at 1/30. A wall and gravity stay on 0.42.
+        let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
+        let courant = if open_wind { 0.85 } else { 0.42 };
+        ((dt * max_s) / (courant * cell.max(1.0e-3)))
             .ceil()
             .clamp(1.0, 8.0) as u32
     };
@@ -1405,11 +1410,14 @@ fn substep(
     // The gain stays small: this sheet is a free surface, and the slope force
     // above is what moves the column. The open 2 cm sheet skips that pair of
     // filters: one CFL pass already paid for the pressure blurs, and the
-    // correction is 0.012 of dt. A wall, the coarse sheet, and the wind sheet
-    // keep it.
-    let project = solid.is_some()
-        || cell > FINE_CELL_M + 1.0e-6
-        || !matches!(drive, SheetDrive::Gravity { .. });
+    // correction is 0.012 of dt. A wall, the coarse sheet, and gravity keep it.
+    // Open wind does not. The dust caller rescales each layer to the volume it
+    // passed in, and that 0.012*dt tweak is not what sets the plume.
+    let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
+    let project = !open_wind
+        && (solid.is_some()
+            || cell > FINE_CELL_M + 1.0e-6
+            || !matches!(drive, SheetDrive::Gravity { .. }));
     if project {
         for j in j0..=j1 {
             for i in i0..=i1 {
@@ -3763,6 +3771,13 @@ struct Parked {
     moisture: f32,
 }
 
+fn park_slot(slot: &Parked, ambient: f32) -> bool {
+    slot.water > 1.0e-8
+        || slot.slurry > 1.0e-8
+        || slot.dust > 1.0e-8
+        || (slot.moisture - ambient).abs() > 6.0e-3
+}
+
 /// The moving window. Coarse sheet, fine sheet under the tires, dust column.
 pub struct FluidCore {
     pub center: [f32; 2],
@@ -3776,6 +3791,10 @@ pub struct FluidCore {
     vs: Vec<f32>,
     bed: Vec<f32>,
     moisture: Vec<f32>,
+    /// Pore moisture of the pad, the value most cells share after a substrate
+    /// read. A leaving cell that only holds this pad is not parked: the next
+    /// window writes it back. A wet track, which differs, still parks.
+    moisture_ambient: f32,
     grain: Vec<u8>,
     settled: Vec<f32>,
     fine_origin: [f32; 2],
@@ -3850,6 +3869,7 @@ impl FluidCore {
             vs: vec![0.0; n],
             bed: vec![0.0; n],
             moisture: vec![0.0; n],
+            moisture_ambient: 0.0,
             grain: vec![Grain::Other as u8; n],
             settled: vec![0.0; n],
             fine_origin: [0.0, 0.0],
@@ -3871,9 +3891,9 @@ impl FluidCore {
             fog_u: vec![0.0; air_n],
             fog_v: vec![0.0; air_n],
             fog_live: false,
-            parked: HashMap::new(),
-            parked_dust: HashMap::new(),
-            parked_fog: HashMap::new(),
+            parked: HashMap::with_capacity(8192),
+            parked_dust: HashMap::with_capacity(1024),
+            parked_fog: HashMap::with_capacity(1024),
             spray_m3: 0.0,
             drops: Vec::new(),
             last_pushes: Vec::new(),
@@ -4411,18 +4431,31 @@ impl FluidCore {
         mut sample: impl FnMut(usize, usize, f32, f32) -> (f32, f32, Grain),
     ) {
         self.restrict_fine();
+        let mut hist = [0u32; 101];
         for j in 0..WINDOW_RES {
             for i in 0..WINDOW_RES {
                 let (x, z) = self.coarse_xz(i, j);
                 let (bed, moisture, grain) = sample(i, j, x, z);
                 let idx = j * WINDOW_RES + i;
+                let moisture = moisture.clamp(0.0, 1.0);
                 self.bed[idx] = bed;
-                self.moisture[idx] = moisture.clamp(0.0, 1.0);
+                self.moisture[idx] = moisture;
+                let bucket = (moisture * 100.0).round() as usize;
+                hist[bucket.min(100)] += 1;
                 if self.slurry[idx] > 1.0e-5 {
                     self.grain[idx] = grain as u8;
                 }
             }
         }
+        let mut best = 0usize;
+        let mut best_n = 0u32;
+        for (i, n) in hist.iter().enumerate() {
+            if *n > best_n {
+                best = i;
+                best_n = *n;
+            }
+        }
+        self.moisture_ambient = best as f32 * 0.01;
     }
 
     pub fn push_tire(&mut self, push: TirePush) {
@@ -5955,11 +5988,7 @@ impl FluidCore {
                 dust: self.settled[idx],
                 moisture: self.moisture[idx],
             };
-            if slot.water > 1.0e-8
-                || slot.slurry > 1.0e-8
-                || slot.dust > 1.0e-8
-                || slot.moisture > 1.0e-4
-            {
+            if park_slot(&slot, self.moisture_ambient) {
                 self.parked.insert(key, slot);
             } else {
                 self.parked.remove(&key);
@@ -6011,7 +6040,7 @@ impl FluidCore {
                     self.us[dst] = 0.0;
                     self.vs[dst] = 0.0;
                     self.settled[dst] = 0.0;
-                    self.moisture[dst] = 0.0;
+                    self.moisture[dst] = self.moisture_ambient;
                 }
             }
         }
@@ -6044,7 +6073,7 @@ impl FluidCore {
         let mut us = vec![0.0f32; n];
         let mut vs = vec![0.0f32; n];
         let mut bed = vec![0.0f32; n];
-        let mut moisture = vec![0.0f32; n];
+        let mut moisture = vec![self.moisture_ambient; n];
         let mut grain = vec![Grain::Other as u8; n];
         let mut settled = vec![0.0f32; n];
         for j in 0..WINDOW_RES {
@@ -6063,11 +6092,7 @@ impl FluidCore {
                     dust: self.settled[idx],
                     moisture: self.moisture[idx],
                 };
-                if slot.water > 1.0e-8
-                    || slot.slurry > 1.0e-8
-                    || slot.dust > 1.0e-8
-                    || slot.moisture > 1.0e-4
-                {
+                if park_slot(&slot, self.moisture_ambient) {
                     self.parked.insert(key, slot);
                 } else {
                     self.parked.remove(&key);
