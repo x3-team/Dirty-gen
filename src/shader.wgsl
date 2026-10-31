@@ -1275,7 +1275,7 @@ fn puddle_normal(xz: vec2<f32>, t: f32, column: f32) -> vec3<f32> {
         + beauty_bow_wave(xz + vec2<f32>(e, 0.0), t);
     let hz = ripple_height(xz + vec2<f32>(0.0, e), t) + tire_wake_ripples(xz + vec2<f32>(0.0, e), t)
         + beauty_bow_wave(xz + vec2<f32>(0.0, e), t);
-    let g = free_swell_grad(xz, t);
+    let g = select(free_swell_grad(xz, t), vec2<f32>(0.0, 0.0), puddle_beauty_on());
     let dx = (hx - h0) / e + g.x * 0.85;
     let dz = (hz - h0) / e + g.y * 0.85;
     let n = normalize(vec3<f32>(-dx * 2.4, 1.0, -dz * 2.4));
@@ -1326,11 +1326,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
     // Wake ripples stay in the normal on beauty pools; lifting the sheet here
     // reads as blue spheres under the tires.
-    let wake = select(
-        tire_wake_ripples(in.xz, frame.misc.x),
-        beauty_bow_wave(in.xz, frame.misc.x) * clear,
-        beauty,
-    );
+    let wake = select(tire_wake_ripples(in.xz, frame.misc.x), 0.0, beauty);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
     // cut the tire like a clip plane. The pond stays that blurred surface.
@@ -1348,10 +1344,12 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let swell_amp = select(1.0, 0.0, beauty);
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
+    let in_beauty_pool = beauty && column_draw > 0.006 && dug < 0.012;
     let lift = max(column, column_draw * 0.14 * clear);
-    let rip_vert = rip * select(0.45, 0.10, beauty);
+    let rip_vert = rip * select(0.45, 0.04, beauty);
+    let flat_pool = water_bed(in.xz) + 0.006 + rip_vert;
     let surface = base + water_surface_lift(lift) + rip_vert + wake + swell * swell_amp;
-    let y = select(y_sheet, surface, free);
+    let y = select(select(y_sheet, surface, free), flat_pool, in_beauty_pool);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
@@ -1391,19 +1389,19 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz + ez) > 0.02
         || -stamp_bilinear(xz - ez) > 0.02;
     let free = frame.misc.w > 0.5 && in.depth > 0.004;
-    if (!free && (near_cut || own < 0.008 || in.depth < 0.008)) {
-        discard;
-    }
     let column_here = water_column(xz);
+    var near_tire = false;
     if (beauty) {
         for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
-            let slot = ti * 2u;
-            let c = frame.tires[slot].xyz;
-            let tire_meta = frame.tires[slot + 1u];
-            if (distance(xz, c.xz) < 0.11 && column_here < 0.004 && tire_meta.w > 0.5) {
-                discard;
+            let c = frame.tires[ti * 2u].xyz;
+            if (distance(xz, c.xz) < 1.05) {
+                near_tire = true;
             }
         }
+    }
+    let pool_here = column_here > 0.004 || (beauty && near_tire && column_here > 0.0015);
+    if (!free && !pool_here && (near_cut || own < 0.008 || in.depth < 0.008)) {
+        discard;
     }
     let n = select(ripple_normal(xz, frame.misc.x), puddle_normal(xz, frame.misc.x, column_here), beauty);
     let flat = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
@@ -1419,7 +1417,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let dx = (yx - y0) / de;
     let dz = (yz - y0) / de;
     let slope = normalize(vec3<f32>(-(dx * 2.6 + g.x * 2.4), 1.0, -(dz * 2.6 + g.y * 2.4)));
-    let nrm = select(flat, slope, free);
+    let nrm = select(
+        flat,
+        select(slope, normalize(puddle_normal(xz, frame.misc.x, column_here)), beauty),
+        free,
+    );
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
@@ -1475,8 +1477,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             let veh_scene = reflect_vehicle_scene(in.world, nrm, view);
             let veh = niva_water_reflect(in.world, refl_dir);
             var reflect_col = ibl * 0.85 + frame.sun_color.rgb * sun_disk * 0.55 + veh * 0.65;
-            if (length(veh_scene) > 0.03) {
-                reflect_col = mix(reflect_col, veh_scene, 0.82);
+            if (length(veh_scene) > 0.02) {
+                reflect_col = mix(reflect_col, veh_scene, 0.88);
+            }
+            let sky_uv = scene_uv_from_world(in.world + normalize(refl_dir) * 0.4);
+            if (sky_uv.x > 0.03 && sky_uv.x < 0.97) {
+                let sky_samp = textureSampleLevel(scene_color, scene_samp, sky_uv, 0.0).rgb;
+                reflect_col = mix(reflect_col, mix(ibl, sky_samp, 0.65), 0.35);
             }
             if (length(ssr) > 0.03) {
                 reflect_col = mix(reflect_col, ssr, 0.55);
