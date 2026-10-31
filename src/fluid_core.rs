@@ -4545,7 +4545,7 @@ impl FluidCore {
         let pushes = std::mem::take(&mut self.pushes);
         self.last_pushes = pushes.clone();
         // Lift from the column the tire rolls into, before the sheet shoves it.
-        if dt > 0.0 && dt.is_finite() {
+        if dt > 0.0 && dt.is_finite() && !pushes.is_empty() {
             self.entrain_wake(&pushes, dt);
         }
         self.refine(&pushes);
@@ -5954,32 +5954,6 @@ impl FluidCore {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
-        let area = COARSE_CELL_M * COARSE_CELL_M;
-        let n = self.susp.len().min(self.water.len());
-        for idx in 0..n {
-            let s = self.susp[idx];
-            if !s.is_finite() || s <= 1.0e-12 {
-                self.susp[idx] = 0.0;
-                continue;
-            }
-            let w = self.water[idx];
-            if !w.is_finite() || w < 1.0e-5 {
-                self.settled_suspended_m3 += s * area;
-                self.susp[idx] = 0.0;
-                continue;
-            }
-            if s <= w {
-                continue;
-            }
-            // The film no longer covers the load. The grains settle. Setting
-            // the column to the water line would publish turbidity 1 from a
-            // deeper load, which is the clamp.
-            self.settled_suspended_m3 += s * area;
-            self.susp[idx] = 0.0;
-        }
-        if !self.susp.iter().any(|s| *s > 1.0e-8) {
-            return;
-        }
         self.advect_suspended(dt);
     }
 
@@ -6052,7 +6026,26 @@ impl FluidCore {
         let mut j1 = 0usize;
         for j in 0..res {
             for i in 0..res {
-                if self.susp[j * res + i] > 1.0e-8 {
+                let idx = j * res + i;
+                let mut s = self.susp[idx];
+                if !s.is_finite() || s <= 1.0e-12 {
+                    self.susp[idx] = 0.0;
+                    continue;
+                }
+                let w = self.water[idx];
+                if !w.is_finite() || w < 1.0e-5 {
+                    self.settled_suspended_m3 += s * area;
+                    self.susp[idx] = 0.0;
+                    continue;
+                }
+                if s > w {
+                    // The film no longer covers the load. Booking down to the
+                    // water line would publish turbidity 1 from a deeper load.
+                    self.settled_suspended_m3 += s * area;
+                    self.susp[idx] = 0.0;
+                    continue;
+                }
+                if s > 1.0e-8 {
                     i0 = i0.min(i);
                     i1 = i1.max(i);
                     j0 = j0.min(j);

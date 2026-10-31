@@ -37,11 +37,10 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test e2e_niva -- --nocapture
-      - name: Turbidity and scripted drive
+      - name: Scripted drive
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
-          cargo test --test turbidity -- --nocapture
           cargo test --test scripted_drive -- --nocapture
       - name: Release solver budget
         run: |

@@ -143,7 +143,9 @@ fn turbidity_plume_closes() {
     let prep_mean = if timed > 0.0 { prep_ms / timed } else { 0.0 };
     let restrict_mean = if timed > 0.0 { restrict_ms / timed } else { 0.0 };
     let window_mean = if timed > 0.0 { window_ms / timed } else { 0.0 };
-    let budget_note = if step_mean <= f64::from(SOLVER_STEP_BUDGET_MS) {
+    let budget_note = if cfg!(debug_assertions) {
+        "debug (release asserts budget)"
+    } else if step_mean <= f64::from(SOLVER_STEP_BUDGET_MS) {
         "met"
     } else {
         "NOT met"
@@ -273,7 +275,7 @@ fn turbidity_plume_closes() {
             "fluid step {step_mean:.3} ms exceeds {SOLVER_STEP_BUDGET_MS}"
         );
         assert!(
-            water_mean <= WATER_STEP_BUDGET_MS,
+            water_mean > 0.0 && water_mean <= WATER_STEP_BUDGET_MS,
             "water {water_mean:.3} ms exceeds {WATER_STEP_BUDGET_MS}"
         );
         assert!(
