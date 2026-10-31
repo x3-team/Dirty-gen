@@ -3,7 +3,9 @@
 //! This is the dust-trail API (`Dust`, `inject_dust`, `step_pads`, `set_wind`).
 //! The cubic metres live here. Advection is `fluid_core::advect_dust_density`:
 //! the shared upwind flux, pressure filter, and vorticity confinement.
-//! There is no second dust solver and no second dust ledger.
+//! The same grid carries air velocity. `step_vehicle_air` injects the Niva
+//! body and wheels, confines the wake, and `advect_density_by_air` moves
+//! dust on that residual. There is no second dust solver and no second ledger.
 
 use std::collections::HashMap;
 
@@ -241,7 +243,18 @@ pub struct Dust {
     speed: f32,
     forward: Vec3,
     right: Vec3,
+    chassis_x: f32,
     chassis_z: f32,
+    /// Longitudinal slip at each hub, metres per second. Feeds wheel spin.
+    wheel_slip: [f32; 4],
+    /// World air velocity, xyz, same index as `vol`.
+    vel: Vec<f32>,
+    vel_scratch: Vec<f32>,
+    air_ready: bool,
+    wake_vorticity: f32,
+    wake_cells: u32,
+    air_nan: u32,
+    last_air_ms: f32,
     frame: u32,
     settle_dt: f32,
     x0: u32,
@@ -270,7 +283,16 @@ impl Dust {
             speed: 0.0,
             forward: Vec3::new(0.0, 0.0, 1.0),
             right: Vec3::new(1.0, 0.0, 0.0),
+            chassis_x: 0.0,
             chassis_z: 0.0,
+            wheel_slip: [0.0; 4],
+            vel: vec![0.0; n * 3],
+            vel_scratch: vec![0.0; n * 3],
+            air_ready: false,
+            wake_vorticity: 0.0,
+            wake_cells: 0,
+            air_nan: 0,
+            last_air_ms: 0.0,
             frame: 0,
             settle_dt: 0.0,
             x0: 1,
@@ -540,19 +562,123 @@ impl Dust {
         let Some(tire) = tires.first() else {
             return;
         };
-        let i = tire.index as usize;
-        if i < HUBS.len() {
-            self.chassis_z = tire.contact.z - HUBS[i][2];
-        }
-        if tire.forward.length_squared() > 0.0 {
+        if tire.forward.length_squared() > 1.0e-8 {
             self.forward = tire.forward.normalize();
+        }
+        if tire.right.length_squared() > 1.0e-8 {
             self.right = tire.right.normalize();
         }
+        let i = tire.index as usize;
+        if i < HUBS.len() {
+            let h = HUBS[i];
+            self.chassis_x = tire.contact.x - self.right.x * h[0] - self.forward.x * h[2];
+            self.chassis_z = tire.contact.z - self.right.z * h[0] - self.forward.z * h[2];
+        }
         self.speed = tire.speed.max(0.0);
+        self.wheel_slip = [0.0; 4];
+        for tire in tires {
+            let k = tire.index as usize;
+            if k < 4 {
+                self.wheel_slip[k] = tire.slip;
+            }
+        }
+    }
+
+    /// Peak smoothed wake vorticity from the last air step, 1/s.
+    pub fn wake_vorticity(&self) -> f32 {
+        self.wake_vorticity
+    }
+
+    /// Wake cells on the last step whose smoothed |ω| cleared [`crate::fluid_core::WAKE_VORTICITY_MIN`].
+    pub fn wake_cell_count(&self) -> u32 {
+        self.wake_cells
+    }
+
+    /// Non-finite air samples replaced during air steps so far.
+    pub fn air_nan_count(&self) -> u32 {
+        self.air_nan
+    }
+
+    /// Milliseconds spent in the last air step. Zero on wasm.
+    pub fn last_air_ms(&self) -> f32 {
+        self.last_air_ms
+    }
+
+    /// World velocity, xyz, dust-grid index `x + y * nx + z * nx * ny`.
+    pub fn air_velocity_xyz(&self) -> &[f32] {
+        &self.vel
+    }
+
+    /// Pack world velocity into rgba: R +X, G +Y, B +Z, A 0. Metres per second.
+    pub fn write_air_velocity(&self, dst: &mut [f32]) {
+        let n = self.vol.len();
+        if dst.len() < n * 4 || self.vel.len() < n * 3 {
+            return;
+        }
+        for i in 0..n {
+            dst[i * 4] = finite_sample(self.vel[i * 3]);
+            dst[i * 4 + 1] = finite_sample(self.vel[i * 3 + 1]);
+            dst[i * 4 + 2] = finite_sample(self.vel[i * 3 + 2]);
+            dst[i * 4 + 3] = 0.0;
+        }
+    }
+
+    fn solve_air(&mut self, dt: f32) {
+        let (drive, solids) = crate::fluid_core::niva_air(
+            [self.chassis_x, CHASSIS_Y, self.chassis_z],
+            [self.forward.x, self.forward.y, self.forward.z],
+            [self.right.x, self.right.y, self.right.z],
+            self.speed,
+            self.wheel_slip,
+            self.wind_x,
+            self.wind_z,
+        );
+        let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
+        let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
+        let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
+        let report = crate::fluid_core::step_vehicle_air(
+            &mut self.vel,
+            &mut self.vel_scratch,
+            origin,
+            cell,
+            res,
+            &drive,
+            &solids,
+            dt,
+            self.air_ready,
+        );
+        self.air_ready = true;
+        self.wake_vorticity = report.peak_vorticity;
+        self.wake_cells = report.wake_cells;
+        self.air_nan = self.air_nan.saturating_add(report.nan_count);
+        let n = self.vol.len();
+        let _gap = crate::fluid_core::advect_density_by_air(
+            &mut self.vol,
+            &mut self.vel_scratch[..n],
+            &self.vel,
+            origin,
+            cell,
+            res,
+            &drive,
+            &solids,
+            dt,
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.last_air_ms = t0.elapsed().as_secs_f64() as f32 * 1000.0;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.last_air_ms = 0.0;
+        }
     }
 
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
+        self.solve_air(dt);
+        self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {
@@ -665,7 +791,11 @@ impl Dust {
             left -= frac;
             let index = if positive { AIR_RES - 1 - n } else { n };
             for cross in 0..AIR_RES {
-                let (ix, iz) = if along_z { (cross, index) } else { (index, cross) };
+                let (ix, iz) = if along_z {
+                    (cross, index)
+                } else {
+                    (index, cross)
+                };
                 let mut dropped = 0.0f64;
                 for iy in 0..AIR_LAYERS {
                     let i = at(ix, iy, iz);
@@ -927,6 +1057,14 @@ pub fn reference_samples() -> [Sample; 8] {
 
 fn at(ix: u32, iy: u32, iz: u32) -> usize {
     (ix + iy * AIR_RES + iz * AIR_RES * AIR_LAYERS) as usize
+}
+
+fn finite_sample(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
 }
 
 fn cell_center(chassis_z: f32, ix: u32, iy: u32, iz: u32) -> Vec3 {
@@ -1246,8 +1384,8 @@ mod tests {
 
         let mut fluid = crate::fluid_core::FluidCore::new([0.0, -12.0]);
         fluid.set_wind(1.5, -0.9);
-        fluid.pour_water(-6.0, 6.0, -24.0, 0.0, 0.02);
-        fluid.pour_slurry(
+        let poured_water = fluid.pour_water(-6.0, 6.0, -24.0, 0.0, 0.02) as f64;
+        let poured_slurry = fluid.pour_slurry(
             -2.0,
             2.0,
             -16.0,
@@ -1255,20 +1393,20 @@ mod tests {
             0.04,
             crate::fluid_core::Grain::Clay,
             0.55,
-        );
+        ) as f64;
 
         let mut dust = Dust::new();
         dust.set_wind(1.5, -0.9);
         dust.set_soil_stock(0.25);
         let soil0 = dust.soil_m3();
         let opened_books = fluid.ledger();
-        let opened = opened_books.water_m3 as f64 + opened_books.slurry_m3 as f64 + soil0;
-        assert!(
-            opened.is_finite() && opened_books.water_m3 > 0.0 && opened_books.slurry_m3 > 0.0,
-            "solver books did not open, water {} slurry {} soil {soil0}",
-            opened_books.water_m3,
-            opened_books.slurry_m3
-        );
+        let water_ref = opened_books.water_m3 as f64;
+        let slurry_ref = opened_books.slurry_m3 as f64;
+        let sum_ref = water_ref + slurry_ref + soil0;
+        let opened = sum_ref;
+        assert_volume_converged("water", poured_water, water_ref);
+        assert_volume_converged("slurry", poured_slurry, slurry_ref);
+        assert_volume_converged("sum", poured_water + poured_slurry + soil0, sum_ref);
         let dt = PROOF_DT_S;
         let speed = PROOF_SPEED_M_S;
         let slip = PROOF_SLIP_M_S;
@@ -1377,6 +1515,9 @@ mod tests {
         println!(
             "water {water} slurry {slurry} soil {soil} sum {sum} gap {gap} foam peak {foam_peak} water-drop count {water_drops}"
         );
+        assert_volume_converged("water", water, water_ref);
+        assert_volume_converged("slurry", slurry, slurry_ref);
+        assert_volume_converged("sum", sum, sum_ref);
         assert_ledger_closed(water, slurry, soil, sum, gap, "wet return");
         assert!(
             (dust.emitted - (soil0 - soil)).abs() < 1.0e-9,
@@ -1385,6 +1526,18 @@ mod tests {
             dust.emitted
         );
         closes(&dust);
+    }
+
+    /// Pour and the closed books against the solver ledger.
+    /// Same band as the sheet's pour-to-ledger check.
+    const VOLUME_CONVERGENCE: f64 = 1.0e-3;
+
+    fn assert_volume_converged(name: &str, got: f64, reference: f64) {
+        let err = (got - reference).abs();
+        assert!(
+            got.is_finite() && reference.is_finite() && err < VOLUME_CONVERGENCE,
+            "{name} {got} ledger {reference} err {err} tol {VOLUME_CONVERGENCE}"
+        );
     }
 
     /// Water and slurry from the sheet, soil from the dust stock.
@@ -1422,5 +1575,82 @@ mod tests {
             gap < 1.0e-8,
             "shared ledger gap {gap} at {at}: water {water} slurry {slurry} soil {soil} sum {sum}"
         );
+    }
+
+    /// Body and wheels push the shared air grid. Dust mass stays on the ledger,
+    /// the wake vorticity clears the bar, and the step stays inside its budget.
+    #[test]
+    fn drive_leaves_a_wake_and_conserves_dust() {
+        for (i, hub) in HUBS.iter().enumerate() {
+            assert!(
+                (hub[0] - crate::fluid_core::NIVA_WHEEL_HUB[i][0]).abs() < 1.0e-6
+                    && (hub[2] - crate::fluid_core::NIVA_WHEEL_HUB[i][2]).abs() < 1.0e-6,
+                "air hubs drifted from the dust hubs"
+            );
+        }
+        let mut dust = Dust::new();
+        dust.set_wind(proof_wind().x, proof_wind().z);
+        let dt = PROOF_DT_S;
+        let steps = (2.0 / dt).round() as i32;
+        let mut z = 0.0f32;
+        let mut air_ms = 0.0f64;
+        let mut step_ms = 0.0f64;
+        let mut peak = 0.0f32;
+        let mut wake_cells = 0u32;
+        for i in 0..steps {
+            let tires = tires_at(z, PROOF_SPEED_M_S, PROOF_SLIP_M_S);
+            let t0 = std::time::Instant::now();
+            dust.step(&tires, PROOF_MOISTURE, PROOF_WATER_M, dt);
+            let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+            if i >= 20 {
+                step_ms += elapsed;
+                air_ms += dust.last_air_ms() as f64;
+            }
+            peak = peak.max(dust.wake_vorticity());
+            wake_cells = wake_cells.max(dust.wake_cell_count());
+            z += PROOF_SPEED_M_S * dt;
+        }
+        let timed = (steps - 20).max(1) as f64;
+        let air_mean = air_ms / timed;
+        let step_mean = step_ms / timed;
+        closes(&dust);
+        let gap = (dust.emitted - dust.air - dust.settled).abs();
+        let mut nan = dust.air_nan_count();
+        for v in dust.air_velocity_xyz() {
+            if !v.is_finite() {
+                nan = nan.saturating_add(1);
+            }
+        }
+        for v in &dust.vol {
+            if !v.is_finite() {
+                nan = nan.saturating_add(1);
+            }
+        }
+        println!(
+            "dust emitted {:.6} air {:.6} settled {:.6} gap {:.8}",
+            dust.emitted, dust.air, dust.settled, gap
+        );
+        println!(
+            "wake vorticity {:.3} threshold {:.3} cells {wake_cells}",
+            peak,
+            crate::fluid_core::WAKE_VORTICITY_MIN
+        );
+        println!("nan {nan}");
+        println!("air step ms {air_mean:.3} dust step ms {step_mean:.3}");
+        assert!(gap < 1.0e-9, "ledger gap {gap}");
+        assert!(
+            peak > crate::fluid_core::WAKE_VORTICITY_MIN,
+            "wake vorticity {peak} below {}",
+            crate::fluid_core::WAKE_VORTICITY_MIN
+        );
+        assert!(wake_cells > 8, "wake cells {wake_cells}");
+        assert_eq!(nan, 0, "nan {nan}");
+        assert!(
+            air_mean < crate::fluid_core::AIR_STEP_BUDGET_MS as f64,
+            "air step {air_mean:.3} ms over {}",
+            crate::fluid_core::AIR_STEP_BUDGET_MS
+        );
+        assert!(dust.emitted > 1.0e-3, "emitted {}", dust.emitted);
+        assert!(dust.air > 0.0 && dust.settled > 0.0);
     }
 }

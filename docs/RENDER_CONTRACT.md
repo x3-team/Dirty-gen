@@ -1,6 +1,6 @@
 # Render contract
 
-Version **1**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, fog, headlights, and wet sheen are not maps in this contract.
+Version **2**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, fog, headlights, and wet sheen are not maps in this contract.
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -27,7 +27,7 @@ Valid after the solver step that produced the frame, and until the next step. Th
 
 Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 96 bytes. Spray slot: `SprayGpu`, 48 bytes.
 
-`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust). It is not a solver map. Changing which mode is on screen does not bump the version.
+`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed). It is not a solver map. Changing which mode is on screen does not bump the version.
 
 | Binding | Name | Format | Channels | Units |
 |---|---|---|---|---|
@@ -42,6 +42,7 @@ Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `Cont
 | 8 | `wet_edge` | `r32float` | R edge | 0 or 1 |
 | 9 | `foam_crest` | `rg32float` | R foam, G crest | 0..1, m |
 | 10 | `spray` | storage, read-only | `SprayGpu` × 4096 | see below |
+| 11 | `air_velocity` | `rgba32float` 3D | R +X, G +Y, B +Z, A 0 | m/s |
 
 Ground maps are 200 × 200. `dust_fog` is not that grid. Spray is a buffer, not a grid.
 
@@ -105,6 +106,29 @@ The ledger wins when both are present. It is the closed dust account.
 Writer: `Dust::publish`, or `FluidCore::air_depth` when the ledger is absent.
 
 Valid: `VALID_DUST_FOG` under the same rule as settled dust. `dust_source` 0 means the grid was not written.
+
+### Air velocity — binding 11
+
+World air velocity on the same 128 × 8 × 128 grid as `dust_fog`. Same origin and cell: `header.air_origin_*`, `header.air_cell_*`. Texel centre is `air_origin + (i + 0.5) * air_cell`.
+
+| | |
+|---|---|
+| Format | `rgba32float` 3D |
+| Index | `(x + layer * 128 + z * 128 * 8) * 4` |
+| R | velocity +X, east, m/s |
+| G | velocity +Y, up, m/s |
+| B | velocity +Z, north, m/s |
+| A | 0 |
+| Resolution | 128 × 8 × 128 |
+| Cell | the `dust_fog` cell for this `dust_source` |
+
+The step is 2.5D. Advection and vorticity confinement run in the horizontal plane of each layer. The vertical channel is stored. Wheel spin writes it. The horizontal step does not advect between layers.
+
+Writer, when `dust_source` is 1: `step_vehicle_air` on the dust ledger, packed by `Dust::write_air_velocity`. The Niva body and the four wheels inject velocity. Vorticity confinement rolls the wake. Wind relaxes the field toward the free stream outside the solids. This grid is valid after `Dust::step` / `Dust::step_pads`. Before the first air step the samples are 0.
+
+Writer, when `dust_source` is 2 and the ledger is absent: `FluidCore::write_air_velocity`. R and B are that sheet's horizontal dust velocity, G is 0. That path does not run the body wake.
+
+Valid: `VALID_AIR` when `dust_source` is 1 or 2, the same publishes as `dust_fog`. `dust_source` 0 leaves the binding 0 and the bit clear. A non-finite sample is written as 0.
 
 ### Crust and cracks — binding 7
 
@@ -175,7 +199,7 @@ Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A no
 
 ## Header flags
 
-`header.version` is 1. `header.valid` is a bit mask:
+`header.version` is 2. `header.valid` is a bit mask:
 
 | Bit | Value | Map |
 |---|---|---|
@@ -189,6 +213,7 @@ Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A no
 | 7 | `VALID_WET_EDGE` | wet / dry edge |
 | 8 | `VALID_FOAM` | foam and crest |
 | 9 | `VALID_SPRAY` | spray |
+| 10 | `VALID_AIR` | air velocity |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
 
@@ -222,3 +247,9 @@ The picture cache covers the fixed 192 × 192 soil square, 40 m on a side, centr
 Initial freeze. Ground and rut, moisture, water and slurry thickness, flow, settled dust, airborne dust and fog, crust and crack opening, wet/dry edge, foam and crest, and the spray buffer. Foam and crest are new. Crust and crack channels are defined and written as 0 until the sheet stores those metres.
 
 Dry cells and any other non-finite sample are written as 0. Layout unchanged. Foam on a published frame is the Froude term, the wave-crest lip, and the wet tire footprint, and it stays 0 where the film is under 4 mm. Spray includes the water drops the sheet peeled, still in the air as the Niva leaves the ford.
+
+### 2
+
+`air_velocity`, binding 11, `rgba32float` 3D, 128 × 8 × 128. R, G, B are world velocity in m/s (+X, +Y, +Z). A is 0. Same origin and cell as `dust_fog`. `VALID_AIR` is bit 10, set when `dust_source` is 1 or 2.
+
+With the dust ledger, `step_vehicle_air` writes the field: the Niva body and wheels inject velocity, vorticity confinement leaves a wake, and wind advects the field. Without the ledger, the samples are the fluid sheet's horizontal dust velocity and a zero vertical channel. The header stays 96 bytes. Debug mode 14 shows air speed.
