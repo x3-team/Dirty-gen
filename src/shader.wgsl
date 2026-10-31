@@ -1077,6 +1077,18 @@ fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
     return tan * (0.28 + 1.05 * ndl) * gloss;
 }
 
+fn beauty_tire_clearance(xz: vec2<f32>) -> f32 {
+    if (!puddle_beauty_on()) {
+        return 1.0;
+    }
+    var m = 1.0;
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        let c = frame.tires[i * 2u].xyz.xz;
+        m = min(m, smoothstep(0.14, 0.58, distance(xz, c)));
+    }
+    return m;
+}
+
 fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
     let beauty = puddle_beauty_on();
     var sum = 0.0;
@@ -1086,19 +1098,47 @@ fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
         let tire_meta = frame.tires[slot + 1u];
         var tire_on = tire_meta.w;
         let d = distance(xz, c.xz);
-        if (beauty && d < 2.8) {
-            tire_on = max(tire_on, 1.0 - smoothstep(1.35, 2.75, d));
+        if (beauty && d < 3.2) {
+            tire_on = max(tire_on, 1.0 - smoothstep(0.55, 2.85, d));
         }
         if (tire_on < 0.05) {
             continue;
         }
-        let ring = exp(-d * 2.4) * sin(d * 10.5 - t * 9.0 + f32(i) * 0.9);
-        let splash = exp(-d * 3.6) * sin(d * 16.0 - t * 13.0) * 0.018;
+        let near = exp(-d * 3.2);
+        let ring = near * sin(d * 11.5 - t * 10.5 + f32(i) * 0.9);
+        let ring2 = exp(-d * 1.8) * sin(d * 6.2 - t * 6.0 + f32(i) * 1.3) * 0.55;
+        let splash = exp(-d * 4.0) * sin(d * 18.0 - t * 15.0) * 0.022;
         let contact = tire_meta.z * 22.0;
-        let amp = select(1.0, 2.2 + contact, beauty);
-        sum = sum + (ring * 0.028 + splash) * tire_on * amp;
+        let amp = select(1.0, 2.8 + contact, beauty);
+        sum = sum + (ring * 0.038 + ring2 * 0.024 + splash) * tire_on * amp;
     }
     return sum;
+}
+
+fn beauty_tire_splash(xz: vec2<f32>, t: f32) -> vec3<f32> {
+    if (!puddle_beauty_on()) {
+        return vec3<f32>(0.0);
+    }
+    var spray = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        let slot = i * 2u;
+        let c = frame.tires[slot].xyz;
+        let tire_meta = frame.tires[slot + 1u];
+        if (tire_meta.w < 0.25) {
+            continue;
+        }
+        let rel = xz - c.xz;
+        let d = length(rel);
+        if (d > 0.72 || d < 0.08) {
+            continue;
+        }
+        let ang = atan2(rel.y, rel.x);
+        let fan = smoothstep(0.18, 0.55, tire_meta.z) * (0.5 + 0.5 * sin(ang * 5.0 - t * 14.0 + f32(i)));
+        let lift = pow(smoothstep(0.72, 0.12, d), 1.6);
+        let drop = sin(d * 28.0 - t * 19.0 + f32(i) * 2.1) * 0.5 + 0.5;
+        spray += vec3<f32>(0.82, 0.92, 1.0) * fan * lift * drop * exp(-d * 2.6) * 0.35;
+    }
+    return spray;
 }
 
 fn puddle_normal(xz: vec2<f32>, t: f32, column: f32) -> vec3<f32> {
@@ -1152,7 +1192,8 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let water_mode = frame.misc.w;
     let free = water_mode >= 0.5 && column_draw > 0.004;
     let beauty = puddle_beauty_on();
-    let rip_scale = select(1.0, 3.4, beauty);
+    let clear = beauty_tire_clearance(in.xz);
+    let rip_scale = select(1.0, 2.2 * clear, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
     // Wake ripples stay in the normal on beauty pools; lifting the sheet here
     // reads as blue spheres under the tires.
@@ -1171,11 +1212,12 @@ fn vs_water(in: TerrIn) -> WaterOut {
     // The column is the solved water. Drawing it at full height is a mound.
     // The sheet sits on the ground. The bow is a crest in that sheet, plus a swell.
     let swell = select(0.0, free_swell(in.xz, frame.misc.x), free);
-    let swell_amp = select(1.0, 1.55, beauty);
+    let swell_amp = select(1.0, 0.42 * clear, beauty);
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
-    let lift = max(column, column_draw * 0.22);
-    let surface = base + water_surface_lift(lift) + rip * 0.45 + wake + swell * swell_amp;
+    let lift = max(column, column_draw * 0.14 * clear);
+    let rip_vert = rip * select(0.45, 0.10, beauty);
+    let surface = base + water_surface_lift(lift) + rip_vert + wake + swell * swell_amp;
     let y = select(y_sheet, surface, free);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
@@ -1224,7 +1266,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
             let slot = ti * 2u;
             let c = frame.tires[slot].xyz;
-            if (distance(xz, c.xz) < 0.32 && column_here < 0.035) {
+            if (distance(xz, c.xz) < 0.24 && column_here < 0.018) {
                 discard;
             }
         }
@@ -1307,6 +1349,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             let body_lit = body * (0.18 + 0.95 * ndl);
             col = mix(body_lit, ibl_lit, fres * 0.82 + 0.28);
             col += vec3<f32>(0.88, 0.92, 1.0) * sheen * 0.62;
+            col += beauty_tire_splash(xz, frame.misc.x);
             alpha = mix(0.58, 0.90, deep) * shore_fade;
             alpha = mix(alpha, alpha * 0.55, shallow * 0.78);
         }
