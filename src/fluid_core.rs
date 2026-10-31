@@ -4824,9 +4824,11 @@ impl FluidCore {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
-        // The seat moved the film. The wet set from the sheet step is stale.
         self.collect_wet();
-        self.spawn_breaking_film(dt);
+        if self.wet_idx.is_empty() {
+            return;
+        }
+        self.spawn_breaking_crest(dt);
         self.clear_dry_tracers();
     }
 
@@ -4852,11 +4854,9 @@ impl FluidCore {
         self.wet_idx = ids;
     }
 
-    /// Breaking film and a steep crest. Both write the foam field. A later
-    /// step carries that foam and lets it die. The crest term is the impact:
-    /// how far this cell stands above its neighbours, the same ramp the wave
-    /// test already uses (4 mm to 18 mm). A flat film adds nothing.
-    fn spawn_breaking_film(&mut self, dt: f32) {
+    /// Crest left when the seated sheet stands above its neighbours. Froude
+    /// foam for the same step already ran in [`Self::spawn_breaking_speed`].
+    fn spawn_breaking_crest(&mut self, dt: f32) {
         let res = WINDOW_RES;
         let ids = std::mem::take(&mut self.wet_idx);
         for &id in &ids {
@@ -4867,14 +4867,6 @@ impl FluidCore {
             if !h.is_finite() || h < 0.004 {
                 continue;
             }
-            let u = self.uw[idx];
-            let v = self.vw[idx];
-            let speed = if u.is_finite() && v.is_finite() {
-                u.hypot(v)
-            } else {
-                0.0
-            };
-            let mut prod = breaking_foam(speed, h);
             let mut sum = 0.0f32;
             let mut count = 0.0f32;
             for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
@@ -4890,12 +4882,14 @@ impl FluidCore {
                     count += 1.0;
                 }
             }
-            if count > 0.0 {
-                let excess = h - sum / count;
-                if excess > 0.0 {
-                    prod = prod.max(smoothstep(0.004, 0.018, excess));
-                }
+            if count <= 0.0 {
+                continue;
             }
+            let excess = h - sum / count;
+            if excess <= 0.0 {
+                continue;
+            }
+            let prod = smoothstep(0.004, 0.018, excess);
             self.add_foam(idx, prod, dt);
         }
         self.wet_idx = ids;
@@ -4927,7 +4921,7 @@ impl FluidCore {
         let reach2 = reach * reach;
         let slip_v = speed * slip;
         let cell = COARSE_CELL_M;
-        let wet: Vec<u32> = self.wet_idx.clone();
+        let wet = std::mem::take(&mut self.wet_idx);
         for &id in &wet {
             let idx = id as usize;
             let h = self.water[idx];
@@ -4967,6 +4961,7 @@ impl FluidCore {
                 self.lift_silt(idx, shear_v, dt, area, 0.015, 6.0);
             }
         }
+        self.wet_idx = wet;
     }
 
     fn spawn_shore_tracers(&mut self, dt: f32, area: f32, res: usize) {
@@ -6241,20 +6236,29 @@ impl FluidCore {
 
     fn step_dust(&mut self, dt: f32, _slow: bool) {
         let tick = ProfTick::start();
-        let sum: f32 = self.dust.iter().sum();
-        if sum <= 1.0e-6 {
+        let n = AIR_RES * AIR_RES;
+        let mut live = false;
+        for chunk in self.dust.chunks_exact(n) {
+            if chunk.iter().any(|&d| d > 1.0e-6) {
+                live = true;
+                break;
+            }
+        }
+        if !live {
             self.sheet_times.dust_ms += tick.ms();
             return;
         }
         let cell = self.air_cell();
         let wind = self.wind;
-        let n = AIR_RES * AIR_RES;
         DUST_PLANE.with(|plane| {
             let mut plane = plane.borrow_mut();
             plane.fit(n);
             for layer in 0..AIR_LAYERS {
                 let start = layer * n;
                 let h = &mut self.dust[start..start + n];
+                if !h.iter().any(|&d| d > 1.0e-6) {
+                    continue;
+                }
                 let u = &mut self.dust_u[start..start + n];
                 let v = &mut self.dust_v[start..start + n];
                 soften_border(u, v, AIR_RES);
