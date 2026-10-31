@@ -7431,7 +7431,7 @@ impl SoilField {
             (-2.35_f32, -0.95_f32, 1.05_f32, 0.72_f32, 0.11_f32),
             (-2.35_f32, 1.30_f32, 1.05_f32, 0.72_f32, 0.11_f32),
             // Near the sand/mud seam so one frame can read sand, mud, and standing water.
-            (-1.05_f32, 0.15_f32, 0.92_f32, 0.70_f32, 0.16_f32),
+            (-1.05_f32, 0.15_f32, 1.12_f32, 0.82_f32, 0.20_f32),
         ];
         for j in 0..res {
             for i in 0..res {
@@ -7477,8 +7477,14 @@ impl SoilField {
                     };
                     field.base_wetness[idx] = 0.78;
                     field.loose[idx] = if water > 0.02 { 0.018 } else { 0.02 };
-                    field.roughness[idx] = 0.42;
-                    field.darken[idx] = 0.10;
+                    field.roughness[idx] = if water > 0.02 { 0.08 } else { 0.42 };
+                    field.darken[idx] = if water > 0.02 {
+                        0.24
+                    } else if water > 0.006 {
+                        0.18
+                    } else {
+                        0.10
+                    };
                 } else {
                     field.kind[idx] = SurfaceKind::Undisturbed as u8;
                     field.wetness[idx] = 0.38;
