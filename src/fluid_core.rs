@@ -67,6 +67,10 @@ pub const WINDOW_RES: usize = 200;
 pub const FINE_CELL_M: f32 = 0.02;
 /// Fine patch on a side. 160 × 0.02 m = 3.2 m, the axle and the track.
 pub const FINE_RES: usize = 160;
+/// Coarse cells whose centres lie inside this radius of a tire, or of the
+/// segment between the two tires on one side, are copied onto the 2 cm sheet.
+/// The rest of the standing water stays on the 20 cm sheet.
+const FINE_TIRE_R_M: f32 = 0.56;
 /// Air plan. Columns, not a solid cube.
 pub const AIR_RES: usize = 128;
 /// Layers in each dust column. The bottom layer is the one that can settle.
@@ -534,6 +538,146 @@ pub fn advect_dust_density(
     0.0
 }
 
+struct Down2 {
+    h: Vec<f32>,
+    u: Vec<f32>,
+    v: Vec<f32>,
+    bed: Vec<f32>,
+    nu: Vec<f32>,
+    gate: Vec<u8>,
+    w: Vec<f32>,
+}
+
+impl Down2 {
+    fn fit(&mut self, n: usize) {
+        if self.h.len() == n {
+            return;
+        }
+        self.h.resize(n, 0.0);
+        self.u.resize(n, 0.0);
+        self.v.resize(n, 0.0);
+        self.bed.resize(n, 0.0);
+        self.nu.resize(n, 0.4);
+        self.gate.resize(n, 1);
+        self.w.resize(n * 4, 0.0);
+    }
+}
+
+thread_local! {
+    static DOWN2: RefCell<Down2> = RefCell::new(Down2 {
+        h: Vec::new(),
+        u: Vec::new(),
+        v: Vec::new(),
+        bed: Vec::new(),
+        nu: Vec::new(),
+        gate: Vec::new(),
+        w: Vec::new(),
+    });
+}
+
+/// One sheet step on a grid twice as coarse, then scatter back.
+/// `as_volume` sums the 2×2 block (dust cubic metres). A depth sheet averages it.
+fn step_down2(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    drive: SheetDrive,
+    eps: f32,
+    as_volume: bool,
+) {
+    if res < 4 || res % 2 != 0 || h.len() < res * res {
+        step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, eps, None);
+        return;
+    }
+    let c = res / 2;
+    let cn = c * c;
+    DOWN2.with(|plane| {
+        let mut plane = plane.borrow_mut();
+        plane.fit(cn);
+        for j in 0..c {
+            for i in 0..c {
+                let id = j * c + i;
+                let mut sum = 0.0f32;
+                let mut su = 0.0f32;
+                let mut sv = 0.0f32;
+                for dj in 0..2 {
+                    for di in 0..2 {
+                        let fidx = (j * 2 + dj) * res + (i * 2 + di);
+                        let hv = h[fidx];
+                        plane.w[id * 4 + dj * 2 + di] = hv;
+                        sum += hv;
+                        let m = hv.max(0.0);
+                        su += u[fidx] * m;
+                        sv += v[fidx] * m;
+                    }
+                }
+                plane.h[id] = if as_volume { sum } else { sum * 0.25 };
+                if sum > 1.0e-12 {
+                    plane.u[id] = su / sum;
+                    plane.v[id] = sv / sum;
+                } else {
+                    plane.u[id] = 0.0;
+                    plane.v[id] = 0.0;
+                }
+                let fidx = (j * 2) * res + (i * 2);
+                plane.bed[id] = bed.get(fidx).copied().unwrap_or(0.0);
+                plane.nu[id] = nu.get(fidx).copied().unwrap_or(0.4);
+                plane.gate[id] = gate.get(fidx).copied().unwrap_or(1);
+            }
+        }
+        {
+            let Down2 {
+                h,
+                u,
+                v,
+                bed,
+                nu,
+                gate,
+                w: _,
+            } = &mut *plane;
+            step_sheet_eps(h, u, v, bed, nu, gate, c, cell * 2.0, dt, drive, eps, None);
+        }
+        for j in 0..c {
+            for i in 0..c {
+                let id = j * c + i;
+                let new_h = plane.h[id];
+                let mut s = 0.0f32;
+                let mut ws = [0.0f32; 4];
+                for k in 0..4 {
+                    ws[k] = plane.w[id * 4 + k];
+                    s += ws[k].max(0.0);
+                }
+                for dj in 0..2 {
+                    for di in 0..2 {
+                        let k = dj * 2 + di;
+                        let fidx = (j * 2 + dj) * res + (i * 2 + di);
+                        let share = if s > 1.0e-12 {
+                            if as_volume {
+                                ws[k].max(0.0) / s * new_h
+                            } else {
+                                ws[k].max(0.0) / s * new_h * 4.0
+                            }
+                        } else if as_volume {
+                            new_h * 0.25
+                        } else {
+                            new_h
+                        };
+                        h[fidx] = share.max(0.0);
+                        u[fidx] = plane.u[id];
+                        v[fidx] = plane.v[id];
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn advect_dust_plane(
     vol: &mut [f32],
     plane: &mut DustPlane,
@@ -561,7 +705,7 @@ fn advect_dust_plane(
         if before <= 0.0 {
             continue;
         }
-        step_sheet_eps(
+        step_down2(
             &mut plane.h,
             &mut plane.u,
             &mut plane.v,
@@ -577,7 +721,7 @@ fn advect_dust_plane(
                 vorticity: 0.35,
             },
             0.0,
-            None,
+            true,
         );
         let after = plane.h.iter().map(|c| *c as f64).sum::<f64>();
         let scale = if after > 0.0 {
@@ -592,6 +736,141 @@ fn advect_dust_plane(
             }
         }
     }
+}
+
+/// Work boxes are `(i0, i1, j0, j1)` inclusive. A solid wet rectangle stays
+/// one box with the historical halo of 3, so that path is unchanged. Separated
+/// blobs (the tire disks) each carry their own halo and are not stepped across
+/// the dry gap.
+fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(usize, usize, usize, usize)> {
+    let mut i0 = res;
+    let mut i1 = 0usize;
+    let mut j0 = res;
+    let mut j1 = 0usize;
+    let mut wet = 0usize;
+    for j in 0..res {
+        let row = j * res;
+        for i in 0..res {
+            if h[row + i] > eps {
+                wet += 1;
+                i0 = i0.min(i);
+                i1 = i1.max(i);
+                j0 = j0.min(j);
+                j1 = j1.max(j);
+            }
+        }
+    }
+    if wet == 0 {
+        return Vec::new();
+    }
+    let halo3 = |a0: usize, a1: usize| (a0.saturating_sub(3), (a1 + 3).min(res - 1));
+    let (x0, x1) = halo3(i0, i1);
+    let (y0, y1) = halo3(j0, j1);
+    let solid = wet == (i1 - i0 + 1) * (j1 - j0 + 1);
+    if !allow_split || solid {
+        return vec![(x0, x1, y0, y1)];
+    }
+    let n = res * res;
+    MARK.with(|mark| {
+        let mut mark = mark.borrow_mut();
+        if mark.len() < n {
+            mark.resize(n, 0);
+        }
+        mark[..n].fill(0);
+        let mut queue = Vec::new();
+        let mut boxes = Vec::new();
+        for j in 0..res {
+            for i in 0..res {
+                let s = j * res + i;
+                if h[s] <= eps || mark[s] != 0 {
+                    continue;
+                }
+                let (mut ci0, mut ci1, mut cj0, mut cj1) = (i, i, j, j);
+                mark[s] = 1;
+                queue.clear();
+                queue.push(s);
+                while let Some(cur) = queue.pop() {
+                    let cj = cur / res;
+                    let ci = cur - cj * res;
+                    ci0 = ci0.min(ci);
+                    ci1 = ci1.max(ci);
+                    cj0 = cj0.min(cj);
+                    cj1 = cj1.max(cj);
+                    let neigh = [
+                        if ci > 0 { Some(cur - 1) } else { None },
+                        if ci + 1 < res { Some(cur + 1) } else { None },
+                        if cj > 0 { Some(cur - res) } else { None },
+                        if cj + 1 < res { Some(cur + res) } else { None },
+                    ];
+                    for nidx in neigh.into_iter().flatten() {
+                        if mark[nidx] == 0 && h[nidx] > eps {
+                            mark[nidx] = 1;
+                            queue.push(nidx);
+                        }
+                    }
+                }
+                // Two blur passes of radius 2, plus the gradient, sit inside this halo.
+                const SPLIT_HALO: usize = 6;
+                boxes.push((
+                    ci0.saturating_sub(SPLIT_HALO),
+                    (ci1 + SPLIT_HALO).min(res - 1),
+                    cj0.saturating_sub(SPLIT_HALO),
+                    (cj1 + SPLIT_HALO).min(res - 1),
+                ));
+            }
+        }
+        merge_boxes(&mut boxes);
+        // One body keeps the halo of 3, including a puddle with holes. Only
+        // separated disks pay for their own boxes.
+        if boxes.len() == 1 || boxes.len() > 8 {
+            vec![(x0, x1, y0, y1)]
+        } else {
+            boxes
+        }
+    })
+}
+
+fn boxes_touch(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> bool {
+    let (ai0, ai1, aj0, aj1) = a;
+    let (bi0, bi1, bj0, bj1) = b;
+    ai0.saturating_sub(1) <= bi1.saturating_add(1)
+        && bi0.saturating_sub(1) <= ai1.saturating_add(1)
+        && aj0.saturating_sub(1) <= bj1.saturating_add(1)
+        && bj0.saturating_sub(1) <= aj1.saturating_add(1)
+}
+
+fn merge_boxes(boxes: &mut Vec<(usize, usize, usize, usize)>) {
+    loop {
+        let mut did = false;
+        let mut i = 0;
+        while i < boxes.len() {
+            let mut j = i + 1;
+            while j < boxes.len() {
+                if boxes_touch(boxes[i], boxes[j]) {
+                    let a = boxes[i];
+                    let b = boxes[j];
+                    boxes[i] = (
+                        a.0.min(b.0),
+                        a.1.max(b.1),
+                        a.2.min(b.2),
+                        a.3.max(b.3),
+                    );
+                    boxes.swap_remove(j);
+                    did = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+        if !did {
+            break;
+        }
+    }
+}
+
+thread_local! {
+    static MARK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 fn step_sheet_scratch(
@@ -609,33 +888,22 @@ fn step_sheet_scratch(
     solid: Option<&[u8]>,
     sc: &mut Scratch,
 ) {
-    let (mut i0, mut i1, mut j0, mut j1) = (res, 0usize, res, 0usize);
-    for j in 0..res {
-        for i in 0..res {
-            if h[j * res + i] > eps {
-                i0 = i0.min(i);
-                i1 = i1.max(i);
-                j0 = j0.min(j);
-                j1 = j1.max(j);
-            }
-        }
-    }
-    if i0 > i1 {
+    // A mask does not glue separate tire disks into one rectangle. A single
+    // connected sheet still returns the historical halo-3 box.
+    let boxes = sheet_work_boxes(h, res, eps, true);
+    if boxes.is_empty() {
         return;
     }
-    i0 = i0.saturating_sub(3);
-    j0 = j0.saturating_sub(3);
-    i1 = (i1 + 3).min(res - 1);
-    j1 = (j1 + 3).min(res - 1);
-
     let mut max_s = 0.15f32;
     if let SheetDrive::Wind { x, z, .. } = drive {
         max_s = max_s.max(x.hypot(z));
     }
-    for j in j0..=j1 {
-        for i in i0..=i1 {
-            let idx = j * res + i;
-            max_s = max_s.max(u[idx].hypot(v[idx]));
+    for &(i0, i1, j0, j1) in &boxes {
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                max_s = max_s.max(u[row + i].hypot(v[row + i]));
+            }
         }
     }
     let nsub = ((dt * max_s) / (0.42 * cell.max(1.0e-3)))
@@ -643,9 +911,11 @@ fn step_sheet_scratch(
         .clamp(1.0, 8.0) as u32;
     let dts = dt / nsub as f32;
     for _ in 0..nsub {
-        substep(
-            h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, sc,
-        );
+        for &(i0, i1, j0, j1) in &boxes {
+            substep(
+                h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, sc,
+            );
+        }
     }
 }
 
@@ -707,31 +977,10 @@ fn substep(
     } else {
     match drive {
         SheetDrive::Gravity { vorticity } => {
-            for j in j0..=j1 {
-                for i in i0..=i1 {
-                    let idx = j * res + i;
-                    if h[idx] <= eps {
-                        continue;
-                    }
-                    let (px, pz) = grad(p, res, i, j, cell);
-                    // Mud films keep their reduced mobility. A rigid body is a
-                    // wall, so the water against it feels the full free-surface
-                    // gradient and can pass around the geometry.
-                    let mut mob = sheet_mobility_for(nu[idx]);
-                    if let Some(mask) = solid {
-                        // Thin films on the bank already sit on a steep bed. Full
-                        // gravity there runs them up to the speed cap and back.
-                        if h[idx] > 0.08 && solid_near(mask, res, i, j, 1) {
-                            mob = mob.max(1.0);
-                        }
-                    }
-                    u[idx] += -GRAVITY * px * mob * dt;
-                    v[idx] += -GRAVITY * pz * mob * dt;
-                    if vorticity > 0.0 {
-                        confine_one(u, v, res, i, j, cell, dt, vorticity);
-                    }
-                }
-            }
+            let mask = solid.expect("solid sheet");
+            force_gravity_solid(
+                h, u, v, nu, p, mask, res, cell, dt, vorticity, eps, i0, i1, j0, j1,
+            );
         }
         SheetDrive::Wind { x, z, vorticity } => {
             let blend = 1.0 - (-dt * 1.6).exp();
@@ -828,6 +1077,122 @@ fn substep(
     }
 }
 
+fn force_gravity_solid(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    nu: &[f32],
+    p: &[f32],
+    mask: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    vorticity: f32,
+    eps: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+        force_gravity_solid_par(
+            h, u, v, nu, p, mask, res, cell, dt, vorticity, eps, i0, i1, j0, j1,
+        );
+        return;
+    }
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if h[idx] <= eps {
+                continue;
+            }
+            let (px, pz) = grad(p, res, i, j, cell);
+            let mut mob = sheet_mobility_for(nu[idx]);
+            if h[idx] > 0.08 && solid_near(mask, res, i, j, 1) {
+                mob = mob.max(1.0);
+            }
+            u[idx] += -GRAVITY * px * mob * dt;
+            v[idx] += -GRAVITY * pz * mob * dt;
+            if vorticity > 0.0 {
+                confine_one(u, v, res, i, j, cell, dt, vorticity);
+            }
+        }
+    }
+}
+
+/// Gravity is bit-exact across rows. Confinement stays a forward Gauss–Seidel
+/// sweep: a Jacobi sweep moves the standing slurry out of the golden band.
+#[cfg(not(target_arch = "wasm32"))]
+fn force_gravity_solid_par(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    nu: &[f32],
+    p: &[f32],
+    mask: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    vorticity: f32,
+    eps: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    let up = ShareMut(u.as_mut_ptr());
+    let vp = ShareMut(v.as_mut_ptr());
+    let un = u.len();
+    let vn = v.len();
+    let mask_p = ShareU8(mask.as_ptr());
+    let mn = mask.len();
+    let threads = rayon::current_num_threads().clamp(1, 4);
+    let rows = j1 + 1 - j0;
+    let chunk = rows.div_ceil(threads);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = j0 + t * chunk;
+            if a > j1 {
+                break;
+            }
+            let b = (a + chunk - 1).min(j1);
+            s.spawn(move |_| {
+                let u = unsafe { up.slice(un) };
+                let v = unsafe { vp.slice(vn) };
+                let mask = unsafe { mask_p.slice(mn) };
+                for j in a..=b {
+                    for i in i0..=i1 {
+                        let idx = j * res + i;
+                        if h[idx] <= eps {
+                            continue;
+                        }
+                        let (px, pz) = grad(p, res, i, j, cell);
+                        let mut mob = sheet_mobility_for(nu[idx]);
+                        if h[idx] > 0.08 && solid_near(mask, res, i, j, 1) {
+                            mob = mob.max(1.0);
+                        }
+                        u[idx] += -GRAVITY * px * mob * dt;
+                        v[idx] += -GRAVITY * pz * mob * dt;
+                    }
+                }
+            });
+        }
+    });
+    if vorticity <= 0.0 {
+        return;
+    }
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let idx = j * res + i;
+            if h[idx] <= eps {
+                continue;
+            }
+            confine_one(u, v, res, i, j, cell, dt, vorticity);
+        }
+    }
+}
+
 fn force_gravity_open(
     h: &[f32],
     u: &mut [f32],
@@ -844,6 +1209,11 @@ fn force_gravity_open(
     j0: usize,
     j1: usize,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+        force_gravity_par(h, u, v, nu, p, res, cell, dt, vorticity, eps, i0, i1, j0, j1);
+        return;
+    }
     let two = 2.0 * cell;
     for j in j0..=j1 {
         for i in i0..=i1 {
@@ -873,6 +1243,193 @@ fn force_gravity_open(
     }
 }
 
+/// Gravity, then one Jacobi confinement sweep from the post-gravity velocity.
+/// Rows do not read each other's confinement update, so the sweep is parallel.
+#[cfg(not(target_arch = "wasm32"))]
+fn force_gravity_par(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    nu: &[f32],
+    p: &[f32],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    vorticity: f32,
+    eps: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    let two = 2.0 * cell;
+    let up = ShareMut(u.as_mut_ptr());
+    let vp = ShareMut(v.as_mut_ptr());
+    let un = u.len();
+    let vn = v.len();
+    let threads = rayon::current_num_threads().clamp(1, 4);
+    let rows = j1 + 1 - j0;
+    let chunk = rows.div_ceil(threads);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = j0 + t * chunk;
+            if a > j1 {
+                break;
+            }
+            let b = (a + chunk - 1).min(j1);
+            s.spawn(move |_| {
+                let u = unsafe { up.slice(un) };
+                let v = unsafe { vp.slice(vn) };
+                for j in a..=b {
+                    for i in i0..=i1 {
+                        let idx = j * res + i;
+                        if h[idx] <= eps {
+                            continue;
+                        }
+                        let (px, pz) = if i >= 2 && j >= 2 && i + 2 < res && j + 2 < res {
+                            (
+                                (p[idx + 1] - p[idx - 1]) / two,
+                                (p[idx + res] - p[idx - res]) / two,
+                            )
+                        } else {
+                            grad(p, res, i, j, cell)
+                        };
+                        let mob = sheet_mobility_for(nu[idx]);
+                        u[idx] += -GRAVITY * px * mob * dt;
+                        v[idx] += -GRAVITY * pz * mob * dt;
+                    }
+                }
+            });
+        }
+    });
+    if vorticity <= 0.0 {
+        return;
+    }
+    let n = res * res;
+    VEL_SNAP.with(|snap| {
+        let mut snap = snap.borrow_mut();
+        if snap.u.len() < n {
+            snap.u.resize(n, 0.0);
+            snap.v.resize(n, 0.0);
+        }
+        snap.u[..n].copy_from_slice(&u[..n]);
+        snap.v[..n].copy_from_slice(&v[..n]);
+    });
+    VEL_SNAP.with(|snap| {
+        let snap = snap.borrow();
+        let su = ShareConst(snap.u.as_ptr());
+        let sv = ShareConst(snap.v.as_ptr());
+        rayon::scope(|s| {
+            for t in 0..threads {
+                let a = j0 + t * chunk;
+                if a > j1 {
+                    break;
+                }
+                let b = (a + chunk - 1).min(j1);
+                s.spawn(move |_| {
+                    let u = unsafe { up.slice(un) };
+                    let v = unsafe { vp.slice(vn) };
+                    let su = unsafe { su.slice(n) };
+                    let sv = unsafe { sv.slice(n) };
+                    for j in a..=b {
+                        for i in i0..=i1 {
+                            let idx = j * res + i;
+                            if h[idx] <= eps {
+                                continue;
+                            }
+                            if i >= 2 && j >= 2 && i + 2 < res && j + 2 < res {
+                                confine_jacobi_interior(
+                                    su, sv, u, v, res, i, j, dt, vorticity, two,
+                                );
+                            } else {
+                                confine_jacobi(su, sv, u, v, res, i, j, cell, dt, vorticity);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn confine_jacobi(
+    su: &[f32],
+    sv: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    i: usize,
+    j: usize,
+    cell: f32,
+    dt: f32,
+    eps: f32,
+) {
+    let w = vorticity_at(su, sv, res, i, j, cell);
+    if !w.is_finite() || w.abs() < 1.0e-4 {
+        return;
+    }
+    let wxp = vorticity_at(su, sv, res, (i + 1).min(res - 1), j, cell).abs();
+    let wxm = vorticity_at(su, sv, res, i.saturating_sub(1), j, cell).abs();
+    let wzp = vorticity_at(su, sv, res, i, (j + 1).min(res - 1), cell).abs();
+    let wzm = vorticity_at(su, sv, res, i, j.saturating_sub(1), cell).abs();
+    let nx = (wxp - wxm) / (2.0 * cell);
+    let nz = (wzp - wzm) / (2.0 * cell);
+    let du = eps * dt * (-nz * w);
+    let dv = eps * dt * (nx * w);
+    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+        let idx = j * res + i;
+        u[idx] += du;
+        v[idx] += dv;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn confine_jacobi_interior(
+    su: &[f32],
+    sv: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    i: usize,
+    j: usize,
+    dt: f32,
+    eps: f32,
+    two: f32,
+) {
+    let w = vort_interior(su, sv, res, i, j, two);
+    if !w.is_finite() || w.abs() < 1.0e-4 {
+        return;
+    }
+    let wxp = vort_interior(su, sv, res, i + 1, j, two).abs();
+    let wxm = vort_interior(su, sv, res, i - 1, j, two).abs();
+    let wzp = vort_interior(su, sv, res, i, j + 1, two).abs();
+    let wzm = vort_interior(su, sv, res, i, j - 1, two).abs();
+    let nx = (wxp - wxm) / two;
+    let nz = (wzp - wzm) / two;
+    let du = eps * dt * (-nz * w);
+    let dv = eps * dt * (nx * w);
+    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+        let idx = j * res + i;
+        u[idx] += du;
+        v[idx] += dv;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct VelSnap {
+    u: Vec<f32>,
+    v: Vec<f32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static VEL_SNAP: RefCell<VelSnap> = RefCell::new(VelSnap {
+        u: Vec::new(),
+        v: Vec::new(),
+    });
+}
+
 fn force_wind_open(
     h: &[f32],
     u: &mut [f32],
@@ -889,6 +1446,11 @@ fn force_wind_open(
     j0: usize,
     j1: usize,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+        force_wind_par(h, u, v, res, cell, dt, x, z, vorticity, eps, i0, i1, j0, j1);
+        return;
+    }
     let blend = 1.0 - (-dt * 1.6).exp();
     let two = 2.0 * cell;
     for j in j0..=j1 {
@@ -908,6 +1470,105 @@ fn force_wind_open(
             }
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn force_wind_par(
+    h: &[f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    x: f32,
+    z: f32,
+    vorticity: f32,
+    eps: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+) {
+    let blend = 1.0 - (-dt * 1.6).exp();
+    let two = 2.0 * cell;
+    let up = ShareMut(u.as_mut_ptr());
+    let vp = ShareMut(v.as_mut_ptr());
+    let un = u.len();
+    let vn = v.len();
+    let threads = rayon::current_num_threads().clamp(1, 4);
+    let rows = j1 + 1 - j0;
+    let chunk = rows.div_ceil(threads);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = j0 + t * chunk;
+            if a > j1 {
+                break;
+            }
+            let b = (a + chunk - 1).min(j1);
+            s.spawn(move |_| {
+                let u = unsafe { up.slice(un) };
+                let v = unsafe { vp.slice(vn) };
+                for j in a..=b {
+                    for i in i0..=i1 {
+                        let idx = j * res + i;
+                        if h[idx] <= eps {
+                            continue;
+                        }
+                        u[idx] += (x - u[idx]) * blend;
+                        v[idx] += (z - v[idx]) * blend;
+                    }
+                }
+            });
+        }
+    });
+    if vorticity <= 0.0 {
+        return;
+    }
+    let n = res * res;
+    VEL_SNAP.with(|snap| {
+        let mut snap = snap.borrow_mut();
+        if snap.u.len() < n {
+            snap.u.resize(n, 0.0);
+            snap.v.resize(n, 0.0);
+        }
+        snap.u[..n].copy_from_slice(&u[..n]);
+        snap.v[..n].copy_from_slice(&v[..n]);
+    });
+    VEL_SNAP.with(|snap| {
+        let snap = snap.borrow();
+        let su = ShareConst(snap.u.as_ptr());
+        let sv = ShareConst(snap.v.as_ptr());
+        rayon::scope(|s| {
+            for t in 0..threads {
+                let a = j0 + t * chunk;
+                if a > j1 {
+                    break;
+                }
+                let b = (a + chunk - 1).min(j1);
+                s.spawn(move |_| {
+                    let u = unsafe { up.slice(un) };
+                    let v = unsafe { vp.slice(vn) };
+                    let su = unsafe { su.slice(n) };
+                    let sv = unsafe { sv.slice(n) };
+                    for j in a..=b {
+                        for i in i0..=i1 {
+                            let idx = j * res + i;
+                            if h[idx] <= eps {
+                                continue;
+                            }
+                            if i >= 2 && j >= 2 && i + 2 < res && j + 2 < res {
+                                confine_jacobi_interior(
+                                    su, sv, u, v, res, i, j, dt, vorticity, two,
+                                );
+                            } else {
+                                confine_jacobi(su, sv, u, v, res, i, j, cell, dt, vorticity);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    });
 }
 
 fn confine_interior(
@@ -959,6 +1620,11 @@ fn transport_open(
     along_x: bool,
     sc: &mut Scratch,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if i1 - i0 >= 31 && j1 - j0 >= 47 {
+        transport_open_par(h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, sc);
+        return;
+    }
     for j in j0..=j1 {
         let row = j * res;
         for i in i0..=i1 {
@@ -1002,6 +1668,166 @@ fn transport_open(
             }
         }
     }
+}
+
+/// Horizontal flux stays on one row. Vertical flux stays on one column.
+/// Workers do not share a written index.
+#[cfg(not(target_arch = "wasm32"))]
+fn transport_open_par(
+    h: &mut [f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    sc: &mut Scratch,
+) {
+    let threads = rayon::current_num_threads().clamp(1, 4);
+    let removed = ShareMut(sc.removed.as_mut_ptr());
+    let added = ShareMut(sc.added.as_mut_ptr());
+    let n = sc.removed.len().min(sc.added.len());
+    let depth = ShareConst(h.as_ptr());
+    let hn = h.len();
+    let rows = j1 + 1 - j0;
+    let chunk = rows.div_ceil(threads);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = j0 + t * chunk;
+            if a > j1 {
+                break;
+            }
+            let b = (a + chunk - 1).min(j1);
+            s.spawn(move |_| {
+                let removed = unsafe { removed.slice(n) };
+                let added = unsafe { added.slice(n) };
+                for j in a..=b {
+                    let row = j * res;
+                    for i in i0..=i1 {
+                        removed[row + i] = 0.0;
+                        added[row + i] = 0.0;
+                    }
+                }
+            });
+        }
+    });
+    if along_x {
+        rayon::scope(|s| {
+            for t in 0..threads {
+                let a = j0 + t * chunk;
+                if a > j1 {
+                    break;
+                }
+                let b = (a + chunk - 1).min(j1);
+                s.spawn(move |_| {
+                    let h = unsafe { depth.slice(hn) };
+                    let removed = unsafe { removed.slice(n) };
+                    let added = unsafe { added.slice(n) };
+                    for j in a..=b {
+                        let row = j * res;
+                        for i in i0..i1 {
+                            let ia = row + i;
+                            let ib = ia + 1;
+                            let speed = 0.5 * (vel[ia] + vel[ib]);
+                            if speed.abs() < 1.0e-5 {
+                                continue;
+                            }
+                            flux_open_bufs(h, gate, ia, ib, speed, cell, dt, removed, added);
+                        }
+                    }
+                });
+            }
+        });
+    } else {
+        let cols = i1 + 1 - i0;
+        let cthreads = threads.min(cols.max(1));
+        let cchunk = cols.div_ceil(cthreads);
+        rayon::scope(|s| {
+            for t in 0..cthreads {
+                let a = i0 + t * cchunk;
+                if a > i1 {
+                    break;
+                }
+                let b = (a + cchunk - 1).min(i1);
+                s.spawn(move |_| {
+                    let h = unsafe { depth.slice(hn) };
+                    let removed = unsafe { removed.slice(n) };
+                    let added = unsafe { added.slice(n) };
+                    for j in j0..j1 {
+                        for i in a..=b {
+                            let ia = j * res + i;
+                            let ib = ia + res;
+                            let speed = 0.5 * (vel[ia] + vel[ib]);
+                            if speed.abs() < 1.0e-5 {
+                                continue;
+                            }
+                            flux_open_bufs(h, gate, ia, ib, speed, cell, dt, removed, added);
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let hp = ShareMut(h.as_mut_ptr());
+    let hn = h.len();
+    let removed_r = ShareConst(removed.0);
+    let added_r = ShareConst(added.0);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = j0 + t * chunk;
+            if a > j1 {
+                break;
+            }
+            let b = (a + chunk - 1).min(j1);
+            s.spawn(move |_| {
+                let h = unsafe { hp.slice(hn) };
+                let removed = unsafe { removed_r.slice(n) };
+                let added = unsafe { added_r.slice(n) };
+                for j in a..=b {
+                    let row = j * res;
+                    for i in i0..=i1 {
+                        let idx = row + i;
+                        if removed[idx] > 0.0 || added[idx] > 0.0 {
+                            h[idx] = (h[idx] - removed[idx] + added[idx]).max(0.0);
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn flux_open_bufs(
+    h: &[f32],
+    gate: &[u8],
+    a: usize,
+    b: usize,
+    vel: f32,
+    cell: f32,
+    dt: f32,
+    removed: &mut [f32],
+    added: &mut [f32],
+) {
+    let (donor, recv) = if vel > 0.0 { (a, b) } else { (b, a) };
+    let room = h[donor] - removed[donor];
+    if room <= 1.0e-8 {
+        return;
+    }
+    if gate[recv] == 0 && h[recv] <= 1.0e-6 {
+        return;
+    }
+    let frac = (vel.abs() * dt / cell).min(0.45);
+    let dh = (h[donor] * frac).min(room);
+    if dh <= 1.0e-8 {
+        return;
+    }
+    removed[donor] += dh;
+    added[recv] += dh;
 }
 
 #[inline(always)]
@@ -1133,12 +1959,101 @@ fn blur_box(
     if i0 > i1 || j0 > j1 || res == 0 {
         return;
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+        par_blur_axis(src, tmp, res, i0, i1, j0, j1, k, true);
+        par_blur_axis(tmp, dst, res, i0, i1, j0, j1, k, false);
+        return;
+    }
     for j in j0..=j1 {
         blur_axis_x(src, tmp, res, j, i0, i1, k);
     }
     for j in j0..=j1 {
         blur_axis_z(tmp, dst, res, j, i0, i1, k);
     }
+}
+
+/// Raw pointers shared by row workers. Each worker writes a disjoint row range,
+/// and the scope joins before the buffer is freed.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Copy, Clone)]
+struct ShareMut(*mut f32);
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ShareMut {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for ShareMut {}
+#[cfg(not(target_arch = "wasm32"))]
+impl ShareMut {
+    unsafe fn slice<'a>(self, n: usize) -> &'a mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0, n) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Copy, Clone)]
+struct ShareConst(*const f32);
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ShareConst {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for ShareConst {}
+#[cfg(not(target_arch = "wasm32"))]
+impl ShareConst {
+    unsafe fn slice<'a>(self, n: usize) -> &'a [f32] {
+        unsafe { std::slice::from_raw_parts(self.0, n) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Copy, Clone)]
+struct ShareU8(*const u8);
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ShareU8 {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for ShareU8 {}
+#[cfg(not(target_arch = "wasm32"))]
+impl ShareU8 {
+    unsafe fn slice<'a>(self, n: usize) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.0, n) }
+    }
+}
+
+/// Each row is written by one worker. `blur_axis_*` only stores `j * res + i`.
+#[cfg(not(target_arch = "wasm32"))]
+fn par_blur_axis(
+    src: &[f32],
+    dst: &mut [f32],
+    res: usize,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    k: &[f32; 5],
+    axis_x: bool,
+) {
+    let ptr = ShareMut(dst.as_mut_ptr());
+    let len = dst.len();
+    let threads = rayon::current_num_threads().clamp(1, 4);
+    let rows = j1 + 1 - j0;
+    let chunk = rows.div_ceil(threads);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = j0 + t * chunk;
+            if a > j1 {
+                break;
+            }
+            let b = (a + chunk - 1).min(j1);
+            s.spawn(move |_| {
+                let dst = unsafe { ptr.slice(len) };
+                for j in a..=b {
+                    if axis_x {
+                        blur_axis_x(src, dst, res, j, i0, i1, k);
+                    } else {
+                        blur_axis_z(src, dst, res, j, i0, i1, k);
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Five taps, left to right. A leading zero add matches the clamped loop (`a = 0; a += …`).
@@ -1372,6 +2287,14 @@ fn transport(
     bed: Option<&[f32]>,
     sc: &mut Scratch,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if i1 - i0 >= 31 && j1 - j0 >= 47 {
+        let speed = if along_x { u } else { v };
+        transport_par(
+            h, speed, gate, res, cell, dt, i0, i1, j0, j1, along_x, solid, bed, sc,
+        );
+        return;
+    }
     let n = res * res;
     for idx in 0..n {
         sc.removed[idx] = 0.0;
@@ -1425,6 +2348,164 @@ fn transport(
     }
 }
 
+/// Same fluxes as [`transport`], split across rows (x) or columns (z).
+/// A row does not share a written index with another row on a horizontal edge.
+#[cfg(not(target_arch = "wasm32"))]
+fn transport_par(
+    h: &mut [f32],
+    speed: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    solid: Option<&[u8]>,
+    bed: Option<&[f32]>,
+    sc: &mut Scratch,
+) {
+    let removed = ShareMut(sc.removed.as_mut_ptr());
+    let added = ShareMut(sc.added.as_mut_ptr());
+    let n = res * res;
+    let depth = ShareConst(h.as_ptr());
+    let hn = h.len();
+    let sp = ShareConst(speed.as_ptr());
+    let sn = speed.len();
+    let gate_p = ShareU8(gate.as_ptr());
+    let gn = gate.len();
+    let solid_p = solid.map(|s| ShareU8(s.as_ptr()));
+    let solid_n = solid.map(|s| s.len()).unwrap_or(0);
+    let bed_p = bed.map(|s| ShareConst(s.as_ptr()));
+    let bed_n = bed.map(|s| s.len()).unwrap_or(0);
+    let threads = rayon::current_num_threads().clamp(1, 4);
+    let chunk_n = n.div_ceil(threads);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = t * chunk_n;
+            if a >= n {
+                break;
+            }
+            let b = (a + chunk_n).min(n);
+            s.spawn(move |_| {
+                let removed = unsafe { removed.slice(n) };
+                let added = unsafe { added.slice(n) };
+                for idx in a..b {
+                    removed[idx] = 0.0;
+                    added[idx] = 0.0;
+                }
+            });
+        }
+    });
+    if along_x {
+        let rows = j1 + 1 - j0;
+        let chunk = rows.div_ceil(threads);
+        rayon::scope(|s| {
+            for t in 0..threads {
+                let a = j0 + t * chunk;
+                if a > j1 {
+                    break;
+                }
+                let b = (a + chunk - 1).min(j1);
+                s.spawn(move |_| {
+                    let h = unsafe { depth.slice(hn) };
+                    let speed = unsafe { sp.slice(sn) };
+                    let gate = unsafe { gate_p.slice(gn) };
+                    let solid = solid_p.map(|p| unsafe { p.slice(solid_n) });
+                    let bed = bed_p.map(|p| unsafe { p.slice(bed_n) });
+                    let removed = unsafe { removed.slice(n) };
+                    let added = unsafe { added.slice(n) };
+                    for j in a..=b {
+                        let row = j * res;
+                        for i in i0..i1 {
+                            let ia = row + i;
+                            let ib = ia + 1;
+                            move_edge_bufs(
+                                h,
+                                gate,
+                                ia,
+                                ib,
+                                0.5 * (speed[ia] + speed[ib]),
+                                cell,
+                                dt,
+                                solid,
+                                bed,
+                                removed,
+                                added,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    } else {
+        let cols = i1 + 1 - i0;
+        let cthreads = threads.min(cols.max(1));
+        let cchunk = cols.div_ceil(cthreads);
+        rayon::scope(|s| {
+            for t in 0..cthreads {
+                let a = i0 + t * cchunk;
+                if a > i1 {
+                    break;
+                }
+                let b = (a + cchunk - 1).min(i1);
+                s.spawn(move |_| {
+                    let h = unsafe { depth.slice(hn) };
+                    let speed = unsafe { sp.slice(sn) };
+                    let gate = unsafe { gate_p.slice(gn) };
+                    let solid = solid_p.map(|p| unsafe { p.slice(solid_n) });
+                    let bed = bed_p.map(|p| unsafe { p.slice(bed_n) });
+                    let removed = unsafe { removed.slice(n) };
+                    let added = unsafe { added.slice(n) };
+                    for j in j0..j1 {
+                        for i in a..=b {
+                            let ia = j * res + i;
+                            let ib = ia + res;
+                            move_edge_bufs(
+                                h,
+                                gate,
+                                ia,
+                                ib,
+                                0.5 * (speed[ia] + speed[ib]),
+                                cell,
+                                dt,
+                                solid,
+                                bed,
+                                removed,
+                                added,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let hp = ShareMut(h.as_mut_ptr());
+    let removed_r = ShareConst(removed.0);
+    let added_r = ShareConst(added.0);
+    rayon::scope(|s| {
+        for t in 0..threads {
+            let a = t * chunk_n;
+            if a >= n {
+                break;
+            }
+            let b = (a + chunk_n).min(n);
+            s.spawn(move |_| {
+                let h = unsafe { hp.slice(hn) };
+                let removed = unsafe { removed_r.slice(n) };
+                let added = unsafe { added_r.slice(n) };
+                for idx in a..b {
+                    if removed[idx] > 0.0 || added[idx] > 0.0 {
+                        h[idx] = (h[idx] - removed[idx] + added[idx]).max(0.0);
+                    }
+                }
+            });
+        }
+    });
+}
+
 fn move_edge(
     h: &[f32],
     _speed: &[f32],
@@ -1437,6 +2518,34 @@ fn move_edge(
     solid: Option<&[u8]>,
     bed: Option<&[f32]>,
     sc: &mut Scratch,
+) {
+    move_edge_bufs(
+        h,
+        gate,
+        a,
+        b,
+        vel,
+        cell,
+        dt,
+        solid,
+        bed,
+        &mut sc.removed,
+        &mut sc.added,
+    );
+}
+
+fn move_edge_bufs(
+    h: &[f32],
+    gate: &[u8],
+    a: usize,
+    b: usize,
+    vel: f32,
+    cell: f32,
+    dt: f32,
+    solid: Option<&[u8]>,
+    bed: Option<&[f32]>,
+    removed: &mut [f32],
+    added: &mut [f32],
 ) {
     if let Some(solid) = solid {
         if solid[a] != 0 || solid[b] != 0 {
@@ -1454,7 +2563,7 @@ fn move_edge(
             return;
         }
     }
-    let room = h[donor] - sc.removed[donor];
+    let room = h[donor] - removed[donor];
     if room <= 1.0e-8 {
         return;
     }
@@ -1466,8 +2575,8 @@ fn move_edge(
     if dh <= 1.0e-8 {
         return;
     }
-    sc.removed[donor] += dh;
-    sc.added[recv] += dh;
+    removed[donor] += dh;
+    added[recv] += dh;
 }
 
 /// Free-surface stand-in for a wall. Each solid cell takes the mean of the
@@ -1993,6 +3102,9 @@ pub struct FluidCore {
     fine_moisture: Vec<f32>,
     fine_grain: Vec<u8>,
     fine_on: bool,
+    /// 1 when this coarse cell's sheet was moved onto the 2 cm patch.
+    /// Survives `restrict_fine` so the coarse shove does not hit it twice.
+    fine_hold: Vec<u8>,
     dust: Vec<f32>,
     dust_u: Vec<f32>,
     dust_v: Vec<f32>,
@@ -2057,6 +3169,7 @@ impl FluidCore {
             fine_moisture: vec![0.0; fine_n],
             fine_grain: vec![Grain::Other as u8; fine_n],
             fine_on: false,
+            fine_hold: vec![0; n],
             dust: vec![0.0; air_n],
             dust_u: vec![0.0; air_n],
             dust_v: vec![0.0; air_n],
@@ -2647,14 +3760,13 @@ impl FluidCore {
         let pushes = std::mem::take(&mut self.pushes);
         self.last_pushes = pushes.clone();
         self.refine(&pushes);
-        let fine_rect = self.fine_rect();
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
-        let mut spray = self.peel_spray(&pushes, true, None);
+        let mut spray = self.peel_spray(&pushes, true, false);
         self.restrict_fine();
-        self.apply_pushes_outside(&pushes, fine_rect);
+        self.apply_pushes_outside(&pushes);
         self.step_pair(dt, false);
-        spray.extend(self.peel_spray(&pushes, false, fine_rect));
+        spray.extend(self.peel_spray(&pushes, false, true));
         if !self.solids.is_empty() {
             self.scour_contacts(dt);
         }
@@ -3469,12 +4581,10 @@ impl FluidCore {
         }
     }
 
-    fn apply_pushes_outside(&mut self, pushes: &[TirePush], skip: Option<[f32; 4]>) {
+    fn apply_pushes_outside(&mut self, pushes: &[TirePush]) {
         for p in pushes {
-            if let Some(rect) = skip {
-                if p.x >= rect[0] && p.x < rect[1] && p.z >= rect[2] && p.z < rect[3] {
-                    continue;
-                }
+            if self.fine_held_at(p.x, p.z) {
+                continue;
             }
             self.push_on(p, false);
         }
@@ -3514,8 +4624,11 @@ impl FluidCore {
         let rx = fz;
         let rz = -fx;
         let speed = p.speed.max(0.0);
-        for j in 0..res {
-            for i in 0..res {
+        let reach = (p.radius * 1.4).hypot(p.width * 0.65 + cell) + cell;
+        let (i0, i1) = index_span(origin[0], cell, res, p.x, reach);
+        let (j0, j1) = index_span(origin[1], cell, res, p.z, reach);
+        for j in j0..j1 {
+            for i in i0..i1 {
                 let x = origin[0] + (i as f32 + 0.5) * cell;
                 let z = origin[1] + (j as f32 + 0.5) * cell;
                 let dx = x - p.x;
@@ -3549,13 +4662,14 @@ impl FluidCore {
         }
     }
 
-    fn peel_spray(
-        &mut self,
-        pushes: &[TirePush],
-        fine: bool,
-        skip: Option<[f32; 4]>,
-    ) -> Vec<SprayEvent> {
+    fn peel_spray(&mut self, pushes: &[TirePush], fine: bool, skip_held: bool) -> Vec<SprayEvent> {
         let mut out = Vec::new();
+        let hold = if skip_held {
+            self.fine_hold.clone()
+        } else {
+            Vec::new()
+        };
+        let coarse_origin = self.origin;
         let (res, cell, origin, water, uw, vw) = if fine {
             (
                 FINE_RES,
@@ -3583,14 +4697,15 @@ impl FluidCore {
             if p.speed < 0.8 {
                 continue;
             }
-            for j in 0..res {
-                for i in 0..res {
+            let reach = p.radius * 1.3 + cell;
+            let (i0, i1) = index_span(origin[0], cell, res, p.x, reach);
+            let (j0, j1) = index_span(origin[1], cell, res, p.z, reach);
+            for j in j0..j1 {
+                for i in i0..i1 {
                     let x = origin[0] + (i as f32 + 0.5) * cell;
                     let z = origin[1] + (j as f32 + 0.5) * cell;
-                    if let Some(rect) = skip {
-                        if x >= rect[0] && x < rect[1] && z >= rect[2] && z < rect[3] {
-                            continue;
-                        }
+                    if skip_held && coarse_held(&hold, coarse_origin, x, z) {
+                        continue;
                     }
                     let dx = x - p.x;
                     let dz = z - p.z;
@@ -3635,10 +4750,17 @@ impl FluidCore {
         ])
     }
 
-    /// A coarse cell is refined only when the fine patch covers it completely,
-    /// so the hand-off does not drop the uncovered part of the cell.
+    fn fine_held_at(&self, x: f32, z: f32) -> bool {
+        let Some((i, j)) = self.coarse_ij(x, z) else {
+            return false;
+        };
+        self.fine_hold.get(j * WINDOW_RES + i).copied() == Some(1)
+    }
+
+    /// A coarse cell is refined only when the fine patch covers it completely
+    /// and it sits under a tire, so the hand-off does not drop the uncovered part.
     fn cell_is_refined(&self, x: f32, z: f32) -> bool {
-        if !self.fine_on {
+        if !self.fine_on || !self.fine_held_at(x, z) {
             return false;
         }
         let Some((i, j)) = self.coarse_ij(x, z) else {
@@ -3679,7 +4801,9 @@ impl FluidCore {
         self.fine_vw.fill(0.0);
         self.fine_us.fill(0.0);
         self.fine_vs.fill(0.0);
+        self.fine_hold.fill(0);
         let full = ((COARSE_CELL_M / FINE_CELL_M).round() as u32).pow(2);
+        let r2 = FINE_TIRE_R_M * FINE_TIRE_R_M;
         let mut count = vec![0u32; WINDOW_RES * WINDOW_RES];
         let mut hits: Vec<(usize, usize)> = Vec::new();
         for j in 0..FINE_RES {
@@ -3694,8 +4818,19 @@ impl FluidCore {
                 hits.push((j * FINE_RES + i, cidx));
             }
         }
+        for (cidx, n) in count.iter().enumerate() {
+            if *n != full {
+                continue;
+            }
+            let ci = cidx % WINDOW_RES;
+            let cj = cidx / WINDOW_RES;
+            let (x, z) = self.coarse_xz(ci, cj);
+            if near_tire_zone(pushes, x, z, r2) {
+                self.fine_hold[cidx] = 1;
+            }
+        }
         for (fidx, cidx) in &hits {
-            if count[*cidx] != full {
+            if self.fine_hold[*cidx] != 1 {
                 continue;
             }
             self.fine_water[*fidx] = self.water[*cidx];
@@ -3708,8 +4843,8 @@ impl FluidCore {
             self.fine_moisture[*fidx] = self.moisture[*cidx];
             self.fine_grain[*fidx] = self.grain[*cidx];
         }
-        for (cidx, n) in count.iter().enumerate() {
-            if *n == full {
+        for (cidx, held) in self.fine_hold.iter().enumerate() {
+            if *held == 1 {
                 self.water[cidx] = 0.0;
                 self.slurry[cidx] = 0.0;
                 self.uw[cidx] = 0.0;
@@ -3759,12 +4894,40 @@ impl FluidCore {
                 cnt[cidx] += 1;
             }
         }
+        let full = ((COARSE_CELL_M / FINE_CELL_M).round() as u32).pow(2);
         for idx in 0..WINDOW_RES * WINDOW_RES {
             if cnt[idx] == 0 {
                 continue;
             }
+            let held = self.fine_hold.get(idx).copied() == Some(1);
             let w = acc_w[idx] / coarse_area;
             let s = acc_s[idx] / coarse_area;
+            // A coarse cell that stayed off the 2 cm sheet keeps its depth.
+            // Only volume that flowed onto a fine cell of that column is added.
+            if !held && cnt[idx] >= full {
+                if w <= 0.0 && s <= 0.0 {
+                    continue;
+                }
+                let old_w = self.water[idx];
+                let old_s = self.slurry[idx];
+                let new_w = old_w + w;
+                let new_s = old_s + s;
+                if new_w > 1.0e-6 {
+                    self.uw[idx] = (old_w * self.uw[idx] * coarse_area + acc_uw[idx])
+                        / (new_w * coarse_area);
+                    self.vw[idx] = (old_w * self.vw[idx] * coarse_area + acc_vw[idx])
+                        / (new_w * coarse_area);
+                }
+                if new_s > 1.0e-6 {
+                    self.us[idx] = (old_s * self.us[idx] * coarse_area + acc_us[idx])
+                        / (new_s * coarse_area);
+                    self.vs[idx] = (old_s * self.vs[idx] * coarse_area + acc_vs[idx])
+                        / (new_s * coarse_area);
+                }
+                self.water[idx] = new_w;
+                self.slurry[idx] = new_s;
+                continue;
+            }
             self.water[idx] = w;
             self.slurry[idx] = s;
             if w > 1.0e-6 {
@@ -3811,7 +4974,7 @@ impl FluidCore {
             let u = &mut self.dust_u[start..start + n];
             let v = &mut self.dust_v[start..start + n];
             soften_border(u, v, AIR_RES);
-            step_sheet(
+            step_down2(
                 h,
                 u,
                 v,
@@ -3826,6 +4989,8 @@ impl FluidCore {
                     z: self.wind[1],
                     vorticity: 0.35,
                 },
+                1.0e-6,
+                false,
             );
         }
         self.sheet_times.dust_ms += tick.ms();
@@ -4206,6 +5371,12 @@ impl FluidCore {
             return None;
         }
         let idx = j * FINE_RES + i;
+        if let Some((ci, cj)) = self.coarse_ij(x, z) {
+            let held = self.fine_hold.get(cj * WINDOW_RES + ci).copied() == Some(1);
+            if !held && self.fine_water[idx] <= 1.0e-8 && self.fine_slurry[idx] <= 1.0e-8 {
+                return None;
+            }
+        }
         Some(GroundSample {
             water_m: self.fine_water[idx],
             slurry_m: self.fine_slurry[idx],
@@ -4299,6 +5470,70 @@ fn soften_border(u: &mut [f32], v: &mut [f32], res: usize) {
             v[idx] *= w;
         }
     }
+}
+
+/// Tire disks, plus the rut between the axles on each side. The axle line
+/// between left and right is not a zone.
+fn near_tire_zone(pushes: &[TirePush], x: f32, z: f32, r2: f32) -> bool {
+    for p in pushes {
+        let dx = x - p.x;
+        let dz = z - p.z;
+        if dx * dx + dz * dz <= r2 {
+            return true;
+        }
+    }
+    for i in 0..pushes.len() {
+        for j in (i + 1)..pushes.len() {
+            let a = &pushes[i];
+            let b = &pushes[j];
+            let dx = (a.x - b.x).abs();
+            // Same flank only. An axle segment would bridge the two ruts and
+            // pull the dry middle into the fine sheet.
+            if dx >= 0.45 {
+                continue;
+            }
+            if dist2_segment(x, z, a.x, a.z, b.x, b.z) <= r2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn dist2_segment(px: f32, pz: f32, ax: f32, az: f32, bx: f32, bz: f32) -> f32 {
+    let abx = bx - ax;
+    let abz = bz - az;
+    let ab2 = abx * abx + abz * abz;
+    let t = if ab2 < 1.0e-8 {
+        0.0
+    } else {
+        (((px - ax) * abx + (pz - az) * abz) / ab2).clamp(0.0, 1.0)
+    };
+    let dx = px - (ax + abx * t);
+    let dz = pz - (az + abz * t);
+    dx * dx + dz * dz
+}
+
+fn coarse_held(hold: &[u8], origin: [f32; 2], x: f32, z: f32) -> bool {
+    let i = ((x - origin[0]) / COARSE_CELL_M).floor();
+    let j = ((z - origin[1]) / COARSE_CELL_M).floor();
+    if i < 0.0 || j < 0.0 {
+        return false;
+    }
+    let (i, j) = (i as usize, j as usize);
+    i < WINDOW_RES && j < WINDOW_RES && hold.get(j * WINDOW_RES + i).copied() == Some(1)
+}
+
+/// Half-open index range covering cell centres within `reach` of `center`, plus one cell.
+fn index_span(origin: f32, cell: f32, res: usize, center: f32, reach: f32) -> (usize, usize) {
+    if !(cell > 0.0) || res == 0 {
+        return (0, 0);
+    }
+    let lo = ((center - reach - origin) / cell - 1.0).floor().max(0.0);
+    let hi = ((center + reach - origin) / cell + 2.0).ceil().max(0.0);
+    let lo = (lo as usize).min(res);
+    let hi = (hi as usize).min(res).max(lo);
+    (lo, hi)
 }
 
 fn snap_origin(center: [f32; 2], extent: f32, cell: f32) -> [f32; 2] {

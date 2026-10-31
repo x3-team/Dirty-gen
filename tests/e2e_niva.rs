@@ -20,8 +20,9 @@ use silt::ThroughDrive;
 
 const DT: f32 = 1.0 / 30.0;
 /// Release through-drive step mean, milliseconds.
-/// Locked at a measured 31.231 ms plus 20 percent. Not the 7 ms frame budget.
-const E2E_STEP_BUDGET_MS: f64 = 37.477;
+/// The release CI mean on EPYC 7763 (4 cores), not a pad on the Xeon measurement.
+/// The log has that mean; it does not print a sample median. Not the 7 ms frame budget.
+const E2E_STEP_BUDGET_MS: f64 = 33.004;
 /// Release air step. Debug still uses [`AIR_STEP_BUDGET_MS`] (4 ms).
 const AIR_RELEASE_BUDGET_MS: f64 = 1.5;
 const SPEED: f32 = 8.0;
@@ -674,6 +675,9 @@ fn e2e_niva() {
         max_gap
     );
 
+    #[cfg(not(debug_assertions))]
+    print_through_drive();
+
     assert!(
         (puddle_n - 18.0).abs() < 0.5,
         "puddle samples {puddle_n}"
@@ -800,15 +804,13 @@ fn e2e_niva() {
     #[cfg(not(debug_assertions))]
     assert!(
         step_mean <= E2E_STEP_BUDGET_MS,
-        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the release measurement"
+        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the CI mean"
     );
     #[cfg(not(debug_assertions))]
     assert!(
         air_mean <= AIR_RELEASE_BUDGET_MS,
         "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
     );
-    #[cfg(not(debug_assertions))]
-    print_through_drive();
 }
 
 /// Release breakdown of [`ThroughDrive::step`] at dt = 1/30. Printed for the CI log.
