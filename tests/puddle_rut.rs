@@ -1,7 +1,9 @@
 //! Niva wheels in the puddle. The rut is the tire force on wet sand, the
 //! spoil is a berm, and the tread sits 10–15 cm under the free surface.
 
-use silt::render_contract::{publish, ContractFrame, RENDER_CONTRACT_VERSION};
+use silt::render_contract::{
+    publish, ContractFrame, FLOW_CHANNELS, RENDER_CONTRACT_VERSION,
+};
 use silt::soil::rut_depth_from_force;
 use silt::vehicle::{Vehicle, WHEEL_RADIUS};
 use silt::world::ThroughDrive;
@@ -796,8 +798,8 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
             let water = frame.film[idx * 2];
             let slurry = frame.film[idx * 2 + 1];
             let film = water + slurry;
-            let u = frame.flow[idx * 2];
-            let v = frame.flow[idx * 2 + 1];
+            let u = frame.flow[idx * FLOW_CHANNELS];
+            let v = frame.flow[idx * FLOW_CHANNELS + 1];
             let foam = frame.foam_crest[idx * 2];
             let crest = frame.foam_crest[idx * 2 + 1];
             // A dry cell is film under 0.01 mm. Velocity and foam stay 0.
