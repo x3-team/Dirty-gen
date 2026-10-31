@@ -740,13 +740,19 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     }
     let tag = if fog { "fog-" } else { "" };
     let dt = 1.0 / 30.0;
-    let stills: [(f32, &str, fn(&World) -> CameraPose); 4] = [
+    // The scene stills (CPO, 2026-10-31) use the puddle-side pose at other
+    // points of the same drive: mud and slurry in the slurry rut, wet and dry
+    // sand leaving the pool, dust on the dry run out.
+    let stills: [(f32, &str, fn(&World) -> CameraPose); 7] = [
         (-17.5, "puddle-wave", beauty_puddle_camera),
         (-16.5, "puddle-side", beauty_puddle_side_camera),
+        (-12.0, "scene-sand", beauty_puddle_side_camera),
         (-6.5, "slurry-spray", beauty_spray_camera),
+        (-6.0, "scene-mud", beauty_puddle_side_camera),
         (9.0, "dust-exit", beauty_dust_camera),
+        (9.5, "scene-dust", beauty_puddle_side_camera),
     ];
-    let mut saved = [false; 4];
+    let mut saved = [false; 7];
     // SILT_BEAUTY_STILLS=puddle-wave,... renders only those stills and stops.
     let only = std::env::var("SILT_BEAUTY_STILLS").ok();
     if let Some(list) = &only {
@@ -763,8 +769,8 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
         let z = drive.world.vehicle.pos.z;
         for (k, (at, name, cam)) in stills.iter().enumerate() {
             if !saved[k] && z >= *at {
-                renderer.sun_override =
-                    (*name == "puddle-side").then(|| beauty_puddle_side_sun(&drive.world));
+                renderer.sun_override = (*name == "puddle-side" || name.starts_with("scene-"))
+                    .then(|| beauty_puddle_side_sun(&drive.world));
                 let rgba = renderer
                     .draw_with_sheet(
                         &drive.world,
@@ -870,6 +876,19 @@ fn capture_beauty_crust(renderer: &mut Renderer, width: u32, height: u32, dir: &
     };
     let rgba = renderer.draw(&world, cam, None, true).expect("readback");
     let path = dir.join("drying-crust.png");
+    write_png(&path, width, height, &rgba).expect("still");
+    println!("beauty still {}", path.display());
+    // The drying field from the puddle still's low side height and pitch
+    // (lens ~0.75 m up, looking down ~6 degrees), aimed at the field.
+    renderer.sun_override = Some(beauty_puddle_side_sun(&world));
+    let low = CameraPose {
+        eye: Vec3::new(6.2, 0.76, -2.4),
+        target: Vec3::new(0.8, 0.1, 3.4),
+        ortho_width: None,
+    };
+    let rgba = renderer.draw(&world, low, None, true).expect("readback");
+    renderer.sun_override = None;
+    let path = dir.join("scene-crust.png");
     write_png(&path, width, height, &rgba).expect("still");
     println!("beauty still {}", path.display());
 }
@@ -3603,6 +3622,15 @@ fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
     }
     write_png(&parsed.snow_ruts_proof, parsed.width, parsed.height, &rgba)
         .expect("snow ruts still");
+    // The same ruts from the low side pose of the puddle still (beauty scenes).
+    renderer.sun_override = Some(beauty_puddle_side_sun(&world));
+    let rgba = renderer
+        .draw(&world, beauty_puddle_side_camera(&world), None, true)
+        .expect("readback");
+    renderer.sun_override = None;
+    let side = parsed.snow_ruts_proof.with_file_name("scene-snow.png");
+    write_png(&side, parsed.width, parsed.height, &rgba).expect("snow side still");
+    println!("beauty still {}", side.display());
     println!(
         "snow-ruts {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2}) niva=({:.2},{:.2},{:.2})",
         parsed.snow_ruts_proof.display(),

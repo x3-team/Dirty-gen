@@ -1678,8 +1678,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let film_in = smoothstep(0.0005, 0.003, film_t);
         // Same grain, darker: wet sand at ~0.55 of the dry albedo, barely
         // more saturated, no brown cast (the old multiplier read as murk).
-        let wet_col = max(mix(vec3<f32>(wet_lum), albedo, 1.05), vec3<f32>(0.0))
-            * mix(vec3<f32>(0.57, 0.55, 0.52), vec3<f32>(0.78, 0.76, 0.71), film_in);
+        let wet_col = max(mix(vec3<f32>(wet_lum), albedo, mix(1.05, 1.06, film_in)), vec3<f32>(0.0))
+            * mix(vec3<f32>(0.57, 0.55, 0.52), vec3<f32>(0.8, 0.77, 0.71), film_in);
         albedo = mix(albedo, wet_col, soak);
         // A thin pale line of dried silt right where the film runs out, on
         // the land side only, broken along its length.
@@ -1842,6 +1842,35 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (frame.debug.x > 8.5) {
         // 9: soil kind 10 (r), film 0-2 cm (g), albedo luminance (b).
         return vec4<f32>(select(0.0, 1.0, kind == 10u), clamp((film_c.r + film_c.g) * 50.0, 0.0, 1.0), dot(albedo, vec3<f32>(0.33)), 1.0);
+    }
+    // ---- Requested contract fields (docs/beauty/CONTRACT_REQUESTS.md). Dark
+    // until the solver publishes them: both readers return 0 today.
+    // Soil seams: blend the ground layers by the published fractions, and
+    // the seam stays wet where the moisture map says so.
+    let soil_mix = bc_soil_mix(xz);
+    let mix_sum = dot(soil_mix, vec4<f32>(1.0));
+    if (mix_sum > 0.01) {
+        let fr = soil_mix / max(mix_sum, 1.0);
+        let c_mud = textureSampleLevel(ground_diff, ground_samp, layer_uv(5, xz), 5, 0.0).rgb;
+        let c_grass = textureSampleLevel(ground_diff, ground_samp, layer_uv(3, xz), 3, 0.0).rgb;
+        let c_sand = textureSampleLevel(ground_diff, ground_samp, layer_uv(6, xz), 6, 0.0).rgb;
+        let c_grav = textureSampleLevel(ground_diff, ground_samp, layer_uv(4, xz), 4, 0.0).rgb;
+        let seam_col = c_mud * fr.x + c_grass * fr.y + c_sand * fr.z + c_grav * fr.w;
+        let seam_wet = smoothstep(0.6, 0.95, bc_moisture(xz, 0.0));
+        albedo = mix(albedo, seam_col * mix(1.0, 0.55, seam_wet), min(mix_sum, 1.0));
+        rough_out = mix(rough_out, 0.35, seam_wet * fr.x);
+    }
+    // Snow: depth covers the ground, compaction turns fresh powder into
+    // grey packed snow with a satin sheen, the belly scrape shows ice.
+    let snow_c = bc_snow(xz);
+    if (snow_c.r > 0.0) {
+        let cover = smoothstep(0.0, 0.03, snow_c.r);
+        let fresh = vec3<f32>(0.86, 0.89, 0.93);
+        let packed = vec3<f32>(0.62, 0.66, 0.71);
+        let scrape = smoothstep(0.0, 0.02, snow_c.a);
+        albedo = mix(albedo, mix(mix(fresh, packed, snow_c.b), vec3<f32>(0.55, 0.6, 0.66), scrape), cover);
+        rough_out = mix(rough_out, mix(mix(0.9, 0.55, snow_c.b), 0.25, scrape), cover);
+        n = normalize(mix(n, n_geo, cover * 0.6));
     }
     let lit = shade_pbr(in.world, n, albedo, rough_out, 0.0, mix(1.0, ao, 0.6) * niva_ground_ao(in.world), emit);
     return present(lit);
@@ -2581,7 +2610,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let wp = vec2<f32>(-wd.y, wd.x);
     var wg = vec2<f32>(0.0);
     let lens_d = length(in.world - frame.cam_pos.xyz);
-    let near_k = mix(0.8, 1.0, smoothstep(1.5, 5.0, lens_d));
+    // Calmer far off: the stretched crests drew the sky mirror as long streaks.
+    let near_k = mix(1.0, 0.45, smoothstep(4.0, 9.0, lens_d));
     for (var o: i32 = 0; o < 3; o = o + 1) {
         let fo = f32(o);
         let f_along = 16.0 * pow(2.5, fo);
@@ -2729,7 +2759,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // F_AB of bevy_pbr at that roughness, which falls well under the smooth
     // Schlick value at a grazing look.
     let w_rough = (mix(0.14, 0.08, smoothstep(0.01, 0.08, depth)) * mix(0.8, 1.2, gust) + near_tire * 0.15)
-        * mix(1.0, 0.55, smoothstep(3.0, 7.0, length(in.world - frame.cam_pos.xyz)));
+        * mix(1.0, 0.9, smoothstep(3.0, 7.0, length(in.world - frame.cam_pos.xyz)))
+        // Specular AA: roughen by how much the normal turns across the pixel.
+        + min(length(fwidth(nrm)) * 1.5, 0.25);
     let w_ab = F_AB(w_rough, ndv);
     // Capped: a turbid, rippled sheet never turns into a full mirror even
     // at the far grazing end.
@@ -2744,7 +2776,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // and the car (FluidNinja's light grazing shallows). Only the last
     // millimetres of film at the edge thin it out.
     let fres = min((0.02 * w_ab.x + w_ab.y) * mix(1.0, 1.6, far_k), 0.95) * (1.0 - 0.6 * collar_t)
-        * mix(0.25, 1.0, smoothstep(0.003, 0.012, depth));
+        * mix(0.25, 1.0, smoothstep(0.003, 0.012, depth))
+        // The near shallows are looked into: the sky film greyed the sand.
+        * mix(0.6, 1.0, far_k);
     let refl_dir = reflect(-view, nrm);
     // The sky the water mirrors is the sky drawn behind it, at full radiance.
     // Same grade as the backdrop sky, so the mirror is not brighter than
@@ -2803,7 +2837,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let ndl_w = clamp(dot(nrm, sun), 0.0, 1.0);
     // Backlit: the sun sits behind the car, so a glint near the lens burns
     // the foreground white; keep it to the far water.
-    let glint = ggx_d(ndh, 0.035) * 0.008 * ndl_w * shadow * calm * mix(0.1, 1.0, smoothstep(2.5, 7.0, cam_d));
+    let g_a = clamp(0.035 + length(fwidth(nrm)) * 3.0, 0.035, 0.45);
+    let glint = ggx_d(ndh, g_a) * 0.008 * (0.035 / g_a) * ndl_w * shadow * calm * mix(0.1, 1.0, smoothstep(2.5, 7.0, cam_d));
     let sun_spec = frame.sun_color.rgb * min(glint, 40.0);
 
     // Foam is the published fraction (Froude above 0.85). It is broken into

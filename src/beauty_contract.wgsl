@@ -592,3 +592,29 @@ fn bc_foam_soft(xz: vec2<f32>) -> vec2<f32> {
     }
     return acc / 256.0;
 }
+
+// ---- Requested fields, not in contract v2 yet (docs/beauty/CONTRACT_REQUESTS.md).
+// The bits are reserved here so the readers below compile and stay dark:
+// until the header sets them, every reader returns 0 and nothing is drawn.
+const BC_VALID_SNOW: u32 = 2048u;      // bit 11, requested binding 12
+const BC_VALID_SOIL_MIX: u32 = 4096u;  // bit 12, requested binding 13
+
+// Requested binding 12, rgba32float on the ground grid: R snow depth (m),
+// G density (kg/m3), B compaction 0..1 (fresh 0, packed by a tire 1),
+// A belly scrape depth (m) where the underbody cut the blanket.
+fn bc_snow(xz: vec2<f32>) -> vec4<f32> {
+    if (!bc_has(BC_VALID_SNOW)) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(0.0);
+}
+
+// Requested binding 13, rgba32float on the ground grid: fractions of mud,
+// grass, sand and gravel in the cell (sum <= 1). Fractions, not a kind id,
+// so a seam between two soils blends over the cells instead of stepping.
+fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
+    if (!bc_has(BC_VALID_SOIL_MIX)) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(0.0);
+}
