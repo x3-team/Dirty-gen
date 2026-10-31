@@ -4,6 +4,9 @@ use std::time::Instant;
 
 use silt::{demo_drive, World};
 
+/// Whole solver frame. Do not raise this.
+const SOLVER_FRAME_BUDGET_MS: f64 = 7.0;
+
 #[test]
 fn baseline_solver_frame() {
     let mut world = World::demo();
@@ -19,8 +22,13 @@ fn baseline_solver_frame() {
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
     eprintln!(
-        "SOLVER_FRAME ms={ms:.3} frames={frames} t={:.2} pos=({:.1},{:.1})",
+        "SOLVER_FRAME ms={ms:.3} budget={SOLVER_FRAME_BUDGET_MS:.0} frames={frames} t={:.2} pos=({:.1},{:.1})",
         world.time, world.vehicle.pos.x, world.vehicle.pos.z
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        ms <= SOLVER_FRAME_BUDGET_MS,
+        "SOLVER_FRAME {ms:.3} ms over {SOLVER_FRAME_BUDGET_MS}"
     );
 
     let mut soil = world.soil.clone();
