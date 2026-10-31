@@ -617,30 +617,45 @@ fn bc_foam_soft(xz: vec2<f32>) -> vec2<f32> {
     return acc / 256.0;
 }
 
-// ---- Requested fields, not in contract v2 yet (docs/beauty/CONTRACT_REQUESTS.md).
-// The bits are reserved here so the readers below compile and stay dark:
-// until the header sets them, every reader returns 0 and nothing is drawn.
-const BC_VALID_SNOW: u32 = 2048u;      // bit 11, requested binding 12
-const BC_VALID_SOIL_MIX: u32 = 4096u;  // bit 12, requested binding 13
+// ---- Fields from Cursor's open contract PRs. Bits and bindings are theirs
+// (docs/beauty/CONTRACT_REQUESTS.md); every reader checks the header
+// version (RENDER_CONTRACT_VERSION) and its valid bit, and returns 0 until
+// the solver sets it. Bindings 12 and 13 are not in main's layout yet, so
+// their textures are declared when those PRs land; until then the readers
+// stay dark.
+const BC_VALID_TURBIDITY: u32 = 2048u; // 1 << 11, #99 (v3): binding 4 A
+const BC_VALID_MIX: u32 = 4096u;       // 1 << 12, #107 (v6): binding 13
+const BC_VALID_FOG: u32 = 8192u;       // 1 << 13, #106 (v5): binding 12, 3D
 
-// Requested binding 12, rgba32float on the ground grid: R snow depth (m),
-// G density (kg/m3), B compaction 0..1 (fresh 0, packed by a tire 1),
-// A belly scrape depth (m) where the underbody cut the blanket.
+// Suspended solids in the water, 0..1 (contract v3, binding 4 A).
+fn bc_turbidity(xz: vec2<f32>) -> f32 {
+    if (bc_header.version < 3u || !bc_has(BC_VALID_TURBIDITY)) {
+        return 0.0;
+    }
+    return clamp(bc_bilinear(bc_flow_tex, xz).a, 0.0, 1.0) * bc_inside(xz);
+}
+
+// Snow column (#105): height m, density kg/m3, compaction 0..1. That PR
+// still names binding 12 / bit 11, which fog (#106) and turbidity (#99)
+// hold; dark until #105 is rebased onto its own binding and bit.
 fn bc_snow(xz: vec2<f32>) -> vec4<f32> {
-    if (!bc_has(BC_VALID_SNOW)) {
+    return vec4<f32>(0.0);
+}
+
+// Material shares (#107, v6, binding 13): R mud, G sand, B gravel, A grass.
+fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
+    if (bc_header.version < 6u || !bc_has(BC_VALID_MIX)) {
         return vec4<f32>(0.0);
     }
     return vec4<f32>(0.0);
 }
 
-// Requested binding 13, rgba32float on the ground grid: fractions of mud,
-// grass, sand and gravel in the cell (sum <= 1). Fractions, not a kind id,
-// so a seam between two soils blends over the cells instead of stepping.
-fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
-    if (!bc_has(BC_VALID_SOIL_MIX)) {
-        return vec4<f32>(0.0);
+// Solver water fog (#106, v5, binding 12), volume fraction on the air grid.
+fn bc_fog_water(p: vec3<f32>) -> f32 {
+    if (bc_header.version < 5u || !bc_has(BC_VALID_FOG)) {
+        return 0.0;
     }
-    return vec4<f32>(0.0);
+    return 0.0;
 }
 
 // Free-surface height, ground + water + slurry, through one 3 x 3 binomial.

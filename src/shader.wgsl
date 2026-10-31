@@ -1909,12 +1909,13 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let soil_mix = bc_soil_mix(xz);
     let mix_sum = dot(soil_mix, vec4<f32>(1.0));
     if (mix_sum > 0.01) {
+        // #107 order: R mud, G sand, B gravel, A grass.
         let fr = soil_mix / max(mix_sum, 1.0);
         let c_mud = textureSampleLevel(ground_diff, ground_samp, layer_uv(5, xz), 5, 0.0).rgb;
-        let c_grass = textureSampleLevel(ground_diff, ground_samp, layer_uv(3, xz), 3, 0.0).rgb;
         let c_sand = textureSampleLevel(ground_diff, ground_samp, layer_uv(6, xz), 6, 0.0).rgb;
         let c_grav = textureSampleLevel(ground_diff, ground_samp, layer_uv(4, xz), 4, 0.0).rgb;
-        let seam_col = c_mud * fr.x + c_grass * fr.y + c_sand * fr.z + c_grav * fr.w;
+        let c_grass = textureSampleLevel(ground_diff, ground_samp, layer_uv(3, xz), 3, 0.0).rgb;
+        let seam_col = c_mud * fr.x + c_sand * fr.y + c_grav * fr.z + c_grass * fr.w;
         let seam_wet = smoothstep(0.6, 0.95, bc_moisture(xz, 0.0));
         albedo = mix(albedo, seam_col * mix(1.0, 0.55, seam_wet), min(mix_sum, 1.0));
         rough_out = mix(rough_out, 0.35, seam_wet * fr.x);
@@ -2643,7 +2644,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         nrm = select(normalize(mix(nrm, c_n2, inside)), c_n2, inside > 0.99);
     }
     let depth = mix(in.depth, column_c, inside);
-    let slurry_frac = select(0.0, film_c.g / max(column_c, 1e-4), column_c > 1e-4) * inside;
+    // Murk from the published slurry fraction and, with contract v3, the
+    // suspended solids the wheels lift (binding 4 A).
+    let slurry_frac = max(select(0.0, film_c.g / max(column_c, 1e-4), column_c > 1e-4) * inside, bc_turbidity(xz));
     // Published flow (binding 4). A still pool publishes ~0; until contract
     // v3 the drift direction is taken down the gradient of the published
     // water depth (deep to shallow), a few cm/s, only for the ripple drift.
