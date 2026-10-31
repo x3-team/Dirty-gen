@@ -22,6 +22,8 @@ struct Frame {
     snow_arc: vec4<f32>,
     snow_arc2: vec4<f32>,
     snow_profile: array<vec4<f32>, 8>,
+    reflect_view_proj: mat4x4<f32>,
+    reflect_flags: vec4<f32>,
 }
 
 struct Model {
@@ -61,6 +63,7 @@ struct Model {
 @group(1) @binding(10) var scene_color: texture_2d<f32>;
 @group(1) @binding(11) var scene_depth: texture_2d<f32>;
 @group(1) @binding(12) var scene_samp: sampler;
+@group(1) @binding(13) var pool_reflect_tex: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -781,6 +784,13 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     var n = terrain_normal(xz);
+    if (win_demo_flat_terrain() && win_demo_in_pool(xz) && n.y > 0.62) {
+        discard;
+    }
+    let demo_seam_early = win_demo_flat_terrain() && distance(xz, beauty_seam_center()) < 3.35;
+    if (demo_seam_early && n.y < 0.58) {
+        discard;
+    }
     // The rut keeps the kind the solver wrote. A wet-mud pad on the cover
     // was a flat card in the groove behind the tire.
     let kind = kind_nearest(xz);
@@ -1237,6 +1247,65 @@ fn scene_uv_from_world(p: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
 }
 
+fn pool_reflect_ready() -> bool {
+    return win_demo_flat_terrain() && (u32(frame.misc.w) & 8u) != 0u;
+}
+
+fn pool_reflect_geom_pass() -> bool {
+    return (u32(frame.misc.w) & 16u) != 0u;
+}
+
+fn pool_reflect_mirror_world(world: vec4<f32>) -> vec4<f32> {
+    if (!pool_reflect_geom_pass()) {
+        return world;
+    }
+    let plane = win_demo_pool_level();
+    var p = world;
+    p.y = 2.0 * plane - p.y;
+    return p;
+}
+
+fn pool_reflect_uv(x: f32, z: f32) -> vec2<f32> {
+    let level = win_demo_pool_level();
+    let clip = frame.view_proj * vec4<f32>(x, level, z, 1.0);
+    if (clip.w <= 0.02) {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    var uv = clip.xy / clip.w;
+    return vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
+}
+
+fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
+    if (uv.x < 0.005 || uv.x > 0.995 || uv.y < 0.005 || uv.y > 0.995) {
+        return vec3<f32>(0.0);
+    }
+    return textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
+}
+
+// Win-demo pool: sample the mirrored-geometry pass (Niva + sky), not SSR over terrain.
+fn pool_planar_reflect_sample(world: vec3<f32>) -> vec3<f32> {
+    if (!pool_reflect_ready()) {
+        return vec3<f32>(0.0);
+    }
+    var center = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        center += frame.tires[i * 2u].xyz;
+    }
+    center = center * 0.25 + vec3<f32>(0.0, 0.68, 0.0);
+    let uv_plane = pool_reflect_uv(world.x, world.z);
+    let uv_body = pool_reflect_uv(center.x, center.z);
+    let s_plane = pool_reflect_tex_sample(uv_plane);
+    let s_body = pool_reflect_tex_sample(uv_body);
+    let under = smoothstep(0.95, 0.18, distance(world.xz, center.xz));
+    if (under > 0.45 && length(s_body) > 0.03) {
+        return s_body;
+    }
+    if (length(s_plane) > 0.03) {
+        return s_plane;
+    }
+    return s_body;
+}
+
 // wgpu water.wgsl-style screen reflection: march in reflection direction and
 // sample the pre-water colour buffer (Niva + sky already drawn).
 fn pool_scene_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
@@ -1567,7 +1636,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
         let rip = ripple_height(in.xz, t) * 0.004 * (1.0 - calm * 0.85);
         let bow = max(beauty_bow_wave(in.xz, t), 0.0);
         let driven = smoothstep(4.0, 5.5, t);
-        var y = level + rip + bow * (0.08 + driven * 0.62);
+        var y = level + rip + bow * (0.022 + driven * 1.05);
         y = win_demo_clamp_surface_y(in.xz, y);
         var o: WaterOut;
         o.clip = frame.view_proj * vec4<f32>(in.xz.x, y, in.xz.y, 1.0);
@@ -1644,6 +1713,38 @@ fn shade_seam_pool(
         let driven = smoothstep(4.0, 5.5, t);
         let ripple_mix = clamp(0.12 + max(bow, 0.0) * 3.2 * (0.35 + driven * 0.65), 0.12, 0.58);
         nrm = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), nrm, ripple_mix));
+        if (nrm.y < 0.52) {
+            discard;
+        }
+        let view = normalize(frame.cam_pos.xyz - in.world);
+        let sun = normalize(frame.sun_dir.xyz);
+        let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
+        let fres = schlick_fresnel(ndotv);
+        let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
+        let water_tint = vec3<f32>(0.05, 0.34, 0.52);
+        let body = water_tint * (0.12 + 0.88 * ndl);
+        var reflect_col = pool_planar_reflect_sample(in.world);
+        let refl_dir = reflect(-view, nrm);
+        if (length(reflect_col) < 0.02) {
+            reflect_col = sky_reflect(refl_dir);
+        }
+        let fres_w = clamp(fres * 0.28 + 0.94, 0.0, 1.0);
+        var col = reflect_col * (0.08 + 0.92 * fres_w) + body * (1.0 - fres_w) * 0.12;
+        let bow_foam = max(beauty_bow_wave(xz, t), 0.0) * smoothstep(4.0, 5.5, t) * 2.4;
+        col = mix(col, vec3<f32>(0.90, 0.94, 0.98), clamp(bow_foam, 0.0, 1.0) * 0.55);
+        let halfv = normalize(sun + view);
+        let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), 128.0);
+        col += vec3<f32>(0.82, 0.88, 0.96) * sheen * 0.08;
+        let c = beauty_seam_center();
+        let dx = (xz.x - c.x) / 1.32;
+        let dz = (xz.y - c.y) / 1.02;
+        let r = sqrt(dx * dx + dz * dz);
+        let edge_a = smoothstep(1.26, 0.68, r);
+        let core_a = smoothstep(1.05, 0.42, r);
+        let alpha = max(edge_a * 0.92, core_a * 0.97);
+        let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
+        let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+        return vec4<f32>(gamma, alpha);
     }
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
@@ -1658,74 +1759,41 @@ fn shade_seam_pool(
     let water_tint = vec3<f32>(0.05, 0.34, 0.52);
     let water_deep = vec3<f32>(0.02, 0.16, 0.30);
     var body = mix(water_tint, water_deep, deep);
-    if (win_demo_flat_terrain()) {
-        let absorb = exp(-thickness * vec3<f32>(0.75, 0.16, 0.08));
-        body = mix(mix(bed * vec3<f32>(0.55, 0.45, 0.34), water_tint, 0.45), water_deep, deep);
-        body *= 0.35 + 0.65 * absorb;
-    } else {
-        body = mix(mix(bed * vec3<f32>(0.42, 0.34, 0.26), water_tint * 0.62, 0.55), body, 1.0 - shallow * 0.35);
-    }
+    body = mix(mix(bed * vec3<f32>(0.42, 0.34, 0.26), water_tint * 0.62, 0.55), body, 1.0 - shallow * 0.35);
     body *= 0.22 + 0.88 * ndl;
     let refl_dir = reflect(-view, nrm);
     var reflect_col = pool_scene_reflect(in.world, nrm, view);
     let ibl = sky_reflect(refl_dir);
     let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 96.0);
-    let ibl_mix = select(0.52, 0.18, win_demo_flat_terrain());
-    reflect_col = mix(reflect_col, ibl * 1.52 + frame.sun_color.rgb * sun_disk * 0.72, ibl_mix);
+    reflect_col = mix(reflect_col, ibl * 1.52 + frame.sun_color.rgb * sun_disk * 0.72, 0.52);
     let veh_scene = reflect_vehicle_scene(in.world, nrm, view);
     let planar = niva_planar_reflect(in.world, nrm, view);
     if (length(veh_scene) > 0.03) {
-        reflect_col = mix(
-            reflect_col,
-            veh_scene,
-            select(select(0.62, 0.78, ultra), 0.88, win_demo_flat_terrain()),
-        );
+        reflect_col = mix(reflect_col, veh_scene, select(0.62, 0.78, ultra));
     }
     if (length(planar) > 0.02) {
-        reflect_col = mix(
-            reflect_col,
-            planar,
-            select(select(0.48, 0.62, ultra), 0.72, win_demo_flat_terrain()),
-        );
+        reflect_col = mix(reflect_col, planar, select(0.48, 0.62, ultra));
     }
-    var fres_w = clamp(
-        fres * select(0.82, 0.95, ultra) + select(select(0.38, 0.52, ultra), 0.58, win_demo_flat_terrain()),
+    let fres_w = clamp(
+        fres * select(0.82, 0.95, ultra) + select(0.38, 0.52, ultra),
         0.0,
         1.0,
     );
-    if (win_demo_flat_terrain() && body_cover(xz) > 0.08) {
-        fres_w = max(fres_w, 0.90);
-    }
     var col = mix(body, reflect_col, fres_w);
-    if (win_demo_flat_terrain()) {
-        let g = length(solver_column_grad(xz));
-        let shore_foam = smoothstep(0.08, 0.22, thickness) * (1.0 - smoothstep(0.22, 0.32, thickness));
-        let edge_foam = smoothstep(0.04, 0.14, g);
-        let bow_foam = max(beauty_bow_wave(xz, t), 0.0) * smoothstep(4.0, 5.5, t) * 2.2;
-        let foam = clamp(shore_foam * 0.55 + edge_foam * 0.35 + bow_foam, 0.0, 1.0);
-        col = mix(col, vec3<f32>(0.90, 0.94, 0.98), foam * 0.62);
-    }
+    let g = length(solver_column_grad(xz));
+    let shore_foam = smoothstep(0.08, 0.22, thickness) * (1.0 - smoothstep(0.22, 0.32, thickness));
+    let edge_foam = smoothstep(0.04, 0.14, g);
+    let foam = clamp(shore_foam * 0.55 + edge_foam * 0.35, 0.0, 1.0);
+    col = mix(col, vec3<f32>(0.90, 0.94, 0.98), foam * 0.62);
     let shore_wet = smoothstep(0.11, 0.018, column_here) * (1.0 - smoothstep(0.0, 0.012, column_here));
     col = mix(col, mix(bed * vec3<f32>(0.28, 0.22, 0.16), col, 0.55), shore_wet * 0.45);
-    // Ripples and bow live in puddle_normal only — emissive rings read as red/black bands.
     let halfv = normalize(sun + view);
     let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), select(64.0, 128.0, ultra));
-    col += vec3<f32>(0.82, 0.88, 0.96) * sheen * select(select(0.22, 0.38, ultra), 0.10, win_demo_flat_terrain());
+    col += vec3<f32>(0.82, 0.88, 0.96) * sheen * select(0.22, 0.38, ultra);
     var edge_a = smoothstep(0.0, 0.016, column_here);
-    if (win_demo_flat_terrain()) {
-        edge_a = max(edge_a, smoothstep(0.0, 0.04, thickness));
-    }
     col = mix(mix(bed * vec3<f32>(0.36, 0.30, 0.24), col, 0.65), col, edge_a);
     var alpha = mix(0.76, 0.91, deep) * edge_a;
     alpha = max(alpha, select(0.74, 0.82, ultra) * edge_a);
-    if (win_demo_flat_terrain()) {
-        let c = beauty_seam_center();
-        let dx = (xz.x - c.x) / 1.32;
-        let dz = (xz.y - c.y) / 1.02;
-        let r = sqrt(dx * dx + dz * dz);
-        alpha = max(alpha, smoothstep(1.22, 0.42, r) * 0.92);
-        alpha = max(alpha, 0.86);
-    }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(gamma, alpha);
@@ -2042,11 +2110,16 @@ fn tread_recess(pos: vec3<f32>, panel: f32) -> f32 {
 @vertex
 fn vs_mesh(in: MeshIn) -> MeshOut {
     let pos = displace_mesh(in.pos, in.nrm, in.uv, in.panel);
-    let world = model.world * vec4<f32>(pos, 1.0);
+    var world = model.world * vec4<f32>(pos, 1.0);
+    world = pool_reflect_mirror_world(world);
     var o: MeshOut;
     o.clip = frame.view_proj * world;
     o.world = world.xyz;
-    o.nrm = normalize((model.world * vec4<f32>(in.nrm, 0.0)).xyz);
+    var nrm = normalize((model.world * vec4<f32>(in.nrm, 0.0)).xyz);
+    if (pool_reflect_geom_pass()) {
+        nrm.y = -nrm.y;
+    }
+    o.nrm = nrm;
     o.uv = in.uv;
     o.panel = in.panel;
     o.recess = tread_recess(pos, in.panel);

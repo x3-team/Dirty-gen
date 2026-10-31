@@ -42,6 +42,8 @@ struct FrameData {
     snow_arc: [f32; 4],
     snow_arc2: [f32; 4],
     snow_profile: [[f32; 4]; 8],
+    reflect_view_proj: [[f32; 4]; 4],
+    reflect_flags: [f32; 4],
 }
 
 #[repr(C)]
@@ -80,8 +82,14 @@ pub struct Renderer {
     color_view: wgpu::TextureView,
     scene_color: wgpu::Texture,
     scene_color_view: wgpu::TextureView,
+    reflect_color: wgpu::Texture,
+    reflect_color_view: wgpu::TextureView,
+    reflect_rt: wgpu::Texture,
+    reflect_rt_view: wgpu::TextureView,
     scene_depth: wgpu::Texture,
     scene_depth_view: wgpu::TextureView,
+    reflect_depth: wgpu::Texture,
+    reflect_depth_view: wgpu::TextureView,
     scene_samp: wgpu::Sampler,
     tex_bgl: wgpu::BindGroupLayout,
     depth: wgpu::Texture,
@@ -376,6 +384,7 @@ impl Renderer {
                     count: None,
                 },
                 filter_samp(12, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(13, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -682,8 +691,18 @@ impl Renderer {
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
             make_targets(&device, width, height, formats.depth);
-        let (scene_color, scene_color_view, scene_depth, scene_depth_view) =
-            make_scene_targets(&device, width, height);
+        let (
+            scene_color,
+            scene_color_view,
+            reflect_color,
+            reflect_color_view,
+            reflect_rt,
+            reflect_rt_view,
+            scene_depth,
+            scene_depth_view,
+            reflect_depth,
+            reflect_depth_view,
+        ) = make_scene_targets(&device, width, height, formats.depth);
         let scene_samp = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scene-samp"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -707,6 +726,7 @@ impl Renderer {
             &scene_color_view,
             &scene_depth_view,
             &scene_samp,
+            &reflect_color_view,
         );
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
@@ -786,7 +806,7 @@ impl Renderer {
                 wgpu::CompareFunction::Less,
             )),
             true,
-            None,
+            Some(wgpu::Face::Back),
         );
         let pipe_mesh = pipeline(
             &device,
@@ -1075,8 +1095,14 @@ impl Renderer {
             color_view,
             scene_color,
             scene_color_view,
+            reflect_color,
+            reflect_color_view,
+            reflect_rt,
+            reflect_rt_view,
             scene_depth,
             scene_depth_view,
+            reflect_depth,
+            reflect_depth_view,
             scene_samp,
             tex_bgl,
             depth,
@@ -1271,6 +1297,11 @@ impl Renderer {
             Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
         };
         let view_proj = proj * view;
+        let reflect_view_proj = if self.win_demo_still && !self.snow {
+            Some(win_demo_reflect_view_proj(cam, proj))
+        } else {
+            None
+        };
         // The window keeps the low sun. Persist stills ask for daylight.
         let sun = if self.daylight {
             Vec3::new(0.38, 0.88, 0.18).normalize()
@@ -1332,14 +1363,21 @@ impl Renderer {
                 if self.height_packed { 1.0 } else { 0.0 },
                 (if self.water_column { 1.0 } else { 0.0 })
                     + (if self.puddle_beauty { 2.0 } else { 0.0 })
-                    + (if self.win_demo_still { 4.0 } else { 0.0 }),
+                    + (if self.win_demo_still { 4.0 } else { 0.0 })
+                    + (if reflect_view_proj.is_some() { 8.0 } else { 0.0 }),
             ],
             tires: tire_frame(&world.vehicle),
             snow_arc: [0.0; 4],
             snow_arc2: [1.0, 0.0, 0.0, 0.0],
             snow_profile: [[0.0; 4]; 8],
+            reflect_view_proj: [[0.0; 4]; 4],
+            reflect_flags: [0.0; 4],
         };
         let mut frame = frame;
+        if let Some(reflect_vp) = reflect_view_proj {
+            frame.reflect_view_proj = reflect_vp.to_cols_array_2d();
+            frame.reflect_flags = [1.0, 0.0, 0.0, 0.0];
+        }
         if self.snow {
             if let Some(arc) = self.snow_arc {
                 frame.snow_arc = [arc.center.x, arc.center.y, arc.sweep, arc.r_lo];
@@ -1514,26 +1552,75 @@ impl Renderer {
             }
         }
         if water_ssr {
-            let extent = wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            };
-            encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &self.color,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyTexture {
-                    texture: &self.scene_color,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                extent,
-            );
+            let main_frame = frame;
+            if self.win_demo_still {
+                self.encode_win_demo_pool_reflect(
+                    &mut encoder,
+                    reflect_view_proj.expect("win demo reflect vp"),
+                    main_frame,
+                );
+                let extent = wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                };
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.reflect_rt,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.reflect_color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.reflect_rt,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.scene_color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+                self.queue.write_buffer(
+                    &self.frame_buf,
+                    0,
+                    bytemuck::bytes_of(&main_frame),
+                );
+            } else {
+                let extent = wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                };
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.scene_color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main-water"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1855,6 +1942,50 @@ impl Renderer {
         }
     }
 
+    fn encode_win_demo_pool_reflect(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        reflect_view_proj: Mat4,
+        mut reflect_frame: FrameData,
+    ) {
+        reflect_frame.misc[3] += 16.0;
+        self.queue
+            .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&reflect_frame));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("win-demo-pool-reflect"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.reflect_rt_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.reflect_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, &self.frame_bg, &[]);
+        pass.set_pipeline(&self.pipe_sky);
+        pass.draw(0..3, 0..1);
+        pass.set_bind_group(1, &self.tex_bg, &[]);
+        pass.set_pipeline(&self.pipe_mesh);
+        pass.set_bind_group(3, &self.paint_bg, &[]);
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        self.draw_vehicle(&mut pass);
+        pass.set_pipeline(&self.pipe_mesh_blend);
+        pass.set_bind_group(3, &self.paint_bg, &[]);
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        self.draw_glass(&mut pass);
+    }
+
     fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>) {
         let (body, wheels) = if self.niva_picture {
             (&self.niva_body, &self.niva_wheels)
@@ -1941,6 +2072,15 @@ impl Renderer {
         pass.set_index_buffer(self.dust_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
+}
+
+fn win_demo_reflect_view_proj(cam: CameraPose, proj: Mat4) -> Mat4 {
+    let plane = 0.22_f32;
+    let flip = |p: Vec3| Vec3::new(p.x, 2.0 * plane - p.y, p.z);
+    let eye = flip(cam.eye);
+    let target = flip(cam.target);
+    let view = Mat4::look_at_rh(eye, target, Vec3::new(0.0, -1.0, 0.0));
+    proj * view
 }
 
 fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
@@ -2444,7 +2584,14 @@ fn make_scene_targets(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    depth_format: wgpu::TextureFormat,
 ) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
     wgpu::Texture,
     wgpu::TextureView,
     wgpu::Texture,
@@ -2462,10 +2609,34 @@ fn make_scene_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let scene_color_view = scene_color.create_view(&Default::default());
+    let reflect_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-color"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let reflect_color_view = reflect_color.create_view(&Default::default());
+    let reflect_rt = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-rt"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let reflect_rt_view = reflect_rt.create_view(&Default::default());
     let scene_depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("scene-depth"),
         size,
@@ -2477,7 +2648,29 @@ fn make_scene_targets(
         view_formats: &[],
     });
     let scene_depth_view = scene_depth.create_view(&Default::default());
-    (scene_color, scene_color_view, scene_depth, scene_depth_view)
+    let reflect_depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: depth_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let reflect_depth_view = reflect_depth.create_view(&Default::default());
+    (
+        scene_color,
+        scene_color_view,
+        reflect_color,
+        reflect_color_view,
+        reflect_rt,
+        reflect_rt_view,
+        scene_depth,
+        scene_depth_view,
+        reflect_depth,
+        reflect_depth_view,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2497,6 +2690,7 @@ fn build_tex_bg(
     scene_color_view: &wgpu::TextureView,
     scene_depth_view: &wgpu::TextureView,
     scene_samp: &wgpu::Sampler,
+    pool_reflect_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tex-bg"),
@@ -2561,6 +2755,10 @@ fn build_tex_bg(
             wgpu::BindGroupEntry {
                 binding: 12,
                 resource: wgpu::BindingResource::Sampler(scene_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(pool_reflect_view),
             },
         ],
     })

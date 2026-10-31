@@ -1077,7 +1077,7 @@ fn win_demo_pool_surface_y() -> f32 {
 fn win_demo_hub_on_water(_sink: f32) -> f32 {
     use silt::vehicle::WHEEL_RADIUS;
     // Hub height so the mesh contact patch meets the flat pool plane (not bowl bed).
-    win_demo_pool_surface_y() + WHEEL_RADIUS - 0.034
+    win_demo_pool_surface_y() + WHEEL_RADIUS - 0.098
 }
 
 fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
