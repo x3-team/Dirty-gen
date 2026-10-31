@@ -1,0 +1,57 @@
+name: demo-win
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Smoke launch
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath ".\target\release\silt.exe" -ArgumentList "--win-demo" -PassThru
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            Write-Error "silt.exe exited early with code $($proc.ExitCode)"
+            exit 1
+          }
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "smoke ok pid=$($proc.Id)"
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item target\release\silt.exe pkg\
+          @"
+          Silt — Niva Windows demo
+
+          Run: silt.exe --win-demo
+          WASD drive, R reset, mouse orbit, wheel zoom.
+          "@ | Set-Content -Encoding utf8 pkg\README.txt
+          Compress-Archive -Path pkg\* -DestinationPath silt-win-demo.zip -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: demo-win-${{ github.run_number }}-${{ github.sha }}
+          name: Windows Niva demo ${{ github.run_number }}
+          body: |
+            Playable Windows build from workflow run ${{ github.run_number }}.
+            Launch with `silt.exe --win-demo`.
+            WASD drive, R reset, mouse orbit, wheel zoom.
+          files: silt-win-demo.zip
+          make_latest: false

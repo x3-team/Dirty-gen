@@ -17,7 +17,7 @@ use web_time::Instant;
 use glam::Vec3;
 use silt::world::{demo_camera, demo_drive, demo_drive_bike, CameraPose, Input, World};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -33,7 +33,7 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     {
         console_error_panic_hook::set_once();
-        run_window();
+        run_window(false);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -42,10 +42,25 @@ fn main() {
         if args.next().as_deref() == Some("capture") {
             let rest: Vec<String> = args.collect();
             capture(&rest);
+        } else if std::env::args().any(|a| a == "--win-demo-shot") {
+            capture_win_demo_stills();
+        } else if win_demo_enabled() {
+            run_window(true);
         } else {
-            run_window();
+            run_window(false);
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn win_demo_enabled() -> bool {
+    std::env::var("SILT_WIN_DEMO").ok().as_deref() == Some("1")
+        || std::env::args().any(|a| a == "--win-demo")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn win_demo_enabled() -> bool {
+    false
 }
 
 struct Keys {
@@ -88,8 +103,12 @@ struct App {
     keys: Keys,
     orbit_yaw: f32,
     orbit_pitch: f32,
+    orbit_dist: f32,
     chase_cam: bool,
     drive_bike: bool,
+    win_demo: bool,
+    mouse_orbit: bool,
+    last_cursor: Option<(f64, f64)>,
     /// Set once the player presses a drive key. Until then both vehicles run
     /// the scripted lap. After that, the selected one takes the keys and the
     /// other keeps the lap.
@@ -132,9 +151,16 @@ impl ApplicationHandler for App {
                 }
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
-                        PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
-                        PhysicalKey::Code(KeyCode::Backspace) => self.world.reset_vehicle(),
+                        PhysicalKey::Code(KeyCode::KeyC) if !self.win_demo => {
+                            self.chase_cam = !self.chase_cam
+                        }
+                        PhysicalKey::Code(KeyCode::KeyV) if !self.win_demo => {
+                            self.drive_bike = !self.drive_bike
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) if !self.win_demo => {
+                            self.world.reset_vehicle()
+                        }
+                        PhysicalKey::Code(KeyCode::KeyR) if self.win_demo => self.world.reset_vehicle(),
                         _ => {}
                     }
                 }
@@ -164,12 +190,35 @@ impl ApplicationHandler for App {
                             self.player_drove = true;
                         }
                     }
-                    PhysicalKey::Code(KeyCode::KeyQ) => self.keys.orbit_left = down,
-                    PhysicalKey::Code(KeyCode::KeyE) => self.keys.orbit_right = down,
-                    PhysicalKey::Code(KeyCode::KeyR) => self.keys.orbit_up = down,
-                    PhysicalKey::Code(KeyCode::KeyF) => self.keys.orbit_down = down,
+                    PhysicalKey::Code(KeyCode::KeyQ) if !self.win_demo => self.keys.orbit_left = down,
+                    PhysicalKey::Code(KeyCode::KeyE) if !self.win_demo => self.keys.orbit_right = down,
+                    PhysicalKey::Code(KeyCode::KeyR) if !self.win_demo => self.keys.orbit_up = down,
+                    PhysicalKey::Code(KeyCode::KeyF) if !self.win_demo => self.keys.orbit_down = down,
                     _ => {}
                 }
+            }
+            WindowEvent::MouseInput { state, button, .. } if self.win_demo && button == MouseButton::Left => {
+                self.mouse_orbit = state == ElementState::Pressed;
+                if !self.mouse_orbit {
+                    self.last_cursor = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } if self.win_demo && self.mouse_orbit => {
+                let (x, y) = (position.x, position.y);
+                if let Some((lx, ly)) = self.last_cursor {
+                    let dx = (x - lx) as f32;
+                    let dy = (y - ly) as f32;
+                    self.orbit_yaw += dx * 0.0055;
+                    self.orbit_pitch = (self.orbit_pitch - dy * 0.004).clamp(-0.2, 1.25);
+                }
+                self.last_cursor = Some((x, y));
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.win_demo => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 60.0) as f32,
+                };
+                self.orbit_dist = (self.orbit_dist - scroll * 0.85).clamp(4.5, 18.0);
             }
             WindowEvent::RedrawRequested => self.frame(),
             _ => {}
@@ -190,7 +239,11 @@ impl App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("Silt")
+                        .with_title(if self.win_demo {
+                            "Silt — Niva demo"
+                        } else {
+                            "Silt"
+                        })
                         .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720)),
                 )
                 .expect("window"),
@@ -237,6 +290,15 @@ impl App {
             scene,
         );
         renderer.set_present_format(format);
+        if self.win_demo {
+            renderer.show_props = false;
+            renderer.show_bike = false;
+            renderer.show_hills = false;
+            renderer.show_environment = true;
+            renderer.niva_picture = true;
+            renderer.daylight = true;
+            renderer.water_column = true;
+        }
         self.window = Some(window);
         self.surface = Some(surface);
         self.config = Some(config);
@@ -255,36 +317,43 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.05);
         self.last = now;
-        if self.keys.orbit_left {
-            self.orbit_yaw -= dt * 0.9;
-        }
-        if self.keys.orbit_right {
-            self.orbit_yaw += dt * 0.9;
-        }
-        if self.keys.orbit_up {
-            self.orbit_pitch = (self.orbit_pitch + dt * 0.7).min(1.1);
-        }
-        if self.keys.orbit_down {
-            self.orbit_pitch = (self.orbit_pitch - dt * 0.7).max(-0.35);
+        if !self.win_demo {
+            if self.keys.orbit_left {
+                self.orbit_yaw -= dt * 0.9;
+            }
+            if self.keys.orbit_right {
+                self.orbit_yaw += dt * 0.9;
+            }
+            if self.keys.orbit_up {
+                self.orbit_pitch = (self.orbit_pitch + dt * 0.7).min(1.1);
+            }
+            if self.keys.orbit_down {
+                self.orbit_pitch = (self.orbit_pitch - dt * 0.7).max(-0.35);
+            }
         }
         self.acc += dt;
         let step = 1.0 / 60.0;
         while self.acc >= step {
-            // The page opens on the lap: buggy and bike both chase the loop.
-            // A drive key takes the selected vehicle. The other one stays on
-            // the script, so the track never drops to a single machine.
-            let bike_input = if self.player_drove && self.drive_bike {
-                self.keys.input(self.world.bike.speed())
+            if self.win_demo {
+                let input = self.keys.input(self.world.vehicle.speed());
+                self.world.step(step, &input);
             } else {
-                demo_drive_bike(&self.world)
-            };
-            let buggy_input = if self.player_drove && !self.drive_bike {
-                self.keys.input(self.world.vehicle.speed())
-            } else {
-                demo_drive(&self.world)
-            };
-            self.world.step_bike(step, &bike_input);
-            self.world.step(step, &buggy_input);
+                // The page opens on the lap: buggy and bike both chase the loop.
+                // A drive key takes the selected vehicle. The other one stays on
+                // the script, so the track never drops to a single machine.
+                let bike_input = if self.player_drove && self.drive_bike {
+                    self.keys.input(self.world.bike.speed())
+                } else {
+                    demo_drive_bike(&self.world)
+                };
+                let buggy_input = if self.player_drove && !self.drive_bike {
+                    self.keys.input(self.world.vehicle.speed())
+                } else {
+                    demo_drive(&self.world)
+                };
+                self.world.step_bike(step, &bike_input);
+                self.world.step(step, &buggy_input);
+            }
             self.acc -= step;
         }
         let Some(renderer) = self.renderer.as_mut() else {
@@ -293,19 +362,24 @@ impl App {
         let Some(surface) = self.surface.as_ref() else {
             return;
         };
-        let (cam_pos, cam_yaw) = if self.drive_bike {
-            (self.world.bike.pos, self.world.bike.yaw)
+        let pose = if self.win_demo {
+            let target = self.world.vehicle.pos + Vec3::Y * 0.55;
+            orbit_camera(target, self.orbit_yaw, self.orbit_pitch, self.orbit_dist)
         } else {
-            (self.world.vehicle.pos, self.world.vehicle.yaw)
-        };
-        let pose = if self.chase_cam {
-            chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
-        } else {
-            demo_camera(
-                self.world.time,
-                self.world.vehicle.pos,
-                self.world.vehicle.yaw,
-            )
+            let (cam_pos, cam_yaw) = if self.drive_bike {
+                (self.world.bike.pos, self.world.bike.yaw)
+            } else {
+                (self.world.vehicle.pos, self.world.vehicle.yaw)
+            };
+            if self.chase_cam {
+                chase(cam_pos, cam_yaw, self.orbit_yaw, self.orbit_pitch)
+            } else {
+                demo_camera(
+                    self.world.time,
+                    self.world.vehicle.pos,
+                    self.world.vehicle.yaw,
+                )
+            }
         };
         let pose = lift_camera(&self.world, pose);
         let frame = match surface.get_current_texture() {
@@ -371,6 +445,18 @@ impl App {
     }
 }
 
+fn orbit_camera(target: Vec3, yaw: f32, pitch: f32, distance: f32) -> CameraPose {
+    let pitch = pitch.clamp(-0.2, 1.25);
+    let cp = pitch.cos();
+    let sp = pitch.sin().max(0.05);
+    let offset = Vec3::new(yaw.sin() * cp * distance, sp * distance + 1.4, yaw.cos() * cp * distance);
+    CameraPose {
+        eye: target + offset,
+        target,
+        ortho_width: None,
+    }
+}
+
 fn chase(pos: Vec3, yaw: f32, orbit_yaw: f32, orbit_pitch: f32) -> CameraPose {
     let yaw = yaw + orbit_yaw;
     let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
@@ -424,7 +510,7 @@ fn clear_ortho_eye(world: &World, mut eye: Vec3, target: Vec3, ortho: f32) -> Ve
     eye
 }
 
-fn run_window() {
+fn run_window(win_demo: bool) {
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let app = App {
@@ -432,7 +518,11 @@ fn run_window() {
         surface: None,
         config: None,
         renderer: None,
-        world: World::demo(),
+        world: if win_demo {
+            World::win_demo()
+        } else {
+            World::demo()
+        },
         keys: Keys {
             throttle: false,
             reverse: false,
@@ -443,11 +533,15 @@ fn run_window() {
             orbit_up: false,
             orbit_down: false,
         },
-        orbit_yaw: 0.0,
-        orbit_pitch: 0.0,
-        chase_cam: false,
+        orbit_yaw: if win_demo { 0.55 } else { 0.0 },
+        orbit_pitch: if win_demo { 0.78 } else { 0.0 },
+        orbit_dist: if win_demo { 11.0 } else { 7.4 },
+        chase_cam: win_demo,
         drive_bike: false,
-        player_drove: false,
+        win_demo,
+        mouse_orbit: false,
+        last_cursor: None,
+        player_drove: win_demo,
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
@@ -723,6 +817,46 @@ fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     let path = PathBuf::from(MEDIA).join("slurry-belly-proof.png");
     write_png(&path, width, height, &rgba).expect("belly still");
     println!("belly {}", path.display());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_win_demo_stills() {
+    prepare_software_vulkan();
+    let (_instance, adapter, device, queue) = open_adapter(true, None);
+    let formats = render::gpu_formats(&adapter);
+    let width = 1280_u32;
+    let height = 720_u32;
+    let scene = cc0::load();
+    let mut renderer = Renderer::new(
+        device,
+        queue,
+        adapter.get_info().name,
+        width,
+        height,
+        formats,
+        scene,
+    );
+    renderer.show_props = false;
+    renderer.show_bike = false;
+    renderer.show_hills = false;
+    renderer.niva_picture = true;
+    renderer.daylight = true;
+    renderer.water_column = true;
+    let world = World::win_demo();
+    let media = PathBuf::from(MEDIA).join("win-demo");
+    std::fs::create_dir_all(&media).expect("win-demo dir");
+    let shots = [
+        ("overview.png", 0.55_f32, 0.78, 11.0),
+        ("close.png", 0.35, 0.62, 7.2),
+    ];
+    for (name, yaw, pitch, dist) in shots {
+        let target = world.vehicle.pos + Vec3::Y * 0.55;
+        let pose = lift_camera(&world, orbit_camera(target, yaw, pitch, dist));
+        let rgba = renderer.draw(&world, pose, None, true).expect("win demo still");
+        let path = media.join(name);
+        write_png(&path, width, height, &rgba).expect("win demo png");
+        println!("win demo {}", path.display());
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

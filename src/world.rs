@@ -307,6 +307,18 @@ impl World {
         Self::rest(SoilField::surface_split())
     }
 
+    /// Playable Windows demo: sand, mud, and puddles on a small pad.
+    pub fn win_demo() -> Self {
+        let mut world = Self::rest(SoilField::win_playground());
+        world.bike.pos = Vec3::new(120.0, 0.5, 120.0);
+        world.bike.vel = Vec3::ZERO;
+        world.vehicle.yaw = 0.92;
+        world.vehicle.pos = Vec3::new(0.42, 0.8, 0.08);
+        world.place_on_soil();
+        world.remember_spawn();
+        world
+    }
+
     fn rest(soil: SoilField) -> Self {
         let mut world = Self {
             soil,

@@ -7420,6 +7420,78 @@ impl SoilField {
         field
     }
 
+    /// Flat pad for the Windows playable demo: dry sand on +X, wet mud on −X,
+    /// two shallow puddles in the mud lane.
+    pub fn win_playground() -> Self {
+        let mut field = Self::flat(0.22);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        let puddles = [
+            (-2.35_f32, -0.95_f32, 1.05_f32, 0.72_f32, 0.11_f32),
+            (-2.35_f32, 1.30_f32, 1.05_f32, 0.72_f32, 0.11_f32),
+        ];
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let mut h = field.height[idx];
+                for (cx, cz, rx, rz, depth) in puddles {
+                    h -= bowl(x, z, cx, cz, rx, rz, depth);
+                }
+                field.height[idx] = h;
+                field.bed[idx] = h;
+                field.initial_height[idx] = h;
+            }
+        }
+        let water_line = -0.014;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let h = field.height[idx];
+                let sand = smooth01(-0.25, 0.55, x);
+                let mud = 1.0 - sand;
+                let mut water = 0.0;
+                if h < water_line {
+                    water = (water_line - h).min(0.20);
+                }
+                field.water[idx] = water;
+                if sand > 0.55 {
+                    field.kind[idx] = SurfaceKind::Sand as u8;
+                    field.wetness[idx] = lerp(0.14, 0.24, sand);
+                    field.base_wetness[idx] = 0.12;
+                    field.loose[idx] = 0.008;
+                    field.roughness[idx] = 0.92;
+                    field.darken[idx] = 0.03;
+                } else if mud > 0.55 {
+                    field.kind[idx] = SurfaceKind::WetMud as u8;
+                    field.wetness[idx] = if water > 0.02 {
+                        1.0
+                    } else {
+                        lerp(0.72, 0.88, mud)
+                    };
+                    field.base_wetness[idx] = 0.78;
+                    field.loose[idx] = if water > 0.02 { 0.018 } else { 0.02 };
+                    field.roughness[idx] = 0.42;
+                    field.darken[idx] = 0.10;
+                } else {
+                    field.kind[idx] = SurfaceKind::Undisturbed as u8;
+                    field.wetness[idx] = 0.38;
+                    field.base_wetness[idx] = 0.32;
+                    field.loose[idx] = 0.0;
+                    field.roughness[idx] = 0.78;
+                    field.darken[idx] = 0.05;
+                }
+                let _ = z;
+            }
+        }
+        field.rebuild_height();
+        field
+    }
+
     /// Flat pad with clay, silt, and sand strips. Each strip holds four moisture
     /// bands along Z so the Niva can sit on damp clay while the readout compares
     /// dry, damp, saturated, and pooled traction on all three soils.
