@@ -42,4 +42,4 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release --test e2e_niva --test frame_bench -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
