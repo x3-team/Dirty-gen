@@ -475,10 +475,12 @@ pub fn publish(
     } else {
         (DUST_NONE, [0.0; 3], [0.0; 3])
     };
+    let mut fog_valid = false;
     if let Some(dust) = dust {
         dust.write_air_velocity(&mut out.air_velocity);
         if dust.fog_air_m3() > 1.0e-12 {
             dust.write_fog(&mut out.fog);
+            fog_valid = true;
         }
     } else if let Some(fluid) = fluid {
         fluid.write_air_velocity(&mut out.air_velocity);
@@ -491,6 +493,9 @@ pub fn publish(
                     } else {
                         0.0
                     };
+                    if frac > 1.0e-12 {
+                        fog_valid = true;
+                    }
                     let dst = ix + layer * AIR_RES + iz * AIR_RES * AIR_LAYERS;
                     out.fog[dst] = frac;
                 }
@@ -579,9 +584,9 @@ pub fn publish(
     }
     if dust_source != DUST_NONE {
         valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR;
-        if dust.is_some_and(|d| d.fog_air_m3() > 1.0e-12) {
-            valid |= VALID_FOG;
-        }
+    }
+    if fog_valid {
+        valid |= VALID_FOG;
     }
 
     scrub(&mut out.ground_rut);
