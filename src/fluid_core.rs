@@ -4530,7 +4530,6 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
-        self.last_pushes = pushes.clone();
         self.refine(&pushes);
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
@@ -4539,6 +4538,7 @@ impl FluidCore {
         self.apply_pushes_outside(&pushes);
         self.step_pair(dt, false);
         spray.extend(self.peel_spray(&pushes, false, true));
+        self.last_pushes = pushes;
         if !self.solids.is_empty() {
             self.scour_contacts(dt);
         }
@@ -5245,6 +5245,9 @@ impl FluidCore {
     }
 
     fn step_pair(&mut self, dt: f32, fine: bool) {
+        if fine && !self.fine_on {
+            return;
+        }
         let prep = ProfTick::start();
         let (res, cell) = if fine {
             (FINE_RES, FINE_CELL_M)

@@ -327,7 +327,7 @@ impl Dust {
             row_lo: vec![1; AIR_RES as usize],
             row_hi: vec![0; AIR_RES as usize],
             settled_cells: HashMap::new(),
-            fog: vec![0.0; n],
+            fog: Vec::new(),
             fog_emitted: 0.0,
             fog_air: 0.0,
             fog_settled: 0.0,
@@ -1007,11 +1007,19 @@ impl Dust {
         }
     }
 
+    fn ensure_fog_grid(&mut self) {
+        let n = self.vol.len();
+        if self.fog.len() != n {
+            self.fog.resize(n, 0.0);
+        }
+    }
+
     /// Same wind step and the same wake residual as dust. No second velocity solve.
     fn transport_fog(&mut self, dt: f32) {
         if dt <= 0.0 || self.fog_air <= 1.0e-12 {
             return;
         }
+        self.ensure_fog_grid();
         let _outflow = crate::fluid_core::advect_dust_density(
             &mut self.fog,
             self.wind_x,
@@ -1352,6 +1360,7 @@ pub fn inject_fog(air: &mut Dust, inject: FogInject, dt: f32) -> f32 {
     if wsum <= 0.0 {
         return 0.0;
     }
+    air.ensure_fog_grid();
     let budget = (inject.offer_m3_s * dt) as f64;
     let mut added = 0.0f64;
     for iz in iz0..=iz1 {
