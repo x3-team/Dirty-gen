@@ -1316,6 +1316,19 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
     var n = terrain_normal(xz);
+    // On the beauty sand the mesh is the contract ground (bc_ground_soft);
+    // the solver heightfield's normal stepped on the 0.20 m rut cells and lit
+    // the rut wall as an orange plate. Take the normal from the same filtered
+    // contract height, over a 0.3 m baseline.
+    if (sand_field() && bc_inside(xz) > 0.0) {
+        let ge = 0.15;
+        let hx1 = bc_ground_soft(xz + vec2<f32>(ge, 0.0), terrain_height(xz + vec2<f32>(ge, 0.0)));
+        let hx0 = bc_ground_soft(xz - vec2<f32>(ge, 0.0), terrain_height(xz - vec2<f32>(ge, 0.0)));
+        let hz1 = bc_ground_soft(xz + vec2<f32>(0.0, ge), terrain_height(xz + vec2<f32>(0.0, ge)));
+        let hz0 = bc_ground_soft(xz - vec2<f32>(0.0, ge), terrain_height(xz - vec2<f32>(0.0, ge)));
+        let nc = normalize(vec3<f32>(hx0 - hx1, 2.0 * ge, hz0 - hz1));
+        n = normalize(mix(n, nc, bc_inside(xz)));
+    }
     var kind = kind_nearest(xz);
     let xz_fw = length(fwidth(xz));
 
@@ -1685,7 +1698,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             // In the last centimetre the swell's caustic lines lay parallel
             // stripes on the rim; they build in with depth and break up in patches.
             let c_patch = smoothstep(0.3, 0.7, noise(xz * 1.6 + vec2<f32>(4.0, -3.0)));
-            caustic = max(ratio - 0.85, 0.0) * 2.2 * (1.0 - slurry_f) * under * smoothstep(0.015, 0.05, film_t) * c_patch;
+            caustic = max(ratio - 0.85, 0.0) * 2.4 * (1.0 - slurry_f) * under * smoothstep(0.008, 0.04, film_t) * mix(0.5, 1.0, c_patch);
             // Saturated: already x0.55 from the wet band above; a second
             // darkening printed a black rim along the shallows.
             // The water layer owns the specular; a backlit bed under a thin
@@ -1704,7 +1717,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let rut_k = smoothstep(0.004, 0.025, rp.x);
         // Relief from the published cut and berm: their slope lights the
         // sunward wall and shades the other, so the groove reads on the bed.
-        let re = 0.12;
+        let re = select(0.12, 0.25, sand_field());
         let rx = bc_rut_soft(xz + vec2<f32>(re, 0.0));
         let rz = bc_rut_soft(xz + vec2<f32>(0.0, re));
         let hx = (rx.y - rx.x) - (rp.y - rp.x);
@@ -1969,7 +1982,20 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 return vec4<f32>(0.0);
             }
             if (gap < 0.35 + t * 0.08) {
-                let col = textureLoad(scene_color, pix, 0).rgb;
+                // Refine the hit halfway back along the last step, then read a
+                // small cross of texels: a soft mirror instead of the block
+                // the coarse march landed on.
+                let pm = world + dir * (t - 0.025);
+                let cm = frame.view_proj * vec4<f32>(pm, 1.0);
+                let uvm = vec2<f32>(cm.x / cm.w * 0.5 + 0.5, 0.5 - cm.y / cm.w * 0.5);
+                let uvh = clamp(mix(uv, uvm, 0.5), vec2<f32>(0.0), vec2<f32>(0.9999));
+                let ph = vec2<i32>(uvh * dims);
+                let dmax = vec2<i32>(dims) - vec2<i32>(1);
+                var col = textureLoad(scene_color, ph, 0).rgb * 0.4;
+                col += textureLoad(scene_color, clamp(ph + vec2<i32>(2, 0), vec2<i32>(0), dmax), 0).rgb * 0.15;
+                col += textureLoad(scene_color, clamp(ph - vec2<i32>(2, 0), vec2<i32>(0), dmax), 0).rgb * 0.15;
+                col += textureLoad(scene_color, clamp(ph + vec2<i32>(0, 2), vec2<i32>(0), dmax), 0).rgb * 0.15;
+                col += textureLoad(scene_color, clamp(ph - vec2<i32>(0, 2), vec2<i32>(0), dmax), 0).rgb * 0.15;
                 let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
                 // Fade to the IBL sky toward the screen edge and with the
                 // gap, so a ray leaving the frame blends out, not cuts off.
@@ -2470,7 +2496,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Round a tire the stirred silt hides the rubber within a few cm.
     // Clear at a few centimetres (the sand reads through 5 cm), murky by
     // 15-20 cm: the silt load grows with the published depth.
-    let sigma = mix(vec3<f32>(4.0, 5.2, 7.0) * mix(0.3, 1.6, smoothstep(0.03, 0.2, depth)),
+    // Clear water absorbs (red first) and scatters little: the shallows are
+    // a window onto the sand. Only the published slurry clouds it.
+    let sigma = mix(vec3<f32>(1.2, 1.8, 3.0) * mix(0.3, 1.2, smoothstep(0.03, 0.2, depth)),
         vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
     let trans = exp(-sigma * path);
     // Light scattered by the silt in the column, lit by sun and sky.
@@ -2935,7 +2963,11 @@ struct ShadowOut {
 
 @vertex
 fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
-    let h = apply_seat(in.xz, height_bilinear(in.xz)).x;
+    // On the beauty sand the drawn ground is the contract's (binding 1),
+    // which this pass cannot read; the solver's own heightfield here held a
+    // thin ridge that threw a long black line from the car. The sand under a
+    // high sun has no relief worth a cast shadow, so it casts none.
+    let h = apply_seat(in.xz, height_bilinear(in.xz)).x - select(0.0, 50.0, sand_field());
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     let clip = frame.light_vp * vec4<f32>(world, 1.0);
     var o: ShadowOut;
@@ -3698,16 +3730,18 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
             let cap_f = cap_f0 + (vec3<f32>(1.0) - cap_f0) * pow(1.0 - cap_nv, 5.0);
             // Satin steel: a blurred mirror of the IBL and a broad sun lobe.
             // Satin steel, roughness ~0.35: a blurred IBL and a broad sun lobe.
-            let cap_env = mix(env_radiance(cap_r, 0.6), sh_irradiance(cap_r) * 0.45, 0.65);
+            // Roughness ~0.5: mostly the irradiance, a faint blurred sky.
+            let cap_env = mix(env_radiance(cap_r, 0.8), sh_irradiance(cap_r) * 0.45, 0.85);
             let cap_spec = cap_env * frame.env.y * 1.3 * cap_f
-                + frame.sun_color.rgb * pow(max(dot(cap_r, sun_d), 0.0), 12.0) * 0.12;
+                + frame.sun_color.rgb * pow(max(dot(cap_r, sun_d), 0.0), 8.0) * 0.06;
             // The body and the arch hide the upper sky from the lower half.
             let cap_occ = mix(0.55, 1.0, smoothstep(-0.4, 0.3, cap_r.y));
             var cap_lit = (vec3<f32>(0.1) * cap_l + cap_spec * cap_occ) * mix(0.7, 1.05, ring);
             // Dried mud film: patchy, thicker toward the bottom of the cap.
             let rel_w = rel - axis * ax;
             let dirt_n = noise(vec2<f32>(dot(rel_w, vec3<f32>(fw2.x, 0.0, fw2.y)), rel_w.y) * 60.0 + vec2<f32>(f32(i) * 5.0, 1.0));
-            let dirt = clamp(smoothstep(0.35, 0.75, dirt_n) * 0.7 + smoothstep(0.02, -0.05, rel_w.y) * 0.35, 0.0, 0.85);
+            let low_c = smoothstep(c.y + 0.02, c.y - c.w * 0.85, in.world.y);
+            let dirt = clamp(smoothstep(0.62 - 0.4 * low_c, 0.75 - 0.4 * low_c, dirt_n) * mix(0.4, 1.0, low_c) + low_c * 0.25, 0.0, 0.9);
             let mud_c = vec3<f32>(0.32, 0.24, 0.15) * cap_l * 0.9;
             lit = mix(cap_lit, mud_c, dirt);
         }
