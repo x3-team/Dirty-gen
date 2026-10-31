@@ -1,7 +1,7 @@
 //! Niva wheels in the puddle. The rut is the tire force on wet sand, the
 //! spoil is a berm, and the tread sits 10–15 cm under the free surface.
 
-use silt::render_contract::{publish, ContractFrame, RENDER_CONTRACT_VERSION};
+use silt::render_contract::{publish, ContractFrame, FLOW_CHANNELS, RENDER_CONTRACT_VERSION};
 use silt::soil::rut_depth_from_force;
 use silt::vehicle::{Vehicle, WHEEL_RADIUS};
 use silt::world::ThroughDrive;
@@ -116,7 +116,7 @@ fn puddle_wheels_sit_in_a_force_rut() {
     );
 
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 2);
+    assert_eq!(RENDER_CONTRACT_VERSION, 3);
     assert!(
         n >= 4.0,
         "wheels in a wet rut: {n}, chassis z {:.2}",
@@ -570,7 +570,7 @@ fn puddle_ruts_follow_the_treads() {
         Some(drive.dust()),
     );
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 2);
+    assert_eq!(RENDER_CONTRACT_VERSION, 3);
     let z = drive.world.vehicle.pos.z;
     println!("frame 25 chassis z {z:.3}");
     // Under the body, where a belly-wide slab would sit, and on the track
@@ -627,7 +627,7 @@ fn puddle_rut_water_stays_with_the_pond() {
         Some(drive.dust()),
     );
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 2);
+    assert_eq!(RENDER_CONTRACT_VERSION, 3);
 
     let res = frame.header.window_res.max(1) as i32;
     let mut floor_eta = Vec::new();
@@ -799,12 +799,16 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
             let water = frame.film[idx * 2];
             let slurry = frame.film[idx * 2 + 1];
             let film = water + slurry;
-            let u = frame.flow[idx * 2];
-            let v = frame.flow[idx * 2 + 1];
+            let u = frame.flow[idx * FLOW_CHANNELS];
+            let v = frame.flow[idx * FLOW_CHANNELS + 1];
+            let speed_ch = frame.flow[idx * FLOW_CHANNELS + 2];
+            let turb = frame.flow[idx * FLOW_CHANNELS + 3];
             let foam = frame.foam_crest[idx * 2];
             let crest = frame.foam_crest[idx * 2 + 1];
-            // A dry cell is film under 0.01 mm. Velocity and foam stay 0.
-            if film < 1.0e-5 && (u != 0.0 || v != 0.0 || foam != 0.0) {
+            // A dry cell is film under 0.01 mm. Velocity, speed, turbidity, and foam stay 0.
+            if film < 1.0e-5
+                && (u != 0.0 || v != 0.0 || speed_ch != 0.0 || turb != 0.0 || foam != 0.0)
+            {
                 dry_bad += 1;
             }
             if !(-18.0..-10.0).contains(&drive.world.vehicle.pos.z) {
@@ -884,8 +888,8 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
             }
         }
     }
-    let (flow_u_min, flow_u_max) = channel_minmax(&frame.flow, 2, 0);
-    let (flow_v_min, flow_v_max) = channel_minmax(&frame.flow, 2, 1);
+    let (flow_u_min, flow_u_max) = channel_minmax(&frame.flow, FLOW_CHANNELS, 0);
+    let (flow_v_min, flow_v_max) = channel_minmax(&frame.flow, FLOW_CHANNELS, 1);
     println!(
         "puddle foam {foam_min:.4}..{foam_max:.4}  crest {crest_min:.4}..{crest_max:.4}  flow speed {flow_min:.4}..{flow_max:.4}  last-frame flow u {flow_u_min:.4}..{flow_u_max:.4} v {flow_v_min:.4}..{flow_v_max:.4}  spray drops {spray_max}  dry bad {dry_bad}  gap rut {gap_rut:.6} berm {gap_berm:.6}"
     );

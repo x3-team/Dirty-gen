@@ -320,6 +320,9 @@ pub struct CoarseCell {
     pub u: f32,
     pub v: f32,
     pub settled_dust_m: f32,
+    /// Suspended-solids concentration in the water column, 0..1.
+    /// Zero when the water column is under 0.01 mm.
+    pub turbidity: f32,
 }
 
 /// Maps a beauty pass can read. Coarse window, after the fine patch is put back.
@@ -346,6 +349,15 @@ pub struct FluidLedger {
     pub frozen_slurry_m3: f32,
     pub frozen_dust_m3: f32,
     pub spray_m3: f32,
+    /// Suspended solids still in the water column, cubic metres.
+    pub suspended_m3: f32,
+    /// Suspended solids that left the column: a dry cell, or the part above the water.
+    pub settled_suspended_m3: f32,
+    /// Suspended solids parked with a coarse cell that slid off the window.
+    pub frozen_suspended_m3: f32,
+    /// Volume the wheels have lifted into suspension. The column, the settled
+    /// part, and the parked part sum to this.
+    pub entrained_m3: f32,
     pub total_m3: f32,
 }
 
@@ -625,10 +637,9 @@ fn step_sheet_eps(
 
 /// Advect one vehicle-frame dust volume, `x + layer * 128 + z * 128 * 8`.
 ///
-/// The dust caller owns the cubic metres. This is the shared wind step:
-/// the same upwind flux, pressure filter, and vorticity confinement as the
-/// ground sheets. Mass that stays in `vol` is still airborne. The return is
-/// the cubic metres that left the window, which the caller books as settled.
+/// Donor-cell upwind on cells that hold volume. Empty layers are not visited.
+/// Mass that stays in `vol` is still airborne. The return is the cubic metres
+/// that left the window, which the caller books as settled.
 pub fn advect_dust_density(
     vol: &mut [f32],
     wind_x: f32,
@@ -923,10 +934,6 @@ fn advect_one_dust_layer(
     });
 }
 
-/// Work boxes are `(i0, i1, j0, j1)` inclusive. A solid wet rectangle stays
-/// one box with the historical halo of 3, so that path is unchanged. Separated
-/// blobs (the tire disks) each carry their own halo and are not stepped across
-/// the dry gap.
 fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(usize, usize, usize, usize)> {
     let mut i0 = res;
     let mut i1 = 0usize;
@@ -1427,8 +1434,8 @@ fn substep(
             }
             let decay = (-sheet_damp(nu[idx]) * dt).exp();
             let lim = match drive {
-                SheetDrive::Wind { x, z, .. } => x.hypot(z).max(1.6),
-                SheetDrive::Gravity { .. } => 1.6,
+                SheetDrive::Wind { x, z, .. } => x.hypot(z).max(FILM_SPEED_CAP_MPS),
+                SheetDrive::Gravity { .. } => FILM_SPEED_CAP_MPS,
             };
             u[idx] = finite_speed(u[idx] * decay, lim);
             v[idx] = finite_speed(v[idx] * decay, lim);
@@ -1485,7 +1492,7 @@ fn force_gravity_solid(
     j1: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 96 && i1 - i0 >= 31 {
         force_gravity_solid_par(
             h, u, v, nu, p, mask, res, cell, dt, vorticity, eps, i0, i1, j0, j1,
         );
@@ -1613,7 +1620,7 @@ fn force_gravity_open(
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 96 && i1 - i0 >= 31 {
         force_gravity_par(h, u, v, nu, p, res, cell, dt, vorticity, eps, i0, i1, j0, j1);
         return;
     }
@@ -2532,6 +2539,18 @@ fn finite0(v: f32) -> f32 {
     }
 }
 
+/// Thickness-weighted film velocity. The same blend the render contract publishes.
+fn film_uv(water: f32, slurry: f32, uw: f32, vw: f32, us: f32, vs: f32) -> (f32, f32) {
+    let h = water + slurry;
+    if !h.is_finite() || h < 1.0e-5 {
+        return (0.0, 0.0);
+    }
+    (
+        finite0((uw * water + us * slurry) / h),
+        finite0((vw * water + vs * slurry) / h),
+    )
+}
+
 fn vorticity_at(u: &[f32], v: &[f32], res: usize, i: usize, j: usize, cell: f32) -> f32 {
     let ip = (i + 1).min(res - 1);
     let im = i.saturating_sub(1);
@@ -2586,6 +2605,8 @@ fn blur_box(
     if i0 > i1 || j0 > j1 || res == 0 {
         return;
     }
+    // A tire-sized box is slower with a rayon scope than on one thread.
+    // The full window still splits.
     #[cfg(not(target_arch = "wasm32"))]
     if j1 - j0 >= 47 && i1 - i0 >= 31 && res != FINE_RES && res > SERIAL_SHEET_MAX {
         par_blur_axis(src, tmp, res, i0, i1, j0, j1, k, true);
@@ -2941,7 +2962,7 @@ fn transport(
     sc: &mut Scratch,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if i1 - i0 >= 31 && j1 - j0 >= 47 {
+    if i1 - i0 >= 31 && j1 - j0 >= 96 {
         let speed = if along_x { u } else { v };
         transport_par(
             h, speed, gate, res, cell, dt, i0, i1, j0, j1, along_x, solid, bed, sc,
@@ -3743,12 +3764,30 @@ struct Parked {
     /// Pore moisture, 0..1. Stays with the ground cell when the window moves,
     /// so a wet tire track does not slide with the Niva.
     moisture: f32,
+    /// Suspended-solids depth in the water column, metres. Not a second sheet.
+    susp: f32,
+}
+
+/// Sheet times inside one [`FluidCore::step`], milliseconds.
+///
+/// Water and slurry are the fine sheet plus the coarse sheet. Dust is the
+/// column carried in this step. Suspended solids are the plume advection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepParts {
+    pub water_ms: f32,
+    pub slurry_ms: f32,
+    pub dust_ms: f32,
+    pub suspended_ms: f32,
+    pub prep_ms: f32,
+    pub restrict_ms: f32,
+    pub window_ms: f32,
 }
 
 fn park_slot(slot: &Parked, ambient: f32) -> bool {
     slot.water > 1.0e-8
         || slot.slurry > 1.0e-8
         || slot.dust > 1.0e-8
+        || slot.susp > 1.0e-8
         || (slot.moisture - ambient).abs() > 6.0e-3
 }
 
@@ -3771,6 +3810,15 @@ pub struct FluidCore {
     moisture_ambient: f32,
     grain: Vec<u8>,
     settled: Vec<f32>,
+    /// Suspended-solids depth, metres, on the coarse water column.
+    susp: Vec<f32>,
+    /// Scratch for the suspended advection. Sized once.
+    susp_next: Vec<f32>,
+    /// Cubic metres lifted into suspension. Not spent twice.
+    entrained_m3: f32,
+    /// Cubic metres that left the live column and stayed in the account.
+    settled_suspended_m3: f32,
+    last_parts: StepParts,
     fine_origin: [f32; 2],
     fine_water: Vec<f32>,
     fine_slurry: Vec<f32>,
@@ -3839,6 +3887,11 @@ impl FluidCore {
             moisture_ambient: 0.0,
             grain: vec![Grain::Other as u8; n],
             settled: vec![0.0; n],
+            susp: vec![0.0; n],
+            susp_next: vec![0.0; n],
+            entrained_m3: 0.0,
+            settled_suspended_m3: 0.0,
+            last_parts: StepParts::default(),
             fine_origin: [0.0, 0.0],
             fine_water: vec![0.0; fine_n],
             fine_slurry: vec![0.0; fine_n],
@@ -3882,6 +3935,14 @@ impl FluidCore {
 
     pub fn sheet_times(&self) -> SheetTimes {
         self.sheet_times
+    }
+
+    /// Kept so the plume bench can ask for per-step times. They are always recorded.
+    pub fn set_step_parts(&mut self, _on: bool) {}
+
+    /// Times from the last [`Self::step`].
+    pub fn step_parts(&self) -> StepParts {
+        self.last_parts
     }
 
     /// Coarse water and slurry are both under a dry film, and the fine patch is off.
@@ -4473,6 +4534,9 @@ impl FluidCore {
             self.scour_contacts(dt);
         }
         self.cycle_stream();
+        let sus_tick = ProfTick::start();
+        self.step_suspended(dt, &pushes);
+        let suspended_ms = sus_tick.ms() as f32;
         self.step_dust(dt, slow);
         if slow {
             self.settle_dust();
@@ -4481,12 +4545,27 @@ impl FluidCore {
             self.spray_m3 += s.volume;
         }
         self.keep_spray(&spray, dt);
-        let accounted = (self.sheet_times.water_ms - w0)
-            + (self.sheet_times.slurry_ms - s0)
-            + (self.sheet_times.prep_ms - p0)
-            + (self.sheet_times.restrict_ms - r0)
-            + (self.sheet_times.window_ms - n0)
-            + (self.sheet_times.dust_ms - d0);
+        let water_ms = (self.sheet_times.water_ms - w0) as f32;
+        let slurry_ms = (self.sheet_times.slurry_ms - s0) as f32;
+        let prep_ms = (self.sheet_times.prep_ms - p0) as f32;
+        let restrict_ms = (self.sheet_times.restrict_ms - r0) as f32;
+        let window_ms = (self.sheet_times.window_ms - n0) as f32;
+        let dust_ms = (self.sheet_times.dust_ms - d0) as f32;
+        self.last_parts = StepParts {
+            water_ms,
+            slurry_ms,
+            dust_ms,
+            suspended_ms,
+            prep_ms,
+            restrict_ms,
+            window_ms,
+        };
+        let accounted = f64::from(water_ms)
+            + f64::from(slurry_ms)
+            + f64::from(prep_ms)
+            + f64::from(restrict_ms)
+            + f64::from(window_ms)
+            + f64::from(dust_ms);
         self.sheet_times.rest_ms += (wall.ms() - accounted).max(0.0);
         spray
     }
@@ -4571,14 +4650,17 @@ impl FluidCore {
         }
         let dust_air = column_sum(&self.dust, self.air_cell());
         let dust_settled = column_sum(&self.settled, COARSE_CELL_M);
+        let suspended = column_sum(&self.susp, COARSE_CELL_M);
         let mut frozen_water = 0.0f32;
         let mut frozen_slurry = 0.0f32;
         let mut frozen_dust = 0.0f32;
+        let mut frozen_suspended = 0.0f32;
         for p in self.parked.values() {
             let area = COARSE_CELL_M * COARSE_CELL_M;
             frozen_water += p.water * area;
             frozen_slurry += p.slurry * area;
             frozen_dust += p.dust * area;
+            frozen_suspended += p.susp * area;
         }
         for d in self.parked_dust.values() {
             frozen_dust += *d;
@@ -4590,7 +4672,10 @@ impl FluidCore {
             + frozen_water
             + frozen_slurry
             + frozen_dust
-            + self.spray_m3;
+            + self.spray_m3
+            + suspended
+            + self.settled_suspended_m3
+            + frozen_suspended;
         FluidLedger {
             water_m3: water,
             slurry_m3: slurry,
@@ -4600,8 +4685,18 @@ impl FluidCore {
             frozen_slurry_m3: frozen_slurry,
             frozen_dust_m3: frozen_dust,
             spray_m3: self.spray_m3,
+            suspended_m3: suspended,
+            settled_suspended_m3: self.settled_suspended_m3,
+            frozen_suspended_m3: frozen_suspended,
+            entrained_m3: self.entrained_m3,
             total_m3: total,
         }
+    }
+
+    /// |column + settled + parked − lifted|. Zero when the suspended account closes.
+    pub fn suspended_gap(&self) -> f32 {
+        let b = self.ledger();
+        (b.suspended_m3 + b.settled_suspended_m3 + b.frozen_suspended_m3 - b.entrained_m3).abs()
     }
 
     pub fn export_maps(&mut self) -> SurfaceMaps {
@@ -4687,6 +4782,11 @@ impl FluidCore {
             u,
             v,
             settled_dust_m: finite0(self.settled[idx]),
+            turbidity: if water_m < 1.0e-5 {
+                0.0
+            } else {
+                finite0(self.susp[idx] / water_m).clamp(0.0, 1.0)
+            },
         })
     }
 
@@ -5768,6 +5868,189 @@ impl FluidCore {
         }
     }
 
+    /// Lift solids in the aft sector of each tire and carry that column with the flow.
+    ///
+    /// The solids are a depth on the coarse water sheet. Turbidity is that depth
+    /// over the water column, clamped to 0..1. A dry cell keeps none of it: the
+    /// depth is booked as settled so the volume ledger still closes.
+    fn step_suspended(&mut self, dt: f32, pushes: &[TirePush]) {
+        if dt <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        let before = self.entrained_m3;
+        self.entrain_wake(pushes, dt);
+        if self.entrained_m3 <= before && !self.susp.iter().any(|s| *s > 1.0e-8) {
+            return;
+        }
+        self.advect_suspended(dt);
+    }
+
+    fn entrain_wake(&mut self, pushes: &[TirePush], dt: f32) {
+        let res = WINDOW_RES as i32;
+        let cell = COARSE_CELL_M;
+        let area = cell * cell;
+        let origin = self.origin;
+        for p in pushes {
+            if p.speed < 0.3 {
+                continue;
+            }
+            let fl = (p.forward_x * p.forward_x + p.forward_z * p.forward_z)
+                .sqrt()
+                .max(1.0e-4);
+            let fx = p.forward_x / fl;
+            let fz = p.forward_z / fl;
+            let rx = fz;
+            let rz = -fx;
+            let reach = p.radius * 3.4 + cell;
+            let i0 = (((p.x - reach) - origin[0]) / cell).floor() as i32;
+            let i1 = (((p.x + reach) - origin[0]) / cell).floor() as i32;
+            let j0 = (((p.z - reach) - origin[1]) / cell).floor() as i32;
+            let j1 = (((p.z + reach) - origin[1]) / cell).floor() as i32;
+            let aft = p.radius * 3.2;
+            let half = p.width * 0.55 + 0.08;
+            for j in j0.max(0)..=j1.min(res - 1) {
+                for i in i0.max(0)..=i1.min(res - 1) {
+                    let x = origin[0] + (i as f32 + 0.5) * cell;
+                    let z = origin[1] + (j as f32 + 0.5) * cell;
+                    let dx = x - p.x;
+                    let dz = z - p.z;
+                    let along = dx * fx + dz * fz;
+                    // Positive along is ahead of the tire. The plume is the aft sector.
+                    if along > -0.05 || along < -aft {
+                        continue;
+                    }
+                    let lat = (dx * rx + dz * rz).abs();
+                    if lat > half {
+                        continue;
+                    }
+                    let idx = j as usize * WINDOW_RES + i as usize;
+                    let water = self.water[idx];
+                    if !water.is_finite() || water < 0.004 {
+                        continue;
+                    }
+                    let along_t = ((-along) / aft).clamp(0.0, 1.0);
+                    let lat_t = (lat / half).clamp(0.0, 1.0);
+                    let core = (1.0 - along_t) * (1.0 - lat_t);
+                    let room = (water - self.susp[idx]).max(0.0);
+                    // Per second, so a 30 Hz step and a 60 Hz step lift the same volume.
+                    let add = (4.0 * dt * core * water).min(room);
+                    if add <= 1.0e-8 {
+                        continue;
+                    }
+                    self.susp[idx] += add;
+                    self.entrained_m3 += add * area;
+                }
+            }
+        }
+    }
+
+    fn advect_suspended(&mut self, dt: f32) {
+        let res = WINDOW_RES;
+        let cell = COARSE_CELL_M;
+        let area = cell * cell;
+        let mut i0 = res;
+        let mut i1 = 0usize;
+        let mut j0 = res;
+        let mut j1 = 0usize;
+        for j in 0..res {
+            for i in 0..res {
+                if self.susp[j * res + i] > 1.0e-8 {
+                    i0 = i0.min(i);
+                    i1 = i1.max(i);
+                    j0 = j0.min(j);
+                    j1 = j1.max(j);
+                }
+            }
+        }
+        if i0 > i1 {
+            return;
+        }
+        i0 = i0.saturating_sub(1);
+        j0 = j0.saturating_sub(1);
+        i1 = (i1 + 1).min(res - 1);
+        j1 = (j1 + 1).min(res - 1);
+
+        self.susp_next.copy_from_slice(&self.susp);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                self.susp_next[j * res + i] = 0.0;
+            }
+        }
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                let depth = self.susp[idx];
+                if depth <= 1.0e-12 || !depth.is_finite() {
+                    continue;
+                }
+                let (u, v) = film_uv(
+                    self.water[idx],
+                    self.slurry[idx],
+                    self.uw[idx],
+                    self.vw[idx],
+                    self.us[idx],
+                    self.vs[idx],
+                );
+                let ax = (u * dt / cell).abs().min(1.0);
+                let az = (v * dt / cell).abs().min(1.0);
+                let scale = if ax + az > 1.0 {
+                    1.0 / (ax + az)
+                } else {
+                    1.0
+                };
+                let mut give_x = depth * ax * scale;
+                let mut give_z = depth * az * scale;
+                let outflow = give_x + give_z;
+                if outflow > depth && outflow > 0.0 {
+                    let fit = depth / outflow;
+                    give_x *= fit;
+                    give_z *= fit;
+                }
+                let stay = (depth - give_x - give_z).max(0.0);
+                self.susp_next[idx] += stay;
+                if give_x > 0.0 {
+                    if u > 0.0 && i + 1 < res {
+                        self.susp_next[idx + 1] += give_x;
+                    } else if u < 0.0 && i > 0 {
+                        self.susp_next[idx - 1] += give_x;
+                    } else {
+                        self.settled_suspended_m3 += give_x * area;
+                    }
+                }
+                if give_z > 0.0 {
+                    if v > 0.0 && j + 1 < res {
+                        self.susp_next[idx + res] += give_z;
+                    } else if v < 0.0 && j > 0 {
+                        self.susp_next[idx - res] += give_z;
+                    } else {
+                        self.settled_suspended_m3 += give_z * area;
+                    }
+                }
+            }
+        }
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                let mut s = self.susp_next[idx];
+                if !s.is_finite() || s <= 0.0 {
+                    self.susp_next[idx] = 0.0;
+                    continue;
+                }
+                let w = self.water[idx];
+                if !w.is_finite() || w < 1.0e-5 {
+                    self.settled_suspended_m3 += s * area;
+                    s = 0.0;
+                } else if s > w {
+                    self.settled_suspended_m3 += (s - w) * area;
+                    s = w;
+                }
+                self.susp_next[idx] = s;
+            }
+        }
+        // Cells outside the box were copied and not rewritten. Swap the whole grid.
+        std::mem::swap(&mut self.susp, &mut self.susp_next);
+    }
+
     fn shift_coarse(&mut self, new_origin: [f32; 2]) {
         if (new_origin[0] - self.origin[0]).abs() < 1.0e-4
             && (new_origin[1] - self.origin[1]).abs() < 1.0e-4
@@ -5807,6 +6090,7 @@ impl FluidCore {
                 vs: self.vs[idx],
                 dust: self.settled[idx],
                 moisture: self.moisture[idx],
+                susp: self.susp[idx],
             };
             if park_slot(&slot, self.moisture_ambient) {
                 self.parked.insert(key, slot);
@@ -5814,7 +6098,7 @@ impl FluidCore {
                 self.parked.remove(&key);
             }
         });
-        let need = n * 8;
+        let need = n * 9;
         if self.shift_scratch.len() < need {
             self.shift_scratch.resize(need, 0.0);
         }
@@ -5827,6 +6111,7 @@ impl FluidCore {
         scratch[n * 5..n * 6].copy_from_slice(&self.vs);
         scratch[n * 6..n * 7].copy_from_slice(&self.settled);
         scratch[n * 7..n * 8].copy_from_slice(&self.moisture);
+        scratch[n * 8..n * 9].copy_from_slice(&self.susp);
         let res_i = res as i32;
         for j in 0..res {
             for i in 0..res {
@@ -5839,6 +6124,7 @@ impl FluidCore {
                         || scratch[n + src] > 1.0e-8
                         || scratch[n * 6 + src] > 1.0e-8
                         || scratch[n * 7 + src] > 1.0e-4
+                        || scratch[n * 8 + src] > 1.0e-8
                 } else {
                     false
                 };
@@ -5852,6 +6138,7 @@ impl FluidCore {
                     self.vs[dst] = scratch[n * 5 + src];
                     self.settled[dst] = scratch[n * 6 + src];
                     self.moisture[dst] = scratch[n * 7 + src];
+                    self.susp[dst] = scratch[n * 8 + src];
                 } else {
                     self.water[dst] = 0.0;
                     self.slurry[dst] = 0.0;
@@ -5861,6 +6148,7 @@ impl FluidCore {
                     self.vs[dst] = 0.0;
                     self.settled[dst] = 0.0;
                     self.moisture[dst] = self.moisture_ambient;
+                    self.susp[dst] = 0.0;
                 }
             }
         }
@@ -5880,6 +6168,7 @@ impl FluidCore {
                 self.vs[idx] = slot.vs;
                 self.settled[idx] = slot.dust;
                 self.moisture[idx] = slot.moisture;
+                self.susp[idx] = slot.susp;
             }
         });
     }
@@ -5896,6 +6185,7 @@ impl FluidCore {
         let mut moisture = vec![self.moisture_ambient; n];
         let mut grain = vec![Grain::Other as u8; n];
         let mut settled = vec![0.0f32; n];
+        let mut susp = vec![0.0f32; n];
         for j in 0..WINDOW_RES {
             for i in 0..WINDOW_RES {
                 let x = self.origin[0] + (i as f32 + 0.5) * COARSE_CELL_M;
@@ -5911,6 +6201,7 @@ impl FluidCore {
                     vs: self.vs[idx],
                     dust: self.settled[idx],
                     moisture: self.moisture[idx],
+                    susp: self.susp[idx],
                 };
                 if park_slot(&slot, self.moisture_ambient) {
                     self.parked.insert(key, slot);
@@ -5935,6 +6226,7 @@ impl FluidCore {
                     vs[idx] = slot.vs;
                     settled[idx] = slot.dust;
                     moisture[idx] = slot.moisture;
+                    susp[idx] = slot.susp;
                 }
                 bed[idx] = self.bed[idx];
                 grain[idx] = self.grain[idx];
@@ -5947,6 +6239,7 @@ impl FluidCore {
         self.us = us;
         self.vs = vs;
         self.settled = settled;
+        self.susp = susp;
         self.bed = bed;
         self.moisture = moisture;
         self.grain = grain;
@@ -6420,6 +6713,11 @@ pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 /// inject, advect, confine, and the density flux. The proof drive must stay
 /// under 4 ms, which is the budget for the step that feeds the GPU upload.
 pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
+/// Gravity-sheet speed cap, metres per second. Published `vx` and `vz` stay inside it.
+pub const FILM_SPEED_CAP_MPS: f32 = 1.6;
+/// Milliseconds for one scene step: water, clay, soil, air, dust, and the plume.
+/// The plume test asserts that sum. Do not raise this, and do not treat a miss as known.
+pub const SOLVER_STEP_BUDGET_MS: f32 = 7.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
 pub const AIR_FLUX_STRIDE: u32 = 4;
 /// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.

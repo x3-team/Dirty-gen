@@ -1,4 +1,4 @@
-//! Physics → render contract, version 2.
+//! Physics → render contract, version 3.
 //!
 //! The solver publishes these maps at the end of a frame. The debug view
 //! reads only this contract. Picture shading (materials, light, HDRI, fog,
@@ -15,7 +15,10 @@ use crate::particles::Particle;
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 2;
+pub const RENDER_CONTRACT_VERSION: u32 = 3;
+
+/// Floats per flow texel: vx, vz, speed, turbidity.
+pub const FLOW_CHANNELS: usize = 4;
 
 /// Coarse ground window. 200 × 0.20 m = 40 m. The 2 cm tire patch is restricted
 /// back into this window before publish. It is not a second map.
@@ -66,6 +69,7 @@ pub const VALID_WET_EDGE: u32 = 1 << 7;
 pub const VALID_FOAM: u32 = 1 << 8;
 pub const VALID_SPRAY: u32 = 1 << 9;
 pub const VALID_AIR: u32 = 1 << 10;
+pub const VALID_TURBIDITY: u32 = 1 << 11;
 
 pub const BIND_HEADER: u32 = 0;
 pub const BIND_GROUND: u32 = 1;
@@ -150,7 +154,7 @@ impl ContractFrame {
             ground_rut: vec![0.0; n * 4],
             moisture: vec![0.0; n],
             film: vec![0.0; n * 2],
-            flow: vec![0.0; n * 2],
+            flow: vec![0.0; n * FLOW_CHANNELS],
             dust_settled: vec![0.0; n],
             crust: vec![0.0; n * 2],
             wet_edge: vec![0.0; n],
@@ -308,27 +312,30 @@ pub fn publish(
             out.ground_rut[idx * 4 + 2] = finite0(bed);
             out.ground_rut[idx * 4 + 3] = finite0(placed);
 
-            let (sheet_moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
-                (
-                    cell.moisture,
-                    cell.water_m,
-                    cell.slurry_m,
-                    cell.u,
-                    cell.v,
-                    cell.settled_dust_m,
-                )
-            } else if let Some(sidx) = soil_idx {
-                (
-                    soil.wetness[sidx],
-                    soil.water[sidx],
-                    soil.slurry[sidx],
-                    0.0,
-                    0.0,
-                    0.0,
-                )
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            };
+            let (sheet_moisture, water_m, slurry_m, u, v, settled, turbidity) =
+                if let Some(cell) = sheet {
+                    (
+                        cell.moisture,
+                        cell.water_m,
+                        cell.slurry_m,
+                        cell.u,
+                        cell.v,
+                        cell.settled_dust_m,
+                        cell.turbidity,
+                    )
+                } else if let Some(sidx) = soil_idx {
+                    (
+                        soil.wetness[sidx],
+                        soil.water[sidx],
+                        soil.slurry[sidx],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                } else {
+                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                };
             // Wet tire track: soil wetness under this texel is part of the same
             // moisture channel. The drained film stays in the water channel.
             // Neither fill adds a map, a unit, or a resolution.
@@ -343,11 +350,25 @@ pub fn publish(
             } else {
                 (finite0(u), finite0(v))
             };
+            let speed = if dry {
+                0.0
+            } else {
+                finite0((u * u + v * v).sqrt())
+            };
+            // Turbidity is solids in the water column. No water, no sample: 0, not NaN.
+            let turb = if !water_m.is_finite() || water_m < 1.0e-5 {
+                0.0
+            } else {
+                finite0(turbidity).clamp(0.0, 1.0)
+            };
             out.moisture[idx] = finite0(moisture);
             out.film[idx * 2] = finite0(water_m);
             out.film[idx * 2 + 1] = finite0(slurry_m);
-            out.flow[idx * 2] = u;
-            out.flow[idx * 2 + 1] = v;
+            let flow = idx * FLOW_CHANNELS;
+            out.flow[flow] = u;
+            out.flow[flow + 1] = v;
+            out.flow[flow + 2] = speed;
+            out.flow[flow + 3] = turb;
             if dust.is_none() {
                 out.dust_settled[idx] = settled;
             }
@@ -414,8 +435,8 @@ pub fn publish(
             let mean = if count > 0.0 { sum / count } else { h };
             let excess = finite0((h - mean).max(0.0));
             let placed = finite0(out.ground_rut[idx * 4 + 3].max(0.0));
-            let u = out.flow[idx * 2];
-            let v = out.flow[idx * 2 + 1];
+            let u = out.flow[idx * FLOW_CHANNELS];
+            let v = out.flow[idx * FLOW_CHANNELS + 1];
             let speed = if u.is_finite() && v.is_finite() {
                 (u * u + v * v).sqrt()
             } else {
@@ -552,7 +573,7 @@ pub fn publish(
         | VALID_FOAM
         | VALID_SPRAY;
     if flow_source == FLOW_FLUID_SHEET {
-        valid |= VALID_FLOW;
+        valid |= VALID_FLOW | VALID_TURBIDITY;
     }
     if dust_source != DUST_NONE {
         valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR;
@@ -773,8 +794,8 @@ impl ContractGpu {
             device,
             "contract-flow",
             res,
-            wgpu::TextureFormat::Rg32Float,
-            2,
+            wgpu::TextureFormat::Rgba32Float,
+            FLOW_CHANNELS,
         )?;
         let dust_settled = map2(
             device,
@@ -1081,6 +1102,8 @@ mod tests {
         assert!(wgsl.contains("@group(0) @binding(10)"));
         assert!(wgsl.contains("@group(0) @binding(11)"));
         assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
+        assert!(wgsl.contains("flow.a"));
+        assert!(wgsl.contains("flow.b"));
         let air_row = padded_row_bytes(AIR_CELLS, 4);
         assert_eq!(air_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
         assert!(!wgsl.contains("height_tex"));
@@ -1293,7 +1316,7 @@ mod tests {
             None,
         );
         assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-        assert_eq!(RENDER_CONTRACT_VERSION, 2);
+        assert_eq!(RENDER_CONTRACT_VERSION, 3);
         let res = frame.header.window_res as usize;
         let mut moist = 0.0_f32;
         let mut n = 0.0_f32;
