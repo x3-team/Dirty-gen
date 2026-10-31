@@ -4411,7 +4411,7 @@ impl ThroughDrive {
         // The 40 m sheet stays fixed in world space until the car nears an edge.
         // That cuts scroll work mid-puddle while the full e2e still recenters.
         let (_x0, z0, extent) = self.fluid.window_bounds();
-        let margin = 4.0;
+        let margin = 8.0;
         if z < z0 + margin || z > z0 + extent - margin {
             self.fluid.recenter([0.0, z]);
         } else {
@@ -4797,6 +4797,13 @@ impl ThroughDrive {
     /// wiped when the sheet is mirrored back, so that spoil stays placed.
     fn stamp_puddle_tires(&mut self, dt: f32) {
         let tires = crate::dust::tires_at(self.world.vehicle.pos.z, 8.0, 1.6);
+        let on_sheet = tires.iter().any(|tire| {
+            let column = self.fluid.sample(tire.contact.x, tire.contact.z);
+            puddle_tire_on_sheet(column.water_m, tire.contact.x, tire.contact.z)
+        });
+        if !on_sheet {
+            return;
+        }
         for tire in &tires {
             let column = self.fluid.sample(tire.contact.x, tire.contact.z);
             // The shove can leave the contact dry for one step while the

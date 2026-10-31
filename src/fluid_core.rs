@@ -4939,8 +4939,12 @@ impl FluidCore {
         self.step_dust(dt, slow);
         self.step_fog(dt);
         if slow {
-            self.settle_dust();
-            self.settle_fog();
+            if self.dust.iter().sum::<f32>() > 1.0e-6 {
+                self.settle_dust();
+            }
+            if self.fog_live {
+                self.settle_fog();
+            }
         }
         for s in &spray {
             self.spray_m3 += s.volume;
