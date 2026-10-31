@@ -4616,7 +4616,19 @@ impl FluidCore {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
+        let wake = pushes.iter().any(|p| {
+            (p.speed.is_finite() && p.speed >= 0.25)
+                || (p.slip.is_finite() && p.slip.abs() >= 0.05)
+        });
+        let live_silt = self.turbid.iter().any(|t| t.is_finite() && *t > 1.0e-8);
+        let live_foam = self.foam.iter().any(|f| f.is_finite() && *f > 1.0e-4);
+        if !wake && !live_silt && !live_foam {
+            return;
+        }
         self.collect_wet();
+        if self.wet_idx.is_empty() && !live_silt {
+            return;
+        }
         self.advect_foam(dt);
         self.advect_turbid(dt);
         self.settle_turbid(dt);
@@ -4801,7 +4813,7 @@ impl FluidCore {
             self.spawn_tire_tracers(push, dt, area);
         }
         self.spawn_shore_tracers(dt, area, res);
-        self.spawn_breaking_film(dt);
+        self.spawn_breaking_speed(dt);
     }
 
     /// Crest left by seating the sheet into the rut. That seat runs after
@@ -4816,6 +4828,28 @@ impl FluidCore {
         self.collect_wet();
         self.spawn_breaking_film(dt);
         self.clear_dry_tracers();
+    }
+
+    /// Froude foam on the wet cells. Crest from the seated sheet runs in
+    /// [`Self::note_surface_foam`], after `seat_rut_sheet`.
+    fn spawn_breaking_speed(&mut self, dt: f32) {
+        let ids = std::mem::take(&mut self.wet_idx);
+        for &id in &ids {
+            let idx = id as usize;
+            let h = self.water[idx] + self.slurry[idx];
+            if !h.is_finite() || h < 0.004 {
+                continue;
+            }
+            let u = self.uw[idx];
+            let v = self.vw[idx];
+            let speed = if u.is_finite() && v.is_finite() {
+                u.hypot(v)
+            } else {
+                0.0
+            };
+            self.add_foam(idx, breaking_foam(speed, h), dt);
+        }
+        self.wet_idx = ids;
     }
 
     /// Breaking film and a steep crest. Both write the foam field. A later
