@@ -37,3 +37,7 @@ fn bc_dust_settled(xz: vec2<f32>) -> f32 {
 fn bc_rut(xz: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(0.0);
 }
+
+fn bc_ground(xz: vec2<f32>, fallback: f32) -> f32 {
+    return fallback;
+}
