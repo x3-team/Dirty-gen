@@ -4277,8 +4277,8 @@ impl ThroughDrive {
         // The compass depth is only the column that is poured. The bed under
         // it is the bank plus centimetre relief. Both sheets then drain, and
         // the shoreline is wherever those columns come to rest. The open 2 cm
-        // sheet takes one pressure solve and then a flux per Courant slice,
-        // capped at eight. A bare FluidCore still uses the single pass.
+        // sheet splits the wet rectangle by adaptive CFL, capped at eight.
+        // A bare FluidCore still uses the single open pass from #100.
         fluid.set_fine_sub_cap(8.0);
         fluid.set_fine_pace(3);
         let _poured_water = fluid.map_water_bed(|x, z| {

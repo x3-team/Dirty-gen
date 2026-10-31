@@ -1284,16 +1284,18 @@ fn step_sheet_scratch(
     // A mask does not glue separate tire disks into one rectangle. A single
     // connected sheet still returns the historical halo-3 box.
     // Pace 0 is the open 2 cm sheet: one CFL pass, flat tiles asleep. Pace 1
-    // is the same awake tiles with an adaptive CFL count, capped at eight.
-    // Pace 2 is that split on the whole wet rectangle. Pace 3 pays for one
-    // pressure and then the transports the Courant number asks for. A wall
-    // keeps the substep loop and the forward Gauss–Seidel sweep.
+    // is adaptive CFL on awake tiles, capped at eight. Pace 2 and 3 split the
+    // whole wet rectangle the same way. A wall keeps the substep loop and the
+    // forward Gauss–Seidel sweep.
     let open_fine = solid.is_none()
         && cell <= FINE_CELL_M + 1.0e-6
         && matches!(drive, SheetDrive::Gravity { .. });
     let fine_open = open_fine && pace == 0;
-    let awake = open_fine && pace != 2;
-    let boxes = if awake {
+    // Pace 2 and 3 split the whole wet rectangle by adaptive CFL, capped at
+    // eight. Pace 0 keeps flat tiles asleep. Pace 1 uses awake tiles only.
+    let whole_wet = open_fine && (pace == 2 || pace == 3);
+    let awake = open_fine && !whole_wet && !fine_open;
+    let boxes = if fine_open || awake {
         awake_work_boxes(h, u, v, bed, res, cell, eps)
     } else {
         sheet_work_boxes(h, res, eps, true)
@@ -1331,24 +1333,24 @@ fn step_sheet_scratch(
             .clamp(1.0, cap) as u32
     };
     let dts = dt / nsub as f32;
-    // Pace 3: one pressure and the full impulse, then one flux per Courant
-    // slice. Repeating the Jacobi sweep every slice misses the 7 ms step.
-    if pace == 3 && open_fine && nsub > 1 {
+    // Pace 3: one pressure solve on the whole wet sheet, then one flux per
+    // Courant slice. Pace 2 repeats the Jacobi sweep every slice. The shore
+    // equality test keeps pace 2 as the reference.
+    if pace == 3 && whole_wet && nsub > 1 {
         for &(i0, i1, j0, j1) in &boxes {
             substep(
                 h, u, v, bed, nu, gate, res, cell, dt, drive, eps, i0, i1, j0, j1, solid, banks,
                 false, sc,
             );
         }
-        let dt_pass = dts;
         let frac_cap = 0.45f32;
         for _ in 0..nsub {
             for &(i0, i1, j0, j1) in &boxes {
                 transport_open(
-                    h, u, gate, res, cell, dt_pass, i0, i1, j0, j1, true, None, frac_cap, sc,
+                    h, u, gate, res, cell, dts, i0, i1, j0, j1, true, None, frac_cap, sc,
                 );
                 transport_open(
-                    h, v, gate, res, cell, dt_pass, i0, i1, j0, j1, false, None, frac_cap, sc,
+                    h, v, gate, res, cell, dts, i0, i1, j0, j1, false, None, frac_cap, sc,
                 );
             }
         }
