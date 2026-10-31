@@ -969,11 +969,14 @@ fn beauty_puddle_camera(world: &World) -> CameraPose {
 /// wheel in the water, the bank behind. The fixed shot for puddle iterations.
 fn beauty_puddle_side_camera(world: &World) -> CameraPose {
     let (p, fwd, right) = vehicle_axes(world);
-    // Low, beside the front wheel, horizon in frame. Fixed for the puddle
-    // iterations: do not move it.
+    // Low, beside the front wheel, horizon in frame. Since iter 28 (Vitalii,
+    // 2026-10-31) the iter-01 pose moved 1.5 m back along its own view line,
+    // same height and direction, so the near shore of the solved pool is in
+    // frame. Fixed for all later iterations: do not move it.
+    let back = (fwd * 1.6 + right * 2.7).normalize() * 1.5;
     CameraPose {
-        eye: p + fwd * 2.6 + right * 3.3 + Vec3::Y * 0.2,
-        target: p + fwd * 1.0 + right * 0.6 - Vec3::Y * 0.45,
+        eye: p + fwd * 2.6 + right * 3.3 + back + Vec3::Y * 0.2,
+        target: p + fwd * 1.0 + right * 0.6 + back - Vec3::Y * 0.45,
         ortho_width: None,
     }
 }
