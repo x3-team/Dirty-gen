@@ -22,6 +22,81 @@ const SPEED: f32 = 4.0;
 /// Water sheet inside the timed [`FluidCore::step`]. Do not raise.
 const WATER_STEP_BUDGET_MS: f64 = 2.0;
 
+/// Release turbidity timing gate. Production caps stay [`SOLVER_STEP_BUDGET_MS`] and
+/// [`WATER_STEP_BUDGET_MS`]; do not raise them.
+fn assert_fluid_step_budget(
+    step_mean: f64,
+    step_p95: f64,
+    water_mean: f64,
+    slurry_mean: f64,
+    fluid_cap_ms: f32,
+    water_cap_ms: f64,
+) {
+    assert!(
+        step_mean > 0.0 && step_mean <= f64::from(fluid_cap_ms),
+        "fluid step {step_mean:.3} ms exceeds {fluid_cap_ms}"
+    );
+    assert!(
+        water_mean > 0.0 && water_mean <= water_cap_ms,
+        "water {water_mean:.3} ms exceeds {water_cap_ms}"
+    );
+    assert!(
+        slurry_mean > 0.0 && slurry_mean <= f64::from(fluid_cap_ms),
+        "clay pond {slurry_mean:.3} ms exceeds {fluid_cap_ms}"
+    );
+    assert!(
+        step_p95 > 0.0 && step_p95 <= f64::from(fluid_cap_ms),
+        "fluid step p95 {step_p95:.3} ms exceeds {fluid_cap_ms}"
+    );
+}
+
+#[test]
+fn fluid_step_budget_assert_fails_when_cap_artificially_low() {
+    let mut fluid = FluidCore::new([0.0, 0.0]);
+    fluid.pour_water(-2.4, 2.4, -3.2, 3.4, 0.08);
+    fluid.pour_slurry(-2.4, 2.4, -3.2, 3.4, 0.08, Grain::Clay, 0.55);
+    fluid.push_tire(TirePush {
+        x: 0.0,
+        z: 0.0,
+        forward_x: 0.0,
+        forward_z: 1.0,
+        radius: 0.36,
+        width: 0.22,
+        speed: SPEED,
+        slip: 0.9,
+    });
+    let t0 = Instant::now();
+    fluid.step(DT);
+    let step_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let parts = fluid.step_parts();
+    let water_ms = f64::from(parts.water_ms);
+    let slurry_ms = f64::from(parts.slurry_ms);
+    assert!(step_ms > 0.05, "step_ms {step_ms}");
+    let tight_cap = (step_ms * 0.5).max(0.01);
+    assert!(
+        step_ms > tight_cap,
+        "sanity: measured {step_ms:.3} ms must exceed artificial cap {tight_cap:.3} ms"
+    );
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_fluid_step_budget(
+            step_ms,
+            step_ms,
+            water_ms,
+            slurry_ms,
+            tight_cap as f32,
+            WATER_STEP_BUDGET_MS,
+        );
+    }));
+    assert!(
+        failed.is_err(),
+        "artificial fluid cap {tight_cap:.3} ms must trip assert (measured {step_ms:.3} ms)"
+    );
+    println!(
+        "fluid budget proof: one step {step_ms:.3} ms fails artificial cap {tight_cap:.3} ms; \
+         production fluid cap {SOLVER_STEP_BUDGET_MS} ms unchanged"
+    );
+}
+
 #[test]
 fn turbidity_plume_closes() {
     let mut fluid = FluidCore::new([0.0, 0.0]);
@@ -144,11 +219,9 @@ fn turbidity_plume_closes() {
     let restrict_mean = if timed > 0.0 { restrict_ms / timed } else { 0.0 };
     let window_mean = if timed > 0.0 { window_ms / timed } else { 0.0 };
     let budget_note = if cfg!(debug_assertions) {
-        "debug (release asserts budget)"
-    } else if step_mean <= f64::from(SOLVER_STEP_BUDGET_MS) {
-        "met"
+        "debug (budget assert runs in release only)"
     } else {
-        "NOT met"
+        "release assert below"
     };
     let clamp_frac = if wet_cells > 0 {
         clamp_cells as f64 / wet_cells as f64
@@ -269,24 +342,14 @@ fn turbidity_plume_closes() {
     assert_eq!(SOLVER_STEP_BUDGET_MS, 7.0, "do not raise the solver step budget");
     assert_eq!(WATER_STEP_BUDGET_MS, 2.0, "do not raise the water step budget");
     #[cfg(not(debug_assertions))]
-    {
-        assert!(
-            step_mean > 0.0 && step_mean <= f64::from(SOLVER_STEP_BUDGET_MS),
-            "fluid step {step_mean:.3} ms exceeds {SOLVER_STEP_BUDGET_MS}"
-        );
-        assert!(
-            water_mean > 0.0 && water_mean <= WATER_STEP_BUDGET_MS,
-            "water {water_mean:.3} ms exceeds {WATER_STEP_BUDGET_MS}"
-        );
-        assert!(
-            slurry_mean > 0.0 && slurry_mean <= f64::from(SOLVER_STEP_BUDGET_MS),
-            "clay pond {slurry_mean:.3} ms exceeds {SOLVER_STEP_BUDGET_MS}"
-        );
-        assert!(
-            step_p95 > 0.0 && step_p95 <= f64::from(SOLVER_STEP_BUDGET_MS),
-            "fluid step p95 {step_p95:.3} ms exceeds {SOLVER_STEP_BUDGET_MS}"
-        );
-    }
+    assert_fluid_step_budget(
+        step_mean,
+        step_p95,
+        water_mean,
+        slurry_mean,
+        SOLVER_STEP_BUDGET_MS,
+        WATER_STEP_BUDGET_MS,
+    );
 }
 
 fn flow_bounds(frame: &ContractFrame) -> (f32, f32, f32, f32, f32, f32) {
