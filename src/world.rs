@@ -309,7 +309,8 @@ impl World {
 
     /// Playable Windows demo: sand, mud, and puddles on a small pad.
     pub fn win_demo() -> Self {
-        let mut world = Self::rest(SoilField::win_playground());
+        // No idle settle: 90 steps carve spoil that reads as stumps/boards in stills.
+        let mut world = Self::rest_after(SoilField::win_playground(), 0);
         world.bike.pos = Vec3::new(120.0, 0.5, 120.0);
         world.bike.vel = Vec3::ZERO;
         world.vehicle.yaw = 0.92;
@@ -320,6 +321,10 @@ impl World {
     }
 
     fn rest(soil: SoilField) -> Self {
+        Self::rest_after(soil, 90)
+    }
+
+    fn rest_after(soil: SoilField, settle_steps: u32) -> Self {
         let mut world = Self {
             soil,
             vehicle: Vehicle::new(),
@@ -348,12 +353,14 @@ impl World {
         world.vehicle.pos = Vec3::new(0.0, 0.8, 0.0);
         world.vehicle.yaw = 0.0;
         world.place_on_soil();
-        for _ in 0..90 {
+        for _ in 0..settle_steps {
             world.step(1.0 / 60.0, &Input::default());
         }
-        world.restore_sidewall_skim();
-        world.refund_spawn_coat();
-        world.vehicle.clear_loose_mud();
+        if settle_steps > 0 {
+            world.restore_sidewall_skim();
+            world.refund_spawn_coat();
+            world.vehicle.clear_loose_mud();
+        }
         world.particles.clear();
         world.coat_in_rut = 0.0;
         world.slurry_plow_m3 = (0.0, 0.0);

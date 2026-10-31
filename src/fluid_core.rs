@@ -88,7 +88,7 @@ pub fn dust_stream_hold(local_x: f32) -> f32 {
     1.0 - (1.0 - DUST_STREAM_HOLD) * lee
 }
 /// Slow exchange (settle, park compact) runs on this stride, inside 4–8 frames.
-pub const SLOW_STRIDE: u32 = 6;
+pub const SLOW_STRIDE: u32 = 8;
 /// Settled dust does not lift at or above this pore moisture.
 pub const DUST_WET_MOISTURE: f32 = 0.55;
 /// Settled dust does not lift at or above this standing water, metres.
@@ -1282,7 +1282,7 @@ fn step_sheet_scratch(
         let nsub_max = if cell <= FINE_CELL_M + 1.0e-6 {
             5.0
         } else {
-            8.0
+            7.0
         };
         ((dt * max_s) / (courant * cell.max(1.0e-3)))
             .ceil()
@@ -6433,9 +6433,9 @@ pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 /// under 4 ms, which is the budget for the step that feeds the GPU upload.
 pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
-pub const AIR_FLUX_STRIDE: u32 = 12;
+pub const AIR_FLUX_STRIDE: u32 = 14;
 /// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.
-pub const AIR_SOLVE_STRIDE: u32 = 6;
+pub const AIR_SOLVE_STRIDE: u32 = 8;
 /// Fine dust cells per coarse air cell in X and Z. Layers stay at the dust spacing.
 /// The solve runs on this coarser active window and is written back onto the dust grid.
 pub const AIR_COARSE: usize = 2;

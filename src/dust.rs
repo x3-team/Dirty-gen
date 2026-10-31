@@ -716,12 +716,24 @@ impl Dust {
     }
 
     fn finish_frame(&mut self, dt: f32) {
-        self.transport_dust(dt);
         let airborne = self.vol.iter().any(|&v| v > 1.0e-9);
-        if airborne || !self.occupied.is_empty() {
+        if airborne {
+            self.transport_dust(dt);
             self.solve_air(dt);
+            self.rebuild_rows_from_volume();
+        } else {
+            self.occupied.clear();
+            self.x0 = 1;
+            self.x1 = 0;
+            self.z0 = 1;
+            self.z1 = 0;
+            for row in &mut self.row_lo {
+                *row = 1;
+            }
+            for row in &mut self.row_hi {
+                *row = 0;
+            }
         }
-        self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {

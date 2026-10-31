@@ -874,6 +874,7 @@ fn capture_win_demo_stills() {
     renderer.show_props = false;
     renderer.show_bike = false;
     renderer.show_hills = false;
+    renderer.show_environment = false;
     renderer.niva_picture = true;
     renderer.daylight = true;
     renderer.water_column = true;
