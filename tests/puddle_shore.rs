@@ -21,6 +21,9 @@ const VOL_REL: f32 = 5.0e-3;
 /// L1 of |Δh| on the coarse film, cubic metres. 0.10 m³ on the drained
 /// sheet is about 3 mm average. The uniform eight-substep solve is the reference.
 const L1_DEPTH_M3: f64 = 0.10;
+/// Peak cell difference on that same film. A tongue that only moved one
+/// coarse cell stays under this. A different bay does not.
+const MAX_DH_M: f32 = 0.05;
 const STORE_DIR: &str =
     "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/puddle-shore";
 
@@ -510,6 +513,21 @@ fn cfl_split(dt: f32, speed: f32, cell: f32, cap: f32) -> (f32, u32) {
     (courant, nsub)
 }
 
+fn copy_chassis(dst: &mut ThroughDrive, src: &ThroughDrive) {
+    let s = &src.world.vehicle;
+    let d = &mut dst.world.vehicle;
+    d.pos = s.pos;
+    d.vel = s.vel;
+    d.yaw = s.yaw;
+    d.pitch = s.pitch;
+    d.roll = s.roll;
+    d.yaw_rate = s.yaw_rate;
+    d.pitch_rate = s.pitch_rate;
+    d.roll_rate = s.roll_rate;
+    d.jump_hold = s.jump_hold;
+    d.wheels = s.wheels;
+}
+
 fn rel_vol(a: f32, b: f32) -> f32 {
     let scale = a.abs().max(b.abs()).max(1.0e-6);
     (a - b).abs() / scale
@@ -571,6 +589,10 @@ fn one_fine_substep_matches_eight() {
     let mut peak_p = 0.0f32;
     let mut peak_f = 0.0f32;
     for _ in 0..48 {
+        // Same chassis at the start of the step. The sheet is what differs.
+        // Leaving the second car to wander makes a 4 mm tongue depend on the
+        // libm of the host, not on the Courant split.
+        copy_chassis(&mut full, &prod);
         prod.step(dt);
         full.step(dt);
         peak_p = peak_p.max(peak_sheet_mps(&prod.fluid));
@@ -649,6 +671,12 @@ fn one_fine_substep_matches_eight() {
         "L1 depth {:.6} m3 over {L1_DEPTH_M3} (max |dh| {:.5} m)",
         run_full.l1_m3,
         run_full.max_dh
+    );
+    assert!(
+        run_full.max_dh <= MAX_DH_M,
+        "max |dh| {:.5} m over {MAX_DH_M} (L1 {:.6} m3)",
+        run_full.max_dh,
+        run_full.l1_m3
     );
     assert_eq!(
         run_prod.tongues, run_full.tongues,
