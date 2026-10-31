@@ -4411,7 +4411,7 @@ impl ThroughDrive {
         // The 40 m sheet stays fixed in world space until the car nears an edge.
         // That cuts scroll work mid-puddle while the full e2e still recenters.
         let (_x0, z0, extent) = self.fluid.window_bounds();
-        let margin = 8.0;
+        let margin = 4.0;
         if z < z0 + margin || z > z0 + extent - margin {
             self.fluid.recenter([0.0, z]);
         } else {
