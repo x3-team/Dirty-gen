@@ -37,6 +37,10 @@ struct Frame {
     tire_water: vec4<f32>,
     // x: 1 = depth debug.
     debug: vec4<f32>,
+    // Last frame's view-projection (SSR history reprojection).
+    prev_view_proj: mat4x4<f32>,
+    // x: SSR history valid. y, z: half-res SSR target size.
+    ssr_info: vec4<f32>,
 }
 
 struct Model {
@@ -70,6 +74,12 @@ struct Model {
 // Tileable curl (rgb) and billow (a) noise for the dust and fog detail.
 @group(2) @binding(3) var air_noise: texture_3d<f32>;
 @group(2) @binding(4) var air_samp: sampler;
+// Half-res water SSR. In the water pass: this frame's trace. In the SSR
+// pass itself: last frame's, for the temporal blend.
+// A: rgb premultiplied by the hit weight, a = weight.
+// B: x = view depth, y/z = normal xz, w = 1 where the sheet was traced.
+@group(2) @binding(5) var ssr_a_tex: texture_2d<f32>;
+@group(2) @binding(6) var ssr_b_tex: texture_2d<f32>;
 
 @group(1) @binding(0) var height_tex: texture_2d<f32>;
 @group(1) @binding(1) var mat_tex: texture_2d<f32>;
@@ -1667,7 +1677,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         // the film a shade lighter, so the shallows show a sandy bed.
         let film_in = smoothstep(0.002, 0.01, film_t);
         let wet_col = max(mix(vec3<f32>(wet_lum), albedo, 1.08), vec3<f32>(0.0))
-            * mix(vec3<f32>(0.52, 0.47, 0.4), vec3<f32>(0.6, 0.55, 0.47), film_in);
+            * mix(vec3<f32>(0.52, 0.47, 0.4), vec3<f32>(0.5, 0.46, 0.38), film_in);
         albedo = mix(albedo, wet_col, soak);
         // A thin pale line of dried silt right where the film runs out, on
         // the land side only, broken along its length.
@@ -1698,7 +1708,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             // In the last centimetre the swell's caustic lines lay parallel
             // stripes on the rim; they build in with depth and break up in patches.
             let c_patch = smoothstep(0.3, 0.7, noise(xz * 1.6 + vec2<f32>(4.0, -3.0)));
-            caustic = max(ratio - 0.85, 0.0) * 2.4 * (1.0 - slurry_f) * under * smoothstep(0.008, 0.04, film_t) * mix(0.5, 1.0, c_patch);
+            caustic = max(ratio - 0.8, 0.0) * 2.0 * (1.0 - slurry_f) * under * smoothstep(0.005, 0.02, film_t)
+                * (1.0 - smoothstep(0.08, 0.2, film_t) * 0.6) * mix(0.6, 1.0, c_patch);
             // Saturated: already x0.55 from the wet band above; a second
             // darkening printed a black rim along the shallows.
             // The water layer owns the specular; a backlit bed under a thin
@@ -1956,6 +1967,7 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
     // mirror image into horizontal bands; jittered, they average out.
     let jit = hash12(world.xz * 731.0 + dir.xz * 97.0);
     var t = 0.04 + jit * 0.08;
+    var t_prev = 0.0;
     for (var i: i32 = 0; i < 28; i = i + 1) {
         let p = world + dir * t;
         let c = frame.view_proj * vec4<f32>(p, 1.0);
@@ -1982,13 +1994,26 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 return vec4<f32>(0.0);
             }
             if (gap < 0.35 + t * 0.08) {
-                // Refine the hit halfway back along the last step, then read a
-                // small cross of texels: a soft mirror instead of the block
-                // the coarse march landed on.
-                let pm = world + dir * (t - 0.025);
-                let cm = frame.view_proj * vec4<f32>(pm, 1.0);
+                // Binary search between the last step in front and this one
+                // behind: the coarse geometric steps landed on the same few
+                // rows and cut the mirror into horizontal blocks.
+                var lo = t_prev;
+                var hi = t;
+                for (var b: i32 = 0; b < 5; b = b + 1) {
+                    let tm = 0.5 * (lo + hi);
+                    let cb = frame.view_proj * vec4<f32>(world + dir * tm, 1.0);
+                    let nb = cb.xyz / cb.w;
+                    let ub = clamp(vec2<f32>(nb.x * 0.5 + 0.5, 0.5 - nb.y * 0.5), vec2<f32>(0.0), vec2<f32>(0.9999));
+                    let db = textureLoad(scene_depth, vec2<i32>(ub * dims), 0);
+                    if (db < 0.9999 && nb.z > db) {
+                        hi = tm;
+                    } else {
+                        lo = tm;
+                    }
+                }
+                let cm = frame.view_proj * vec4<f32>(world + dir * hi, 1.0);
                 let uvm = vec2<f32>(cm.x / cm.w * 0.5 + 0.5, 0.5 - cm.y / cm.w * 0.5);
-                let uvh = clamp(mix(uv, uvm, 0.5), vec2<f32>(0.0), vec2<f32>(0.9999));
+                let uvh = clamp(uvm, vec2<f32>(0.0), vec2<f32>(0.9999));
                 let ph = vec2<i32>(uvh * dims);
                 let dmax = vec2<i32>(dims) - vec2<i32>(1);
                 var col = textureLoad(scene_color, ph, 0).rgb * 0.4;
@@ -2004,6 +2029,7 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 return vec4<f32>(col, w);
             }
         }
+        t_prev = t;
         t = t * 1.16 + 0.05 * (0.75 + 0.5 * fract(jit * 7.0 + f32(i) * 0.618));
     }
     return vec4<f32>(0.0);
@@ -2277,6 +2303,154 @@ fn vs_water(in: TerrIn) -> WaterOut {
     return o;
 }
 
+struct SsrOut {
+    @location(0) a: vec4<f32>,
+    @location(1) b: vec4<f32>,
+}
+
+// View depth (clip w) of a world point: the key the bilateral upscale and
+// the history test compare.
+fn ssr_view_depth(p: vec3<f32>) -> f32 {
+    return (frame.view_proj * vec4<f32>(p, 1.0)).w;
+}
+
+// The large-scale surface normal for the half-res trace: the published
+// surface slope, the long swell and the wind ripples. The capillary detail
+// is below a half-res texel and is left to the roughness blur.
+fn ssr_surface_normal(xz: vec2<f32>, column_c: f32, depth: f32) -> vec3<f32> {
+    let n = ripple_normal(xz, frame.misc.x);
+    let dc = 0.2;
+    let s0 = bc_ground_soft(xz, height_bilinear(xz)) + column_c;
+    let f_x = bc_film_soft(xz + vec2<f32>(dc, 0.0));
+    let f_z = bc_film_soft(xz + vec2<f32>(0.0, dc));
+    let sx = bc_ground_soft(xz + vec2<f32>(dc, 0.0), height_bilinear(xz + vec2<f32>(dc, 0.0))) + f_x.r + f_x.g;
+    let sz = bc_ground_soft(xz + vec2<f32>(0.0, dc), height_bilinear(xz + vec2<f32>(0.0, dc))) + f_z.r + f_z.g;
+    let c_n = normalize(vec3<f32>(-(sx - s0) / dc * 1.6, 1.0, -(sz - s0) / dc * 1.6));
+    var nrm = normalize(c_n + vec3<f32>(n.x * 0.8, 0.0, n.z * 0.8));
+    let t_now = frame.misc.x;
+    let wv = frame.air[0].xz;
+    let wd0 = select(vec2<f32>(0.8, 0.6), normalize(wv), dot(wv, wv) > 1e-4);
+    let swing = (noise(xz * 0.8 + vec2<f32>(3.0, 1.0)) - 0.5) * 1.8 + (noise(xz * 2.6) - 0.5) * 0.6;
+    let wd = vec2<f32>(wd0.x * cos(swing) - wd0.y * sin(swing), wd0.x * sin(swing) + wd0.y * cos(swing));
+    let wp = vec2<f32>(-wd.y, wd.x);
+    var wg = vec2<f32>(0.0);
+    for (var o: i32 = 0; o < 2; o = o + 1) {
+        let fo = f32(o);
+        let f_along = 16.0 * pow(2.5, fo);
+        let f_across = 9.0 * pow(2.6, fo);
+        let drift = t_now * (0.9 + 0.7 * fo);
+        let q = vec2<f32>(dot(xz, wd) * f_along - drift * f_along * 0.1, dot(xz, wp) * f_across) + vec2<f32>(fo * 17.0, 3.0);
+        let h0 = bw_vnoise2d(q);
+        let ha = bw_vnoise2d(q + vec2<f32>(0.25, 0.0)) - h0;
+        let hc = bw_vnoise2d(q + vec2<f32>(0.0, 0.25)) - h0;
+        let amp = select(0.035, 0.018, o == 1);
+        wg += (wd * ha * f_along + wp * hc * f_across) * 4.0 * amp / f_along;
+    }
+    let gust = smoothstep(0.42, 0.72, noise(xz * 0.45 + wd * t_now * 0.4) * 0.7 + noise(xz * 1.7 - wd * t_now * 0.3) * 0.3);
+    return normalize(nrm - vec3<f32>(wg.x, 0.0, wg.y) * mix(0.45, 1.6, gust) * smoothstep(0.003, 0.015, depth));
+}
+
+// Half-resolution SSR of the water sheet. Four jittered rays per texel,
+// the jitter rotated every frame, blended with last frame's result
+// reprojected through the previous view-projection. The water pass reads
+// it back with a depth- and normal-aware upscale.
+@fragment
+fn fs_water_ssr(in: WaterOut) -> SsrOut {
+    var o: SsrOut;
+    let xz = in.world.xz;
+    let inside = bc_inside(xz);
+    if (inside < 0.5) {
+        discard;
+    }
+    let film_c = bc_film_soft(xz);
+    let column_c = film_c.r + film_c.g;
+    if (column_c < 0.003) {
+        discard;
+    }
+    let nrm = ssr_surface_normal(xz, column_c, column_c);
+    let view = normalize(frame.cam_pos.xyz - in.world);
+    let refl_dir = reflect(-view, nrm);
+    let vfl = normalize(vec2<f32>(view.x, view.z) + vec2<f32>(1e-5, 0.0));
+    let seed = fract(hash12(floor(in.clip.xy) + vec2<f32>(17.0, 3.0)) + fract(frame.misc.x * 7.31) * 0.618);
+    var sum = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var k: i32 = 0; k < 4; k = k + 1) {
+        let along = ((f32(k) + seed) / 4.0 - 0.5) * 0.22;
+        let side = (fract(seed * 13.7 + f32(k) * 0.37) - 0.5) * 0.06;
+        let jd = vec3<f32>(vfl.x * along - vfl.y * side, 0.0, vfl.y * along + vfl.x * side);
+        let sk = water_ssr(in.world + nrm * 0.005, normalize(refl_dir + jd));
+        sum += sk.rgb * sk.a;
+        wsum += sk.a;
+    }
+    var a = vec4<f32>(sum, wsum) * 0.25;
+    let vd = ssr_view_depth(in.world);
+    // Temporal accumulation: the same world point in last frame's half-res
+    // target, accepted when its stored view depth matches.
+    if (frame.ssr_info.x > 0.5) {
+        let pc = frame.prev_view_proj * vec4<f32>(in.world, 1.0);
+        if (pc.w > 0.01) {
+            let puv = vec2<f32>(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+            if (all(puv >= vec2<f32>(0.0)) && all(puv < vec2<f32>(1.0))) {
+                let ip = vec2<i32>(puv * frame.ssr_info.yz);
+                let hb = textureLoad(ssr_b_tex, ip, 0);
+                if (hb.w > 0.5 && abs(hb.x - pc.w) < 0.03 * pc.w) {
+                    let ha = textureLoad(ssr_a_tex, ip, 0);
+                    a = mix(ha, a, 0.2);
+                }
+            }
+        }
+    }
+    // A NaN or overflow in one texel would spread through the history and
+    // the upscale; drop it.
+    let ok = all(a == a) && all(abs(a) < vec4<f32>(1e3)) && vd == vd;
+    o.a = select(vec4<f32>(0.0), clamp(a, vec4<f32>(0.0), vec4<f32>(64.0)), ok);
+    o.b = select(vec4<f32>(0.0), vec4<f32>(vd, nrm.x, nrm.z, 1.0), ok);
+    return o;
+}
+
+// Bilateral upscale of the half-res SSR at a full-res water pixel: a 4x4
+// window of half-res texels, Gaussian in screen space with a radius that
+// grows with the roughness, weighted by view depth and normal so the
+// reflection does not bleed across the waterline or a tire.
+fn ssr_upsample(clip_xy: vec2<f32>, vd: f32, nrm: vec3<f32>, rough: f32) -> vec4<f32> {
+    let hc = clip_xy * 0.5 - vec2<f32>(0.5);
+    let sigma = mix(0.8, 2.2, smoothstep(0.06, 0.2, rough));
+    let r = i32(ceil(sigma * 1.5));
+    let base = vec2<i32>(floor(hc));
+    let dmax = vec2<i32>(textureDimensions(ssr_a_tex)) - vec2<i32>(1);
+    var acc = vec4<f32>(0.0);
+    var wt = 0.0;
+    for (var j: i32 = -r; j <= r + 1; j = j + 1) {
+        for (var i: i32 = -r; i <= r + 1; i = i + 1) {
+            let ip = clamp(base + vec2<i32>(i, j), vec2<i32>(0), dmax);
+            let b = textureLoad(ssr_b_tex, ip, 0);
+            if (b.w < 0.5) {
+                continue;
+            }
+            let dpx = vec2<f32>(ip) - hc;
+            let ws = exp(-dot(dpx, dpx) / (2.0 * sigma * sigma));
+            let wz = exp(-abs(b.x - vd) / (0.015 * vd + 0.01));
+            let nb = vec3<f32>(b.y, sqrt(max(1.0 - b.y * b.y - b.z * b.z, 0.0)), b.z);
+            let wn = pow(max(dot(nb, nrm), 0.0), 16.0);
+            let w = ws * wz * wn;
+            let av = textureLoad(ssr_a_tex, ip, 0);
+            if (!(all(av == av) && w == w)) {
+                continue;
+            }
+            acc += av * w;
+            wt += w;
+        }
+    }
+    if (wt < 1e-5) {
+        return vec4<f32>(0.0);
+    }
+    let a = acc / wt;
+    if (a.a < 1e-3) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(clamp(a.rgb / a.a, vec3<f32>(0.0), vec3<f32>(4.0)), clamp(a.a, 0.0, 1.0));
+}
+
 @fragment
 fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let xz = in.world.xz;
@@ -2424,7 +2598,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     nrm = normalize(nrm - vec3<f32>(fslope.x, 0.0, fslope.y) * smoothstep(0.002, 0.01, depth) * (1.0 - smoothstep(0.008, 0.03, w_fw)));
     // Rings run out from each wheel standing in the water, and the bow
     // pushes a swell ahead of it.
-    nrm = normalize(nrm + wheel_ripples(xz, in.world.y, t_now) * calm_or_film(depth));
+    // Faded where a pixel spans the chop: at the grazing view it aliased into
+    // bright speckles round the tires.
+    nrm = normalize(nrm + wheel_ripples(xz, in.world.y, t_now) * calm_or_film(depth) * (1.0 - smoothstep(0.006, 0.02, w_fw)));
     // Running water combs into streaks along the current.
     if (speed > 0.05) {
         let along = flow / speed;
@@ -2498,7 +2674,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // 15-20 cm: the silt load grows with the published depth.
     // Clear water absorbs (red first) and scatters little: the shallows are
     // a window onto the sand. Only the published slurry clouds it.
-    let sigma = mix(vec3<f32>(1.2, 1.8, 3.0) * mix(0.3, 1.2, smoothstep(0.03, 0.2, depth)),
+    let sigma = mix(vec3<f32>(3.0, 2.3, 4.6) * mix(0.25, 1.4, smoothstep(0.02, 0.15, depth)),
         vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
     let trans = exp(-sigma * path);
     // Light scattered by the silt in the column, lit by sun and sky.
@@ -2512,21 +2688,21 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         // Murk only where the contract publishes slurry: no circle per tire.
         stir = max(stir, 0.0 * dot(dd, dd));
     }
-    var silt = mix(vec3<f32>(0.17, 0.10, 0.042), bed * vec3<f32>(0.7, 0.52, 0.32), 0.35) * mix(1.0, 0.45, deep_t);
+    var silt = vec3<f32>(0.17, 0.10, 0.042) * mix(1.0, 0.45, deep_t);
     // What clear water scatters back is blue-green and dim; a little silt
     // warms it. Slurry is the brown suspension.
     // Brown suspension: silt scatters a warm, fairly bright light back out,
     // which is what keeps a turbid pool from reading as varnish.
     // Silt is a bright scatterer: a turbid pool returns a good share of the
     // light as a yellow-brown glow, which is what reads as mud, not glass.
-    let clear_sc = mix(vec3<f32>(0.27, 0.22, 0.15), vec3<f32>(0.24, 0.18, 0.11), smoothstep(0.01, 0.08, depth));
+    let clear_sc = mix(vec3<f32>(0.21, 0.18, 0.11), vec3<f32>(0.11, 0.1, 0.055), smoothstep(0.02, 0.15, depth));
     // Shallow water shows the sand's own warmth; deep water the teal.
-    silt = mix(mix(bed * vec3<f32>(0.5, 0.42, 0.3), clear_sc, smoothstep(0.015, 0.1, depth)), silt, 0.2);
+    silt = mix(clear_sc, silt, 0.2 * slurry_frac);
     silt = mix(silt, vec3<f32>(0.13, 0.075, 0.035), max(slurry_frac, max(stir * 0.35, collar_t * 0.35)));
     // The middle of the pool is deeper and murkier than the clear rim.
     // Deeper reads murkier and greyer, not black: a dark centre was taken
     // for the car's shadow.
-    silt = mix(silt, vec3<f32>(0.22, 0.13, 0.05), deep_t * 0.7) * mix(1.0, 0.7, smoothstep(0.06, 0.2, depth));
+    silt = mix(silt, vec3<f32>(0.22, 0.13, 0.05), deep_t * 0.7 * slurry_frac) * mix(1.0, 0.6, smoothstep(0.04, 0.2, depth));
     let ndl = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
     // Silt in the shade still glows with sky light scattered sideways in the
     // column: the car's shadow on turbid water is softer than on dry sand.
@@ -2614,7 +2790,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Foam is the published fraction (Froude above 0.85). It is broken into
     // a lace that rides the current, not a flat white decal. A crest the
     // picture swell pushes up adds a little churn where no sheet is attached.
-    let fc = bc_foam_crest(xz);
+    let fc = bc_foam_soft(xz);
     let lace_p = xz * 9.0 - flow * t_now * 9.0;
     let lace = noise(lace_p) * 0.6 + noise(lace_p * 2.7 + vec2<f32>(3.1, 1.7)) * 0.4;
     let churn = smoothstep(0.7, 0.45, nrm.y) * smoothstep(0.06, 0.14, depth) * (1.0 - inside);
@@ -2658,7 +2834,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // drifting Voronoi, gated by the lace.
     let bubbles = 1.0 - smoothstep(0.0, 0.12, cell_border(lace_p * 2.2));
     let lace_f = smoothstep(1.0 - foam_amt * 0.9, 1.05 - foam_amt * 0.6, lace);
-    let foam = clamp(lace_f * (0.75 + 0.25 * bubbles) + bubbles * foam_amt * 0.12, 0.0, 1.0)
+    // Thin foam: a fine net of bubble walls and a few drifting flecks over
+    // the published fraction, never a solid sheet (FluidNinja's lace).
+    let fine = 1.0 - smoothstep(0.0, 0.07, cell_border(lace_p * 4.1 + vec2<f32>(1.3, 0.0)));
+    let foam = clamp((bubbles * 0.55 + fine * 0.35) * smoothstep(0.05, 0.6, foam_amt) * mix(0.5, 1.0, lace)
+        + lace_f * 0.18, 0.0, 0.8)
         * smoothstep(0.002, 0.005, depth);
     // Foam on silty water is dirty beige, never white.
     // Silt-laden scum, a shade lighter than the water, not a white sheet: the
@@ -2696,6 +2876,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // A thin light lip where the film runs out: the meniscus catches the sky
     // and a little of the sun.
     // No bright contour along the waterline: it read as a drawn isoline.
+    // A pixel or two wide whatever the bank slope: the depth band alone drew
+    // a grey stroke round the shore from this low view.
+    let dfw = max(fwidth(depth), 1e-5);
+    let glint_line = (1.0 - smoothstep(0.0, 1.5, abs(depth - 0.0042) / dfw)) * torn * inside * (1.0 - near_tire)
+        * smoothstep(0.003, 0.008, nmax - depth);
+    lit = mix(lit, refl * 1.2 + frame.sun_color.rgb * 0.1 * shadow, glint_line * 0.35);
+    alpha = max(alpha, glint_line * 0.3);
     alpha = max(alpha * smoothstep(0.003, 0.0045, depth), foam * 0.85 * smoothstep(0.003, 0.0045, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
@@ -2705,20 +2892,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Five rays spread mostly toward and away from the lens (a per-pixel
     // offset plus the ripple slope): the ripples stretch the body's mirror
     // image into soft vertical streaks instead of a sharp copy of the sill.
-    let vfl_s = normalize(vec2<f32>(view.x, view.z) + vec2<f32>(1e-5, 0.0));
-    let ph_s = hash12(floor(in.clip.xy) + vec2<f32>(17.0, 3.0));
-    let side_s = (noise(xz * 23.0 + vec2<f32>(t_now, 0.0)) - 0.5) * 0.05;
-    var ssr_sum = vec3<f32>(0.0);
-    var ssr_w = 0.0;
-    for (var k: i32 = 0; k < 8; k = k + 1) {
-        // Spread by the ripple roughness: a glossy, blurred mirror.
-        let along = ((f32(k) + ph_s) / 8.0 - 0.5) * mix(0.12, 0.4, smoothstep(0.06, 0.2, w_rough));
-        let jd = vec3<f32>(vfl_s.x * along - vfl_s.y * side_s, 0.0, vfl_s.y * along + vfl_s.x * side_s);
-        let sk = water_ssr(in.world + nrm * 0.005, normalize(refl_dir + jd));
-        ssr_sum += sk.rgb * sk.a;
-        ssr_w += sk.a;
-    }
-    let ssr = vec4<f32>(ssr_sum / max(ssr_w, 1e-4), ssr_w / 8.0);
+    // Half-res trace, accumulated over frames, upscaled by depth and
+    // normal and blurred by the ripple roughness. Where it found nothing the
+    // weight is low and the env (IBL) reflection already in out_rgb stays.
+    let ssr = ssr_upsample(in.clip.xy, ssr_view_depth(in.world), nrm, w_rough);
     if (ssr.a > 0.0) {
         // Near the Niva the sheet mirrors the sills, body and tires with its
         // Fresnel weight, blurred by the stretched rays; elsewhere a trace.
@@ -2799,6 +2976,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // under a centimetre the bed keeps its own colour.
     let tint = mix(vec3<f32>(1.0), clamp(trans / max((trans.r + trans.g + trans.b) / 3.0, 1e-3), vec3<f32>(0.0), vec3<f32>(1.12)),
         smoothstep(0.012, 0.05, depth));
+    if (frame.debug.x > 5.5) {
+        // 6: foam (r), slurry fraction (g), alpha (b).
+        return vec4<f32>(foam, slurry_frac, a_out, 1.0);
+    }
     if (frame.debug.x > 4.5) {
         // 5: film thickness 0-2 cm (blue 0, green 1 cm, red 2 cm), a line per mm.
         let dd5 = select(in.depth, column_c, inside > 0.5);

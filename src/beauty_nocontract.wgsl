@@ -53,3 +53,7 @@ fn bc_ground_soft(xz: vec2<f32>, fallback: f32) -> f32 {
 fn bc_rut_soft(xz: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(0.0);
 }
+
+fn bc_foam_soft(xz: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(0.0);
+}
