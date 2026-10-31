@@ -5,8 +5,8 @@ use glam::Vec3;
 use crate::adhesion::{AdhereContact, AdhesionReport, PASS_OFFER_M3_S};
 use crate::bike::{Bike, BIKE_RADIUS, BIKE_WIDTH};
 use crate::fluid_core::{
-    bow_height_m, dust_may_lift, FluidCore, Grain, ProfTick, SprayEvent, TirePush, COARSE_CELL_M,
-    WINDOW_RES,
+    bow_height_m, dust_may_lift, relief_value, FluidCore, Grain, ProfTick, SprayEvent, TirePush,
+    COARSE_CELL_M, WINDOW_RES,
 };
 use crate::particles::Particles;
 use crate::patch::{
@@ -4236,9 +4236,19 @@ pub struct ThroughDrive {
     /// the Bekker sinkage of this pair on the wet sand, not a painted groove.
     pub puddle_normal_n: f32,
     pub puddle_push_n: f32,
+    /// Water + slurry thickness on the coarse window before the sheet drained.
+    shore_before: Vec<f32>,
+    /// Water thickness of that same pour, before the sheet drained.
+    shore_before_water: Vec<f32>,
+    /// Water + slurry + spray the pour put on the sheet, cubic metres.
+    sheet_opened_m3: f64,
     /// Breakdown of the step that just finished.
     pub last_parts: DriveParts,
 }
+
+/// Frames of the gravity sheet that let a pour find the bank. Init only.
+const SHORE_DRAIN_STEPS: u32 = 720;
+const SHORE_DRAIN_DT: f32 = 1.0 / 30.0;
 
 impl ThroughDrive {
     pub fn new() -> Self {
@@ -4259,20 +4269,36 @@ impl ThroughDrive {
         }
         let mut fluid = FluidCore::new([0.0, -12.0]);
         fluid.set_wind(1.5, -0.9);
-        // The slurry ruts are a masked pour. The puddle is not: a box scaled
-        // by a mask is a lens on a flat bed, and the shore is a step in the
-        // moisture. A bank rises around the floor until it stands above the
-        // water, the depth falls to 0 on that slope, and a wet band sits past
-        // the shoreline. The bank stays inside the heightfield. A pour that
+        // A bank rises around the floor until it stands above the water, the
+        // depth falls to 0 on that slope, and a wet band sits past the
+        // shoreline. The bank stays inside the heightfield. A pour that
         // crosses z = -20 is cut into a straight wall by the map edge.
-        let _poured_slurry = fluid.pour_slurry(-1.8, 1.8, -14.0, -0.6, 0.08, Grain::Clay, 0.55);
-        fluid.scale_columns(|x, z| (1.0, slurry_rut_mask(x, z)));
         carve_puddle_bank(&mut world.soil);
+        // The compass depth is only the column that is poured. The bed under
+        // it is the bank plus centimetre relief. Both sheets then drain, and
+        // the shoreline is wherever those columns come to rest. The open 2 cm
+        // sheet takes one pressure solve and then a flux per Courant slice,
+        // capped at eight. A bare FluidCore still uses the single pass.
+        fluid.set_fine_sub_cap(8.0);
+        fluid.set_fine_pace(3);
         let _poured_water = fluid.map_water_bed(|x, z| {
-            let rise = puddle_bank_rise(x, z);
-            (rise, puddle_water_depth(x, z))
+            (puddle_terrain(x, z), puddle_water_depth(x, z))
         });
         pull_substrate(&mut fluid, &world.soil);
+        let _poured_slurry = fluid.lay_slurry_on_water(0.018, Grain::Clay);
+        let opened = fluid.ledger();
+        let sheet_opened_m3 = (opened.water_m3 + opened.slurry_m3 + opened.spray_m3) as f64;
+        let mut shore_before = vec![0.0f32; WINDOW_RES * WINDOW_RES];
+        let mut shore_before_water = vec![0.0f32; WINDOW_RES * WINDOW_RES];
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let idx = j * WINDOW_RES + i;
+                let cell = fluid.coarse_cell(i, j).expect("window");
+                shore_before_water[idx] = cell.water_m;
+                shore_before[idx] = cell.water_m + cell.slurry_m;
+            }
+        }
+        fluid.drain_over_bed(SHORE_DRAIN_DT, SHORE_DRAIN_STEPS);
         mirror_fluid(&fluid, &mut world.soil);
         world.vehicle.pos.x = 0.0;
         world.vehicle.pos.z = -20.0;
@@ -4311,6 +4337,9 @@ impl ThroughDrive {
             ribbon_tick: 0,
             puddle_normal_n: 0.0,
             puddle_push_n: 0.0,
+            shore_before,
+            shore_before_water,
+            sheet_opened_m3,
             last_parts: DriveParts::default(),
         }
     }
@@ -4318,6 +4347,21 @@ impl ThroughDrive {
     /// Dust ledger attached to this pass. The render contract reads it.
     pub fn dust(&self) -> &crate::dust::Dust {
         &self.dust
+    }
+
+    /// Water + slurry before the sheet drained, one value per coarse cell.
+    pub fn shore_before(&self) -> &[f32] {
+        &self.shore_before
+    }
+
+    /// Water column of the compass pour, before the sheet drained.
+    pub fn shore_before_water(&self) -> &[f32] {
+        &self.shore_before_water
+    }
+
+    /// Cubic metres poured onto the sheet, before the drain.
+    pub fn sheet_opened_m3(&self) -> f64 {
+        self.sheet_opened_m3
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -4920,7 +4964,7 @@ fn carve_puddle_bank(soil: &mut SoilField) {
                 continue;
             }
             let idx = j * soil.res + i;
-            let rise = puddle_bank_rise(x, z);
+            let rise = puddle_terrain(x, z);
             soil.bed[idx] += rise;
             soil.initial_height[idx] += rise;
             let moist = puddle_pore_moisture(x, z, background);
@@ -4946,8 +4990,8 @@ fn sheet_beside(fluid: &FluidCore, z: f32) -> f32 {
     let mut n = 0.0_f32;
     for x in [-2.6_f32, -1.8, 0.0, 1.8, 2.6] {
         let s = fluid.sample(x, z);
-        let rise = puddle_bank_rise(x, z);
-        let undisturbed = (s.bed_m - rise).abs() < 0.015;
+        let rise = puddle_terrain(x, z);
+        let undisturbed = (s.bed_m - rise).abs() < 0.03;
         if undisturbed && s.water_m > 0.02 {
             sum += s.water_m;
             n += 1.0;
@@ -5052,10 +5096,12 @@ const PUDDLE_CZ: f32 = -14.0;
 /// Standing depth on the floor, metres. A deeper sheet sinks the tread
 /// past the 0.15 m seat once the bow piles on the front tires.
 const PUDDLE_DEPTH: f32 = 0.078;
-/// Crest of the bank above the floor, metres. It stands above the water.
-const PUDDLE_CREST: f32 = 0.11;
+/// Crest of the berm above the floor, metres. The beach tops out near 5 cm
+/// and the relief on it is several centimetres, so the berm has to stand
+/// well above that water line or a low tongue spills onto the pad.
+const PUDDLE_CREST: f32 = 0.22;
 /// Ellipse radius where the wet band has fallen back to the pad.
-const PUDDLE_MOIST_END: f32 = 1.45;
+const PUDDLE_MOIST_END: f32 = 1.48;
 
 fn puddle_e(x: f32, z: f32) -> f32 {
     let dx = x / PUDDLE_RX;
@@ -5063,22 +5109,68 @@ fn puddle_e(x: f32, z: f32) -> f32 {
     (dx * dx + dz * dz).sqrt()
 }
 
+/// Bank plus the centimetre relief the sheet drains over.
+fn puddle_terrain(x: f32, z: f32) -> f32 {
+    puddle_bank_rise(x, z) + puddle_ground_noise(x, z)
+}
+
+/// Centimetre relief around the shore.
+///
+/// Sampled on a circle in noise space, so it is continuous around the pond
+/// and constant along a radial ray. The east bank at z = -14 therefore stays
+/// a monotonic rise, while the water line runs in and out as the angle
+/// changes. The floor, where the tires run, stays smooth. The berm is bare,
+/// so a tongue cannot cut a saddle onto the pad.
+fn puddle_ground_noise(x: f32, z: f32) -> f32 {
+    let e = puddle_e(x, z);
+    if e >= PUDDLE_MOIST_END {
+        return 0.0;
+    }
+    // Off through the floor and the wake. A ridge there traps a bore after
+    // the tires have passed. The water line itself sits further out.
+    let up = smooth01((e - 0.68) / 0.10);
+    let down = if e < 1.08 {
+        1.0
+    } else {
+        smooth01((1.24 - e) / 0.16)
+    };
+    let gate = up * down;
+    if gate <= 0.0 {
+        return 0.0;
+    }
+    let theta = (z - PUDDLE_CZ).atan2(x);
+    let c = theta.cos();
+    let s = theta.sin();
+    // About seven broad lobes, plus a shorter ring of bays. Peak under 6 cm.
+    let broad = relief_value(c * 1.15, s * 1.15, 0xC0FF_EE11);
+    let fine = relief_value(c * 2.55 + 4.0, s * 2.55 - 1.5, 0xC0FF_EE11 ^ 0x9E37_79B9);
+    // The circle in noise space does not hit ±1, so the gains are larger
+    // than the centimetres we want on the ground. The sum stays under 6 cm.
+    (broad * 0.070 + fine * 0.034) * gate
+}
+
 /// Metres the bank stands above the floor. 0 on the floor and outside the
 /// outer face. The crest is above the water line.
 fn puddle_bank_rise(x: f32, z: f32) -> f32 {
     let e = puddle_e(x, z);
-    // Floor through e = 0.50, so both axles at the checkpoint are still on it.
-    // The inner face is long enough that the shallow column falls to 0 over
-    // about a metre, not in one cell.
-    if e <= 0.50 || e >= 1.24 {
+    // Floor through e = 0.40, so both axles at the checkpoint are still on it.
+    // The beach is long and low: a few centimetres of relief move the water
+    // line by a metre or more. The berm above the beach holds the pond.
+    if e <= 0.40 || e >= 1.52 {
         return 0.0;
     }
-    if e <= 1.0 {
-        let t = (e - 0.50) / 0.50;
-        let s = smooth01(t);
-        return PUDDLE_CREST * (0.72 * t + 0.28 * s);
+    // Gentle through the water line. A steep beach turns centimetres of
+    // relief into a wrinkle on an oval; this rise lets a low cell run out
+    // about a metre past a high one.
+    if e <= 1.16 {
+        let t = (e - 0.40) / 0.76;
+        return 0.10 * smooth01(t);
     }
-    let t = (e - 1.0) / 0.24;
+    if e <= 1.30 {
+        let t = (e - 1.16) / 0.14;
+        return 0.10 + (PUDDLE_CREST - 0.10) * smooth01(t);
+    }
+    let t = ((e - 1.30) / 0.22).clamp(0.0, 1.0);
     PUDDLE_CREST * (1.0 - smooth01(t))
 }
 
@@ -5106,25 +5198,6 @@ fn puddle_pore_moisture(x: f32, z: f32, background: f32) -> f32 {
 /// Soft oval, wholly inside the heightfield. 1 in the middle, 0 at the shore.
 fn puddle_mask(x: f32, z: f32) -> f32 {
     smooth01(1.0 - puddle_e(x, z))
-}
-
-/// Two wheel ruts. The center between them stays dry so the pour is not a pit.
-fn slurry_rut_mask(x: f32, z: f32) -> f32 {
-    let end = if z < -13.2 {
-        (-12.4 - z) / 1.15
-    } else if z > -1.4 {
-        (z + 0.8) / 1.15
-    } else {
-        0.0
-    };
-    let along = smooth01(1.0 - end);
-    let mut mask = 0.0_f32;
-    for track in [-0.74_f32, 0.74] {
-        let lat = (x - track).abs() / 0.58;
-        let across = smooth01(1.0 - lat);
-        mask = mask.max(across * along);
-    }
-    mask
 }
 
 fn cut_rut_groove(soil: &mut SoilField, x: f32, z: f32) {
@@ -5681,6 +5754,27 @@ mod tests {
         assert!(report.stuck_kg > 20.0, "stuck mass {}", report.stuck_kg);
         assert!(report.arch_brake_nm > 40.0, "arch brake {}", report.arch_brake_nm);
         assert!(report.imbalance_n > 15.0, "imbalance {}", report.imbalance_n);
+    }
+
+    #[test]
+    fn shore_relief_swings_by_centimetres() {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for k in 0..36 {
+            let th = k as f32 / 36.0 * std::f32::consts::TAU;
+            let e = 0.90_f32;
+            let x = e * PUDDLE_RX * th.cos();
+            let z = PUDDLE_CZ + e * PUDDLE_RZ * th.sin();
+            let n = puddle_ground_noise(x, z);
+            lo = lo.min(n);
+            hi = hi.max(n);
+        }
+        assert!(
+            hi - lo > 0.06 && hi < 0.06 && lo > -0.06,
+            "relief {:.4}..{:.4} is not a few centimetres",
+            lo,
+            hi
+        );
     }
 
     #[test]
