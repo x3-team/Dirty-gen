@@ -1641,7 +1641,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let band = max((1.0 - smoothstep(0.1, 0.2, shore_d)) * (0.85 + 0.15 * band_w),
             smoothstep(0.45, 0.9, moist) * 0.55 * (1.0 - smoothstep(0.2, 0.5, shore_d)));
         // A glossy rim right at the water, a hand's width.
-        let rim = 1.0 - smoothstep(0.03, 0.1, shore_d);
+        let rim = 1.0 - smoothstep(0.01, 0.04, shore_d);
         // The published moisture only darkens where it is near saturation;
         // past the rim the sand dries back to its own colour.
         let margin = max(max(smoothstep(0.0005, 0.004, film_t), smoothstep(0.75, 0.98, wet) * 0.5), band);
@@ -1674,7 +1674,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
             // Backlit, any sheen on the rippled sand lit every crest white.
             // Dry and damp sand stay matte; only the hand's-width rim at the
             // water is glossy.
-            rough_out = max(rough_out, mix(mix(0.88, 0.75, band), 0.4, rim * on_land));
+            rough_out = max(rough_out, mix(mix(0.88, 0.75, band), 0.5, rim * on_land));
         }
         let under = smoothstep(0.002, 0.012, film_t);
         if (under > 0.0) {
@@ -1709,7 +1709,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let rz = bc_rut_soft(xz + vec2<f32>(0.0, re));
         let hx = (rx.y - rx.x) - (rp.y - rp.x);
         let hz = (rz.y - rz.x) - (rp.y - rp.x);
-        n = normalize(n + vec3<f32>(-hx / re, 0.0, -hz / re) * 2.5);
+        n = normalize(n + vec3<f32>(-hx / re, 0.0, -hz / re) * select(2.5, 0.9, sand_field()));
         // Packed and a little damper than the loose top: the floor goes darker,
         // so the lane reads from a distance.
         // On sand the pressed floor is wet sand: darker and more saturated,
@@ -2326,7 +2326,16 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     }
     let depth = mix(in.depth, column_c, inside);
     let slurry_frac = select(0.0, film_c.g / max(column_c, 1e-4), column_c > 1e-4) * inside;
-    let flow = bc_flow(xz);
+    // Published flow (binding 4). A still pool publishes ~0; until contract
+    // v3 the drift direction is taken down the gradient of the published
+    // water depth (deep to shallow), a few cm/s, only for the ripple drift.
+    var flow = bc_flow(xz);
+    let fg_e = 0.2;
+    let dgx = (bc_film_soft(xz + vec2<f32>(fg_e, 0.0)).r - bc_film_soft(xz - vec2<f32>(fg_e, 0.0)).r) / (2.0 * fg_e);
+    let dgz = (bc_film_soft(xz + vec2<f32>(0.0, fg_e)).r - bc_film_soft(xz - vec2<f32>(0.0, fg_e)).r) / (2.0 * fg_e);
+    let dgrad = vec2<f32>(dgx, dgz);
+    let drift_dir = select(vec2<f32>(0.0), -normalize(dgrad), dot(dgrad, dgrad) > 1e-8);
+    let ripple_flow = select(drift_dir * 0.04, flow, dot(flow, flow) > 1e-6);
     let speed = length(flow);
     let t_now = frame.misc.x;
     // Ripples from bevy_water's wave pattern, the same field that throws
@@ -2347,7 +2356,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let wp = vec2<f32>(-wd.y, wd.x);
     var wg = vec2<f32>(0.0);
     let lens_d = length(in.world - frame.cam_pos.xyz);
-    let near_k = mix(0.45, 1.0, smoothstep(1.5, 5.0, lens_d));
+    let near_k = mix(0.8, 1.0, smoothstep(1.5, 5.0, lens_d));
     for (var o: i32 = 0; o < 3; o = o + 1) {
         let fo = f32(o);
         let f_along = 16.0 * pow(2.5, fo);
@@ -2364,6 +2373,16 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Cat's paws: wind touches the water in patches; between them it is glassy.
     let gust = smoothstep(0.42, 0.72, noise(xz * 0.45 + wd * t_now * 0.4) * 0.7 + noise(xz * 1.7 - wd * t_now * 0.3) * 0.3);
     nrm = normalize(nrm - vec3<f32>(wg.x, 0.0, wg.y) * mix(0.45, 1.6, gust) * smoothstep(0.003, 0.015, depth));
+    // Fine capillary ripples carried by the flow: short crests across the
+    // current, so the sheet near the lens is a rippled window, not a glaze.
+    let fdir = select(vec2<f32>(0.8, 0.6), normalize(ripple_flow), dot(ripple_flow, ripple_flow) > 1e-8);
+    let fper = vec2<f32>(-fdir.y, fdir.x);
+    let fq = vec2<f32>(dot(xz, fdir) * 55.0 - t_now * 3.0, dot(xz, fper) * 22.0) + ripple_flow * t_now * 40.0;
+    let f0 = bw_vnoise2d(fq);
+    let fa = bw_vnoise2d(fq + vec2<f32>(0.25, 0.0)) - f0;
+    let fc2 = bw_vnoise2d(fq + vec2<f32>(0.0, 0.25)) - f0;
+    let fslope = (fdir * fa * 55.0 + fper * fc2 * 22.0) * 4.0 * 0.0022;
+    nrm = normalize(nrm - vec3<f32>(fslope.x, 0.0, fslope.y) * smoothstep(0.002, 0.01, depth));
     // Rings run out from each wheel standing in the water, and the bow
     // pushes a swell ahead of it.
     nrm = normalize(nrm + wheel_ripples(xz, in.world.y, t_now) * calm_or_film(depth));
@@ -2493,7 +2512,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // and the car (FluidNinja's light grazing shallows). Only the last
     // millimetres of film at the edge thin it out.
     let fres = min(0.02 * w_ab.x + w_ab.y, 0.9) * (1.0 - 0.6 * collar_t)
-        * mix(0.45, 1.0, smoothstep(0.001, 0.006, depth));
+        * mix(0.25, 1.0, smoothstep(0.003, 0.012, depth));
     let refl_dir = reflect(-view, nrm);
     // The sky the water mirrors is the sky drawn behind it, at full radiance.
     // Same grade as the backdrop sky, so the mirror is not brighter than
@@ -2539,7 +2558,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let th = tire_ray_hit(in.world + nrm * 0.003, refl_dir, 0.9);
     if (th > 0.0) {
         let rubber = sh_irradiance(vec3<f32>(0.0, -0.3, 1.0)) * frame.env.y * vec3<f32>(0.05, 0.045, 0.04);
-        refl = mix(refl, rubber, 0.4 * (1.0 - smoothstep(0.3, 0.9, th)));
+        refl = mix(refl, rubber, 0.5 * (1.0 - smoothstep(0.15, 0.5, th)));
     }
     let halfv = normalize(sun + view);
     let ndh = clamp(dot(nrm, halfv), 0.0, 1.0);
@@ -2587,7 +2606,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let clumps = smoothstep(0.38, 0.6, noise(xz * 6.0 + vec2<f32>(t_now * 0.1, 0.0)) * 0.6 + noise(xz * 19.0) * 0.4);
     // The waterline itself: the thin edge of the film, wherever deeper
     // water lies inward of it.
-    let edge_line = smoothstep(0.003, 0.0045, depth) * (1.0 - smoothstep(0.008, 0.014, depth))
+    let edge_line = smoothstep(0.003, 0.004, depth) * (1.0 - smoothstep(0.0045, 0.0065, depth))
         * smoothstep(0.003, 0.008, nmax - depth) * (1.0 - smoothstep(0.0008, 0.002, nmin)) * inside;
     let torn = smoothstep(0.3, 0.55, noise(xz * 14.0 + vec2<f32>(t_now * 0.2, 0.0)) * 0.7 + noise(xz * 41.0) * 0.3);
     let shore = max(shore_band * (1.0 - smoothstep(0.008, 0.016, depth)) * clumps, edge_line * torn);
@@ -2633,7 +2652,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // The film runs out clear over the sand: no bright line at the edge.
     // A thin light lip where the film runs out: the meniscus catches the sky
     // and a little of the sun.
-    lit = lit * (1.0 + meniscus * 0.9) + frame.sun_color.rgb * meniscus * 0.07;
+    lit = lit * (1.0 + meniscus * 0.5) + frame.sun_color.rgb * meniscus * 0.04;
     alpha = max(max(alpha, meniscus * 0.5) * smoothstep(0.003, 0.0045, depth), foam * 0.85 * smoothstep(0.003, 0.0045, depth));
     lit = atmosphere(in.world, lit);
     var out_rgb = tonemap(lit);
@@ -2661,7 +2680,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         // Fresnel weight, blurred by the stretched rays; elsewhere a trace.
         let near_car = 1.0 - smoothstep(0.4, 2.2, max(length(xz - frame.air[1].xz) - 1.2, 0.0));
         let k = ssr.a * (1.0 - foam) * calm_or_film(depth)
-            * fres * mix(0.75, 0.95, near_car);
+            * min(fres * mix(1.0, 1.7, near_car) + 0.12 * near_car, 0.95);
         out_rgb = mix(out_rgb, ssr.rgb * 0.92 * mix(1.0, w_ao, 0.35), clamp(k / max(alpha, 0.05), 0.0, 1.0));
         alpha = max(alpha, k);
     }
@@ -2689,13 +2708,16 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         let tm = tire_ray_hit(mirror_o, md, 0.6);
         if (tm > 0.0) {
             let h = max(mirror_o.y + md.y * tm - in.world.y, 0.0);
-            mir_w += 1.0 - smoothstep(0.0, 0.14, h);
+            mir_w += 1.0 - smoothstep(0.0, 0.08, h);
         }
     }
     mir_w /= 6.0;
     if (mir_w > 0.0) {
         let rub = sh_irradiance(vec3<f32>(0.0, -0.3, 1.0)) * frame.env.y * vec3<f32>(0.06, 0.05, 0.045);
-        let w = 0.35 * mir_w * (1.0 - foam) * smoothstep(0.01, 0.03, depth);
+        // Mirror weight is the Fresnel of this pixel: from the low lens the
+        // sheet by the tire is looked into, so the image is a faint band
+        // hanging from the waterline, not a dark disc.
+        let w = fres * 0.6 * mir_w * (1.0 - foam) * smoothstep(0.01, 0.03, depth);
         out_rgb = mix(out_rgb, tonemap(rub), w);
         alpha = max(alpha, w);
     }
@@ -2720,7 +2742,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let front = textureLoad(scene_depth, rpix, 0) < here_c.z / here_c.w;
     let off_screen = any(ruv < vec2<f32>(0.0)) || any(ruv > vec2<f32>(1.0));
     let dst = textureLoad(scene_color, select(rpix, hpix, front || over_tire > 0.5 || off_screen), 0).rgb;
-    let a_out = clamp(alpha, 0.0, 1.0) * max(smoothstep(edge_t, 0.0055, depth), near_tire);
+    // Soft intersection with the rubber (bevy_water depth_diff): the sheet
+    // thins over the last centimetre of view path in front of the tire, so
+    // the waterline is a filtered line, not the pixel steps of two meshes.
+    let soft_tire = mix(1.0, smoothstep(0.0, 0.012, view_path), near_tire);
+    let a_out = clamp(alpha, 0.0, 1.0) * max(smoothstep(edge_t, 0.0055, depth), near_tire) * soft_tire;
     // Beer-Lambert per channel on the bed seen through the water: the red
     // goes first, so shallow stays the sand's warm colour and the deeper
     // middle turns teal.
@@ -3607,8 +3633,10 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         // darker, no light line.
         // A thin light line where the water climbs the rubber, catching the
         // sky; the soaked band above it is the dark wet rubber.
-        let men_w = smoothstep(-0.0015, 0.0, dz) * (1.0 - smoothstep(0.002, 0.004, dz + wav * 0.15));
-        lit = mix(lit, sky * vec3<f32>(0.42, 0.41, 0.4) + sun_l * 0.08, men_w * 0.6);
+        // A soft meniscus 1-2 cm tall: brightest at the line, fading up the
+        // rubber, its top wandering with the ripple.
+        let men_w = smoothstep(-0.004, 0.0, dz) * (1.0 - smoothstep(0.0, 0.015 + wav * 0.4, dz));
+        lit = mix(lit, sky * vec3<f32>(0.42, 0.41, 0.4) + sun_l * 0.08, men_w * 0.45);
     }
     // The rim's centre bore is open in the mesh and showed as a black hole:
     // close it with a dished steel cap, lit by sky and sun.
@@ -3626,7 +3654,7 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         if (rad < c.w * 0.24 && abs(ax) < 0.16) {
             // A domed cap: the normal tips out to ~45 degrees at the rim, so it
             // mirrors sky above, horizon across the middle, sand below.
-            let cap_n = normalize(axis * sign(dot(frame.cam_pos.xyz - c.xyz, axis)) + (rel - axis * ax) / (c.w * 0.24) * 1.1);
+            let cap_n = normalize(axis * sign(dot(frame.cam_pos.xyz - c.xyz, axis)) + (rel - axis * ax) / (c.w * 0.24) * 0.55);
             let sun_d = normalize(frame.sun_dir.xyz);
             let cap_v = normalize(frame.cam_pos.xyz - in.world);
             let cap_l = frame.sun_color.rgb * max(dot(cap_n, sun_d), 0.0) * 0.45 + sh_irradiance(cap_n) * frame.env.y;
@@ -3634,14 +3662,15 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
             // Brushed steel: mostly the environment it mirrors (the same HDRI
             // as the rim), a little diffuse, a tight sun lobe.
             let cap_r = reflect(-cap_v, cap_n);
-            let cap_f0 = vec3<f32>(0.62, 0.63, 0.64);
+            let cap_f0 = vec3<f32>(0.5, 0.5, 0.5);
             let cap_nv = clamp(dot(cap_n, cap_v), 0.0, 1.0);
             let cap_f = cap_f0 + (vec3<f32>(1.0) - cap_f0) * pow(1.0 - cap_nv, 5.0);
-            let cap_spec = env_radiance(cap_r, 0.1) * frame.env.y * 2.0 * cap_f
-                + frame.sun_color.rgb * pow(max(dot(cap_r, sun_d), 0.0), 220.0) * 1.2;
+            // Satin steel: a blurred mirror of the IBL and a broad sun lobe.
+            let cap_spec = env_radiance(cap_r, 0.38) * frame.env.y * 1.5 * cap_f
+                + frame.sun_color.rgb * pow(max(dot(cap_r, sun_d), 0.0), 30.0) * 0.25;
             // The body and the arch hide the upper sky from the lower half.
             let cap_occ = mix(0.55, 1.0, smoothstep(-0.4, 0.3, cap_r.y));
-            lit = (vec3<f32>(0.04) * cap_l + cap_spec * cap_occ) * mix(0.7, 1.05, ring);
+            lit = (vec3<f32>(0.1) * cap_l + cap_spec * cap_occ) * mix(0.7, 1.05, ring);
         }
     }
     var mapped = present(lit);

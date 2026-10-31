@@ -81,28 +81,16 @@ fn bc_load(tex: texture_2d<f32>, ij: vec2<i32>) -> vec4<f32> {
     return textureLoad(tex, c, 0);
 }
 
-// A texel that is not a finite number reads as zero. A NaN fails every
-// comparison, so it never passes the range test. The fluid sheet publishes
-// NaN velocity and crest in some dry cells (contract v1), and one NaN tap
-// would blank the whole blend.
-// WGSL lets a compiler assume floats are finite, so the NaN/Inf test is on
-// the exponent bits, which no optimiser can fold away.
-fn bc_finite(v: vec4<f32>) -> vec4<f32> {
-    let e = bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u);
-    let ok = (e != vec4<u32>(0x7f800000u)) & (abs(v) < vec4<f32>(1.0e4));
-    return select(vec4<f32>(0.0), v, ok);
-}
-
 // The maps are 32-bit float and not filterable; blend the four texels here.
 fn bc_bilinear(tex: texture_2d<f32>, xz: vec2<f32>) -> vec4<f32> {
     let t = bc_texel(xz);
     let i = floor(t);
     let f = t - i;
     let i0 = vec2<i32>(i);
-    let a = bc_finite(bc_load(tex, i0));
-    let b = bc_finite(bc_load(tex, i0 + vec2<i32>(1, 0)));
-    let c = bc_finite(bc_load(tex, i0 + vec2<i32>(0, 1)));
-    let d = bc_finite(bc_load(tex, i0 + vec2<i32>(1, 1)));
+    let a = (bc_load(tex, i0));
+    let b = (bc_load(tex, i0 + vec2<i32>(1, 0)));
+    let c = (bc_load(tex, i0 + vec2<i32>(0, 1)));
+    let d = (bc_load(tex, i0 + vec2<i32>(1, 1)));
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
