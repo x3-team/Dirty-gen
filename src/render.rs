@@ -61,6 +61,11 @@ struct FrameData {
     tire_water: [f32; 4],
     /// x: 1 draws the depth debug (water by depth, tire bottoms marked).
     debug: [f32; 4],
+    /// Last frame's view-projection, for reprojecting the SSR history.
+    prev_view_proj: [[f32; 4]; 4],
+    /// x: 1 when the SSR history holds a valid previous frame. y, z: the
+    /// half-resolution SSR target size in pixels.
+    ssr_info: [f32; 4],
 }
 
 #[repr(C)]
@@ -78,6 +83,11 @@ struct GpuMesh {
 }
 
 pub struct Renderer {
+    ssr: SsrTargets,
+    post_bg_ssr: wgpu::BindGroup,
+    pipe_water_ssr: wgpu::RenderPipeline,
+    ssr_prev_vp: [[f32; 4]; 4],
+    ssr_hist_valid: f32,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     #[allow(dead_code)]
@@ -904,6 +914,28 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Half-resolution SSR: reflection (rgb premultiplied, a weight)
+                // and the view distance it was traced from.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let water_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
@@ -939,6 +971,7 @@ impl Renderer {
         });
         let (fog_half_view, fog_up_bg) = make_fog_half(&device, &fog_up_bgl, width, height);
         let (air_noise_view, air_samp) = make_air_noise(&device, &queue);
+        let ssr = make_ssr(&device, width, height);
         let post_bg = make_post_bg(
             &device,
             &post_bgl,
@@ -946,6 +979,18 @@ impl Renderer {
             &scene_copy_view,
             &air_noise_view,
             &air_samp,
+            &ssr.a_view,
+            &ssr.b_view,
+        );
+        let post_bg_ssr = make_post_bg(
+            &device,
+            &post_bgl,
+            &depth_view,
+            &scene_copy_view,
+            &air_noise_view,
+            &air_samp,
+            &ssr.hist_a_view,
+            &ssr.hist_b_view,
         );
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
@@ -1006,6 +1051,44 @@ impl Renderer {
             true,
             None,
         );
+        // Half-resolution SSR trace of the water surface: two targets (the
+        // reflection and its view distance) with its own depth so the
+        // nearest sheet wins.
+        let ssr_target = Some(wgpu::ColorTargetState {
+            format: SSR_FORMAT,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        });
+        let pipe_water_ssr = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water-ssr"),
+            layout: Some(&water_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_water"),
+                compilation_options: Default::default(),
+                buffers: terrain_buffers(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_water_ssr"),
+                compilation_options: Default::default(),
+                targets: &[ssr_target.clone(), ssr_target],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let pipe_mesh = pipeline(
             &device,
             &shader,
@@ -1434,6 +1517,11 @@ impl Renderer {
             air_samp,
             scene_copy,
             scene_copy_view,
+            ssr,
+            post_bg_ssr,
+            pipe_water_ssr,
+            ssr_prev_vp: Mat4::IDENTITY.to_cols_array_2d(),
+            ssr_hist_valid: 0.0,
             debug_contract: false,
             debug_mode: 0,
         }
@@ -1494,6 +1582,8 @@ impl Renderer {
         self.fog_up_bg = fog_up_bg;
         self.scene_copy = scene_copy;
         self.scene_copy_view = scene_copy_view;
+        self.ssr = make_ssr(&self.device, width, height);
+        self.ssr_hist_valid = 0.0;
         self.post_bg = make_post_bg(
             &self.device,
             &self.post_bgl,
@@ -1501,6 +1591,18 @@ impl Renderer {
             &self.scene_copy_view,
             &self.air_noise_view,
             &self.air_samp,
+            &self.ssr.a_view,
+            &self.ssr.b_view,
+        );
+        self.post_bg_ssr = make_post_bg(
+            &self.device,
+            &self.post_bgl,
+            &self.depth_view,
+            &self.scene_copy_view,
+            &self.air_noise_view,
+            &self.air_samp,
+            &self.ssr.hist_a_view,
+            &self.ssr.hist_b_view,
         );
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
@@ -1753,7 +1855,15 @@ impl Renderer {
             },
             tire_water: self.tire_water,
             debug: [self.debug_depth, 0.0, 0.0, 0.0],
+            prev_view_proj: self.ssr_prev_vp,
+            ssr_info: [
+                self.ssr_hist_valid,
+                self.ssr.width as f32,
+                self.ssr.height as f32,
+                0.0,
+            ],
         };
+        self.ssr_prev_vp = view_proj.to_cols_array_2d();
         let mut frame = frame;
         if self.snow {
             if let Some(arc) = self.snow_arc {
@@ -1994,6 +2104,50 @@ impl Renderer {
         );
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("water-ssr"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.ssr.a_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.ssr.b_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.ssr.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.frame_bg, &[]);
+            pass.set_bind_group(1, &self.tex_bg, &[]);
+            pass.set_bind_group(2, &self.post_bg_ssr, &[]);
+            if let Some(gpu) = &self.contract {
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                pass.set_bind_group(4, &gpu.bind_group, &[]);
+            }
+            pass.set_pipeline(&self.pipe_water_ssr);
+            if std::env::var("SILT_NO_SSR").is_err() {
+                draw_indexed(&mut pass, &self.terrain);
+            }
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.color_view,
@@ -2021,6 +2175,30 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_water);
             draw_indexed(&mut pass, &self.terrain);
         }
+        // This frame's SSR becomes next frame's history.
+        let ssr_extent = wgpu::Extent3d {
+            width: self.ssr.width,
+            height: self.ssr.height,
+            depth_or_array_layers: 1,
+        };
+        for (src, dst) in [(&self.ssr.a, &self.ssr.hist_a), (&self.ssr.b, &self.ssr.hist_b)] {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: src,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: dst,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                ssr_extent,
+            );
+        }
+        self.ssr_hist_valid = 1.0;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("after-water"),
@@ -3489,6 +3667,8 @@ fn make_post_bg(
     scene_view: &wgpu::TextureView,
     air_noise: &wgpu::TextureView,
     air_samp: &wgpu::Sampler,
+    ssr_a: &wgpu::TextureView,
+    ssr_b: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("post"),
@@ -3510,6 +3690,62 @@ fn make_post_bg(
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(air_samp),
             },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(ssr_a),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(ssr_b),
+            },
         ],
     })
+}
+
+/// Half-resolution screen-space reflection of the water: the traced
+/// result (a, b) and last frame's (history a, b), plus a depth buffer so
+/// the nearest water surface wins.
+struct SsrTargets {
+    width: u32,
+    height: u32,
+    a: wgpu::Texture,
+    a_view: wgpu::TextureView,
+    b: wgpu::Texture,
+    b_view: wgpu::TextureView,
+    hist_a: wgpu::Texture,
+    hist_a_view: wgpu::TextureView,
+    hist_b: wgpu::Texture,
+    hist_b_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+}
+
+const SSR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+fn make_ssr(device: &wgpu::Device, width: u32, height: u32) -> SsrTargets {
+    let w = (width / 2).max(1);
+    let h = (height / 2).max(1);
+    let tex = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let v = t.create_view(&Default::default());
+        (t, v)
+    };
+    let rt = wgpu::TextureUsages::RENDER_ATTACHMENT
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC;
+    let hist = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+    let (a, a_view) = tex("ssr-a", SSR_FORMAT, rt);
+    let (b, b_view) = tex("ssr-b", SSR_FORMAT, rt);
+    let (hist_a, hist_a_view) = tex("ssr-hist-a", SSR_FORMAT, hist);
+    let (hist_b, hist_b_view) = tex("ssr-hist-b", SSR_FORMAT, hist);
+    let (_depth, depth_view) = tex("ssr-depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT);
+    SsrTargets { width: w, height: h, a, a_view, b, b_view, hist_a, hist_a_view, hist_b, hist_b_view, depth_view }
 }

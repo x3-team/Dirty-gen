@@ -577,3 +577,18 @@ fn bc_rut_soft(xz: vec2<f32>) -> vec2<f32> {
     }
     return acc / 256.0;
 }
+
+// Published foam low-passed with the same 5 x 5 binomial as the rut: the
+// 0.20 m foam cells printed as grey plates with stepped edges.
+fn bc_foam_soft(xz: vec2<f32>) -> vec2<f32> {
+    let e = max(bc_header.cell_m, 0.05) * 0.75;
+    var acc = vec2<f32>(0.0);
+    for (var j: i32 = -2; j <= 2; j = j + 1) {
+        for (var i: i32 = -2; i <= 2; i = i + 1) {
+            let wi = select(select(1.0, 4.0, abs(i) == 1), 6.0, i == 0);
+            let wj = select(select(1.0, 4.0, abs(j) == 1), 6.0, j == 0);
+            acc += bc_foam_crest(xz + vec2<f32>(f32(i), f32(j)) * e) * (wi * wj);
+        }
+    }
+    return acc / 256.0;
+}
