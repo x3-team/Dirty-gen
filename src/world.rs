@@ -4258,6 +4258,7 @@ impl ThroughDrive {
             w.omega = 8.0 / WHEEL_RADIUS;
         }
         let mut fluid = FluidCore::new([0.0, -12.0]);
+        fluid.set_turbidity_enabled(false);
         fluid.set_wind(1.5, -0.9);
         // The slurry ruts are a masked pour. The puddle is not: a box scaled
         // by a mask is a lens on a flat bed, and the shore is a step in the

@@ -684,9 +684,6 @@ fn e2e_niva() {
         max_gap
     );
 
-    #[cfg(not(debug_assertions))]
-    print_through_drive();
-
     assert!(
         (puddle_n - 18.0).abs() < 0.5,
         "puddle samples {puddle_n}"
