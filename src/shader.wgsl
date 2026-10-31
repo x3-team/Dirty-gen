@@ -1058,20 +1058,44 @@ fn sky_reflect(dir: vec3<f32>) -> vec3<f32> {
     return mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, pow(t, 0.62));
 }
 
+fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
+    var center = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        center += frame.tires[i * 2u].xyz;
+    }
+    center = center * 0.25 + vec3<f32>(0.0, 0.58, 0.0);
+    let to_veh = normalize(center - world);
+    let aim = dot(normalize(refl_dir), to_veh);
+    if (aim < 0.48) {
+        return vec3<f32>(0.0);
+    }
+    let d = distance(world.xz, center.xz);
+    let gloss = exp(-d * 0.38) * smoothstep(0.48, 0.86, aim);
+    let sun = normalize(frame.sun_dir.xyz);
+    let ndl = clamp(dot(to_veh, sun), 0.0, 1.0);
+    let tan = vec3<f32>(0.72, 0.60, 0.44);
+    return tan * (0.28 + 1.05 * ndl) * gloss;
+}
+
 fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
+    let beauty = puddle_beauty_on();
     var sum = 0.0;
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
         let slot = i * 2u;
         let c = frame.tires[slot].xyz;
         let tire_meta = frame.tires[slot + 1u];
-        let tire_on = tire_meta.w;
-        if (tire_on < 0.5) {
+        var tire_on = tire_meta.w;
+        let d = distance(xz, c.xz);
+        if (beauty && d < 2.8) {
+            tire_on = max(tire_on, 1.0 - smoothstep(1.35, 2.75, d));
+        }
+        if (tire_on < 0.05) {
             continue;
         }
-        let d = distance(xz, c.xz);
         let ring = exp(-d * 2.8) * sin(d * 9.0 - t * 7.5 + f32(i) * 0.9);
         let splash = exp(-d * 4.2) * sin(d * 14.0 - t * 11.0) * 0.012;
-        sum = sum + (ring * 0.022 + splash) * tire_on;
+        let amp = select(1.0, 2.15, beauty);
+        sum = sum + (ring * 0.022 + splash) * tire_on * amp;
     }
     return sum;
 }
@@ -1258,7 +1282,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             let refl_dir = reflect(-view, nrm);
             let ibl = sky_reflect(refl_dir);
             let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 112.0);
-            let ibl_lit = ibl * 1.18 + frame.sun_color.rgb * sun_disk * 0.55;
+            let veh = niva_water_reflect(in.world, refl_dir);
+            let ibl_lit = ibl * 1.18 + frame.sun_color.rgb * sun_disk * 0.55 + veh * 0.92;
             let rim = smoothstep(0.16, 0.012, column_here) * (1.0 - smoothstep(0.001, 0.008, column_here));
             col = mix(col, vec3<f32>(0.014, 0.010, 0.008), rim * 0.88);
             let shallow = 1.0 - smoothstep(0.008, 0.095, column_here);

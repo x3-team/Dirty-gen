@@ -905,11 +905,11 @@ fn capture_win_demo_stills() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-const WIN_DEMO_LOW_YAW: f32 = 3.05;
+const WIN_DEMO_LOW_YAW: f32 = 2.68;
 #[cfg(not(target_arch = "wasm32"))]
-const WIN_DEMO_LOW_PITCH: f32 = 0.14;
+const WIN_DEMO_LOW_PITCH: f32 = 0.11;
 #[cfg(not(target_arch = "wasm32"))]
-const WIN_DEMO_LOW_DIST: f32 = 4.05;
+const WIN_DEMO_LOW_DIST: f32 = 4.85;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn win_demo_low_pose(world: &World) -> CameraPose {
@@ -925,11 +925,15 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     use silt::world::Input;
 
     let mut parked = World::win_demo();
-    parked.vehicle.pos = Vec3::new(1.35, 0.8, 0.88);
-    parked.vehicle.yaw = -2.78;
+    parked.vehicle.pos = Vec3::new(0.62, 0.8, 0.72);
+    parked.vehicle.yaw = -2.42;
     let pad = parked.soil.sample(parked.vehicle.pos.x, parked.vehicle.pos.z);
     parked.vehicle.pos.y = pad.height + 0.62;
-    parked.time = 3.1;
+    parked.time = 4.6;
+    for w in &mut parked.vehicle.wheels {
+        w.sinkage = w.sinkage.max(0.018);
+        w.omega = 2.4;
+    }
     let pose = win_demo_low_pose(&parked);
 
     let saved_beauty = renderer.puddle_beauty;

@@ -2,6 +2,11 @@ name: demo-win
 
 on:
   workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Branch or tag to build
+        required: false
+        default: main
 
 permissions:
   contents: write
