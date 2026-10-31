@@ -2421,7 +2421,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         collar_t = max(collar_t, 1.0 - smoothstep(0.4, 0.55, length(xz - frame.tires[i * 2].xz)));
     }
     // Round a tire the stirred silt hides the rubber within a few cm.
-    let sigma = mix(vec3<f32>(6.5, 8.5, 11.5) * mix(0.35, 1.4, smoothstep(0.01, 0.12, depth)),
+    // Clear at a few centimetres (the sand reads through 5 cm), murky by
+    // 15-20 cm: the silt load grows with the published depth.
+    let sigma = mix(vec3<f32>(4.0, 5.2, 7.0) * mix(0.3, 1.6, smoothstep(0.03, 0.2, depth)),
         vec3<f32>(90.0, 110.0, 140.0), slurry_frac);
     let trans = exp(-sigma * path);
     // Light scattered by the silt in the column, lit by sun and sky.

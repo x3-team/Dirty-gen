@@ -924,13 +924,17 @@ fn probe_waterline(drive: &silt::ThroughDrive, cam: CameraPose, width: u32, heig
         // Rut (cm, soil initial - bed) and film (cm) on a 0.2 m grid round
         // the Niva, rows along +X, columns along +Z.
         let p = drive.world.vehicle.pos;
+        let half: f32 = std::env::var("SILT_BEAUTY_MAP").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        let step = half / 15.0;
+        let (_, fwd, right) = vehicle_axes(&drive.world);
+        println!("map axes fwd ({:.2},{:.2}) right ({:.2},{:.2}); camera at p+fwd*2.6+right*3.3", fwd.x, fwd.z, right.x, right.z);
         for (name, which) in [("rut", 0), ("placed", 1), ("film", 2)] {
-            println!("map {name} (cm) x {:.1}..{:.1} rows, z {:.1}..{:.1} cols", p.x - 3.0, p.x + 3.0, p.z - 3.0, p.z + 3.0);
+            println!("map {name} (cm) x {:.1}..{:.1} rows, z {:.1}..{:.1} cols", p.x - half, p.x + half, p.z - half, p.z + half);
             for ix in 0..31 {
-                let x = p.x - 3.0 + ix as f32 * 0.2;
+                let x = p.x - half + ix as f32 * step;
                 let mut row = String::new();
                 for iz in 0..31 {
-                    let z = p.z - 3.0 + iz as f32 * 0.2;
+                    let z = p.z - half + iz as f32 * step;
                     let v = match which {
                         0 => drive.world.soil.idx_at(x, z).map(|k| (drive.world.soil.initial_height[k] - drive.world.soil.bed[k]).max(0.0)).unwrap_or(0.0),
                         1 => drive.world.soil.idx_at(x, z).map(|k| drive.world.soil.placed[k]).unwrap_or(0.0),
