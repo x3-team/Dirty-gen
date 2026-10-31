@@ -24,7 +24,7 @@ jobs:
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
-          cargo test --lib
+          cargo test --lib -- --test-threads=1
       - name: Niva creek crossing
         run: |
           # rustc links meshopt with lld, which does not search gcc's lib dir
@@ -41,10 +41,10 @@ jobs:
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
-          cargo test --test e2e_niva -- --nocapture
+          cargo test --test e2e_niva -- --nocapture --test-threads=1
       - name: Release solver budget
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release --test e2e_niva --test frame_bench -- --nocapture
+          cargo test --release -j1 --test e2e_niva --test frame_bench -- --nocapture --test-threads=1
