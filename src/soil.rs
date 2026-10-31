@@ -33,6 +33,11 @@
 //! A rut is a vertical cut at a fixed world XZ. The tire does not push the
 //! column along the ground normal, so a groove on a slope stays where the
 //! wheel was instead of climbing the mesh.
+//!
+//! Mud, sand, gravel, and grass meet as shares of the cell, not as a hard
+//! step. The share of each material is exchanged across that joint, so the
+//! amount on the map stays the same. Pore moisture is exchanged on the same
+//! edges. Silt, crust, and undisturbed ground are not a fifth share.
 
 use glam::Vec3;
 
@@ -73,6 +78,72 @@ pub enum LiquidRegime {
 /// Soil kinds plus the two liquid regimes the solver treats as states.
 /// Sand and silt are their own soils, so this is twelve soils and two liquids.
 pub const SURFACE_STATE_COUNT: usize = 14;
+
+/// Channels of the material-share map. Mud, sand, gravel, grass.
+pub const MIX_MUD: usize = 0;
+pub const MIX_SAND: usize = 1;
+pub const MIX_GRAVEL: usize = 2;
+pub const MIX_GRASS: usize = 3;
+pub const MIX_CHANNELS: usize = 4;
+
+/// Jacobi passes that widen a material joint by one cell each.
+pub const JOINT_PASSES: usize = 4;
+/// Share of the difference moved across one edge per pass.
+/// At most 1/4, so four neighbours cannot push a cell outside 0..1.
+pub const JOINT_RATE: f32 = 0.25;
+
+/// Channel of mud, sand, gravel, or grass. Any other kind is not a share.
+pub fn mix_channel(kind: SurfaceKind) -> Option<usize> {
+    match kind {
+        SurfaceKind::WetMud => Some(MIX_MUD),
+        SurfaceKind::Sand => Some(MIX_SAND),
+        SurfaceKind::Gravel => Some(MIX_GRAVEL),
+        SurfaceKind::Grass => Some(MIX_GRASS),
+        _ => None,
+    }
+}
+
+fn joint_exchange(
+    mix: &mut [f32],
+    prev_mix: &[f32],
+    wet: &mut [f32],
+    prev_wet: &[f32],
+    base: &mut [f32],
+    prev_base: &[f32],
+    a: usize,
+    b: usize,
+) {
+    let sa = prev_mix[a * MIX_CHANNELS]
+        + prev_mix[a * MIX_CHANNELS + 1]
+        + prev_mix[a * MIX_CHANNELS + 2]
+        + prev_mix[a * MIX_CHANNELS + 3];
+    let sb = prev_mix[b * MIX_CHANNELS]
+        + prev_mix[b * MIX_CHANNELS + 1]
+        + prev_mix[b * MIX_CHANNELS + 2]
+        + prev_mix[b * MIX_CHANNELS + 3];
+    if sa <= 1.0e-6 || sb <= 1.0e-6 {
+        return;
+    }
+    let mut diff = 0.0;
+    for channel in 0..MIX_CHANNELS {
+        diff += (prev_mix[a * MIX_CHANNELS + channel] - prev_mix[b * MIX_CHANNELS + channel]).abs();
+    }
+    if diff <= 1.0e-6 {
+        return;
+    }
+    for channel in 0..MIX_CHANNELS {
+        let flux = JOINT_RATE
+            * (prev_mix[a * MIX_CHANNELS + channel] - prev_mix[b * MIX_CHANNELS + channel]);
+        mix[a * MIX_CHANNELS + channel] -= flux;
+        mix[b * MIX_CHANNELS + channel] += flux;
+    }
+    let flux_wet = JOINT_RATE * (prev_wet[a] - prev_wet[b]);
+    wet[a] -= flux_wet;
+    wet[b] += flux_wet;
+    let flux_base = JOINT_RATE * (prev_base[a] - prev_base[b]);
+    base[a] -= flux_base;
+    base[b] += flux_base;
+}
 
 /// Crest chunks stay lumps. Later passes put the rest of the cut on the berm.
 const CREST_CLOD_CAP: f32 = 0.04;
@@ -573,6 +644,9 @@ pub struct SoilSample {
     pub passes: u8,
     /// Seconds since a tire last claimed this cell.
     pub rest: f32,
+    /// Mud, sand, gravel, grass. Sums to 1 on those materials, including on
+    /// a joint, and to 0 on any other kind.
+    pub mix: [f32; 4],
 }
 
 impl SoilSample {
@@ -630,6 +704,11 @@ pub struct SoilField {
     pub crust: Vec<f32>,
     /// Crack opening, metres. A shader reads this. It does not move the bed.
     pub crack: Vec<f32>,
+    /// Mud, sand, gravel, grass per cell, `MIX_CHANNELS` floats.
+    /// Filled by [`SoilField::blend_material_joints`].
+    pub mix: Vec<f32>,
+    /// `mix` is the blended joint field, not a one-hot guess from `kind`.
+    pub mix_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -877,9 +956,66 @@ pub fn sinkage_on_track(
 
 /// Tire constants at a sample. An old crusted track is stiffer than the kind alone.
 pub fn mech_for_sample(sample: &SoilSample) -> Terramech {
-    let mut tm = terramech_for(sample.kind(), sample.softness, sample.water);
+    let mut tm = terramech_for_mix(sample.kind(), sample.mix, sample.softness, sample.water);
     tm.k_eq *= track_harden_mul(sample.crust, sample.crack, sample.passes, sample.rest);
     tm
+}
+
+/// Terramech of one cell. A pure material uses [`terramech_for`] on `kind`.
+/// A joint weights mud, sand, gravel, and grass by [`SoilSample::mix`].
+pub fn terramech_for_mix(
+    kind: SurfaceKind,
+    mix: [f32; 4],
+    softness: f32,
+    water: f32,
+) -> Terramech {
+    let mut sum = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for share in mix {
+        sum += share;
+        peak = peak.max(share);
+    }
+    if !(sum >= 0.05 && peak < 0.999) {
+        return terramech_for(kind, softness, water);
+    }
+    let kinds = [
+        SurfaceKind::WetMud,
+        SurfaceKind::Sand,
+        SurfaceKind::Gravel,
+        SurfaceKind::Grass,
+    ];
+    let mut acc = Terramech {
+        k_eq: 0.0,
+        n: 0.0,
+        cohesion: 0.0,
+        phi: 0.0,
+        shear_k: 0.0,
+        yield_stress: 0.0,
+        viscosity: 0.0,
+    };
+    for (i, material) in kinds.into_iter().enumerate() {
+        let w = mix[i];
+        if w <= 0.0 {
+            continue;
+        }
+        let tm = terramech_for(material, softness, water);
+        acc.k_eq += tm.k_eq * w;
+        acc.n += tm.n * w;
+        acc.cohesion += tm.cohesion * w;
+        acc.phi += tm.phi * w;
+        acc.shear_k += tm.shear_k * w;
+        acc.yield_stress += tm.yield_stress * w;
+        acc.viscosity += tm.viscosity * w;
+    }
+    let inv = 1.0 / sum;
+    acc.k_eq *= inv;
+    acc.n *= inv;
+    acc.cohesion *= inv;
+    acc.phi *= inv;
+    acc.shear_k *= inv;
+    acc.yield_stress *= inv;
+    acc.viscosity *= inv;
+    acc
 }
 
 /// Plastic rut depth (m) for the force on one tire.
@@ -1176,6 +1312,8 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust: vec![0.0; n],
             crack: vec![0.0; n],
+            mix: vec![0.0; n * MIX_CHANNELS],
+            mix_ready: false,
         }
     }
 
@@ -1297,7 +1435,92 @@ impl SoilField {
                 field.kind[idx] = born_kind(x, z, field.wetness[idx], water) as u8;
             }
         }
+        field.blend_material_joints();
         field
+    }
+
+    /// Shares of mud, sand, gravel, and grass, blended across the joints.
+    ///
+    /// Each cell starts as one material. Four Jacobi passes then move
+    /// [`JOINT_RATE`] of the difference across every edge whose two cells
+    /// both carry one of those four and do not already match. The sum of
+    /// each channel over the map is unchanged. The sum of the four channels
+    /// on a cell is unchanged. Pore moisture and the authored base move on
+    /// the same edges, so the wetness transition does not mint or lose water.
+    pub fn blend_material_joints(&mut self) {
+        let n = self.res * self.res;
+        let res = self.res;
+        if self.mix.len() != n * MIX_CHANNELS {
+            self.mix.resize(n * MIX_CHANNELS, 0.0);
+        }
+        for idx in 0..n {
+            let base = idx * MIX_CHANNELS;
+            for channel in 0..MIX_CHANNELS {
+                self.mix[base + channel] = 0.0;
+            }
+            if let Some(channel) = mix_channel(SurfaceKind::from_u8(self.kind[idx])) {
+                self.mix[base + channel] = 1.0;
+            }
+        }
+        let mut wet = self.wetness.clone();
+        let mut base_wet = self.base_wetness.clone();
+        for _ in 0..JOINT_PASSES {
+            let prev_mix = self.mix.clone();
+            let prev_wet = wet.clone();
+            let prev_base = base_wet.clone();
+            for j in 0..res {
+                for i in 0..res - 1 {
+                    let a = j * res + i;
+                    joint_exchange(
+                        &mut self.mix,
+                        &prev_mix,
+                        &mut wet,
+                        &prev_wet,
+                        &mut base_wet,
+                        &prev_base,
+                        a,
+                        a + 1,
+                    );
+                }
+            }
+            for j in 0..res - 1 {
+                for i in 0..res {
+                    let a = j * res + i;
+                    joint_exchange(
+                        &mut self.mix,
+                        &prev_mix,
+                        &mut wet,
+                        &prev_wet,
+                        &mut base_wet,
+                        &prev_base,
+                        a,
+                        a + res,
+                    );
+                }
+            }
+        }
+        self.wetness = wet;
+        self.base_wetness = base_wet;
+        self.mix_ready = true;
+    }
+
+    /// Mud, sand, gravel, grass at one cell. A field that has not been
+    /// blended reports a one-hot share of those four, or zeros.
+    pub fn mix_texel(&self, idx: usize) -> [f32; 4] {
+        if self.mix_ready && self.mix.len() >= (idx + 1) * MIX_CHANNELS {
+            let base = idx * MIX_CHANNELS;
+            return [
+                self.mix[base],
+                self.mix[base + 1],
+                self.mix[base + 2],
+                self.mix[base + 3],
+            ];
+        }
+        let mut mix = [0.0; 4];
+        if let Some(channel) = mix_channel(SurfaceKind::from_u8(self.kind[idx])) {
+            mix[channel] = 1.0;
+        }
+        mix
     }
 
     /// Flat pad with a torn rut and a grip boundary. Film and deep slurry
@@ -1450,6 +1673,7 @@ impl SoilField {
                 crack: 0.0,
                 passes: 0,
                 rest: 0.0,
+                mix: [0.0; 4],
             };
         }
         let i = u.floor() as usize;
@@ -1488,6 +1712,7 @@ impl SoilField {
             crack: self.crack[nidx],
             passes: self.passes[nidx],
             rest: self.rest[nidx],
+            mix: self.mix_texel(nidx),
         }
     }
 
@@ -1677,6 +1902,7 @@ impl SoilField {
             crack: mid.crack,
             passes: mid.passes,
             rest: mid.rest,
+            mix: mid.mix,
         }
     }
 
@@ -5851,16 +6077,8 @@ impl SoilField {
             let hold = water_hold(kind);
             let standing = self.water[idx] > hold + 0.004;
             let wetting = standing || rain > 1.0e-6;
-            let target = if wetting {
-                wet_target(kind)
-            } else {
-                dry_target(kind, self.base_wetness[idx])
-            };
-            let rate = if wetting {
-                wet_rate(kind)
-            } else {
-                dry_rate(kind)
-            };
+            let mix = self.mix_texel(idx);
+            let (target, rate) = moisture_step_target(kind, self.base_wetness[idx], wetting, mix);
             let a = 1.0 - (-rate * dt).exp();
             self.wetness[idx] =
                 (self.wetness[idx] + (target - self.wetness[idx]) * a).clamp(0.0, 1.0);
@@ -6121,6 +6339,7 @@ impl SoilField {
         push_f32s(&mut out, &self.slurry);
         push_f32s(&mut out, &self.crust);
         push_f32s(&mut out, &self.crack);
+        push_f32s(&mut out, &self.mix);
         out
     }
 
@@ -6149,7 +6368,7 @@ impl SoilField {
         let kind = read_u8s(bytes, &mut i, n)?;
         let passes = read_u8s(bytes, &mut i, n)?;
         let remain = bytes.len() - i;
-        let (tread_amp, tread_ang, tread_lat, slurry, crust, crack) = if remain == 0 {
+        let (tread_amp, tread_ang, tread_lat, slurry, crust, crack, mix) = if remain == 0 {
             (
                 vec![0.0; n],
                 vec![0.0; n],
@@ -6157,6 +6376,7 @@ impl SoilField {
                 vec![0.0; n],
                 vec![0.0; n],
                 vec![0.0; n],
+                vec![0.0; n * MIX_CHANNELS],
             )
         } else if remain == n * 12 {
             let tread_amp = read_f32s(bytes, &mut i, n)?;
@@ -6169,6 +6389,7 @@ impl SoilField {
                 vec![0.0; n],
                 vec![0.0; n],
                 vec![0.0; n],
+                vec![0.0; n * MIX_CHANNELS],
             )
         } else if remain == n * 16 {
             let tread_amp = read_f32s(bytes, &mut i, n)?;
@@ -6182,6 +6403,7 @@ impl SoilField {
                 slurry,
                 vec![0.0; n],
                 vec![0.0; n],
+                vec![0.0; n * MIX_CHANNELS],
             )
         } else if remain == n * 24 {
             let tread_amp = read_f32s(bytes, &mut i, n)?;
@@ -6190,10 +6412,28 @@ impl SoilField {
             let slurry = read_f32s(bytes, &mut i, n)?;
             let crust = read_f32s(bytes, &mut i, n)?;
             let crack = read_f32s(bytes, &mut i, n)?;
-            (tread_amp, tread_ang, tread_lat, slurry, crust, crack)
+            (
+                tread_amp,
+                tread_ang,
+                tread_lat,
+                slurry,
+                crust,
+                crack,
+                vec![0.0; n * MIX_CHANNELS],
+            )
+        } else if remain == n * 40 {
+            let tread_amp = read_f32s(bytes, &mut i, n)?;
+            let tread_ang = read_f32s(bytes, &mut i, n)?;
+            let tread_lat = read_f32s(bytes, &mut i, n)?;
+            let slurry = read_f32s(bytes, &mut i, n)?;
+            let crust = read_f32s(bytes, &mut i, n)?;
+            let crack = read_f32s(bytes, &mut i, n)?;
+            let mix = read_f32s(bytes, &mut i, n * MIX_CHANNELS)?;
+            (tread_amp, tread_ang, tread_lat, slurry, crust, crack, mix)
         } else {
             return Err("soil snapshot has trailing bytes".into());
         };
+        let mix_ready = mix.iter().any(|v| v.abs() > 1.0e-8);
         let mut height = vec![0.0; n];
         for idx in 0..n {
             height[idx] = bed[idx] + placed[idx] + slurry[idx];
@@ -6224,6 +6464,8 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust,
             crack,
+            mix,
+            mix_ready,
         })
     }
 
@@ -7697,6 +7939,59 @@ fn born_kind(x: f32, z: f32, wet: f32, water: f32) -> SurfaceKind {
         return SurfaceKind::DryCrust;
     }
     SurfaceKind::Undisturbed
+}
+
+fn moisture_step_target(
+    kind: SurfaceKind,
+    base: f32,
+    wetting: bool,
+    mix: [f32; 4],
+) -> (f32, f32) {
+    let mut sum = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for share in mix {
+        sum += share;
+        peak = peak.max(share);
+    }
+    if !(sum >= 0.05 && peak < 0.999) {
+        return (
+            kind_moisture_target(kind, base, wetting),
+            kind_moisture_rate(kind, wetting),
+        );
+    }
+    let kinds = [
+        SurfaceKind::WetMud,
+        SurfaceKind::Sand,
+        SurfaceKind::Gravel,
+        SurfaceKind::Grass,
+    ];
+    let mut target = 0.0;
+    let mut rate = 0.0;
+    for (i, material) in kinds.into_iter().enumerate() {
+        let w = mix[i];
+        if w <= 0.0 {
+            continue;
+        }
+        target += kind_moisture_target(material, base, wetting) * w;
+        rate += kind_moisture_rate(material, wetting) * w;
+    }
+    (target / sum, rate / sum)
+}
+
+fn kind_moisture_target(kind: SurfaceKind, base: f32, wetting: bool) -> f32 {
+    if wetting {
+        wet_target(kind)
+    } else {
+        dry_target(kind, base)
+    }
+}
+
+fn kind_moisture_rate(kind: SurfaceKind, wetting: bool) -> f32 {
+    if wetting {
+        wet_rate(kind)
+    } else {
+        dry_rate(kind)
+    }
 }
 
 fn wet_target(kind: SurfaceKind) -> f32 {
@@ -9431,19 +9726,19 @@ mod tests {
         );
         assert!((loaded.tread_ang[idx] - soil.tread_ang[idx]).abs() < 1.0e-6);
         let cells = soil.res * soil.res;
-        let legacy_len = saved.len() - cells * 24;
+        let legacy_len = saved.len() - cells * 40;
         let legacy = SoilField::load_state(&saved[..legacy_len]).expect("old snapshot");
         assert_eq!(legacy.tread_amp[idx], 0.0);
         assert_eq!(legacy.slurry[idx], 0.0);
         assert_eq!(legacy.crust[idx], 0.0);
         assert!((legacy.bed[idx] - soil.bed[idx]).abs() < 1.0e-6);
-        let prior = SoilField::load_state(&saved[..saved.len() - cells * 12]).expect("pre-slurry");
+        let prior = SoilField::load_state(&saved[..saved.len() - cells * 28]).expect("pre-slurry");
         assert_eq!(prior.slurry[idx], 0.0);
         assert!((prior.tread_amp[idx] - amp).abs() < 1.0e-6);
         assert!((loaded.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
         assert!((loaded.crust[crust_cell] - 0.018).abs() < 1.0e-6);
         assert!((loaded.crack[crust_cell] - 0.007).abs() < 1.0e-6);
-        let pre_crust = SoilField::load_state(&saved[..saved.len() - cells * 8]).expect("pre-crust");
+        let pre_crust = SoilField::load_state(&saved[..saved.len() - cells * 24]).expect("pre-crust");
         assert_eq!(pre_crust.crust[crust_cell], 0.0);
         assert_eq!(pre_crust.crack[crust_cell], 0.0);
         assert!((pre_crust.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);

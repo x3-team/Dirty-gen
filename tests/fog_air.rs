@@ -117,7 +117,7 @@ fn read_fog(dust: &Dust) -> FogRead {
 
 #[test]
 fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
-    assert_eq!(RENDER_CONTRACT_VERSION, 3);
+    assert_eq!(RENDER_CONTRACT_VERSION, 6);
 
     let mut fluid = FluidCore::new([0.0, 0.0]);
     fluid.set_wind(1.5, -0.9);

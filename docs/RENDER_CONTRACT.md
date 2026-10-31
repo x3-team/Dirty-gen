@@ -1,6 +1,6 @@
 # Render contract
 
-Version **3**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12.
+Version **6**, the value of `RENDER_CONTRACT_VERSION`. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. Material shares are binding 13.
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -27,7 +27,7 @@ Valid after the solver step that produced the frame, and until the next step. Th
 
 Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 96 bytes. Spray slot: `SprayGpu`, 48 bytes.
 
-`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog). It is not a solver map. Changing which mode is on screen does not bump the version.
+`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 material mix). It is not a solver map. Changing which mode is on screen does not bump the version.
 
 | Binding | Name | Format | Channels | Units |
 |---|---|---|---|---|
@@ -44,6 +44,7 @@ Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `Cont
 | 10 | `spray` | storage, read-only | `SprayGpu` × 4096 | see below |
 | 11 | `air_velocity` | `rgba32float` 3D | R +X, G +Y, B +Z, A 0 | m/s |
 | 12 | `fog` | `r32float` 3D | R water volume fraction | m³/m³ |
+| 13 | `soil_mix` | `rgba32float` | R mud, G sand, B gravel, A grass | 0..1 |
 
 Ground maps are 200 × 200. `dust_fog`, `air_velocity`, and `fog` share one air grid. Spray is a buffer, not a grid.
 
@@ -62,6 +63,8 @@ Valid: `VALID_GROUND` is set on every publish.
 Pore moisture, 0 dry to 1 saturated. Not the film thickness.
 
 Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness. With both, the texel is the greater of the two. That is how a wet tire track painted on the soil stays in this map after the sheet is attached. The sheet keeps its own moisture as well: pore moisture is parked with the ground cell when the window follows the Niva, and a disk raised along the drained track is the same channel. Around the puddle the same channel is a wet band: saturated on the floor, still wet on the bank past the shoreline, then back to the pad. A hard step from saturated to the pad is not that band.
+
+On a joint of mud, sand, gravel, and grass the soil wetness is the blended pore moisture. The blend is the same exchange as binding 13. This channel stays the only moisture map.
 
 Valid: `VALID_MOISTURE` is set on every publish.
 
@@ -217,9 +220,26 @@ Writer: the particle list, after the particle step, then the water drops the she
 
 Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A non-finite position, velocity, mass, or age is written as 0.
 
+### Material shares — binding 13
+
+Share of the cell that is mud, sand, gravel, or grass. Not a height and not the pore moisture.
+
+| Channel | Material |
+|---|---|
+| R | mud |
+| G | sand |
+| B | gravel |
+| A | grass |
+
+A cell of one of those four sums to 1. The joint is the same four numbers: each side gives up share to the other, and neither side is a step from 1 to 0. Any other kind sums to 0. The picture cache still stores one kind id in its alpha. That cache is not this map.
+
+Writer: `SoilField::blend_material_joints` on the soil cell under the texel centre. The Niva field is blended when it is built. A pad that was not blended publishes a one-hot share of these four, or zeros. Off the soil square the texel is 0.
+
+Valid: `VALID_MIX` on every publish. A non-finite sample is written as 0.
+
 ## Header flags
 
-`header.version` is 3. `header.valid` is a bit mask:
+`header.version` is `RENDER_CONTRACT_VERSION`. `header.valid` is a bit mask:
 
 | Bit | Value | Map |
 |---|---|---|
@@ -235,6 +255,7 @@ Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A no
 | 9 | `VALID_SPRAY` | spray |
 | 10 | `VALID_AIR` | air velocity |
 | 11 | `VALID_FOG` | fog |
+| 12 | `VALID_MIX` | material shares |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
 
@@ -290,3 +311,11 @@ Dry cells of flow and foam do not bump this version either. Binding 4 on a dry c
 `fog`, binding 12, `r32float` 3D, 128 × 8 × 128. R is the water volume fraction, m³/m³. Same origin and cell as `dust_fog` and `air_velocity`. `VALID_FOG` is bit 11, set when `dust_source` is 1 or 2.
 
 `dust_fog` and `air_velocity` are unchanged. Fog does not replace either channel and it does not add a velocity. With the dust ledger, `inject_fog` writes the scalar and the existing wind step plus `advect_density_by_air` move it. Without the ledger, `FluidCore::inject_fog` takes the water and the same wind step moves the slab. The header stays 96 bytes. Debug mode 15 shows this channel. Debug mode 13 remains airborne dust.
+
+### 6
+
+`soil_mix`, binding 13, `rgba32float`, 200 × 200. R is the mud share, G sand, B gravel, A grass. Each channel is a share of the cell from 0 to 1. `VALID_MIX` is bit 12 (`1 << 12`), set on every publish. The header stays 96 bytes. Debug mode 16 shows the mix. Binding 12 and bit 11 stay the fog channel.
+
+A cell whose material is one of those four sums to 1, including through the joint. Silt, crust, undisturbed ground, a berm, and a cut that is not one of the four are 0 in every channel. Off the soil square the texel is 0.
+
+The solver builds the shares from the cell kind, then runs four Jacobi passes. Across an edge whose two cells both carry one of the four and whose shares differ, each pass moves 1/4 of the difference from one cell to the other. The sum of each channel over the map does not change. The sum of the four channels on a cell does not change. Pore moisture is not a fifth channel: the same edges exchange the soil wetness, and binding 2 publishes that wetness.
