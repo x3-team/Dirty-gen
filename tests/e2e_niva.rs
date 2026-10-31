@@ -21,12 +21,18 @@ use silt::ThroughDrive;
 
 const DT: f32 = 1.0 / 30.0;
 /// Release through-drive step mean, milliseconds.
-/// The release CI mean on EPYC 7763 (4 cores), not a pad on the Xeon measurement.
-/// The log has that mean; it does not print a sample median. Not the 7 ms frame budget.
-const E2E_STEP_BUDGET_MS: f64 = 33.004;
+/// 15% over the #100 release CI mean (10.278 ms, EPYC 9V45, run 41218969837).
+/// Not above that mean plus 20% (12.334) and not above the previous 33.004.
+const E2E_STEP_BUDGET_MS: f64 = 11.820;
 /// Release sum of [`ThroughDrive::step`] subsystems, milliseconds. Do not raise.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 const DRIVE_SOLVER_BUDGET_MS: f64 = 7.0;
+/// Release dust row. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_DUST_BUDGET_MS: f64 = 1.0;
+/// Release p95 of one `ThroughDrive::step`. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_P95_BUDGET_MS: f64 = 7.0;
 /// Release air step. Debug still uses [`AIR_STEP_BUDGET_MS`] (4 ms).
 const AIR_RELEASE_BUDGET_MS: f64 = 1.5;
 const SPEED: f32 = 8.0;
@@ -866,7 +872,9 @@ fn print_through_drive() {
          DRIVE_SHEET_REST ms={:.3}\n\
          DRIVE_OTHER ms={:.3}\n\
          DRIVE_SOLVER ms={solver:.3}\n\
-         DRIVE_SOLVER_BUDGET ms={DRIVE_SOLVER_BUDGET_MS:.3}",
+         DRIVE_SOLVER_BUDGET ms={DRIVE_SOLVER_BUDGET_MS:.3}\n\
+         DRIVE_P95_BUDGET ms={DRIVE_P95_BUDGET_MS:.3}\n\
+         DRIVE_DUST_BUDGET ms={DRIVE_DUST_BUDGET_MS:.3}",
         acc.water_ms / k,
         acc.slurry_ms / k,
         acc.soil_ms / k,
@@ -879,10 +887,21 @@ fn print_through_drive() {
         acc.sheet_rest_ms / k,
         acc.other_ms / k,
     );
+    let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
     assert!(
         solver <= DRIVE_SOLVER_BUDGET_MS,
         "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        p95 <= DRIVE_P95_BUDGET_MS,
+        "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        dust <= DRIVE_DUST_BUDGET_MS,
+        "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
     );
 }
 
