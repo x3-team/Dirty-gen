@@ -762,8 +762,11 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let mat_dims = vec2<f32>(textureDimensions(mat_tex));
     let mat = textureSampleLevel(mat_tex, mat_samp, (in.ij + vec2<f32>(0.5)) / mat_dims, 0.0);
     let wet = mat.r;
-    let water = mat.g * 0.34;
+    let water = select(mat.g * 0.34, water_column(xz), puddle_beauty_on());
     let darken = mat.b;
+    let pool_fill = select(0.0, smoothstep(0.045, 0.11, mat.g), puddle_beauty_on());
+    let pool_shore = select(0.0, smoothstep(0.14, 0.018, mat.g) * (1.0 - smoothstep(0.002, 0.012, mat.g)), puddle_beauty_on());
+    let pool_sheet = select(0.0, smoothstep(0.028, 0.065, mat.g), puddle_beauty_on());
     // Exported skin, metres. Zero where the pad has not baked.
     let crust_rg = crust_bilinear(xz);
     let thickness = crust_rg.x * 0.04;
@@ -835,7 +838,10 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     var albedo = diff * mix(1.0, ao, 0.75);
     let muddy = kind == 4u || kind == 5u || kind == 9u || kind == 6u;
     let wet_amt = select(0.12, 0.32, muddy);
-    albedo = mix(albedo, albedo * vec3<f32>(0.66, 0.58, 0.48), smoothstep(0.18, 0.92, wet) * wet_amt);
+    albedo = mix(albedo, albedo * vec3<f32>(0.66, 0.58, 0.48), smoothstep(0.18, 0.92, wet) * wet_amt * (1.0 - pool_sheet));
+    // Dark bed under the rim only — the sheet is the water pass, not a beige wet patch.
+    albedo = mix(albedo, albedo * vec3<f32>(0.14, 0.10, 0.07), pool_shore * 1.0);
+    albedo = mix(albedo, albedo * vec3<f32>(0.14, 0.11, 0.08), pool_fill * 0.35);
     if (kind == 9u) {
         albedo *= mix(1.0, 0.8, smoothstep(0.35, 0.9, darken));
     } else if (kind == 7u) {
@@ -874,8 +880,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // without a new surface kind.
     albedo *= mix(1.0, 0.36, smoothstep(0.20, 0.52, darken));
 
-    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water));
-    let drowned = smoothstep(0.012, 0.05, water);
+    let shore = smoothstep(0.0, 0.02, water) * (1.0 - smoothstep(0.035, 0.11, water)) * (1.0 - pool_sheet);
+    let drowned = smoothstep(0.012, 0.05, water) * (1.0 - pool_sheet);
     // Film and slurry live on this mesh. A glossy sheet over the cut is a flat card.
     let dug = max(-stamp_bilinear(xz), 0.0);
     let in_cut = dug > 0.012 && water > 0.008;
@@ -982,8 +988,26 @@ fn water_depth(xz: vec2<f32>) -> f32 {
 // Solved column for a crossing. misc.w selects the wider pack so a bow
 // above the old 0.34 m film range is the free surface, not a flat sheet.
 fn water_column(xz: vec2<f32>) -> f32 {
+    let raw = mat_bilinear(xz).g;
+    if (puddle_beauty_on()) {
+        // Mat.g is 0..1 over 0.28 m (see upload_soil liquid_scale).
+        return raw * 0.28;
+    }
     let scale = select(0.34, 0.90, frame.misc.w > 0.5);
-    return mat_bilinear(xz).g * scale;
+    return raw * scale;
+}
+
+fn water_column_dilated(xz: vec2<f32>) -> f32 {
+    if (!puddle_beauty_on()) {
+        return water_column(xz);
+    }
+    let e = 0.38;
+    var m = water_column(xz);
+    m = max(m, water_column(xz + vec2<f32>(e, 0.0)));
+    m = max(m, water_column(xz - vec2<f32>(e, 0.0)));
+    m = max(m, water_column(xz + vec2<f32>(0.0, e)));
+    m = max(m, water_column(xz - vec2<f32>(0.0, e)));
+    return m;
 }
 
 // A dry patch with water on both sides is a hole in the sheet, not a shore.
@@ -1016,12 +1040,10 @@ fn puddle_beauty_on() -> bool {
     return frame.misc.w >= 1.5;
 }
 
-// Standing pool on the playground: draw most of the column so the sheet reads
-// as water, not a mud stain.
+// Playground pools: bed + column is the flat free surface. Do not inflate the
+// column into a mound — depth shows in the tint, not vertex height.
 fn standing_water(column: f32) -> f32 {
-    let pool = min(column, 0.24) * 0.92;
-    let crest = max(column - 0.24, 0.0) * 0.14;
-    return 0.008 + pool + crest;
+    return min(column, 0.28);
 }
 
 fn water_surface_lift(column: f32) -> f32 {
@@ -1101,10 +1123,11 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
     let column = water_column(in.xz);
+    let column_draw = water_column_dilated(in.xz);
     let water_mode = frame.misc.w;
-    let free = water_mode >= 0.5 && column > 0.004;
+    let free = water_mode >= 0.5 && column_draw > 0.004;
     let beauty = puddle_beauty_on();
-    let rip_scale = select(1.0, 2.6, beauty);
+    let rip_scale = select(1.0, 3.4, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
     let wake = select(0.0, tire_wake_ripples(in.xz, frame.misc.x), beauty);
     // Film on the bed, but never below the soil. A bump left uncovered
@@ -1124,14 +1147,15 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let swell_amp = select(1.0, 1.55, beauty);
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
-    let surface = base + water_surface_lift(column) + rip * 0.45 + wake + swell * swell_amp;
+    let lift = max(column, column_draw * 0.22);
+    let surface = base + water_surface_lift(lift) + rip * 0.45 + wake + swell * swell_amp;
     let y = select(y_sheet, surface, free);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
     o.world = world;
     o.ij = in.ij;
-    o.depth = select(depth, column, free);
+    o.depth = select(depth, max(column, column_draw * 0.18), free);
     return o;
 }
 
@@ -1226,26 +1250,28 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
         col = body * (0.10 + 2.8 * ndl);
         let halfv = normalize(sun + view);
-        let spec_pow = select(28.0, 96.0, beauty);
+        let spec_pow = select(28.0, 128.0, beauty);
         let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), spec_pow);
         col += vec3<f32>(0.62, 0.46, 0.24) * sheen * select(1.5, 2.4, beauty);
         alpha = shore_fade * mix(0.46, 0.72, deep);
         if (beauty) {
             let refl_dir = reflect(-view, nrm);
             let ibl = sky_reflect(refl_dir);
-            let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 128.0);
-            let ibl_lit = ibl + frame.sun_color.rgb * sun_disk * 0.35;
-            let rim = smoothstep(0.14, 0.014, column_here) * (1.0 - smoothstep(0.001, 0.009, column_here));
-            col = mix(col, vec3<f32>(0.022, 0.014, 0.008), rim * 0.82);
-            let shallow = 1.0 - smoothstep(0.010, 0.11, column_here);
-            let water_tint = vec3<f32>(0.12, 0.42, 0.58);
-            body = mix(water_tint * 0.38, water_tint, deep);
-            let bed_shallow = soil * vec3<f32>(0.52, 0.46, 0.38);
-            body = mix(body, bed_shallow, shallow * 0.88);
-            col = mix(body * (0.24 + 1.2 * ndl), ibl_lit, fres * 0.72 + 0.32);
-            col += vec3<f32>(0.95, 0.98, 1.0) * sheen * 0.72;
-            alpha = mix(0.52, 0.92, deep) * shore_fade;
-            alpha = mix(alpha, alpha * 0.42, shallow * 0.92);
+            let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 112.0);
+            let ibl_lit = ibl * 1.18 + frame.sun_color.rgb * sun_disk * 0.55;
+            let rim = smoothstep(0.16, 0.012, column_here) * (1.0 - smoothstep(0.001, 0.008, column_here));
+            col = mix(col, vec3<f32>(0.014, 0.010, 0.008), rim * 0.88);
+            let shallow = 1.0 - smoothstep(0.008, 0.095, column_here);
+            let water_tint = vec3<f32>(0.06, 0.38, 0.55);
+            let water_deep = vec3<f32>(0.03, 0.22, 0.38);
+            body = mix(water_tint, water_deep, deep);
+            let bed_shallow = mix(soil * vec3<f32>(0.34, 0.28, 0.22), water_tint * 0.55, 0.62);
+            body = mix(body, bed_shallow, shallow * 0.72);
+            let body_lit = body * (0.18 + 0.95 * ndl);
+            col = mix(body_lit, ibl_lit, fres * 0.82 + 0.28);
+            col += vec3<f32>(0.88, 0.92, 1.0) * sheen * 0.62;
+            alpha = mix(0.58, 0.90, deep) * shore_fade;
+            alpha = mix(alpha, alpha * 0.55, shallow * 0.78);
         }
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);

@@ -1653,7 +1653,7 @@ impl Renderer {
             // already sits on the slurry, so the tint is that one surface.
             let liquid = soil.water[i] + soil.slurry[i];
             let liquid_scale = if self.puddle_beauty {
-                0.72
+                0.28
             } else if self.water_column {
                 0.90
             } else {

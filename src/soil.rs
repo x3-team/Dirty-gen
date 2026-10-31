@@ -7431,7 +7431,7 @@ impl SoilField {
             (-2.35_f32, -0.95_f32, 1.05_f32, 0.72_f32, 0.11_f32),
             (-2.35_f32, 1.30_f32, 1.05_f32, 0.72_f32, 0.11_f32),
             // Near the sand/mud seam so one frame can read sand, mud, and standing water.
-            (-1.05_f32, 0.15_f32, 1.12_f32, 0.82_f32, 0.20_f32),
+            (-1.05_f32, 0.15_f32, 1.28_f32, 0.95_f32, 0.22_f32),
         ];
         for j in 0..res {
             for i in 0..res {
@@ -7458,7 +7458,7 @@ impl SoilField {
                 let mud = 1.0 - sand;
                 let mut water = 0.0;
                 if h < water_line {
-                    water = (water_line - h).min(0.24);
+                    water = (water_line - h).min(0.28);
                 }
                 field.water[idx] = water;
                 field.slurry[idx] = (water * 1.45).min(0.14);
