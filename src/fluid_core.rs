@@ -6215,7 +6215,9 @@ impl FluidCore {
                 self.parked.remove(&key);
             }
         });
-        let need = n * 9;
+        let track_susp = self.turbidity_enabled;
+        let planes = if track_susp { 9 } else { 8 };
+        let need = n * planes;
         if self.shift_scratch.len() < need {
             self.shift_scratch.resize(need, 0.0);
         }
@@ -6228,7 +6230,9 @@ impl FluidCore {
         scratch[n * 5..n * 6].copy_from_slice(&self.vs);
         scratch[n * 6..n * 7].copy_from_slice(&self.settled);
         scratch[n * 7..n * 8].copy_from_slice(&self.moisture);
-        scratch[n * 8..n * 9].copy_from_slice(&self.susp);
+        if track_susp {
+            scratch[n * 8..n * 9].copy_from_slice(&self.susp);
+        }
         let res_i = res as i32;
         for j in 0..res {
             for i in 0..res {
@@ -6241,7 +6245,7 @@ impl FluidCore {
                         || scratch[n + src] > 1.0e-8
                         || scratch[n * 6 + src] > 1.0e-8
                         || scratch[n * 7 + src] > 1.0e-4
-                        || scratch[n * 8 + src] > 1.0e-8
+                        || (track_susp && scratch[n * 8 + src] > 1.0e-8)
                 } else {
                     false
                 };
@@ -6255,7 +6259,11 @@ impl FluidCore {
                     self.vs[dst] = scratch[n * 5 + src];
                     self.settled[dst] = scratch[n * 6 + src];
                     self.moisture[dst] = scratch[n * 7 + src];
-                    self.susp[dst] = scratch[n * 8 + src];
+                    self.susp[dst] = if track_susp {
+                        scratch[n * 8 + src]
+                    } else {
+                        0.0
+                    };
                 } else {
                     self.water[dst] = 0.0;
                     self.slurry[dst] = 0.0;
