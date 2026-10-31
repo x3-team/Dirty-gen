@@ -247,6 +247,13 @@ pub struct Dust {
     /// World air velocity, xyz, same index as `vol`.
     vel: Vec<f32>,
     vel_scratch: Vec<f32>,
+    /// Coarse air velocity for the active window. Same layout, `AIR_COARSE` times fewer X/Z cells.
+    coarse_vel: Vec<f32>,
+    coarse_scratch: Vec<f32>,
+    /// Bits of wind and heading. A change restamps the free stream onto the fine grid.
+    air_stamp_key: [u32; 6],
+    /// Occupied dust columns, `ix | (iz << 16)`, rebuilt with the row spans.
+    occupied: Vec<u32>,
     air_ready: bool,
     wake_vorticity: f32,
     wake_cells: u32,
@@ -268,6 +275,9 @@ pub struct Dust {
 impl Dust {
     pub fn new() -> Self {
         let n = (AIR_RES * AIR_LAYERS * AIR_RES) as usize;
+        let c = (AIR_RES as usize) / crate::fluid_core::AIR_COARSE;
+        let cy = (AIR_LAYERS as usize) / crate::fluid_core::AIR_COARSE_Y;
+        let coarse_n = c * cy * c;
         Self {
             vol: vec![0.0; n],
             emitted: 0.0,
@@ -284,6 +294,10 @@ impl Dust {
             wheel_slip: [0.0; 4],
             vel: vec![0.0; n * 3],
             vel_scratch: vec![0.0; n * 3],
+            coarse_vel: vec![0.0; coarse_n * 3],
+            coarse_scratch: vec![0.0; coarse_n * 3],
+            air_stamp_key: [0; 6],
+            occupied: Vec::new(),
             air_ready: false,
             wake_vorticity: 0.0,
             wake_cells: 0,
@@ -622,35 +636,61 @@ impl Dust {
         let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
         let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
         let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
+        let key = [
+            self.wind_x.to_bits(),
+            self.wind_z.to_bits(),
+            self.speed.to_bits(),
+            self.forward.x.to_bits(),
+            self.forward.z.to_bits(),
+            self.right.x.to_bits(),
+        ];
+        let full_stamp = !self.air_ready || key != self.air_stamp_key;
+        self.air_stamp_key = key;
+        let solve_stride = crate::fluid_core::AIR_SOLVE_STRIDE.max(1);
+        let solve_due = full_stamp || self.frame % solve_stride == 0;
         #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
-        let report = crate::fluid_core::step_vehicle_air(
-            &mut self.vel,
-            &mut self.vel_scratch,
-            origin,
-            cell,
-            res,
-            &drive,
-            &solids,
-            dt,
-            self.air_ready,
-        );
+        let report = if solve_due {
+            crate::fluid_core::step_dust_air(
+                &mut self.vel,
+                &mut self.coarse_vel,
+                &mut self.coarse_scratch,
+                origin,
+                cell,
+                res,
+                &drive,
+                &solids,
+                dt * solve_stride as f32,
+                self.air_ready,
+                full_stamp,
+            )
+        } else {
+            crate::fluid_core::AirReport {
+                peak_vorticity: self.wake_vorticity,
+                wake_cells: self.wake_cells,
+                nan_count: 0,
+            }
+        };
         self.air_ready = true;
         self.wake_vorticity = report.peak_vorticity;
         self.wake_cells = report.wake_cells;
         self.air_nan = self.air_nan.saturating_add(report.nan_count);
         let n = self.vol.len();
-        let _gap = crate::fluid_core::advect_density_by_air(
-            &mut self.vol,
-            &mut self.vel_scratch[..n],
-            &self.vel,
-            origin,
-            cell,
-            res,
-            &drive,
-            &solids,
-            dt,
-        );
+        let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
+        if !self.occupied.is_empty() && self.frame % stride == 0 {
+            let _gap = crate::fluid_core::advect_density_by_air(
+                &mut self.vol,
+                &mut self.vel_scratch[..n],
+                &self.vel,
+                origin,
+                cell,
+                res,
+                &drive,
+                &solids,
+                dt * stride as f32,
+                &self.occupied,
+            );
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.last_air_ms = t0.elapsed().as_secs_f64() as f32 * 1000.0;
@@ -810,6 +850,7 @@ impl Dust {
         self.x1 = 0;
         self.z0 = 1;
         self.z1 = 0;
+        self.occupied.clear();
         for iz in 0..AIR_RES as usize {
             self.row_lo[iz] = 1;
             self.row_hi[iz] = 0;
@@ -818,6 +859,7 @@ impl Dust {
             for ix in 0..AIR_RES {
                 if (0..AIR_LAYERS).any(|iy| self.vol[at(ix, iy, iz)] > 0.0) {
                     self.touch(ix, iz);
+                    self.occupied.push(ix | (iz << 16));
                 }
             }
         }

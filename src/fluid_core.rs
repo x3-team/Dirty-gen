@@ -3291,23 +3291,32 @@ fn world_key(x: f32, z: f32, cell: f32) -> (i32, i32) {
 /// Vorticity confinement, metres per second. The kick is this times N × ω × dt.
 /// High enough that the body shear rolls up behind the rear face instead of
 /// diffusing below [`WAKE_VORTICITY_MIN`].
-pub const AIR_CONFINE: f32 = 6.0;
+pub const AIR_CONFINE: f32 = 18.0;
 /// |ω| the wake behind the body must clear, 1/s. Scored 0.5–5 m aft of the
 /// rear face, inside the track, not on the free-stream shear at the lee edge.
 pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 /// Milliseconds allowed for one air step in an unoptimized `cargo test`:
-/// inject, advect, confine, and the density flux. A quiet debug run of the
-/// proof drive sits near 28 ms. Optimized builds are well under this.
-pub const AIR_STEP_BUDGET_MS: f32 = 48.0;
+/// inject, advect, confine, and the density flux. The proof drive must stay
+/// under 4 ms, which is the budget for the step that feeds the GPU upload.
+pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
+/// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
+pub const AIR_FLUX_STRIDE: u32 = 4;
+/// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.
+pub const AIR_SOLVE_STRIDE: u32 = 2;
+/// Fine dust cells per coarse air cell in X and Z. Layers stay at the dust spacing.
+/// The solve runs on this coarser active window and is written back onto the dust grid.
+pub const AIR_COARSE: usize = 2;
+/// Fine dust layers per coarse air layer.
+pub const AIR_COARSE_Y: usize = 2;
 /// Share of the wake residual that moves dust. Free-stream wind is already
 /// applied by [`advect_dust_density`].
 pub const AIR_DENSITY_COUPLING: f32 = 0.04;
 
 const AIR_FEATHER_M: f32 = 0.22;
 const AIR_WIND_RATE: f32 = 1.35;
-const AIR_WIN_LAT: f32 = 4.2;
-const AIR_WIN_Z0: f32 = -8.6;
-const AIR_WIN_Z1: f32 = 3.0;
+const AIR_WIN_LAT: f32 = 1.9;
+const AIR_WIN_Z0: f32 = -6.5;
+const AIR_WIN_Z1: f32 = 2.0;
 
 /// Niva body half-extents in the chassis frame, metres. +X right, +Y up, +Z forward.
 pub const NIVA_BODY_HALF: [f32; 3] = [0.86, 0.62, 1.78];
@@ -3451,6 +3460,8 @@ pub fn niva_air(
 
 thread_local! {
     static AIR_OMEGA: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static COL_LIVE: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static AIR_WAKE: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
 /// World AABB of every solid, expanded by the occupancy feather.
@@ -3521,6 +3532,7 @@ pub fn step_vehicle_air(
     solids: &[AirSolid],
     dt: f32,
     warm: bool,
+    fill_outside: bool,
 ) -> AirReport {
     let n = res[0].saturating_mul(res[1]).saturating_mul(res[2]);
     if dt <= 0.0 || !dt.is_finite() || n == 0 || vel.len() < n * 3 || scratch.len() < n * 3 {
@@ -3557,17 +3569,19 @@ pub fn step_vehicle_air(
             }
         }
     }
-    for iz in 0..res[2] {
-        for iy in 0..res[1] {
-            for ix in 0..res[0] {
-                if ix >= ix0 && ix <= ix1 && iz >= iz0 && iz <= iz1 {
-                    continue;
+    if fill_outside {
+        for iz in 0..res[2] {
+            for iy in 0..res[1] {
+                for ix in 0..res[0] {
+                    if ix >= ix0 && ix <= ix1 && iz >= iz0 && iz <= iz1 {
+                        continue;
+                    }
+                    let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+                    let i = at3(res, ix, iy, iz);
+                    let fs = row_stream(streams, ix, x, drive);
+                    store3(vel, i, fs);
+                    store3(scratch, i, fs);
                 }
-                let x = origin[0] + (ix as f32 + 0.5) * cell[0];
-                let i = at3(res, ix, iy, iz);
-                let fs = row_stream(streams, ix, x, drive);
-                store3(vel, i, fs);
-                store3(scratch, i, fs);
             }
         }
     }
@@ -3655,8 +3669,8 @@ pub fn step_vehicle_air(
                                 let mut du = AIR_CONFINE * dt * (-nz * w);
                                 let mut dw = AIR_CONFINE * dt * (nx * w);
                                 let kick = du.hypot(dw);
-                                if kick > 1.35 {
-                                    let s = 1.35 / kick;
+                                if kick > 2.5 {
+                                    let s = 2.5 / kick;
                                     du *= s;
                                     dw *= s;
                                 }
@@ -3693,6 +3707,96 @@ pub fn step_vehicle_air(
     }
 }
 
+/// Solve the Niva wake on a coarse active window and copy it onto the fine dust grid.
+///
+/// `warm` keeps the coarse velocity from the previous step. `full_stamp` writes
+/// every fine cell; a steady heading only rewrites the window.
+pub fn step_dust_air(
+    fine: &mut [f32],
+    coarse: &mut [f32],
+    coarse_scratch: &mut [f32],
+    origin: [f32; 3],
+    fine_cell: [f32; 3],
+    fine_res: [usize; 3],
+    drive: &AirDrive,
+    solids: &[AirSolid],
+    dt: f32,
+    warm: bool,
+    full_stamp: bool,
+) -> AirReport {
+    let factor = AIR_COARSE.max(1);
+    let empty = AirReport {
+        peak_vorticity: 0.0,
+        wake_cells: 0,
+        nan_count: 0,
+    };
+    let fy = AIR_COARSE_Y.max(1);
+    if fine_res[0] < factor
+        || fine_res[2] < factor
+        || fine_res[1] < fy
+        || fine_res[0] % factor != 0
+        || fine_res[2] % factor != 0
+        || fine_res[1] % fy != 0
+    {
+        return empty;
+    }
+    let cres = [fine_res[0] / factor, fine_res[1] / fy, fine_res[2] / factor];
+    let n = cres[0].saturating_mul(cres[1]).saturating_mul(cres[2]);
+    if n == 0
+        || coarse.len() < n * 3
+        || coarse_scratch.len() < n * 3
+        || fine.len()
+            < fine_res[0]
+                .saturating_mul(fine_res[1])
+                .saturating_mul(fine_res[2])
+                .saturating_mul(3)
+    {
+        return empty;
+    }
+    let ccell = [
+        fine_cell[0] * factor as f32,
+        fine_cell[1] * fy as f32,
+        fine_cell[2] * factor as f32,
+    ];
+    let report = step_vehicle_air(
+        coarse,
+        coarse_scratch,
+        origin,
+        ccell,
+        cres,
+        drive,
+        solids,
+        dt,
+        warm,
+        full_stamp || !warm,
+    );
+    let (cx0, cx1, cz0, cz1) = if full_stamp {
+        (0usize, cres[0] - 1, 0usize, cres[2] - 1)
+    } else {
+        air_window(origin, ccell, cres, drive)
+    };
+    for cz in cz0..=cz1 {
+        for iy in 0..cres[1] {
+            for cx in cx0..=cx1 {
+                let src = load3(coarse, at3(cres, cx, iy, cz));
+                let ix0 = cx * factor;
+                let iz0 = cz * factor;
+                let iy0 = iy * fy;
+                for dz in 0..factor {
+                    let iz = iz0 + dz;
+                    for dy in 0..fy {
+                        let iy_f = iy0 + dy;
+                        for dx in 0..factor {
+                            store3(fine, at3(fine_res, ix0 + dx, iy_f, iz), src);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
 /// Move dust with the wake residual. The sum of `vol` is put back after the flux.
 ///
 /// Returns the absolute gap between the flux sum and the sum that was restored,
@@ -3707,42 +3811,51 @@ pub fn advect_density_by_air(
     drive: &AirDrive,
     solids: &[AirSolid],
     dt: f32,
+    columns: &[u32],
 ) -> f32 {
     let n = res[0].saturating_mul(res[1]).saturating_mul(res[2]);
-    if dt <= 0.0 || n == 0 || vol.len() < n || scratch.len() < n || vel.len() < n * 3 {
+    if dt <= 0.0
+        || n == 0
+        || columns.is_empty()
+        || vol.len() < n
+        || scratch.len() < n
+        || vel.len() < n * 3
+        || res[0] == 0
+    {
         return 0.0;
     }
+    let mut x_lo = res[0];
+    let mut x_hi = 0usize;
+    let mut z_lo = res[2];
+    let mut z_hi = 0usize;
+    for &col in columns {
+        let ix = (col & 0xffff) as usize;
+        let iz = (col >> 16) as usize;
+        if ix >= res[0] || iz >= res[2] {
+            continue;
+        }
+        x_lo = x_lo.min(ix);
+        x_hi = x_hi.max(ix);
+        z_lo = z_lo.min(iz);
+        z_hi = z_hi.max(iz);
+    }
+    if x_lo > x_hi || z_lo > z_hi {
+        return 0.0;
+    }
+    let xa = x_lo.saturating_sub(1);
+    let za = z_lo.saturating_sub(1);
+    let xb = (x_hi + 1).min(res[0] - 1);
+    let zb = (z_hi + 1).min(res[2] - 1);
     let mut before = 0.0f64;
-    let mut x0 = res[0];
-    let mut x1 = 0usize;
-    let mut z0 = res[2];
-    let mut z1 = 0usize;
-    let mut any = false;
-    for iz in 0..res[2] {
+    for iz in za..=zb {
         for iy in 0..res[1] {
-            for ix in 0..res[0] {
-                let v = vol[at3(res, ix, iy, iz)];
-                if v > 0.0 {
-                    any = true;
-                    before += v as f64;
-                    x0 = x0.min(ix);
-                    x1 = x1.max(ix);
-                    z0 = z0.min(iz);
-                    z1 = z1.max(iz);
-                }
+            let a = at3(res, xa, iy, iz);
+            let b = at3(res, xb, iy, iz) + 1;
+            scratch[a..b].copy_from_slice(&vol[a..b]);
+            for v in &vol[a..b] {
+                before += *v as f64;
             }
         }
-    }
-    if !any {
-        return 0.0;
-    }
-    scratch[..n].copy_from_slice(&vol[..n]);
-    x0 = x0.saturating_sub(2).max(2);
-    z0 = z0.saturating_sub(2).max(2);
-    x1 = (x1 + 2).min(res[0].saturating_sub(3));
-    z1 = (z1 + 2).min(res[2].saturating_sub(3));
-    if x0 > x1 || z0 > z1 {
-        return 0.0;
     }
     let dx = cell[0].max(1.0e-4);
     let dz = cell[2].max(1.0e-4);
@@ -3753,81 +3866,207 @@ pub fn advect_density_by_air(
     } else {
         0
     };
-    for ix in 0..stream_n {
-        let x = origin[0] + (ix as f32 + 0.5) * cell[0];
-        stream_row[ix] = stream_at(x, drive);
+    for ix in xa..=xb {
+        if ix < stream_n {
+            let x = origin[0] + (ix as f32 + 0.5) * cell[0];
+            stream_row[ix] = stream_at(x, drive);
+        }
     }
     let streams: &[[f32; 3]] = if stream_n == 0 {
         &[]
     } else {
         &stream_row[..stream_n]
     };
-    for iz in z0..=z1 {
-        for iy in 0..res[1] {
-            for ix in x0..=x1 {
-                let i0 = at3(res, ix, iy, iz);
-                if ix + 1 < res[0] - 1 {
-                    let i1 = at3(res, ix + 1, iy, iz);
-                    let face = 0.5
-                        * (wake_residual(
-                            vel, origin, cell, res, drive, solids, aabb, streams, ix, iy, iz,
-                        )[0] + wake_residual(
-                            vel,
-                            origin,
-                            cell,
-                            res,
-                            drive,
-                            solids,
-                            aabb,
-                            streams,
-                            ix + 1,
-                            iy,
-                            iz,
-                        )[0])
-                        * AIR_DENSITY_COUPLING;
-                    transfer(scratch, vol, i0, i1, face, dt, dx);
-                }
-                if iz + 1 < res[2] - 1 {
-                    let i1 = at3(res, ix, iy, iz + 1);
-                    let face = 0.5
-                        * (wake_residual(
-                            vel, origin, cell, res, drive, solids, aabb, streams, ix, iy, iz,
-                        )[2] + wake_residual(
-                            vel,
-                            origin,
-                            cell,
-                            res,
-                            drive,
-                            solids,
-                            aabb,
-                            streams,
-                            ix,
-                            iy,
-                            iz + 1,
-                        )[2])
-                        * AIR_DENSITY_COUPLING;
-                    transfer(scratch, vol, i0, i1, face, dt, dz);
+    let nx = res[0];
+    let factor = AIR_COARSE.max(1);
+    let cnx = res[0] / factor;
+    let cny = res[1];
+    let cnz = res[2] / factor;
+    let couple = AIR_DENSITY_COUPLING;
+    AIR_WAKE.with(|wake_slot| {
+        let mut wake = wake_slot.borrow_mut();
+        let cn = cnx.saturating_mul(cny).saturating_mul(cnz);
+        if cn == 0 {
+            return;
+        }
+        if wake.len() < cn * 2 {
+            wake.resize(cn * 2, 0.0);
+        }
+        let cx0 = xa / factor;
+        let cx1 = (xb / factor).min(cnx - 1);
+        let cz0 = za / factor;
+        let cz1 = (zb / factor).min(cnz - 1);
+        let stride_y = cnx;
+        let stride_z = cnx * cny;
+        for cz in cz0..=cz1 {
+            for iy in 0..cny {
+                for cx in cx0..=cx1 {
+                    let ix = (cx * factor).min(res[0] - 1);
+                    let iz = (cz * factor).min(res[2] - 1);
+                    let pc = [
+                        origin[0] + (cx as f32 + 0.5) * cell[0] * factor as f32,
+                        origin[1] + (iy as f32 + 0.5) * cell[1],
+                        origin[2] + (cz as f32 + 0.5) * cell[2] * factor as f32,
+                    ];
+                    let (rx, rz) = if point_in_aabb(pc, aabb) && solid_occupancy(pc, solids) > 0.42
+                    {
+                        (0.0, 0.0)
+                    } else {
+                        let v = load3(vel, at3(res, ix, iy, iz));
+                        let fs = row_stream(streams, ix, pc[0], drive);
+                        (v[0] - fs[0], v[2] - fs[2])
+                    };
+                    let i = (cx + iy * stride_y + cz * stride_z) * 2;
+                    wake[i] = rx;
+                    wake[i + 1] = rz;
                 }
             }
         }
-    }
+        let wake = &wake[..cn * 2];
+        COL_LIVE.with(|slot| {
+            let mut live = slot.borrow_mut();
+            let plane = nx.saturating_mul(res[2]);
+            if live.len() < plane {
+                live.resize(plane, 0);
+            }
+            live[..plane].fill(0);
+            for &col in columns {
+                let ix = (col & 0xffff) as usize;
+                let iz = (col >> 16) as usize;
+                if ix < nx && iz < res[2] {
+                    live[ix + iz * nx] = 1;
+                }
+            }
+            for &col in columns {
+                let ix = (col & 0xffff) as usize;
+                let iz = (col >> 16) as usize;
+                if ix >= nx || iz >= res[2] {
+                    continue;
+                }
+                flux_column(
+                    scratch, vol, wake, res, stride_y, stride_z, factor, couple, dt, dx, dz, ix,
+                    iz, xb, zb, true, true,
+                );
+                if ix > 0 && live[(ix - 1) + iz * nx] == 0 {
+                    flux_column(
+                        scratch,
+                        vol,
+                        wake,
+                        res,
+                        stride_y,
+                        stride_z,
+                        factor,
+                        couple,
+                        dt,
+                        dx,
+                        dz,
+                        ix - 1,
+                        iz,
+                        xb,
+                        zb,
+                        true,
+                        false,
+                    );
+                }
+                if iz > 0 && live[ix + (iz - 1) * nx] == 0 {
+                    flux_column(
+                        scratch,
+                        vol,
+                        wake,
+                        res,
+                        stride_y,
+                        stride_z,
+                        factor,
+                        couple,
+                        dt,
+                        dx,
+                        dz,
+                        ix,
+                        iz - 1,
+                        xb,
+                        zb,
+                        false,
+                        true,
+                    );
+                }
+            }
+        });
+    });
     let mut after = 0.0f64;
-    for v in &scratch[..n] {
-        after += *v as f64;
+    for iz in za..=zb {
+        for iy in 0..res[1] {
+            let a = at3(res, xa, iy, iz);
+            let b = at3(res, xb, iy, iz) + 1;
+            for v in &scratch[a..b] {
+                after += *v as f64;
+            }
+        }
     }
     let gap = (before - after).abs() as f32;
     if after > 1.0e-12 {
         let scale = (before / after) as f32;
-        if scale.is_finite() {
-            for v in &mut scratch[..n] {
-                *v *= scale;
+        if scale.is_finite() && (scale - 1.0).abs() > 0.0 {
+            for iz in za..=zb {
+                for iy in 0..res[1] {
+                    let a = at3(res, xa, iy, iz);
+                    let b = at3(res, xb, iy, iz) + 1;
+                    for v in &mut scratch[a..b] {
+                        *v *= scale;
+                    }
+                }
             }
         }
     }
-    vol[..n].copy_from_slice(&scratch[..n]);
+    for iz in za..=zb {
+        for iy in 0..res[1] {
+            let a = at3(res, xa, iy, iz);
+            let b = at3(res, xb, iy, iz) + 1;
+            vol[a..b].copy_from_slice(&scratch[a..b]);
+        }
+    }
     gap
 }
 
+#[inline(always)]
+fn flux_column(
+    scratch: &mut [f32],
+    vol: &[f32],
+    wake: &[f32],
+    res: [usize; 3],
+    stride_y: usize,
+    stride_z: usize,
+    factor: usize,
+    couple: f32,
+    dt: f32,
+    dx: f32,
+    dz: f32,
+    ix: usize,
+    iz: usize,
+    xb: usize,
+    zb: usize,
+    do_x: bool,
+    do_z: bool,
+) {
+    let cix = ix / factor;
+    let ciz = iz / factor;
+    let ny = res[1];
+    for iy in 0..ny {
+        let i0 = ix + iy * res[0] + iz * res[0] * ny;
+        let base = (cix + iy * stride_y + ciz * stride_z) * 2;
+        if do_x && ix < xb {
+            let nb = ((ix + 1) / factor + iy * stride_y + ciz * stride_z) * 2;
+            let face = 0.5 * (wake[base] + wake[nb]) * couple;
+            transfer(scratch, vol, i0, i0 + 1, face, dt, dx);
+        }
+        if do_z && iz < zb {
+            let nb = (cix + iy * stride_y + (iz + 1) / factor * stride_z) * 2;
+            let face = 0.5 * (wake[base + 1] + wake[nb + 1]) * couple;
+            transfer(scratch, vol, i0, i0 + res[0] * ny, face, dt, dz);
+        }
+    }
+}
+
+#[inline(always)]
 fn transfer(next: &mut [f32], src: &[f32], a: usize, b: usize, face: f32, dt: f32, cell: f32) {
     if !face.is_finite() || face == 0.0 || src[a] <= 0.0 && src[b] <= 0.0 {
         return;
@@ -3845,28 +4084,6 @@ fn transfer(next: &mut [f32], src: &[f32], a: usize, b: usize, face: f32, dt: f3
         next[b] -= take;
         next[a] += take;
     }
-}
-
-fn wake_residual(
-    vel: &[f32],
-    origin: [f32; 3],
-    cell: [f32; 3],
-    res: [usize; 3],
-    drive: &AirDrive,
-    solids: &[AirSolid],
-    aabb: [f32; 6],
-    streams: &[[f32; 3]],
-    ix: usize,
-    iy: usize,
-    iz: usize,
-) -> [f32; 3] {
-    let p = cell_xyz(origin, cell, ix, iy, iz);
-    if point_in_aabb(p, aabb) && solid_occupancy(p, solids) > 0.42 {
-        return [0.0; 3];
-    }
-    let fs = row_stream(streams, ix, p[0], drive);
-    let v = load3(vel, at3(res, ix, iy, iz));
-    [v[0] - fs[0], v[1] - fs[1], v[2] - fs[2]]
 }
 
 fn solid_occupancy(p: [f32; 3], solids: &[AirSolid]) -> f32 {
