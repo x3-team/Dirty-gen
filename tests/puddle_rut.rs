@@ -989,6 +989,8 @@ fn puddle_foam_and_silt_at_the_tire_and_the_shore() {
     let gap = drive.fluid.silt_book_gap();
     let nans = nan_count(&frame);
     let mut dry_bad = 0u32;
+    let mut wet_n = 0u32;
+    let mut hot_n = 0u32;
     let n = frame.header.window_res as usize * frame.header.window_res as usize;
     for idx in 0..n {
         let film = frame.film[idx * 2] + frame.film[idx * 2 + 1];
@@ -999,12 +1001,20 @@ fn puddle_foam_and_silt_at_the_tire_and_the_shore() {
         if !foam.is_finite() {
             dry_bad += 1;
         }
+        if film >= 0.004 {
+            wet_n += 1;
+            if foam >= 0.99 {
+                hot_n += 1;
+            }
+        }
     }
+    let hot_frac = hot_n as f32 / wet_n.max(1) as f32;
 
     println!(
         "foam wheel {foam_wheel:.4} contract {contract_foam_wheel:.4}  silt wheel {silt_wheel:.5} m\n\
          foam edge {foam_edge:.4} contract {contract_foam_edge:.4}  silt edge {silt_edge:.5} m  edge cells {edge_n}\n\
-         far silt {far_silt:.6}  south silt {far_south:.6}  book gap {gap:.6} m3  stirred {:.6} m3  dry bad {dry_bad}  NaN {nans}",
+         far silt {far_silt:.6}  south silt {far_south:.6}  book gap {gap:.6} m3  stirred {:.6} m3  dry bad {dry_bad}  NaN {nans}\n\
+         foam >= 0.99 on {hot_n}/{wet_n} wet cells ({hot_frac:.4})",
         drive.fluid.stirred_m3()
     );
 
@@ -1015,7 +1025,13 @@ fn puddle_foam_and_silt_at_the_tire_and_the_shore() {
     );
     assert!(silt_wheel > 1.0e-4, "silt at the tire {silt_wheel}");
     assert!(edge_n > 0, "the shore band was empty");
+    assert!(foam_wheel < 0.99, "foam at the tire saturated {foam_wheel}");
     assert!(foam_edge > 0.02, "foam on the shore {foam_edge}");
+    assert!(foam_edge < 0.99, "foam on the shore saturated {foam_edge}");
+    assert!(
+        hot_frac < 0.02,
+        "foam >= 0.99 on {hot_frac:.4} of the wet cells ({hot_n}/{wet_n})"
+    );
     assert!(
         contract_foam_edge > 0.02,
         "contract foam on the shore {contract_foam_edge}"

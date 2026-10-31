@@ -99,8 +99,11 @@ const STEEP: [f32; 5] = [0.02, 0.08, 0.80, 0.08, 0.02];
 const GRAVITY: f32 = 9.81;
 /// Foam e-folding time. A few seconds of wake, then it is gone.
 const FOAM_LIFE_S: f32 = 1.8;
-/// Seconds of breaking shear that take foam from 0 to 1.
-const FOAM_BUILD_S: f32 = 0.14;
+/// Production shuts off as a cell approaches this fraction.
+/// A sustained breaker therefore stays under 0.99 instead of filling to 1.
+const FOAM_EQ: f32 = 0.85;
+/// Time scale of that approach at full shear. One step does not paint the cell full.
+const FOAM_TAU_S: f32 = 0.35;
 /// Silt e-folding time in the water before it settles out of the column.
 const SILT_SETTLE_S: f32 = 4.0;
 /// Metres of stirred soil one cell will hold.
@@ -3798,6 +3801,8 @@ pub struct FluidCore {
     stirred_m3: f32,
     /// Scratch for the tracer pass. Not a second sheet.
     tracer_scratch: Vec<f32>,
+    /// Coarse cells with at least 4 mm of film. Foam is computed only here.
+    wet_idx: Vec<u32>,
     fine_origin: [f32; 2],
     fine_water: Vec<f32>,
     fine_slurry: Vec<f32>,
@@ -3871,6 +3876,7 @@ impl FluidCore {
             turbid_settled_m3: 0.0,
             stirred_m3: 0.0,
             tracer_scratch: Vec::new(),
+            wet_idx: Vec::new(),
             fine_origin: [0.0, 0.0],
             fine_water: vec![0.0; fine_n],
             fine_slurry: vec![0.0; fine_n],
@@ -4610,74 +4616,142 @@ impl FluidCore {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
-        let res = WINDOW_RES;
-        let n = res * res;
-        let need = n * 2;
-        if self.tracer_scratch.len() < need {
-            self.tracer_scratch.resize(need, 0.0);
-        }
+        self.collect_wet();
         self.advect_foam(dt);
-        let decay = (-dt / FOAM_LIFE_S).exp();
-        for foam in &mut self.foam {
-            if foam.is_finite() {
-                *foam = (*foam * decay).clamp(0.0, 1.0);
-            } else {
-                *foam = 0.0;
-            }
-        }
         self.advect_turbid(dt);
         self.settle_turbid(dt);
         self.spawn_foam_and_silt(dt, pushes);
         self.clear_dry_tracers();
     }
 
+    /// Cells with a film thick enough to hold foam. Dry ground is not visited.
+    fn collect_wet(&mut self) {
+        self.wet_idx.clear();
+        let n = WINDOW_RES * WINDOW_RES;
+        for idx in 0..n {
+            let h = self.water[idx] + self.slurry[idx];
+            if h.is_finite() && h >= 0.004 {
+                self.wet_idx.push(idx as u32);
+            }
+        }
+    }
+
+    /// Semi-Lagrangian foam on the wet cells only. A dry cell is written 0.
     fn advect_foam(&mut self, dt: f32) {
         let res = WINDOW_RES;
         let cell = COARSE_CELL_M;
         let n = res * res;
-        self.tracer_scratch[..n].copy_from_slice(&self.foam);
-        let mut next = std::mem::take(&mut self.foam);
-        if next.len() != n {
-            next.resize(n, 0.0);
+        if self.foam.len() != n {
+            self.foam.resize(n, 0.0);
         }
-        for j in 0..res {
-            for i in 0..res {
-                let idx = j * res + i;
-                let u = self.uw[idx];
-                let v = self.vw[idx];
-                if !u.is_finite() || !v.is_finite() {
-                    next[idx] = 0.0;
-                    continue;
-                }
+        let src = std::mem::take(&mut self.foam);
+        let ids = std::mem::take(&mut self.wet_idx);
+        if self.tracer_scratch.len() < ids.len() {
+            self.tracer_scratch.resize(ids.len().max(1), 0.0);
+        }
+        for (k, &idx) in ids.iter().enumerate() {
+            let idx = idx as usize;
+            let u = self.uw[idx];
+            let v = self.vw[idx];
+            let sample = if u.is_finite() && v.is_finite() {
+                let i = idx % res;
+                let j = idx / res;
                 // Index space: integer `i` is the centre of that cell.
                 let x = i as f32 - u * dt / cell;
                 let z = j as f32 - v * dt / cell;
-                next[idx] = sample_foam(&self.tracer_scratch[..n], res, x, z);
+                sample_foam(&src, res, x, z)
+            } else {
+                0.0
+            };
+            self.tracer_scratch[k] = sample;
+        }
+        let mut next = src;
+        for value in &mut next {
+            *value = 0.0;
+        }
+        let decay = (-dt / FOAM_LIFE_S).exp();
+        for (k, &idx) in ids.iter().enumerate() {
+            let v = self.tracer_scratch[k] * decay;
+            if v > 1.0e-4 && v.is_finite() {
+                next[idx as usize] = v.min(FOAM_EQ);
             }
         }
         self.foam = next;
+        self.wet_idx = ids;
+    }
+
+    /// Approach `FOAM_EQ` under sustained shear. The source is zero at that
+    /// ceiling, so the cell does not run away to 1.
+    fn add_foam(&mut self, idx: usize, prod: f32, dt: f32) {
+        if prod <= 0.0 || !prod.is_finite() || !(dt > 0.0) {
+            return;
+        }
+        let cur = if self.foam[idx].is_finite() {
+            self.foam[idx].clamp(0.0, FOAM_EQ)
+        } else {
+            0.0
+        };
+        let room = FOAM_EQ - cur;
+        if room <= 1.0e-5 {
+            return;
+        }
+        let grown = cur + room * prod * (dt / FOAM_TAU_S).min(1.0);
+        self.foam[idx] = if grown.is_finite() {
+            grown.min(FOAM_EQ)
+        } else {
+            0.0
+        };
     }
 
     fn advect_turbid(&mut self, dt: f32) {
         let res = WINDOW_RES;
         let cell = COARSE_CELL_M;
         let n = res * res;
+        let Some((i0, i1, j0, j1)) = turbid_span(&self.turbid, res) else {
+            return;
+        };
+        if self.tracer_scratch.len() < n * 2 {
+            self.tracer_scratch.resize(n * 2, 0.0);
+        }
         let scratch = &mut self.tracer_scratch;
-        scratch[..n * 2].fill(0.0);
-        // Split borrows: copy the flux tables out by index after the loops
-        // that only touch scratch, then apply them to turbid.
-        flux_thickness(&self.turbid, &self.uw, &self.vw, res, cell, dt, scratch);
-        for idx in 0..n {
-            let removed = scratch[idx];
-            let added = scratch[n + idx];
-            if removed == 0.0 && added == 0.0 {
-                if !self.turbid[idx].is_finite() {
-                    self.turbid[idx] = 0.0;
-                }
-                continue;
+        // Only the live box is nonzero. Clearing that box is enough: the rest
+        // of scratch stays 0 from the previous step's box, which we also clear.
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                let idx = row + i;
+                scratch[idx] = 0.0;
+                scratch[n + idx] = 0.0;
             }
-            let next = self.turbid[idx] - removed + added;
-            self.turbid[idx] = if next.is_finite() { next.max(0.0) } else { 0.0 };
+        }
+        flux_thickness(
+            &self.turbid,
+            &self.uw,
+            &self.vw,
+            res,
+            cell,
+            dt,
+            i0,
+            i1,
+            j0,
+            j1,
+            scratch,
+        );
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                let idx = row + i;
+                let removed = scratch[idx];
+                let added = scratch[n + idx];
+                if removed == 0.0 && added == 0.0 {
+                    if !self.turbid[idx].is_finite() {
+                        self.turbid[idx] = 0.0;
+                    }
+                    continue;
+                }
+                let next = self.turbid[idx] - removed + added;
+                self.turbid[idx] = if next.is_finite() { next.max(0.0) } else { 0.0 };
+            }
         }
     }
 
@@ -4730,6 +4804,8 @@ impl FluidCore {
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
+        // The seat moved the film. The wet set from the sheet step is stale.
+        self.collect_wet();
         self.spawn_breaking_film(dt);
         self.clear_dry_tracers();
     }
@@ -4740,53 +4816,47 @@ impl FluidCore {
     /// test already uses (4 mm to 18 mm). A flat film adds nothing.
     fn spawn_breaking_film(&mut self, dt: f32) {
         let res = WINDOW_RES;
-        for j in 0..res {
-            for i in 0..res {
-                let idx = j * res + i;
-                let h = self.water[idx] + self.slurry[idx];
-                if !h.is_finite() || h < 0.004 {
-                    continue;
-                }
-                let u = self.uw[idx];
-                let v = self.vw[idx];
-                let speed = if u.is_finite() && v.is_finite() {
-                    u.hypot(v)
-                } else {
-                    0.0
-                };
-                let mut prod = breaking_foam(speed, h);
-                let mut sum = 0.0f32;
-                let mut count = 0.0f32;
-                for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
-                    let ni = i as i32 + di;
-                    let nj = j as i32 + dj;
-                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
-                        continue;
-                    }
-                    let nidx = nj as usize * res + ni as usize;
-                    let nh = self.water[nidx] + self.slurry[nidx];
-                    if nh.is_finite() {
-                        sum += nh.max(0.0);
-                        count += 1.0;
-                    }
-                }
-                if count > 0.0 {
-                    let excess = h - sum / count;
-                    if excess > 0.0 {
-                        prod = prod.max(smoothstep(0.004, 0.018, excess));
-                    }
-                }
-                if prod <= 0.0 {
-                    continue;
-                }
-                let grown = self.foam[idx] + prod * (dt / FOAM_BUILD_S);
-                self.foam[idx] = if grown.is_finite() {
-                    grown.clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
+        let ids = std::mem::take(&mut self.wet_idx);
+        for &id in &ids {
+            let idx = id as usize;
+            let i = idx % res;
+            let j = idx / res;
+            let h = self.water[idx] + self.slurry[idx];
+            if !h.is_finite() || h < 0.004 {
+                continue;
             }
+            let u = self.uw[idx];
+            let v = self.vw[idx];
+            let speed = if u.is_finite() && v.is_finite() {
+                u.hypot(v)
+            } else {
+                0.0
+            };
+            let mut prod = breaking_foam(speed, h);
+            let mut sum = 0.0f32;
+            let mut count = 0.0f32;
+            for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                let ni = i as i32 + di;
+                let nj = j as i32 + dj;
+                if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                    continue;
+                }
+                let nidx = nj as usize * res + ni as usize;
+                let nh = self.water[nidx] + self.slurry[nidx];
+                if nh.is_finite() {
+                    sum += nh.max(0.0);
+                    count += 1.0;
+                }
+            }
+            if count > 0.0 {
+                let excess = h - sum / count;
+                if excess > 0.0 {
+                    prod = prod.max(smoothstep(0.004, 0.018, excess));
+                }
+            }
+            self.add_foam(idx, prod, dt);
         }
+        self.wet_idx = ids;
     }
 
     fn spawn_tire_tracers(&mut self, push: &TirePush, dt: f32, area: f32) {
@@ -4840,14 +4910,7 @@ impl FluidCore {
                 if band > 0.0 {
                     let motion = slip_v.max(speed * 0.45).max(film);
                     let prod = breaking_foam(motion, h) * band;
-                    if prod > 0.0 {
-                        let grown = self.foam[idx] + prod * (dt / FOAM_BUILD_S);
-                        self.foam[idx] = if grown.is_finite() {
-                            grown.clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                    }
+                    self.add_foam(idx, prod, dt);
                 }
                 // Submerged contact. Slip shears the bed and lifts it.
                 let on_patch = lat.abs() <= push.width * 0.55 + COARSE_CELL_M * 0.35
@@ -4862,31 +4925,23 @@ impl FluidCore {
     }
 
     fn spawn_shore_tracers(&mut self, dt: f32, area: f32, res: usize) {
-        let n = res * res;
-        self.tracer_scratch[..n * 2].fill(0.0);
-        shore_source(
-            &self.water,
-            &self.uw,
-            &self.vw,
-            res,
-            dt,
-            &mut self.tracer_scratch,
-        );
-        for idx in 0..n {
-            let foam_add = self.tracer_scratch[idx];
-            let silt_add = self.tracer_scratch[n + idx];
-            if foam_add > 0.0 {
-                let grown = self.foam[idx] + foam_add;
-                self.foam[idx] = if grown.is_finite() {
-                    grown.clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-            }
+        let ids = std::mem::take(&mut self.wet_idx);
+        for &id in &ids {
+            let idx = id as usize;
+            let (prod, silt_add) = shore_cell(
+                &self.water,
+                &self.uw,
+                &self.vw,
+                res,
+                idx,
+            );
+            self.add_foam(idx, prod, dt);
             if silt_add > 0.0 {
-                self.add_silt(idx, silt_add, area);
+                let dh = (silt_add * dt).min(0.0012);
+                self.add_silt(idx, dh, area);
             }
         }
+        self.wet_idx = ids;
     }
 
     fn lift_silt(&mut self, idx: usize, shear_v: f32, dt: f32, area: f32, rate_cap: f32, tau_c: f32) {
@@ -6804,28 +6859,59 @@ fn flux_thickness(
     res: usize,
     cell: f32,
     dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
     scratch: &mut [f32],
 ) {
     let n = res * res;
-    for value in scratch.iter_mut().take(n * 2) {
-        *value = 0.0;
-    }
-    for j in 0..res {
-        for i in 0..res - 1 {
-            let a = j * res + i;
+    for j in j0..=j1 {
+        let row = j * res;
+        for i in i0..i1.min(res - 1) {
+            let a = row + i;
             let b = a + 1;
             let vel = 0.5 * (u[a] + u[b]);
             flux_edge(h, scratch, n, a, b, vel, cell, dt);
         }
     }
-    for j in 0..res - 1 {
-        for i in 0..res {
+    for j in j0..j1.min(res - 1) {
+        for i in i0..=i1 {
             let a = j * res + i;
             let b = a + res;
             let vel = 0.5 * (v[a] + v[b]);
             flux_edge(h, scratch, n, a, b, vel, cell, dt);
         }
     }
+}
+
+/// Inclusive index box of cells that hold silt, grown by one cell so a flux
+/// can land on the neighbour. `None` when the column is empty.
+fn turbid_span(h: &[f32], res: usize) -> Option<(usize, usize, usize, usize)> {
+    let mut i0 = res;
+    let mut i1 = 0usize;
+    let mut j0 = res;
+    let mut j1 = 0usize;
+    for j in 0..res {
+        let row = j * res;
+        for i in 0..res {
+            if h[row + i] > 1.0e-8 {
+                i0 = i0.min(i);
+                i1 = i1.max(i);
+                j0 = j0.min(j);
+                j1 = j1.max(j);
+            }
+        }
+    }
+    if i0 > i1 {
+        return None;
+    }
+    Some((
+        i0.saturating_sub(1),
+        (i1 + 1).min(res - 1),
+        j0.saturating_sub(1),
+        (j1 + 1).min(res - 1),
+    ))
 }
 
 fn flux_edge(
@@ -6856,66 +6942,57 @@ fn flux_edge(
     scratch[n + recv] += dh;
 }
 
-/// Shore foam and silt. `scratch[0..n]` is foam to add, `scratch[n..]` is
-/// metres of silt to lift. Quiet water on the bank adds nothing.
-fn shore_source(
-    water: &[f32],
-    uw: &[f32],
-    vw: &[f32],
-    res: usize,
-    dt: f32,
-    scratch: &mut [f32],
-) {
-    let n = res * res;
-    for j in 1..res - 1 {
-        let row = j * res;
-        for i in 1..res - 1 {
-            let idx = row + i;
-            let h = water[idx];
-            if !h.is_finite() || h < 0.004 {
-                continue;
-            }
-            let mut nx = 0.0f32;
-            let mut nz = 0.0f32;
-            let mut edge = false;
-            for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
-                let nidx = (j as i32 + dj) as usize * res + (i as i32 + di) as usize;
-                let nh = water[nidx];
-                if nh.is_finite() && nh < 0.004 {
-                    edge = true;
-                    nx += di as f32;
-                    nz += dj as f32;
-                }
-            }
-            if !edge {
-                continue;
-            }
-            let u = uw[idx];
-            let v = vw[idx];
-            if !u.is_finite() || !v.is_finite() {
-                continue;
-            }
-            let film = u.hypot(v);
-            let nlen = nx.hypot(nz).max(1.0e-4);
-            let into = ((u * nx + v * nz) / nlen).max(0.0);
-            let strain = (uw[idx + 1] - uw[idx - 1]).abs() + (vw[idx + res] - vw[idx - res]).abs();
-            let shear_v = film.max(strain);
-            if shear_v < 0.2 && into < 0.2 {
-                continue;
-            }
-            let prod = breaking_foam(shear_v.max(into), h).max(smoothstep(0.25, 1.1, into));
-            if prod > 0.02 {
-                scratch[idx] = prod * (dt / 0.22);
-            }
-            if h > 0.012 && h < 0.055 && (shear_v > 0.45 || into > 0.4) {
-                let tau = 1000.0 * 0.025 * shear_v * shear_v;
-                if tau > 3.0 || into > 0.45 {
-                    let rate = (0.006 * (into + shear_v * 0.35)).min(0.01);
-                    scratch[n + idx] = (rate * dt).min(0.0012);
-                }
-            }
+/// Shore foam production (0..1) and silt lift rate (m/s) for one wet cell.
+/// Quiet water on the bank is `(0, 0)`. The border of the window is skipped:
+/// the strain stencil needs both neighbours.
+fn shore_cell(water: &[f32], uw: &[f32], vw: &[f32], res: usize, idx: usize) -> (f32, f32) {
+    let i = idx % res;
+    let j = idx / res;
+    if i == 0 || j == 0 || i + 1 >= res || j + 1 >= res {
+        return (0.0, 0.0);
+    }
+    let h = water[idx];
+    if !h.is_finite() || h < 0.004 {
+        return (0.0, 0.0);
+    }
+    let mut nx = 0.0f32;
+    let mut nz = 0.0f32;
+    let mut edge = false;
+    for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+        let nidx = (j as i32 + dj) as usize * res + (i as i32 + di) as usize;
+        let nh = water[nidx];
+        if nh.is_finite() && nh < 0.004 {
+            edge = true;
+            nx += di as f32;
+            nz += dj as f32;
         }
     }
+    if !edge {
+        return (0.0, 0.0);
+    }
+    let u = uw[idx];
+    let v = vw[idx];
+    if !u.is_finite() || !v.is_finite() {
+        return (0.0, 0.0);
+    }
+    let film = u.hypot(v);
+    let nlen = nx.hypot(nz).max(1.0e-4);
+    let into = ((u * nx + v * nz) / nlen).max(0.0);
+    let strain = (uw[idx + 1] - uw[idx - 1]).abs() + (vw[idx + res] - vw[idx - res]).abs();
+    let shear_v = film.max(strain);
+    if shear_v < 0.2 && into < 0.2 {
+        return (0.0, 0.0);
+    }
+    let prod = breaking_foam(shear_v.max(into), h).max(smoothstep(0.25, 1.1, into));
+    let foam = if prod > 0.02 { prod } else { 0.0 };
+    let mut rate = 0.0f32;
+    if h > 0.012 && h < 0.055 && (shear_v > 0.45 || into > 0.4) {
+        let tau = 1000.0 * 0.025 * shear_v * shear_v;
+        if tau > 3.0 || into > 0.45 {
+            rate = (0.006 * (into + shear_v * 0.35)).min(0.01);
+        }
+    }
+    (foam, rate)
 }
 
 /// Half-open index range covering cell centres within `reach` of `center`, plus one cell.
