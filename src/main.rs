@@ -1077,7 +1077,7 @@ fn win_demo_pool_surface_y() -> f32 {
 fn win_demo_hub_on_water(_sink: f32) -> f32 {
     use silt::vehicle::WHEEL_RADIUS;
     // Hub height so the mesh contact patch meets the flat pool plane (not bowl bed).
-    win_demo_pool_surface_y() + WHEEL_RADIUS - 0.012
+    win_demo_pool_surface_y() + WHEEL_RADIUS - 0.034
 }
 
 fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
@@ -1113,19 +1113,15 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
 }
 
 fn win_demo_clamp_hubs_on_water(world: &mut World, sink: f32) {
-    use silt::vehicle::WHEEL_RADIUS;
     let target = win_demo_hub_on_water(sink);
-    let tol = WHEEL_RADIUS * 0.018;
-    for _ in 0..8 {
-        let mut adjust = 0.0_f32;
+    for _ in 0..12 {
+        let mut err_sum = 0.0_f32;
         for i in 0..4 {
             let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
-            let err = target - hub.y;
-            if err.abs() > tol {
-                adjust += err * 0.25;
-            }
+            err_sum += target - hub.y;
         }
-        if adjust.abs() < 0.0004 {
+        let adjust = err_sum * 0.25;
+        if adjust.abs() < 0.0003 {
             break;
         }
         world.vehicle.pos.y += adjust;
