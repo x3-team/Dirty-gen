@@ -1740,6 +1740,8 @@ impl Renderer {
             let liquid = soil.water[i] + soil.slurry[i];
             let liquid_scale = if self.puddle_beauty {
                 0.28
+            } else if self.win_demo_still {
+                0.90
             } else if self.water_column {
                 0.90
             } else {

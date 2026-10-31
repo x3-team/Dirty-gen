@@ -1100,19 +1100,15 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
         }
         world.vehicle.pos.y += lift * 0.55;
     }
-    let mut hubs = [(0.0_f32, 0.0_f32); 4];
     for i in 0..4 {
         let local = world.vehicle.wheel_center_local(i);
         let hub = world.vehicle.pos + world.vehicle.orientation() * local;
-        hubs[i] = (hub.x, hub.z);
         let ground = world.soil.sample(hub.x, hub.z);
-        let pen = ground.height + WHEEL_RADIUS * 0.96 - hub.y;
-        if pen > 0.004 {
-            world.vehicle.pos.y += pen;
+        let min_hub = ground.height.max(rim) + WHEEL_RADIUS * 0.98;
+        if hub.y < min_hub {
+            world.vehicle.pos.y += min_hub - hub.y;
         }
     }
-    world.soil.win_demo_flatten_wheel_bowls(&hubs, sink);
-    world.soil.rebuild_height();
 }
 
 fn win_demo_stage_wheels_in_pool(world: &mut World) {
@@ -1129,26 +1125,16 @@ fn win_demo_calm_wheels_in_pool(world: &mut World) {
     }
 }
 
-fn win_demo_rear_hubs_xz(world: &World) -> Vec<(f32, f32)> {
-    let mut out = Vec::with_capacity(4);
-    let back = world.vehicle.orientation() * Vec3::new(0.0, 0.0, -1.0);
-    for i in [2_usize, 3] {
-        let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
-        out.push((hub.x, hub.z));
-        out.push((hub.x + back.x * 0.52, hub.z + back.z * 0.52));
-    }
-    out
-}
-
 fn win_demo_seat_vehicle_on_bowl(world: &mut World) {
     use silt::vehicle::WHEEL_RADIUS;
+    let rim = silt::soil::SoilField::win_demo_pool_rim_height(0.22);
     let sink = 0.032_f32;
     for _ in 0..40 {
         let mut lift = 0.0_f32;
         for i in 0..4 {
             let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
             let ground = world.soil.sample(hub.x, hub.z);
-            let target = ground.height + WHEEL_RADIUS * (1.0 - sink * 0.4);
+            let target = ground.height.max(rim) + WHEEL_RADIUS * (1.0 - sink * 0.4);
             lift = lift.max(target - hub.y);
         }
         if lift.abs() < 0.0006 {
@@ -1159,13 +1145,7 @@ fn win_demo_seat_vehicle_on_bowl(world: &mut World) {
 }
 
 fn win_demo_still_touchup(world: &mut World) {
-    let rear = win_demo_rear_hubs_xz(world);
-    let mut wheels = Vec::with_capacity(4);
-    for i in 0..4 {
-        let hub = world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(i);
-        wheels.push((hub.x, hub.z));
-    }
-    world.soil.win_demo_still_touchup(&rear, &wheels);
+    world.soil.win_demo_still_touchup();
 }
 
 fn win_demo_stage_bow_in_pool(world: &mut World) {
