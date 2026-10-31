@@ -2,6 +2,9 @@ name: demo-win
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - cursor/win-niva-demo-f4f9
 
 permissions:
   contents: write
