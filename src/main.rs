@@ -927,8 +927,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     use silt::world::Input;
 
     let mut parked = World::win_demo();
-    parked.vehicle.pos = Vec3::new(0.62, 0.8, 0.72);
-    parked.vehicle.yaw = -2.42;
+    // Flank the seam pool so beauty water can pick up Niva in SSR/planar.
+    parked.vehicle.pos = Vec3::new(-0.48, 0.8, -0.52);
+    parked.vehicle.yaw = -2.05;
     let pad = parked.soil.sample(parked.vehicle.pos.x, parked.vehicle.pos.z);
     parked.vehicle.pos.y = pad.height + 0.62;
     parked.time = 4.6;
@@ -965,30 +966,27 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     let pose = win_demo_low_pose(&parked);
 
-    // Right-front hub in the seam pool: same low side camera, ripples + shader splash.
+    // Front-left hub in the seam pool (visible from the fixed low side camera).
     let mut wheel = World::win_demo();
-    win_demo_seat_wheel_in_puddle(&mut wheel, 1, -2.58);
-    wheel.time = 6.2;
+    win_demo_seat_wheel_in_puddle(&mut wheel, 0, -2.58);
+    let spin = Input {
+        throttle: 0.78,
+        steer: 0.0,
+        ..Input::default()
+    };
+    let dt = 1.0 / 60.0;
+    for step in 0..72 {
+        wheel.step(dt, &spin);
+        wheel.time = 5.5 + step as f32 * dt;
+    }
     wheel.particles.clear();
     let pose = win_demo_low_pose(&wheel);
 
-    renderer.puddle_beauty = false;
-    renderer.water_column = false;
-    let rgba = renderer
-        .draw(&wheel, pose, None, true)
-        .expect("wheel before");
-    write_png(
-        &media.join("puddle-drive-before.png"),
-        width,
-        height,
-        &rgba,
-    )
-    .expect("win demo png");
-    println!("win demo {}", media.join("puddle-drive-before.png").display());
-
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
-    wheel.time = 7.35;
+    renderer.show_mud_particles = false;
+    renderer.show_mud_drops = false;
+    wheel.time = 7.85;
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
         &media.join("puddle-wheel.png"),
@@ -1001,42 +999,57 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     // Through the seam pool: solver sheets + bow on the water column.
     let mut drive = World::win_demo();
-    drive.vehicle.pos = Vec3::new(-1.02, 0.8, -1.48);
-    drive.vehicle.yaw = 0.06;
+    let (px, pz) = WIN_DEMO_SEAM_PUDDLE;
+    drive.vehicle.pos = Vec3::new(px, 0.8, -1.35);
+    drive.vehicle.yaw = 0.0;
     let pad = drive.soil.sample(drive.vehicle.pos.x, drive.vehicle.pos.z);
     drive.vehicle.pos.y = pad.height + 0.62;
     let input = Input {
-        throttle: 0.8,
+        throttle: 0.88,
         steer: 0.0,
         ..Input::default()
     };
-    let pose = win_demo_low_pose(&parked);
+    let pose = win_demo_low_pose(&drive);
     renderer.show_mud_particles = true;
     renderer.show_mud_drops = false;
     let dt = 1.0 / 60.0;
-    let (px, pz) = WIN_DEMO_SEAM_PUDDLE;
-    let mut best_score = f32::MAX;
-    let mut best: Option<Vec<u8>> = None;
+
+    renderer.puddle_beauty = false;
+    renderer.water_column = false;
+    let drive_before = renderer
+        .draw(&drive, pose, None, true)
+        .expect("drive before");
+    write_png(
+        &media.join("puddle-drive-before.png"),
+        width,
+        height,
+        &drive_before,
+    )
+    .expect("win demo png");
+    println!("win demo {}", media.join("puddle-drive-before.png").display());
+
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
-    for i in 0..130 {
+    for _ in 0..95 {
         drive.step(dt, &input);
         let p = drive.vehicle.pos;
-        let score = (p.x - px).powi(2) + (p.z - pz).powi(2);
-        if p.z > -0.2 && p.z < 0.75 && score < best_score {
-            best_score = score;
-            drive.time = 7.0 + i as f32 * 0.09;
-            for w in &mut drive.vehicle.wheels {
-                w.sinkage = w.sinkage.max(0.02);
-                w.omega = w.omega.max(5.5);
-            }
-            best = renderer.draw(&drive, pose, None, true);
-        }
-        if p.z > 0.9 {
-            break;
+        let pad = drive.soil.sample(p.x, p.z);
+        drive.vehicle.pos.y = pad.height + 0.62;
+    }
+    for step in 0..55 {
+        drive.step(dt, &input);
+        let p = drive.vehicle.pos;
+        let pad = drive.soil.sample(p.x, p.z);
+        drive.vehicle.pos.y = pad.height + 0.62;
+        drive.time = 8.0 + step as f32 * dt;
+        for w in &mut drive.vehicle.wheels {
+            w.sinkage = w.sinkage.max(0.036);
+            w.omega = w.omega.max(7.5);
         }
     }
-    let rgba = best.unwrap_or(rgba);
+    let rgba = renderer
+        .draw(&drive, pose, None, true)
+        .expect("drive through pool");
     for name in ["puddle-drive-after.png", "puddle-drive.png"] {
         let path = media.join(name);
         write_png(&path, width, height, &rgba).expect("win demo png");
@@ -1048,29 +1061,34 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 const WIN_DEMO_SEAM_PUDDLE: (f32, f32) = (-1.05, 0.15);
 
 #[cfg(not(target_arch = "wasm32"))]
+fn win_demo_wheel_hub(world: &World, wheel: usize) -> Vec3 {
+    world.vehicle.pos + world.vehicle.orientation() * world.vehicle.wheel_center_local(wheel)
+}
+
+fn win_demo_pool_liquid(soil: &silt::soil::SoilField, x: f32, z: f32) -> f32 {
+    let s = soil.sample(x, z);
+    s.water + s.slurry
+}
+
 fn win_demo_seat_wheel_in_puddle(world: &mut World, wheel: usize, yaw: f32) {
     let (tx, tz) = WIN_DEMO_SEAM_PUDDLE;
     world.vehicle.yaw = yaw;
     world.vehicle.pitch = 0.0;
     world.vehicle.roll = 0.0;
-    world.vehicle.pos = Vec3::new(tx, 0.8, tz);
-    let pad = world.soil.sample(world.vehicle.pos.x, world.vehicle.pos.z);
-    world.vehicle.pos.y = pad.height + 0.62;
-    let ori = world.vehicle.orientation();
-    let local = world.vehicle.wheel_center_local(wheel);
-    let w = world.vehicle.pos + ori * local;
-    world.vehicle.pos += Vec3::new(tx - w.x, 0.0, tz - w.z);
-    let pad = world.soil.sample(world.vehicle.pos.x, world.vehicle.pos.z);
-    world.vehicle.pos.y = pad.height + 0.62;
-    // Nudge into the seam bowl so the staged hub sits in water, not on the lip.
-    world.vehicle.pos += ori * Vec3::new(0.36, 0.0, 0.10);
-    let pad = world.soil.sample(world.vehicle.pos.x, world.vehicle.pos.z);
-    world.vehicle.pos.y = pad.height + 0.62;
     for (i, wh) in world.vehicle.wheels.iter_mut().enumerate() {
-        wh.sinkage = if i == wheel { 0.032 } else { 0.014 };
-        wh.omega = if i == wheel { 7.2 } else { 0.8 };
-        wh.normal = 2800.0;
-        wh.compression = 0.14;
+        let in_pool = i == wheel;
+        wh.sinkage = if in_pool { 0.052 } else { 0.010 };
+        wh.omega = if in_pool { 8.5 } else { 0.4 };
+        wh.normal = if in_pool { 4200.0 } else { 900.0 };
+        wh.compression = if in_pool { 0.24 } else { 0.05 };
+        wh.in_water = in_pool;
+    }
+    for _ in 0..12 {
+        let local = world.vehicle.wheel_center_local(wheel);
+        let ori = world.vehicle.orientation();
+        let hub_y = world.soil.sample(tx, tz).height + 0.34;
+        let hub = Vec3::new(tx, hub_y, tz);
+        world.vehicle.pos = hub - ori * local;
     }
 }
 

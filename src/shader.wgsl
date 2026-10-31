@@ -768,7 +768,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let water = select(mat.g * 0.34, water_column(xz), puddle_beauty_on());
     let darken = mat.b;
     let pool_fill = select(0.0, smoothstep(0.045, 0.11, mat.g), puddle_beauty_on());
-    let pool_shore = select(0.0, smoothstep(0.14, 0.018, mat.g) * (1.0 - smoothstep(0.002, 0.012, mat.g)), puddle_beauty_on());
+    let pool_shore = select(0.0, smoothstep(0.16, 0.014, mat.g) * (1.0 - smoothstep(0.001, 0.010, mat.g)), puddle_beauty_on());
     let pool_sheet = select(0.0, smoothstep(0.028, 0.065, mat.g), puddle_beauty_on());
     // Exported skin, metres. Zero where the pad has not baked.
     let crust_rg = crust_bilinear(xz);
@@ -1045,13 +1045,13 @@ fn puddle_beauty_on() -> bool {
 
 // Playground pools: bed + column is the flat free surface. Do not inflate the
 // column into a mound — depth shows in the tint, not vertex height.
-fn standing_water(column: f32) -> f32 {
-    return min(column, 0.28);
+fn beauty_pool_film(column: f32) -> f32 {
+    return 0.003 + min(column, 0.24) * 0.042;
 }
 
 fn water_surface_lift(column: f32) -> f32 {
     if (puddle_beauty_on()) {
-        return standing_water(column);
+        return beauty_pool_film(column);
     }
     return shallow_water(column);
 }
@@ -1061,32 +1061,69 @@ fn sky_reflect(dir: vec3<f32>) -> vec3<f32> {
     return mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, pow(t, 0.62));
 }
 
+fn scene_uv_from_world(p: vec3<f32>) -> vec2<f32> {
+    let clip = frame.view_proj * vec4<f32>(p, 1.0);
+    if (clip.w <= 0.02) {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    var uv = clip.xy / clip.w;
+    return vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
+}
+
 fn scene_ssr(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
     if (!puddle_beauty_on()) {
         return vec3<f32>(0.0);
     }
     let refl = reflect(-view, nrm);
-    var p = world + nrm * 0.012;
+    var p = world + nrm * 0.018;
     var hit_uv = vec2<f32>(0.0);
     var found = false;
-    for (var step: u32 = 0u; step < 6u; step = step + 1u) {
-        p = p + refl * 0.26;
-        let clip = frame.view_proj * vec4<f32>(p, 1.0);
-        if (clip.w <= 0.02) {
-            break;
-        }
-        var uv = clip.xy / clip.w;
-        uv = vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
-        if (uv.x > 0.012 && uv.x < 0.988 && uv.y > 0.012 && uv.y < 0.988) {
+    for (var step: u32 = 0u; step < 14u; step = step + 1u) {
+        p = p + refl * 0.11;
+        let uv = scene_uv_from_world(p);
+        if (uv.x > 0.02 && uv.x < 0.98 && uv.y > 0.02 && uv.y < 0.98) {
             hit_uv = uv;
             found = true;
-            break;
         }
     }
     if (!found) {
-        return sky_reflect(refl);
+        return vec3<f32>(0.0);
     }
     return textureSampleLevel(scene_color, scene_samp, hit_uv, 0.0).rgb;
+}
+
+fn niva_planar_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
+    let plane_y = world.y;
+    let refl = reflect(-view, nrm);
+    var accum = vec3<f32>(0.0);
+    var wt = 0.0;
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        let slot = i * 2u;
+        let hub = frame.tires[slot].xyz;
+        let tire_meta = frame.tires[slot + 1u];
+        if (tire_meta.w < 0.2) {
+            continue;
+        }
+        let body = hub + vec3<f32>(0.0, 0.78, 0.0);
+        let mirror = vec3<f32>(body.x, 2.0 * plane_y - body.y, body.z);
+        let to_m = normalize(mirror - world);
+        let aim = max(dot(refl, to_m), 0.0);
+        if (aim < 0.22) {
+            continue;
+        }
+        let uv = scene_uv_from_world(mirror);
+        if (uv.x < 0.04 || uv.x > 0.96 || uv.y < 0.04 || uv.y > 0.96) {
+            continue;
+        }
+        let samp = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
+        let w = aim * (0.55 + tire_meta.w * 0.45);
+        accum += samp * w;
+        wt += w;
+    }
+    if (wt < 0.05) {
+        return vec3<f32>(0.0);
+    }
+    return (accum / wt) * 1.08;
 }
 
 fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
@@ -1097,11 +1134,11 @@ fn niva_water_reflect(world: vec3<f32>, refl_dir: vec3<f32>) -> vec3<f32> {
     center = center * 0.25 + vec3<f32>(0.0, 0.58, 0.0);
     let to_veh = normalize(center - world);
     let aim = dot(normalize(refl_dir), to_veh);
-    if (aim < 0.48) {
+    if (aim < 0.22) {
         return vec3<f32>(0.0);
     }
     let d = distance(world.xz, center.xz);
-    let gloss = exp(-d * 0.38) * smoothstep(0.48, 0.86, aim);
+    let gloss = exp(-d * 0.22) * smoothstep(0.22, 0.72, aim);
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = clamp(dot(to_veh, sun), 0.0, 1.0);
     let tan = vec3<f32>(0.72, 0.60, 0.44);
@@ -1140,8 +1177,8 @@ fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
         let ring2 = exp(-d * 1.8) * sin(d * 6.2 - t * 6.0 + f32(i) * 1.3) * 0.55;
         let splash = exp(-d * 4.0) * sin(d * 18.0 - t * 15.0) * 0.022;
         let contact = tire_meta.z * 22.0;
-        let amp = select(1.0, 2.8 + contact, beauty);
-        sum = sum + (ring * 0.038 + ring2 * 0.024 + splash) * tire_on * amp;
+        let amp = select(1.0, 4.2 + contact * 1.4, beauty);
+        sum = sum + (ring * 0.052 + ring2 * 0.034 + splash) * tire_on * amp;
     }
     return sum;
 }
@@ -1243,7 +1280,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     // The column is the solved water. Drawing it at full height is a mound.
     // The sheet sits on the ground. The bow is a crest in that sheet, plus a swell.
     let swell = select(0.0, free_swell(in.xz, frame.misc.x), free);
-    let swell_amp = select(1.0, 0.42 * clear, beauty);
+    let swell_amp = select(1.0, 0.0, beauty);
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
     let lift = max(column, column_draw * 0.14 * clear);
@@ -1297,7 +1334,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
             let slot = ti * 2u;
             let c = frame.tires[slot].xyz;
-            if (distance(xz, c.xz) < 0.24 && column_here < 0.018) {
+            let tire_meta = frame.tires[slot + 1u];
+            if (distance(xz, c.xz) < 0.11 && column_here < 0.004 && tire_meta.w > 0.5) {
                 discard;
             }
         }
@@ -1368,14 +1406,18 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             let ibl = sky_reflect(refl_dir);
             let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 112.0);
             let ssr = scene_ssr(in.world, nrm, view);
+            let planar = niva_planar_reflect(in.world, nrm, view);
             let veh = niva_water_reflect(in.world, refl_dir);
-            let ibl_lit = mix(
-                ibl * 1.18 + frame.sun_color.rgb * sun_disk * 0.55 + veh * 0.55,
-                ssr,
-                0.72,
-            );
-            let rim = smoothstep(0.16, 0.012, column_here) * (1.0 - smoothstep(0.001, 0.008, column_here));
-            col = mix(col, vec3<f32>(0.014, 0.010, 0.008), rim * 0.88);
+            var reflect_col = ibl * 1.12 + frame.sun_color.rgb * sun_disk * 0.62 + veh * 0.85;
+            if (length(ssr) > 0.02) {
+                reflect_col = mix(reflect_col, ssr, 0.68);
+            }
+            if (length(planar) > 0.02) {
+                reflect_col = mix(reflect_col, planar, 0.58);
+            }
+            let ibl_lit = reflect_col;
+            let rim = smoothstep(0.18, 0.010, column_here) * (1.0 - smoothstep(0.0005, 0.007, column_here));
+            col = mix(col, vec3<f32>(0.008, 0.006, 0.005), rim * 0.95);
             let shallow = 1.0 - smoothstep(0.008, 0.095, column_here);
             let water_tint = vec3<f32>(0.06, 0.38, 0.55);
             let water_deep = vec3<f32>(0.03, 0.22, 0.38);
@@ -1383,8 +1425,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             let bed_shallow = mix(soil * vec3<f32>(0.34, 0.28, 0.22), water_tint * 0.55, 0.62);
             body = mix(body, bed_shallow, shallow * 0.72);
             let body_lit = body * (0.18 + 0.95 * ndl);
-            col = mix(body_lit, ibl_lit, fres * 0.82 + 0.28);
-            col += vec3<f32>(0.88, 0.92, 1.0) * sheen * 0.62;
+            col = mix(body_lit, ibl_lit, clamp(fres * 0.88 + 0.42, 0.0, 1.0));
+            col += vec3<f32>(0.88, 0.92, 1.0) * sheen * 0.72;
             col += beauty_tire_splash(xz, frame.misc.x);
             alpha = mix(0.58, 0.90, deep) * shore_fade;
             alpha = mix(alpha, alpha * 0.55, shallow * 0.78);
