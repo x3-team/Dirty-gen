@@ -7461,6 +7461,7 @@ impl SoilField {
                     water = (water_line - h).min(0.24);
                 }
                 field.water[idx] = water;
+                field.slurry[idx] = (water * 1.45).min(0.14);
                 if sand > 0.55 {
                     field.kind[idx] = SurfaceKind::Sand as u8;
                     field.wetness[idx] = lerp(0.14, 0.24, sand);

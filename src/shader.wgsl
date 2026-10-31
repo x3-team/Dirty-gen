@@ -1019,9 +1019,9 @@ fn puddle_beauty_on() -> bool {
 // Standing pool on the playground: draw most of the column so the sheet reads
 // as water, not a mud stain.
 fn standing_water(column: f32) -> f32 {
-    let pool = min(column, 0.22) * 0.88;
-    let crest = max(column - 0.22, 0.0) * 0.12;
-    return 0.006 + pool + crest;
+    let pool = min(column, 0.24) * 0.92;
+    let crest = max(column - 0.24, 0.0) * 0.14;
+    return 0.008 + pool + crest;
 }
 
 fn water_surface_lift(column: f32) -> f32 {
@@ -1048,9 +1048,24 @@ fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
         }
         let d = distance(xz, c.xz);
         let ring = exp(-d * 2.8) * sin(d * 9.0 - t * 7.5 + f32(i) * 0.9);
-        sum = sum + ring * 0.018 * tire_on;
+        let splash = exp(-d * 4.2) * sin(d * 14.0 - t * 11.0) * 0.012;
+        sum = sum + (ring * 0.022 + splash) * tire_on;
     }
     return sum;
+}
+
+fn puddle_normal(xz: vec2<f32>, t: f32, column: f32) -> vec3<f32> {
+    let e = 0.048;
+    let h0 = ripple_height(xz, t) + tire_wake_ripples(xz, t);
+    let hx = ripple_height(xz + vec2<f32>(e, 0.0), t) + tire_wake_ripples(xz + vec2<f32>(e, 0.0), t);
+    let hz = ripple_height(xz + vec2<f32>(0.0, e), t) + tire_wake_ripples(xz + vec2<f32>(0.0, e), t);
+    let g = free_swell_grad(xz, t);
+    let dx = (hx - h0) / e + g.x * 0.85;
+    let dz = (hz - h0) / e + g.y * 0.85;
+    let n = normalize(vec3<f32>(-dx * 2.4, 1.0, -dz * 2.4));
+    let rip = ripple_normal(xz, t);
+    let w = smoothstep(0.004, 0.06, column);
+    return normalize(mix(rip, n, w * 0.65 + 0.2));
 }
 
 // Long swells on the free surface. A few centimetres, so the sheet stays
@@ -1106,8 +1121,10 @@ fn vs_water(in: TerrIn) -> WaterOut {
     // The column is the solved water. Drawing it at full height is a mound.
     // The sheet sits on the ground. The bow is a crest in that sheet, plus a swell.
     let swell = select(0.0, free_swell(in.xz, frame.misc.x), free);
-    let swell_amp = select(1.0, 1.35, beauty);
-    let surface = water_bed(in.xz) + water_surface_lift(column) + rip * 0.45 + wake + swell * swell_amp;
+    let swell_amp = select(1.0, 1.55, beauty);
+    let rut_floor = max(water_bed(in.xz), local + 0.006);
+    let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
+    let surface = base + water_surface_lift(column) + rip * 0.45 + wake + swell * swell_amp;
     let y = select(y_sheet, surface, free);
     let world = vec3<f32>(in.xz.x, y, in.xz.y);
     var o: WaterOut;
@@ -1151,7 +1168,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     if (!free && (near_cut || own < 0.008 || in.depth < 0.008)) {
         discard;
     }
-    let n = ripple_normal(xz, frame.misc.x);
+    let column_here = water_column(xz);
+    let n = select(ripple_normal(xz, frame.misc.x), puddle_normal(xz, frame.misc.x, column_here), beauty);
     let flat = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
     // Slope of the low sheet, not of the full column. A full-column normal
     // is a wall.
@@ -1202,7 +1220,6 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         // Turbid water. The bed shows through the troughs. Crests catch the
         // sun so the swell reads as a wave, not a flat stain.
         let soil = bed;
-        let column_here = water_column(xz);
         let deep = smoothstep(0.02, 0.12, column_here);
         let murk = soil * vec3<f32>(0.26, 0.17, 0.08);
         var body = mix(murk, vec3<f32>(0.07, 0.045, 0.018), deep * 0.5);
@@ -1216,16 +1233,19 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         if (beauty) {
             let refl_dir = reflect(-view, nrm);
             let ibl = sky_reflect(refl_dir);
-            let rim = smoothstep(0.12, 0.016, column_here) * (1.0 - smoothstep(0.0015, 0.010, column_here));
-            col = mix(col, vec3<f32>(0.028, 0.018, 0.010), rim * 0.75);
-            let shallow = 1.0 - smoothstep(0.012, 0.10, column_here);
-            let water_tint = vec3<f32>(0.14, 0.38, 0.52);
-            body = mix(water_tint * 0.45, water_tint, deep);
-            body = mix(body, soil * vec3<f32>(0.42, 0.36, 0.28), shallow * 0.82);
-            col = mix(body * (0.28 + 1.4 * ndl), ibl, fres * 0.62 + 0.28);
-            col += vec3<f32>(0.92, 0.96, 1.0) * sheen * 0.55;
-            alpha = mix(0.58, 0.90, deep) * shore_fade;
-            alpha = mix(alpha, alpha * 0.48, shallow * 0.9);
+            let sun_disk = pow(clamp(dot(refl_dir, sun), 0.0, 1.0), 128.0);
+            let ibl_lit = ibl + frame.sun_color.rgb * sun_disk * 0.35;
+            let rim = smoothstep(0.14, 0.014, column_here) * (1.0 - smoothstep(0.001, 0.009, column_here));
+            col = mix(col, vec3<f32>(0.022, 0.014, 0.008), rim * 0.82);
+            let shallow = 1.0 - smoothstep(0.010, 0.11, column_here);
+            let water_tint = vec3<f32>(0.12, 0.42, 0.58);
+            body = mix(water_tint * 0.38, water_tint, deep);
+            let bed_shallow = soil * vec3<f32>(0.52, 0.46, 0.38);
+            body = mix(body, bed_shallow, shallow * 0.88);
+            col = mix(body * (0.24 + 1.2 * ndl), ibl_lit, fres * 0.72 + 0.32);
+            col += vec3<f32>(0.95, 0.98, 1.0) * sheen * 0.72;
+            alpha = mix(0.52, 0.92, deep) * shore_fade;
+            alpha = mix(alpha, alpha * 0.42, shallow * 0.92);
         }
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);

@@ -905,50 +905,106 @@ fn capture_win_demo_stills() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+const WIN_DEMO_LOW_YAW: f32 = 3.05;
+#[cfg(not(target_arch = "wasm32"))]
+const WIN_DEMO_LOW_PITCH: f32 = 0.14;
+#[cfg(not(target_arch = "wasm32"))]
+const WIN_DEMO_LOW_DIST: f32 = 4.05;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn win_demo_low_pose(world: &World) -> CameraPose {
+    let look = win_demo_puddle_look_at(world);
+    lift_camera(
+        world,
+        orbit_camera(look, WIN_DEMO_LOW_YAW, WIN_DEMO_LOW_PITCH, WIN_DEMO_LOW_DIST),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, media: &Path) {
     use silt::world::Input;
 
-    let mut low = World::win_demo();
-    low.vehicle.pos = Vec3::new(1.05, 0.8, 0.72);
-    low.vehicle.yaw = -2.92;
-    let pad = low.soil.sample(low.vehicle.pos.x, low.vehicle.pos.z);
-    low.vehicle.pos.y = pad.height + 0.62;
-    low.time = 3.1;
-    let puddle_look = win_demo_puddle_look_at(&low);
-    let pose = lift_camera(
-        &low,
-        orbit_camera(puddle_look, 3.05, 0.14, 3.35),
-    );
-    let rgba = renderer.draw(&low, pose, None, true).expect("puddle still");
-    let path = media.join("puddle-patches.png");
-    write_png(&path, width, height, &rgba).expect("win demo png");
-    println!("win demo {}", path.display());
+    let mut parked = World::win_demo();
+    parked.vehicle.pos = Vec3::new(1.35, 0.8, 0.88);
+    parked.vehicle.yaw = -2.78;
+    let pad = parked.soil.sample(parked.vehicle.pos.x, parked.vehicle.pos.z);
+    parked.vehicle.pos.y = pad.height + 0.62;
+    parked.time = 3.1;
+    let pose = win_demo_low_pose(&parked);
+
+    let saved_beauty = renderer.puddle_beauty;
+    let saved_column = renderer.water_column;
+    renderer.puddle_beauty = false;
+    renderer.water_column = false;
+    let rgba = renderer
+        .draw(&parked, pose, None, true)
+        .expect("puddle before");
+    write_png(
+        &media.join("puddle-low-before.png"),
+        width,
+        height,
+        &rgba,
+    )
+    .expect("win demo png");
+    println!("win demo {}", media.join("puddle-low-before.png").display());
+
+    renderer.puddle_beauty = saved_beauty;
+    renderer.water_column = saved_column;
+    let rgba = renderer.draw(&parked, pose, None, true).expect("puddle after");
+    for name in ["puddle-low-after.png", "puddle-patches.png"] {
+        let path = media.join(name);
+        write_png(&path, width, height, &rgba).expect("win demo png");
+        println!("win demo {}", path.display());
+    }
 
     let mut drive = World::win_demo();
-    drive.vehicle.pos = Vec3::new(0.72, 0.8, -0.38);
+    drive.vehicle.pos = Vec3::new(1.15, 0.8, -0.78);
     drive.vehicle.yaw = -2.58;
     let pad = drive.soil.sample(drive.vehicle.pos.x, drive.vehicle.pos.z);
     drive.vehicle.pos.y = pad.height + 0.62;
     let input = Input {
-        throttle: 0.55,
-        steer: -0.03,
+        throttle: 0.82,
+        steer: -0.04,
         ..Input::default()
     };
-    for _ in 0..88 {
+    renderer.puddle_beauty = false;
+    renderer.water_column = false;
+    let pose = win_demo_low_pose(&drive);
+    let rgba = renderer
+        .draw(&drive, pose, None, true)
+        .expect("drive before");
+    write_png(
+        &media.join("puddle-drive-before.png"),
+        width,
+        height,
+        &rgba,
+    )
+    .expect("win demo png");
+    println!("win demo {}", media.join("puddle-drive-before.png").display());
+
+    let mut drive_mid: Option<Vec<u8>> = None;
+    for i in 0..82 {
         drive.step(1.0 / 60.0, &input);
+        if i == 54 {
+            drive.time = 8.2;
+            renderer.puddle_beauty = saved_beauty;
+            renderer.water_column = saved_column;
+            drive_mid = renderer.draw(&drive, pose, None, true);
+        }
     }
-    drive.time = 8.6;
-    let focus = drive.vehicle.pos + Vec3::new(-0.35, 0.45, 0.55);
-    let look = win_demo_puddle_look_at(&drive);
-    let target = focus * 0.35 + look * 0.65;
-    let pose = lift_camera(
-        &drive,
-        orbit_camera(target, 2.55, 0.24, 6.8),
-    );
-    let rgba = renderer.draw(&drive, pose, None, true).expect("puddle drive still");
-    let path = media.join("puddle-drive.png");
-    write_png(&path, width, height, &rgba).expect("win demo png");
-    println!("win demo {}", path.display());
+    drive.time = 9.6;
+    renderer.puddle_beauty = saved_beauty;
+    renderer.water_column = saved_column;
+    let rgba = drive_mid.unwrap_or_else(|| {
+        renderer
+            .draw(&drive, pose, None, true)
+            .expect("drive after")
+    });
+    for name in ["puddle-drive-after.png", "puddle-drive.png"] {
+        let path = media.join(name);
+        write_png(&path, width, height, &rgba).expect("win demo png");
+        println!("win demo {}", path.display());
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
