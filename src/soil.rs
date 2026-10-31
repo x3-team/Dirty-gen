@@ -7459,7 +7459,6 @@ impl SoilField {
                     water = (water_line - h).min(0.28);
                 }
                 field.water[idx] = water;
-                field.slurry[idx] = (water * 1.45).min(0.14);
                 if sand > 0.55 {
                     field.kind[idx] = SurfaceKind::Sand as u8;
                     field.wetness[idx] = lerp(0.14, 0.24, sand);
@@ -7492,6 +7491,7 @@ impl SoilField {
                     field.roughness[idx] = 0.78;
                     field.darken[idx] = 0.05;
                 }
+                field.slurry[idx] = slurry_soil_depth(field.water[idx], field.wetness[idx]);
                 let _ = z;
             }
         }
@@ -7511,7 +7511,7 @@ impl SoilField {
                 let w = (1.0 - r2.sqrt()).max(0.0);
                 let seam_water = 0.045 + w * 0.155;
                 field.water[idx] = field.water[idx].max(seam_water);
-                field.slurry[idx] = field.slurry[idx].max((seam_water * 1.25).min(0.14));
+                field.slurry[idx] = field.slurry[idx].max(slurry_soil_depth(seam_water, 1.0));
                 if seam_water > 0.02 {
                     field.wetness[idx] = 1.0;
                     field.darken[idx] = field.darken[idx].max(0.24);

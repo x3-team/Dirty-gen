@@ -4,7 +4,9 @@
 //! separable filter, a wide gaussian plus a steeper kernel. Viscosity is
 //! the mix, and it enters by overloading the divergence the projection
 //! removes. Dust is a 2.5D air grid on the same advection, projection, and
-//! vorticity confinement. The Niva body and wheels inject velocity on that
+//! vorticity confinement. Fog is a second scalar on that grid, moved by the
+//! same wind step and the same air velocity. It is not a second grid.
+//! The Niva body and wheels inject velocity on that
 //! grid, and the wake is confined there. The window moves with the Niva: a coarse sheet
 //! about 20 cm across the near field, a 2 cm sheet under the tires, and
 //! cells that leave the window are parked so the volume comes back.
@@ -88,11 +90,15 @@ pub fn dust_stream_hold(local_x: f32) -> f32 {
     1.0 - (1.0 - DUST_STREAM_HOLD) * lee
 }
 /// Slow exchange (settle, park compact) runs on this stride, inside 4–8 frames.
-pub const SLOW_STRIDE: u32 = 8;
+pub const SLOW_STRIDE: u32 = 6;
 /// Settled dust does not lift at or above this pore moisture.
 pub const DUST_WET_MOISTURE: f32 = 0.55;
 /// Settled dust does not lift at or above this standing water, metres.
 pub const DUST_WET_WATER_M: f32 = 0.008;
+/// Standing water, metres, at or above which a tire may loft fog.
+pub const FOG_MIN_WATER_M: f32 = 0.004;
+/// Fog droplets fall at this speed on the slow stride, metres per second.
+pub const FOG_SETTLE_M_S: f32 = 0.55;
 
 const GAUSS: [f32; 5] = [0.06, 0.24, 0.40, 0.24, 0.06];
 const STEEP: [f32; 5] = [0.02, 0.08, 0.80, 0.08, 0.02];
@@ -162,6 +168,11 @@ pub fn sheet_damp(nu: f32) -> f32 {
 /// True when slip may loft dust. Wet pore moisture and a standing film may not.
 pub fn dust_may_lift(moisture: f32, water_m: f32) -> bool {
     moisture < DUST_WET_MOISTURE && water_m < DUST_WET_WATER_M
+}
+
+/// True when standing water is deep enough to loft fog. Dry ground returns false.
+pub fn fog_may_lift(water_m: f32) -> bool {
+    water_m >= FOG_MIN_WATER_M
 }
 
 /// What drives a sheet for one step.
@@ -283,6 +294,18 @@ pub struct DustInject {
     pub offer_m3_s: f32,
 }
 
+/// Water a tire offers the air as fog. The sheet path removes that volume
+/// from the water column. The dust-ledger path returns it and the caller
+/// removes it. A thin film returns nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct FogInject {
+    pub x: f32,
+    pub z: f32,
+    pub water_m: f32,
+    /// Cubic metres per second offered by a tire in standing water.
+    pub offer_m3_s: f32,
+}
+
 /// One visible sample of the air column or the settled film. Not a volume.
 /// The cubic metres stay on the grid. Callers draw a mark and discard it.
 #[derive(Clone, Copy, Debug)]
@@ -346,6 +369,9 @@ pub struct FluidLedger {
     pub frozen_slurry_m3: f32,
     pub frozen_dust_m3: f32,
     pub spray_m3: f32,
+    /// Airborne fog plus fog parked off the air window, cubic metres.
+    /// Settled fog is already back in `water_m3`.
+    pub fog_air_m3: f32,
     pub total_m3: f32,
 }
 
@@ -1279,14 +1305,9 @@ fn step_sheet_scratch(
         // substep at 1/60 and two at 1/30. A wall and gravity stay on 0.42.
         let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
         let courant = if open_wind { 0.85 } else { 0.42 };
-        let nsub_max = if cell <= FINE_CELL_M + 1.0e-6 {
-            5.0
-        } else {
-            7.0
-        };
         ((dt * max_s) / (courant * cell.max(1.0e-3)))
             .ceil()
-            .clamp(1.0, nsub_max) as u32
+            .clamp(1.0, 8.0) as u32
     };
     let dts = dt / nsub as f32;
     for _ in 0..nsub {
@@ -3793,8 +3814,15 @@ pub struct FluidCore {
     dust: Vec<f32>,
     dust_u: Vec<f32>,
     dust_v: Vec<f32>,
+    /// Fog depth, metres, same index as `dust`. Not a second air grid.
+    fog: Vec<f32>,
+    fog_u: Vec<f32>,
+    fog_v: Vec<f32>,
+    /// False while every fog slab is empty, so a step does not scan them.
+    fog_live: bool,
     parked: HashMap<(i32, i32), Parked>,
     parked_dust: HashMap<(i32, i32), f32>,
+    parked_fog: HashMap<(i32, i32), f32>,
     spray_m3: f32,
     /// Drops peeled this pass that are still in the air.
     drops: Vec<LiveSpray>,
@@ -3859,8 +3887,13 @@ impl FluidCore {
             dust: vec![0.0; air_n],
             dust_u: vec![0.0; air_n],
             dust_v: vec![0.0; air_n],
+            fog: vec![0.0; air_n],
+            fog_u: vec![0.0; air_n],
+            fog_v: vec![0.0; air_n],
+            fog_live: false,
             parked: HashMap::with_capacity(8192),
             parked_dust: HashMap::with_capacity(1024),
+            parked_fog: HashMap::new(),
             spray_m3: 0.0,
             drops: Vec::new(),
             last_pushes: Vec::new(),
@@ -4454,6 +4487,38 @@ impl FluidCore {
         vol
     }
 
+    /// Cubic metres of water that left the sheet and entered the fog slab.
+    ///
+    /// Zero when the film is thinner than [`FOG_MIN_WATER_M`], or when the
+    /// offer misses the air window. The missed offer is put back on the sheet.
+    /// This does not touch the dust column or `air_velocity`.
+    pub fn inject_fog(&mut self, inj: FogInject, dt: f32) -> f32 {
+        if !fog_may_lift(inj.water_m) || dt <= 0.0 || !dt.is_finite() || inj.offer_m3_s <= 0.0 {
+            return 0.0;
+        }
+        let want = inj.offer_m3_s * dt;
+        if !want.is_finite() || want <= 1.0e-8 {
+            return 0.0;
+        }
+        let taken = self.take_water_at(inj.x, inj.z, want);
+        if taken <= 1.0e-8 {
+            return 0.0;
+        }
+        let air_cell = self.air_cell();
+        let Some((i, j)) = self.air_ij(inj.x, inj.z) else {
+            self.add_water_at(inj.x, inj.z, taken);
+            return 0.0;
+        };
+        let layer = 1usize.min(AIR_LAYERS - 1);
+        let idx = (layer * AIR_RES + j) * AIR_RES + i;
+        let area = air_cell * air_cell;
+        self.fog[idx] += taken / area;
+        self.fog_u[idx] = self.wind[0];
+        self.fog_v[idx] = self.wind[1];
+        self.fog_live = true;
+        taken
+    }
+
     pub fn step(&mut self, dt: f32) -> Vec<SprayEvent> {
         let wall = ProfTick::start();
         let w0 = self.sheet_times.water_ms;
@@ -4465,7 +4530,6 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
-        self.last_pushes = pushes.clone();
         self.refine(&pushes);
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
@@ -4474,16 +4538,16 @@ impl FluidCore {
         self.apply_pushes_outside(&pushes);
         self.step_pair(dt, false);
         spray.extend(self.peel_spray(&pushes, false, true));
+        self.last_pushes = pushes;
         if !self.solids.is_empty() {
             self.scour_contacts(dt);
         }
         self.cycle_stream();
         self.step_dust(dt, slow);
+        self.step_fog(dt);
         if slow {
-            let dust_sum: f32 = self.dust.iter().sum();
-            if dust_sum > 1.0e-4 {
-                self.settle_dust();
-            }
+            self.settle_dust();
+            self.settle_fog();
         }
         for s in &spray {
             self.spray_m3 += s.volume;
@@ -4591,6 +4655,14 @@ impl FluidCore {
         for d in self.parked_dust.values() {
             frozen_dust += *d;
         }
+        let mut fog_air = if self.fog_live {
+            column_sum(&self.fog, self.air_cell())
+        } else {
+            0.0
+        };
+        for d in self.parked_fog.values() {
+            fog_air += *d;
+        }
         let total = water
             + slurry
             + dust_air
@@ -4598,6 +4670,7 @@ impl FluidCore {
             + frozen_water
             + frozen_slurry
             + frozen_dust
+            + fog_air
             + self.spray_m3;
         FluidLedger {
             water_m3: water,
@@ -4608,6 +4681,7 @@ impl FluidCore {
             frozen_slurry_m3: frozen_slurry,
             frozen_dust_m3: frozen_dust,
             spray_m3: self.spray_m3,
+            fog_air_m3: fog_air,
             total_m3: total,
         }
     }
@@ -4712,6 +4786,16 @@ impl FluidCore {
         }
         let idx = (layer * AIR_RES + iz) * AIR_RES + ix;
         self.dust[idx]
+    }
+
+    /// Fog depth in one air slab, metres. Same index as [`Self::air_depth`].
+    /// The render contract republishes this as a volume fraction. It is not `dust`.
+    pub fn fog_depth(&self, ix: usize, layer: usize, iz: usize) -> f32 {
+        if ix >= AIR_RES || iz >= AIR_RES || layer >= AIR_LAYERS {
+            return 0.0;
+        }
+        let idx = (layer * AIR_RES + iz) * AIR_RES + ix;
+        self.fog[idx]
     }
 
     /// Horizontal dust-sheet velocity in contract order, vertical channel 0.
@@ -5161,6 +5245,9 @@ impl FluidCore {
     }
 
     fn step_pair(&mut self, dt: f32, fine: bool) {
+        if fine && !self.fine_on {
+            return;
+        }
         let prep = ProfTick::start();
         let (res, cell) = if fine {
             (FINE_RES, FINE_CELL_M)
@@ -5742,6 +5829,94 @@ impl FluidCore {
         self.sheet_times.dust_ms += tick.ms();
     }
 
+    /// Passive fog on the dust wind step. Empty slabs are not scanned.
+    /// The velocity scratch is not `air_velocity`: that channel stays the dust sheet.
+    fn step_fog(&mut self, dt: f32) {
+        if !self.fog_live || dt <= 0.0 {
+            return;
+        }
+        let tick = ProfTick::start();
+        let cell = self.air_cell();
+        let wind = self.wind;
+        let n = AIR_RES * AIR_RES;
+        DUST_PLANE.with(|plane| {
+            let mut plane = plane.borrow_mut();
+            plane.fit(n);
+            for layer in 0..AIR_LAYERS {
+                let start = layer * n;
+                let h = &mut self.fog[start..start + n];
+                if h.iter().all(|v| *v <= 1.0e-8) {
+                    continue;
+                }
+                let u = &mut self.fog_u[start..start + n];
+                let v = &mut self.fog_v[start..start + n];
+                soften_border(u, v, AIR_RES);
+                step_down2(
+                    h,
+                    u,
+                    v,
+                    &plane.bed,
+                    &plane.nu,
+                    &plane.gate,
+                    AIR_RES,
+                    cell,
+                    dt,
+                    SheetDrive::Wind {
+                        x: wind[0],
+                        z: wind[1],
+                        vorticity: 0.35,
+                    },
+                    1.0e-8,
+                    false,
+                );
+            }
+        });
+        self.sheet_times.dust_ms += tick.ms();
+    }
+
+    /// Bottom fog returns to the water column. Upper slabs fall one step.
+    fn settle_fog(&mut self) {
+        if !self.fog_live {
+            return;
+        }
+        let air_cell = self.air_cell();
+        let air_area = air_cell * air_cell;
+        let coarse_area = COARSE_CELL_M * COARSE_CELL_M;
+        let fall = 0.45f32;
+        let mut left = 0.0f32;
+        for j in 0..AIR_RES {
+            for i in 0..AIR_RES {
+                let x = self.air_origin[0] + (i as f32 + 0.5) * air_cell;
+                let z = self.air_origin[1] + (j as f32 + 0.5) * air_cell;
+                for layer in (0..AIR_LAYERS).rev() {
+                    let idx = (layer * AIR_RES + j) * AIR_RES + i;
+                    let drop = self.fog[idx] * fall;
+                    if drop <= 0.0 {
+                        continue;
+                    }
+                    self.fog[idx] -= drop;
+                    if layer == 0 {
+                        if let Some((ci, cj)) = self.coarse_ij(x, z) {
+                            let cidx = cj * WINDOW_RES + ci;
+                            self.water[cidx] += drop * air_area / coarse_area;
+                        } else {
+                            let key = world_key(x, z, COARSE_CELL_M);
+                            let slot = self.parked.entry(key).or_default();
+                            slot.water += drop * air_area / coarse_area;
+                        }
+                    } else {
+                        let below = ((layer - 1) * AIR_RES + j) * AIR_RES + i;
+                        self.fog[below] += drop;
+                    }
+                }
+                for layer in 0..AIR_LAYERS {
+                    left += self.fog[(layer * AIR_RES + j) * AIR_RES + i];
+                }
+            }
+        }
+        self.fog_live = left > 1.0e-8 || !self.parked_fog.is_empty();
+    }
+
     fn settle_dust(&mut self) {
         let air_cell = self.air_cell();
         for j in 0..AIR_RES {
@@ -5982,6 +6157,9 @@ impl FluidCore {
 
     /// A shift collapses every column onto layer 0. The overlap does that without hashing.
     fn shift_air_scroll(&mut self, new_origin: [f32; 2], cell: f32, di: i32, dj: i32) {
+        if self.fog_live {
+            self.shift_fog_scroll(new_origin, cell, di, dj);
+        }
         let res = AIR_RES;
         let n = res * res;
         let origin = self.air_origin;
@@ -6038,7 +6216,90 @@ impl FluidCore {
         });
     }
 
+    fn shift_fog_scroll(&mut self, new_origin: [f32; 2], cell: f32, di: i32, dj: i32) {
+        let res = AIR_RES;
+        let n = res * res;
+        let origin = self.air_origin;
+        let area = cell * cell;
+        let mut column = vec![0.0f32; n];
+        for j in 0..res {
+            for i in 0..res {
+                let mut vol = 0.0f32;
+                for layer in 0..AIR_LAYERS {
+                    vol += self.fog[(layer * res + j) * res + i];
+                }
+                column[j * res + i] = vol;
+            }
+        }
+        each_leaving(res, di, dj, |i, j| {
+            let vol = column[j * res + i];
+            if vol > 1.0e-8 {
+                let x = origin[0] + (i as f32 + 0.5) * cell;
+                let z = origin[1] + (j as f32 + 0.5) * cell;
+                *self.parked_fog.entry(world_key(x, z, cell)).or_insert(0.0) += vol * area;
+            }
+        });
+        self.fog.fill(0.0);
+        self.fog_u.fill(0.0);
+        self.fog_v.fill(0.0);
+        let res_i = res as i32;
+        for j in 0..res {
+            for i in 0..res {
+                let si = i as i32 + di;
+                let sj = j as i32 + dj;
+                if !(0..res_i).contains(&si) || !(0..res_i).contains(&sj) {
+                    continue;
+                }
+                let vol = column[sj as usize * res + si as usize];
+                if vol > 1.0e-8 {
+                    self.fog[j * res + i] = vol;
+                }
+            }
+        }
+        each_leaving(res, -di, -dj, |i, j| {
+            let x = new_origin[0] + (i as f32 + 0.5) * cell;
+            let z = new_origin[1] + (j as f32 + 0.5) * cell;
+            if let Some(vol) = self.parked_fog.remove(&world_key(x, z, cell)) {
+                self.fog[j * res + i] += vol / area;
+            }
+        });
+        self.fog_live = self.fog.iter().any(|v| *v > 1.0e-8) || !self.parked_fog.is_empty();
+    }
+
+    fn shift_fog_hash(&mut self, new_origin: [f32; 2], cell: f32) {
+        for j in 0..AIR_RES {
+            for i in 0..AIR_RES {
+                let x = self.air_origin[0] + (i as f32 + 0.5) * cell;
+                let z = self.air_origin[1] + (j as f32 + 0.5) * cell;
+                let mut vol = 0.0f32;
+                for layer in 0..AIR_LAYERS {
+                    let idx = (layer * AIR_RES + j) * AIR_RES + i;
+                    vol += self.fog[idx];
+                    self.fog[idx] = 0.0;
+                    self.fog_u[idx] = 0.0;
+                    self.fog_v[idx] = 0.0;
+                }
+                if vol > 1.0e-8 {
+                    *self.parked_fog.entry(world_key(x, z, cell)).or_insert(0.0) += vol * cell * cell;
+                }
+            }
+        }
+        for j in 0..AIR_RES {
+            for i in 0..AIR_RES {
+                let x = new_origin[0] + (i as f32 + 0.5) * cell;
+                let z = new_origin[1] + (j as f32 + 0.5) * cell;
+                if let Some(vol) = self.parked_fog.remove(&world_key(x, z, cell)) {
+                    self.fog[j * AIR_RES + i] = vol / (cell * cell);
+                }
+            }
+        }
+        self.fog_live = self.fog.iter().any(|v| *v > 1.0e-8) || !self.parked_fog.is_empty();
+    }
+
     fn shift_air_hash(&mut self, new_origin: [f32; 2], cell: f32) {
+        if self.fog_live {
+            self.shift_fog_hash(new_origin, cell);
+        }
         for j in 0..AIR_RES {
             for i in 0..AIR_RES {
                 let x = self.air_origin[0] + (i as f32 + 0.5) * cell;
@@ -6433,9 +6694,9 @@ pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 /// under 4 ms, which is the budget for the step that feeds the GPU upload.
 pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
-pub const AIR_FLUX_STRIDE: u32 = 14;
+pub const AIR_FLUX_STRIDE: u32 = 4;
 /// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.
-pub const AIR_SOLVE_STRIDE: u32 = 11;
+pub const AIR_SOLVE_STRIDE: u32 = 2;
 /// Fine dust cells per coarse air cell in X and Z. Layers stay at the dust spacing.
 /// The solve runs on this coarser active window and is written back onto the dust grid.
 pub const AIR_COARSE: usize = 2;

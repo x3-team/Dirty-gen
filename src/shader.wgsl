@@ -1011,16 +1011,7 @@ fn water_column(xz: vec2<f32>) -> f32 {
 }
 
 fn water_column_dilated(xz: vec2<f32>) -> f32 {
-    if (!puddle_beauty_on()) {
-        return water_column(xz);
-    }
-    let e = 0.38;
-    var m = water_column(xz);
-    m = max(m, water_column(xz + vec2<f32>(e, 0.0)));
-    m = max(m, water_column(xz - vec2<f32>(e, 0.0)));
-    m = max(m, water_column(xz + vec2<f32>(0.0, e)));
-    m = max(m, water_column(xz - vec2<f32>(0.0, e)));
-    return m;
+    return water_column(xz);
 }
 
 // A dry patch with water on both sides is a hole in the sheet, not a shore.
@@ -1375,12 +1366,10 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
     let column = water_column(in.xz);
-    let column_draw = water_column_dilated(in.xz);
     let water_mode = frame.misc.w;
-    let free = water_mode >= 0.5 && column_draw > 0.004;
+    let free = water_mode >= 0.5 && column > 0.004;
     let beauty = puddle_beauty_on();
-    let clear = beauty_tire_clearance(in.xz);
-    let rip_scale = select(1.0, 2.2 * clear, beauty);
+    let rip_scale = select(1.0, 1.0, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
     // Wake ripples stay in the normal on beauty pools; lifting the sheet here
     // reads as blue spheres under the tires.
@@ -1403,9 +1392,8 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let rut_floor = max(water_bed(in.xz), local + 0.006);
     let base = select(water_bed(in.xz), rut_floor, beauty && dug > 0.012);
     let seam_flat = beauty_seam_weight(in.xz);
-    let near_tire_v = beauty && clear < 0.96;
-    let in_beauty_pool = beauty && (column_draw > 0.002 || seam_flat > 0.12 || near_tire_v);
-    let lift = max(column, column_draw * 0.14 * clear);
+    let in_beauty_pool = beauty && (column > 0.002 || seam_flat > 0.12);
+    let lift = max(column, column * 0.14);
     let rip_vert = rip * select(0.45, 0.0, beauty);
     let flat_pool = mix(
         water_bed(in.xz) + 0.006 + rip_vert,
@@ -1419,7 +1407,7 @@ fn vs_water(in: TerrIn) -> WaterOut {
     o.clip = frame.view_proj * vec4<f32>(world, 1.0);
     o.world = world;
     o.ij = in.ij;
-    o.depth = select(depth, max(column, column_draw * 0.18), free);
+    o.depth = select(depth, max(column, column * 0.18), free);
     return o;
 }
 
@@ -1455,12 +1443,15 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let column_here = water_column(xz);
     let free = frame.misc.w > 0.5 && in.depth > 0.004;
     var near_tire = false;
-    if (beauty) {
-        for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
-            let c = frame.tires[ti * 2u].xyz;
-            if (distance(xz, c.xz) < 1.05) {
-                near_tire = true;
-            }
+    var under_tire = false;
+    for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
+        let c = frame.tires[ti * 2u].xyz;
+        let d = distance(xz, c.xz);
+        if (d < 1.05) {
+            near_tire = true;
+        }
+        if (d < 0.55) {
+            under_tire = true;
         }
     }
     let seam_flat = beauty_seam_weight(xz);
@@ -1471,10 +1462,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || (beauty && seam_flat > 0.15)
         || (in_seam_pan && column_here > 0.0008);
     let beauty_pool = beauty && pool_here;
-    if (!free && !pool_here && (near_cut || own < 0.008 || in.depth < 0.008)) {
-        if (seam_flat < 0.2) {
-            discard;
-        }
+    if (!free && !pool_here && !under_tire && (near_cut || own < 0.008 || in.depth < 0.008)) {
+        discard;
     }
     let free_water = free || beauty_pool;
     let n = select(ripple_normal(xz, frame.misc.x), puddle_normal(xz, frame.misc.x, column_here), beauty);

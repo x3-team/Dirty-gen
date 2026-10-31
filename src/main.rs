@@ -933,10 +933,6 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let pad = parked.soil.sample(parked.vehicle.pos.x, parked.vehicle.pos.z);
     parked.vehicle.pos.y = pad.height + 0.62;
     parked.time = 4.6;
-    for w in &mut parked.vehicle.wheels {
-        w.sinkage = w.sinkage.max(0.018);
-        w.omega = 2.4;
-    }
     let pose = win_demo_low_pose(&parked);
 
     let saved_beauty = renderer.puddle_beauty;
@@ -969,7 +965,6 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     // Front-left hub in the intact seam pool (no sim — keeps the bowl mesh whole).
     let mut wheel = World::win_demo();
     win_demo_seat_wheel_in_puddle(&mut wheel, 0, -2.58);
-    wheel.particles.clear();
     win_demo_seed_pool_splashes(&mut wheel);
     wheel.time = 7.2;
     let pose = win_demo_low_pose(&wheel);
@@ -1028,7 +1023,6 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     let mut drive = World::win_demo();
     win_demo_place_vehicle_on_seam(&mut drive, px, pz - 0.05, -2.58);
-    win_demo_stage_wheels_in_pool(&mut drive);
     win_demo_seed_pool_splashes(&mut drive);
     drive.time = 8.6;
     renderer.puddle_beauty = saved_beauty;
@@ -1080,7 +1074,6 @@ fn win_demo_stage_wheels_in_pool(world: &mut World) {
 
 fn win_demo_seed_pool_splashes(world: &mut World) {
     use silt::vehicle::WHEEL_RADIUS;
-    world.particles.clear();
     let ori = world.vehicle.orientation();
     let forward = ori * Vec3::Z;
     let right = ori * Vec3::X;
@@ -1109,12 +1102,7 @@ fn win_demo_seat_wheel_in_puddle(world: &mut World, wheel: usize, yaw: f32) {
     world.vehicle.pitch = 0.0;
     world.vehicle.roll = 0.0;
     for (i, wh) in world.vehicle.wheels.iter_mut().enumerate() {
-        let in_pool = i == wheel;
-        wh.sinkage = if in_pool { 0.062 } else { 0.006 };
-        wh.omega = if in_pool { 9.5 } else { 0.2 };
-        wh.normal = if in_pool { 5600.0 } else { 700.0 };
-        wh.compression = if in_pool { 0.28 } else { 0.03 };
-        wh.in_water = in_pool;
+        wh.in_water = i == wheel;
     }
     let pad = world.soil.sample(tx, tz);
     let hub_y = pad.height + 0.008 + WHEEL_RADIUS * 0.42;

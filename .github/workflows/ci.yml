@@ -47,10 +47,14 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release --test e2e_niva --test frame_bench -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
 
   win-demo-zip:
+    needs: test
+    if: success()
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -73,3 +77,11 @@ jobs:
         with:
           name: silt-win-demo
           path: silt-win-demo.zip
+      - name: Tag demo-win at build SHA
+        env:
+          TAG: demo-win-${{ github.run_number }}-${{ github.sha }}
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git tag -f "$TAG" "${{ github.sha }}"
+          git push origin "refs/tags/$TAG" -f
