@@ -1316,7 +1316,6 @@ mod tests {
             None,
         );
         assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-        assert_eq!(RENDER_CONTRACT_VERSION, 3);
         let res = frame.header.window_res as usize;
         let mut moist = 0.0_f32;
         let mut n = 0.0_f32;

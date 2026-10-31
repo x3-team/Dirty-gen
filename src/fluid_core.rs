@@ -361,6 +361,22 @@ pub struct FluidLedger {
     pub total_m3: f32,
 }
 
+/// Suspended fraction on the coarse sheet after the step.
+///
+/// `bins` counts cells that hold solids: `[0, 0.1)`, …, `[0.9, 1)`, then
+/// `ratio >= 1`. Clear water is `clear`, not bin 0. `above_water` is the
+/// count the publish clamp would have painted as 1 because `susp > water`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurbiditySpread {
+    pub bins: [u32; 11],
+    pub clear: u32,
+    pub above_water: u32,
+    pub saturated: u32,
+    pub max_ratio: f32,
+    /// Mean water depth of the `ratio >= 1` bin. Zero when that bin is empty.
+    pub full_water: f32,
+}
+
 /// How a rounded rut in one mix levels.
 #[derive(Clone, Copy, Debug)]
 pub struct RutHeal {
@@ -3814,6 +3830,10 @@ pub struct FluidCore {
     susp: Vec<f32>,
     /// Scratch for the suspended advection. Sized once.
     susp_next: Vec<f32>,
+    /// Solids a neighbour already accepted this pass.
+    susp_taken: Vec<f32>,
+    /// Cells this step where advection booked the column down to the water.
+    last_susp_capped: u32,
     /// Cubic metres lifted into suspension. Not spent twice.
     entrained_m3: f32,
     /// Cubic metres that left the live column and stayed in the account.
@@ -3889,6 +3909,8 @@ impl FluidCore {
             settled: vec![0.0; n],
             susp: vec![0.0; n],
             susp_next: vec![0.0; n],
+            susp_taken: vec![0.0; n],
+            last_susp_capped: 0,
             entrained_m3: 0.0,
             settled_suspended_m3: 0.0,
             last_parts: StepParts::default(),
@@ -4522,6 +4544,10 @@ impl FluidCore {
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
         self.last_pushes = pushes.clone();
+        // Lift from the column the tire rolls into, before the sheet shoves it.
+        if dt > 0.0 && dt.is_finite() {
+            self.entrain_wake(&pushes, dt);
+        }
         self.refine(&pushes);
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
@@ -4535,7 +4561,7 @@ impl FluidCore {
         }
         self.cycle_stream();
         let sus_tick = ProfTick::start();
-        self.step_suspended(dt, &pushes);
+        self.step_suspended(dt);
         let suspended_ms = sus_tick.ms() as f32;
         self.step_dust(dt, slow);
         if slow {
@@ -4697,6 +4723,56 @@ impl FluidCore {
     pub fn suspended_gap(&self) -> f32 {
         let b = self.ledger();
         (b.suspended_m3 + b.settled_suspended_m3 + b.frozen_suspended_m3 - b.entrained_m3).abs()
+    }
+
+    /// Cells whose suspended column was booked down onto the water this step.
+    ///
+    /// A published 1 that did not come from here is a full column (`susp == water`),
+    /// not the publish clamp of a deeper one.
+    pub fn suspended_capped_cells(&self) -> u32 {
+        self.last_susp_capped
+    }
+
+    /// Raw `susp/water` on the coarse sheet. This is the value before the
+    /// publish clamp, so [`TurbiditySpread::above_water`] is the clamp count.
+    pub fn turbidity_spread(&self) -> TurbiditySpread {
+        let mut out = TurbiditySpread::default();
+        let mut full_water = 0.0f32;
+        let n = self.water.len().min(self.susp.len());
+        for idx in 0..n {
+            let w = self.water[idx];
+            if !w.is_finite() || w < 1.0e-5 {
+                continue;
+            }
+            let s = self.susp[idx];
+            if !s.is_finite() || s <= 1.0e-8 {
+                out.clear += 1;
+                continue;
+            }
+            if s > w + 1.0e-5 {
+                out.above_water += 1;
+            }
+            let ratio = s / w;
+            if ratio.is_finite() {
+                out.max_ratio = out.max_ratio.max(ratio);
+            }
+            if ratio >= 1.0 - 1.0e-4 && s <= w + 1.0e-5 {
+                out.saturated += 1;
+                out.bins[10] += 1;
+                full_water += w;
+            } else if ratio >= 1.0 {
+                out.bins[10] += 1;
+                full_water += w;
+            } else {
+                let b = (ratio.max(0.0) * 10.0).floor() as usize;
+                out.bins[b.min(9)] += 1;
+            }
+        }
+        let full_n = out.bins[10];
+        if full_n > 0 {
+            out.full_water = full_water / full_n as f32;
+        }
+        out
     }
 
     pub fn export_maps(&mut self) -> SurfaceMaps {
@@ -5868,18 +5944,40 @@ impl FluidCore {
         }
     }
 
-    /// Lift solids in the aft sector of each tire and carry that column with the flow.
-    ///
-    /// The solids are a depth on the coarse water sheet. Turbidity is that depth
-    /// over the water column, clamped to 0..1. A dry cell keeps none of it: the
-    /// depth is booked as settled so the volume ledger still closes.
-    fn step_suspended(&mut self, dt: f32, pushes: &[TirePush]) {
+    /// The lift already ran on the column the tire rolled into. The solids stay
+    /// in that rut. Clear water the open sheet shoves sideways does not take
+    /// them, so the water that remains is muddier. Where that film no longer
+    /// covers the load, the grains settle. Booking the load down to the water
+    /// line would publish turbidity 1. What still fits rides the along-track film.
+    fn step_suspended(&mut self, dt: f32) {
+        self.last_susp_capped = 0;
         if dt <= 0.0 || !dt.is_finite() {
             return;
         }
-        let before = self.entrained_m3;
-        self.entrain_wake(pushes, dt);
-        if self.entrained_m3 <= before && !self.susp.iter().any(|s| *s > 1.0e-8) {
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let n = self.susp.len().min(self.water.len());
+        for idx in 0..n {
+            let s = self.susp[idx];
+            if !s.is_finite() || s <= 1.0e-12 {
+                self.susp[idx] = 0.0;
+                continue;
+            }
+            let w = self.water[idx];
+            if !w.is_finite() || w < 1.0e-5 {
+                self.settled_suspended_m3 += s * area;
+                self.susp[idx] = 0.0;
+                continue;
+            }
+            if s <= w {
+                continue;
+            }
+            // The film no longer covers the load. The grains settle. Setting
+            // the column to the water line would publish turbidity 1 from a
+            // deeper load, which is the clamp.
+            self.settled_suspended_m3 += s * area;
+            self.susp[idx] = 0.0;
+        }
+        if !self.susp.iter().any(|s| *s > 1.0e-8) {
             return;
         }
         self.advect_suspended(dt);
@@ -5970,59 +6068,74 @@ impl FluidCore {
         i1 = (i1 + 1).min(res - 1);
         j1 = (j1 + 1).min(res - 1);
 
+        // Copy first so a cell outside the box keeps the solids it already holds.
         self.susp_next.copy_from_slice(&self.susp);
+        self.susp_taken.fill(0.0);
+        // The open sheet shoves water onto the shoulders. Solids that followed
+        // that shove left the rut near 0.20. They stay in the track column and
+        // ride the along-track film. A neighbour stops at the donor's fraction,
+        // so a thin film cannot publish 1 from a thicker cell.
         for j in j0..=j1 {
             for i in i0..=i1 {
-                self.susp_next[j * res + i] = 0.0;
+                let idx = j * res + i;
+                let depth = self.susp[idx];
+                let water = self.water[idx];
+                if depth <= 1.0e-12
+                    || !depth.is_finite()
+                    || !water.is_finite()
+                    || water < 1.0e-5
+                {
+                    continue;
+                }
+                // Clay in the same cell is a second sheet. Blending its
+                // velocity would drag the plume off the water that holds it.
+                let (_, v) = film_uv(water, 0.0, self.uw[idx], self.vw[idx], 0.0, 0.0);
+                if !v.is_finite() || v.abs() < 1.0e-5 {
+                    continue;
+                }
+                let frac = (v.abs() * dt / cell).min(0.45);
+                let give = depth * frac;
+                if give <= 1.0e-12 {
+                    continue;
+                }
+                let recv = if v > 0.0 {
+                    if j + 1 < res {
+                        Some(idx + res)
+                    } else {
+                        None
+                    }
+                } else if j > 0 {
+                    Some(idx - res)
+                } else {
+                    None
+                };
+                let Some(n) = recv else {
+                    self.settled_suspended_m3 += give * area;
+                    self.susp_next[idx] -= give;
+                    continue;
+                };
+                let wr = self.water[n];
+                if !wr.is_finite() || wr < 1.0e-5 {
+                    continue;
+                }
+                let c = depth / water;
+                let have = self.susp[n] + self.susp_taken[n];
+                let room = (c * wr - have).max(0.0);
+                let accept = give.min(room).min((wr - have).max(0.0));
+                if accept <= 1.0e-12 {
+                    continue;
+                }
+                self.susp_next[idx] -= accept;
+                self.susp_taken[n] += accept;
             }
         }
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let idx = j * res + i;
-                let depth = self.susp[idx];
-                if depth <= 1.0e-12 || !depth.is_finite() {
-                    continue;
-                }
-                // The column is solids in the water. Clay in the same cell is a
-                // second sheet; blending its velocity would drag the plume.
-                let (u, v) = film_uv(self.water[idx], 0.0, self.uw[idx], self.vw[idx], 0.0, 0.0);
-                let ax = (u * dt / cell).abs().min(1.0);
-                let az = (v * dt / cell).abs().min(1.0);
-                let scale = if ax + az > 1.0 {
-                    1.0 / (ax + az)
-                } else {
-                    1.0
-                };
-                let mut give_x = depth * ax * scale;
-                let mut give_z = depth * az * scale;
-                let outflow = give_x + give_z;
-                if outflow > depth && outflow > 0.0 {
-                    let fit = depth / outflow;
-                    give_x *= fit;
-                    give_z *= fit;
-                }
-                let stay = (depth - give_x - give_z).max(0.0);
-                self.susp_next[idx] += stay;
-                if give_x > 0.0 {
-                    if u > 0.0 && i + 1 < res {
-                        self.susp_next[idx + 1] += give_x;
-                    } else if u < 0.0 && i > 0 {
-                        self.susp_next[idx - 1] += give_x;
-                    } else {
-                        self.settled_suspended_m3 += give_x * area;
-                    }
-                }
-                if give_z > 0.0 {
-                    if v > 0.0 && j + 1 < res {
-                        self.susp_next[idx + res] += give_z;
-                    } else if v < 0.0 && j > 0 {
-                        self.susp_next[idx - res] += give_z;
-                    } else {
-                        self.settled_suspended_m3 += give_z * area;
-                    }
-                }
+                self.susp_next[idx] += self.susp_taken[idx];
             }
         }
+        let mut capped = 0u32;
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let idx = j * res + i;
@@ -6036,12 +6149,17 @@ impl FluidCore {
                     self.settled_suspended_m3 += s * area;
                     s = 0.0;
                 } else if s > w {
-                    self.settled_suspended_m3 += (s - w) * area;
+                    let excess = s - w;
+                    self.settled_suspended_m3 += excess * area;
+                    if excess > 1.0e-5 {
+                        capped += 1;
+                    }
                     s = w;
                 }
                 self.susp_next[idx] = s;
             }
         }
+        self.last_susp_capped += capped;
         // Cells outside the box were copied and not rewritten. Swap the whole grid.
         std::mem::swap(&mut self.susp, &mut self.susp_next);
     }
@@ -6710,8 +6828,9 @@ pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
 /// Gravity-sheet speed cap, metres per second. Published `vx` and `vz` stay inside it.
 pub const FILM_SPEED_CAP_MPS: f32 = 1.6;
-/// Milliseconds for one scene step: water, clay, soil, air, dust, and the plume.
-/// The plume test asserts that sum. Do not raise this, and do not treat a miss as known.
+/// Milliseconds for one [`FluidCore::step`] wall. The plume test times that
+/// call with the clay pond inside it, and asserts the mean and the p95.
+/// Do not raise this, and do not treat a miss as known.
 pub const SOLVER_STEP_BUDGET_MS: f32 = 7.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
 pub const AIR_FLUX_STRIDE: u32 = 4;

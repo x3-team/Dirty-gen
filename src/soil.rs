@@ -5743,54 +5743,51 @@ impl SoilField {
         // Time away from a cell is what makes the next visit a new pass.
         self.age_passes(dt);
         self.infiltrate(dt);
-        // A dry field has nothing to pipe. Rain is added later, in moisture.
-        if self.water.iter().any(|w| *w > 0.0) {
-            let res = self.res;
-            let dx = self.cell;
-            let area = dx * dx;
-            let mut next = self.water.clone();
-            let cond = 1.35; // m/s per metre of head, scaled below by dt
+        let res = self.res;
+        let dx = self.cell;
+        let area = dx * dx;
+        let mut next = self.water.clone();
+        let cond = 1.35; // m/s per metre of head, scaled below by dt
 
-            for j in 0..res {
-                for i in 0..res {
-                    let a = j * res + i;
-                    if i + 1 < res {
-                        let b = a + 1;
-                        transfer(
-                            &self.height,
-                            &self.water,
-                            &self.kind,
-                            &mut next,
-                            a,
-                            b,
-                            dt,
-                            dx,
-                            area,
-                            cond,
-                        );
-                    }
-                    if j + 1 < res {
-                        let b = a + res;
-                        transfer(
-                            &self.height,
-                            &self.water,
-                            &self.kind,
-                            &mut next,
-                            a,
-                            b,
-                            dt,
-                            dx,
-                            area,
-                            cond,
-                        );
-                    }
+        for j in 0..res {
+            for i in 0..res {
+                let a = j * res + i;
+                if i + 1 < res {
+                    let b = a + 1;
+                    transfer(
+                        &self.height,
+                        &self.water,
+                        &self.kind,
+                        &mut next,
+                        a,
+                        b,
+                        dt,
+                        dx,
+                        area,
+                        cond,
+                    );
+                }
+                if j + 1 < res {
+                    let b = a + res;
+                    transfer(
+                        &self.height,
+                        &self.water,
+                        &self.kind,
+                        &mut next,
+                        a,
+                        b,
+                        dt,
+                        dx,
+                        area,
+                        cond,
+                    );
                 }
             }
-            for w in &mut next {
-                *w = w.clamp(0.0, 0.34);
-            }
-            self.water = next;
         }
+        for w in &mut next {
+            *w = w.clamp(0.0, 0.34);
+        }
+        self.water = next;
         self.step_moisture(dt, rain);
         self.step_slurry(dt);
     }
