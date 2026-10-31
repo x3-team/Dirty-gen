@@ -1151,12 +1151,16 @@ fn force_gravity_solid_par(
     let rows = j1 + 1 - j0;
     let chunk = rows.div_ceil(threads);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = j0 + t * chunk;
             if a > j1 {
                 break;
             }
             let b = (a + chunk - 1).min(j1);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
             s.spawn(move |_| {
                 let u = unsafe { up.slice(un) };
                 let v = unsafe { vp.slice(vn) };
@@ -1271,12 +1275,16 @@ fn force_gravity_par(
     let rows = j1 + 1 - j0;
     let chunk = rows.div_ceil(threads);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = j0 + t * chunk;
             if a > j1 {
                 break;
             }
             let b = (a + chunk - 1).min(j1);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
             s.spawn(move |_| {
                 let u = unsafe { up.slice(un) };
                 let v = unsafe { vp.slice(vn) };
@@ -1320,12 +1328,16 @@ fn force_gravity_par(
         let su = ShareConst(snap.u.as_ptr());
         let sv = ShareConst(snap.v.as_ptr());
         rayon::scope(|s| {
+            #[cfg(debug_assertions)]
+            let mut stripe = 0usize;
             for t in 0..threads {
                 let a = j0 + t * chunk;
                 if a > j1 {
                     break;
                 }
                 let b = (a + chunk - 1).min(j1);
+                #[cfg(debug_assertions)]
+                ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
                 s.spawn(move |_| {
                     let u = unsafe { up.slice(un) };
                     let v = unsafe { vp.slice(vn) };
@@ -1499,12 +1511,16 @@ fn force_wind_par(
     let rows = j1 + 1 - j0;
     let chunk = rows.div_ceil(threads);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = j0 + t * chunk;
             if a > j1 {
                 break;
             }
             let b = (a + chunk - 1).min(j1);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
             s.spawn(move |_| {
                 let u = unsafe { up.slice(un) };
                 let v = unsafe { vp.slice(vn) };
@@ -1539,12 +1555,16 @@ fn force_wind_par(
         let su = ShareConst(snap.u.as_ptr());
         let sv = ShareConst(snap.v.as_ptr());
         rayon::scope(|s| {
+            #[cfg(debug_assertions)]
+            let mut stripe = 0usize;
             for t in 0..threads {
                 let a = j0 + t * chunk;
                 if a > j1 {
                     break;
                 }
                 let b = (a + chunk - 1).min(j1);
+                #[cfg(debug_assertions)]
+                ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
                 s.spawn(move |_| {
                     let u = unsafe { up.slice(un) };
                     let v = unsafe { vp.slice(vn) };
@@ -1696,12 +1716,16 @@ fn transport_open_par(
     let rows = j1 + 1 - j0;
     let chunk = rows.div_ceil(threads);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = j0 + t * chunk;
             if a > j1 {
                 break;
             }
             let b = (a + chunk - 1).min(j1);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
             s.spawn(move |_| {
                 let removed = unsafe { removed.slice(n) };
                 let added = unsafe { added.slice(n) };
@@ -1717,12 +1741,16 @@ fn transport_open_par(
     });
     if along_x {
         rayon::scope(|s| {
+            #[cfg(debug_assertions)]
+            let mut stripe = 0usize;
             for t in 0..threads {
                 let a = j0 + t * chunk;
                 if a > j1 {
                     break;
                 }
                 let b = (a + chunk - 1).min(j1);
+                #[cfg(debug_assertions)]
+                ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
                 s.spawn(move |_| {
                     let h = unsafe { depth.slice(hn) };
                     let removed = unsafe { removed.slice(n) };
@@ -1747,12 +1775,16 @@ fn transport_open_par(
         let cthreads = threads.min(cols.max(1));
         let cchunk = cols.div_ceil(cthreads);
         rayon::scope(|s| {
+            #[cfg(debug_assertions)]
+            let mut stripe = 0usize;
             for t in 0..cthreads {
                 let a = i0 + t * cchunk;
                 if a > i1 {
                     break;
                 }
                 let b = (a + cchunk - 1).min(i1);
+                #[cfg(debug_assertions)]
+                ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
                 s.spawn(move |_| {
                     let h = unsafe { depth.slice(hn) };
                     let removed = unsafe { removed.slice(n) };
@@ -1777,12 +1809,16 @@ fn transport_open_par(
     let removed_r = ShareConst(removed.0);
     let added_r = ShareConst(added.0);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = j0 + t * chunk;
             if a > j1 {
                 break;
             }
             let b = (a + chunk - 1).min(j1);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
             s.spawn(move |_| {
                 let h = unsafe { hp.slice(hn) };
                 let removed = unsafe { removed_r.slice(n) };
@@ -1973,19 +2009,41 @@ fn blur_box(
     }
 }
 
-/// Raw pointers shared by row workers. Each worker writes a disjoint row range,
-/// and the scope joins before the buffer is freed.
+/// Raw pointer shared by row or column workers. Each worker writes one stripe.
+/// The scope joins before the buffer is freed.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Copy, Clone)]
 struct ShareMut(*mut f32);
+// SAFETY: workers share this pointer and write the same allocation. That is
+// sound only while their stripes do not overlap. Debug builds check each
+// stripe against the previous one with `ShareMut::debug_assert_stripe` before
+// the spawn. The rayon scope joins before the buffer is dropped.
 #[cfg(not(target_arch = "wasm32"))]
 unsafe impl Send for ShareMut {}
+// SAFETY: same disjoint-stripe invariant as `Send`.
 #[cfg(not(target_arch = "wasm32"))]
 unsafe impl Sync for ShareMut {}
 #[cfg(not(target_arch = "wasm32"))]
 impl ShareMut {
+    /// # Safety
+    ///
+    /// `n` is the length of the live allocation. The slice aliases every other
+    /// slice from this pointer; the caller writes only its own stripe.
     unsafe fn slice<'a>(self, n: usize) -> &'a mut [f32] {
+        // SAFETY: `self.0` covers `n` elements and outlives `'a`.
         unsafe { std::slice::from_raw_parts_mut(self.0, n) }
+    }
+
+    /// `[start, end_excl)` does not overlap the stripe that already ended at
+    /// `prev_excl`. Touching bounds (`prev_excl == start`) are disjoint.
+    #[cfg(debug_assertions)]
+    fn debug_assert_stripe(prev_excl: &mut usize, start: usize, end_excl: usize) {
+        debug_assert!(
+            *prev_excl <= start,
+            "ShareMut thread stripes overlap"
+        );
+        debug_assert!(start <= end_excl, "ShareMut stripe is inverted");
+        *prev_excl = end_excl;
     }
 }
 
@@ -2036,12 +2094,16 @@ fn par_blur_axis(
     let rows = j1 + 1 - j0;
     let chunk = rows.div_ceil(threads);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = j0 + t * chunk;
             if a > j1 {
                 break;
             }
             let b = (a + chunk - 1).min(j1);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
             s.spawn(move |_| {
                 let dst = unsafe { ptr.slice(len) };
                 for j in a..=b {
@@ -2383,12 +2445,16 @@ fn transport_par(
     let threads = rayon::current_num_threads().clamp(1, 4);
     let chunk_n = n.div_ceil(threads);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = t * chunk_n;
             if a >= n {
                 break;
             }
             let b = (a + chunk_n).min(n);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b);
             s.spawn(move |_| {
                 let removed = unsafe { removed.slice(n) };
                 let added = unsafe { added.slice(n) };
@@ -2403,12 +2469,16 @@ fn transport_par(
         let rows = j1 + 1 - j0;
         let chunk = rows.div_ceil(threads);
         rayon::scope(|s| {
+            #[cfg(debug_assertions)]
+            let mut stripe = 0usize;
             for t in 0..threads {
                 let a = j0 + t * chunk;
                 if a > j1 {
                     break;
                 }
                 let b = (a + chunk - 1).min(j1);
+                #[cfg(debug_assertions)]
+                ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
                 s.spawn(move |_| {
                     let h = unsafe { depth.slice(hn) };
                     let speed = unsafe { sp.slice(sn) };
@@ -2445,12 +2515,16 @@ fn transport_par(
         let cthreads = threads.min(cols.max(1));
         let cchunk = cols.div_ceil(cthreads);
         rayon::scope(|s| {
+            #[cfg(debug_assertions)]
+            let mut stripe = 0usize;
             for t in 0..cthreads {
                 let a = i0 + t * cchunk;
                 if a > i1 {
                     break;
                 }
                 let b = (a + cchunk - 1).min(i1);
+                #[cfg(debug_assertions)]
+                ShareMut::debug_assert_stripe(&mut stripe, a, b + 1);
                 s.spawn(move |_| {
                     let h = unsafe { depth.slice(hn) };
                     let speed = unsafe { sp.slice(sn) };
@@ -2486,12 +2560,16 @@ fn transport_par(
     let removed_r = ShareConst(removed.0);
     let added_r = ShareConst(added.0);
     rayon::scope(|s| {
+        #[cfg(debug_assertions)]
+        let mut stripe = 0usize;
         for t in 0..threads {
             let a = t * chunk_n;
             if a >= n {
                 break;
             }
             let b = (a + chunk_n).min(n);
+            #[cfg(debug_assertions)]
+            ShareMut::debug_assert_stripe(&mut stripe, a, b);
             s.spawn(move |_| {
                 let h = unsafe { hp.slice(hn) };
                 let removed = unsafe { removed_r.slice(n) };
