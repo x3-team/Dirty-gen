@@ -50,12 +50,16 @@ jobs:
           Compress-Archive -Path pkg\* -DestinationPath silt-win-demo.zip -Force
 
       - name: Publish GitHub Release
+        env:
+          TAG: demo-win-${{ github.run_number }}-${{ github.sha }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: demo-win-${{ github.run_number }}-${{ github.sha }}
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
           name: Windows Niva demo ${{ github.run_number }}
           body: |
             Playable Windows build from workflow run ${{ github.run_number }}.
+            Built from ref `${{ inputs.git_ref }}` at `${{ github.sha }}`.
             Launch with `silt.exe --win-demo`.
             WASD drive, R reset, mouse orbit, wheel zoom.
           files: silt-win-demo.zip

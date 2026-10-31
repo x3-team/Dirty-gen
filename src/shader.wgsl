@@ -798,6 +798,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         }
     } else if (demo_seam_early && n.y < 0.58) {
         discard;
+    } else if (win_demo_flat_terrain() && demo_seam_early && !win_demo_in_pool(xz) && n.y < 0.68) {
+        discard;
     }
     // The rut keeps the kind the solver wrote. A wet-mud pad on the cover
     // was a flat card in the groove behind the tire.
@@ -1290,7 +1292,12 @@ fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
     if (uv.x < 0.005 || uv.x > 0.995 || uv.y < 0.005 || uv.y > 0.995) {
         return vec3<f32>(0.0);
     }
-    return textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
+    let s = textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
+    // RT holes (sky/clear) must not read as a bright sheet; one UV, no center patch.
+    if (dot(s, vec3<f32>(0.299, 0.587, 0.114)) > 0.52) {
+        return vec3<f32>(0.0);
+    }
+    return s;
 }
 
 // Win-demo pool: one planar UV per fragment (including under the chassis).
@@ -1706,8 +1713,14 @@ fn shade_seam_pool(
     if (win_demo_flat_terrain()) {
         let bow = beauty_bow_wave(xz, t);
         let driven = smoothstep(4.0, 5.5, t);
+        let c = beauty_seam_center();
+        let dx_e = (xz.x - c.x) / 1.32;
+        let dz_e = (xz.y - c.y) / 1.02;
+        let r_e = sqrt(dx_e * dx_e + dz_e * dz_e);
+        let edge_flat = smoothstep(0.62, 1.02, r_e);
         let ripple_mix = clamp(0.12 + max(bow, 0.0) * 3.2 * (0.35 + driven * 0.65), 0.12, 0.58);
-        nrm = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), nrm, ripple_mix));
+        let ripple_use = ripple_mix * (1.0 - edge_flat * 0.92);
+        nrm = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), nrm, ripple_use));
         if (nrm.y < 0.52) {
             discard;
         }
@@ -1726,11 +1739,10 @@ fn shade_seam_pool(
         col = mix(col, vec3<f32>(0.90, 0.94, 0.98), clamp(bow_foam, 0.0, 1.0) * 0.52);
         let halfv = normalize(sun + view);
         let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), 128.0);
-        col += vec3<f32>(0.82, 0.88, 0.96) * sheen * 0.08;
-        let c = beauty_seam_center();
-        let dx = (xz.x - c.x) / 1.32;
-        let dz = (xz.y - c.y) / 1.02;
-        let r = sqrt(dx * dx + dz * dz);
+        col += vec3<f32>(0.82, 0.88, 0.96) * sheen * 0.03;
+        let dx = dx_e;
+        let dz = dz_e;
+        let r = r_e;
         let edge_a = smoothstep(1.26, 0.68, r);
         let core_a = smoothstep(1.05, 0.42, r);
         var alpha = max(edge_a * 0.92, core_a * 0.97);
@@ -2243,9 +2255,12 @@ fn panel_paint(panel: f32, uv: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
 @fragment
 fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     // Planar pool RT: mirrored underbody reads as a white disc under the chassis.
+    let panel_id = i32(in.panel + 0.5);
+    if (pool_reflect_geom_pass() && in.panel > 39.5 && in.panel < 40.5) {
+        discard;
+    }
     if (pool_reflect_geom_pass() && model.extra.x < 1.5 && in.nrm.y > 0.04) {
-        let panel = i32(in.panel + 0.5);
-        let is_glass = panel > 64 && panel < 66;
+        let is_glass = panel_id > 64 && panel_id < 66;
         if (!is_glass) {
             discard;
         }

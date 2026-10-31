@@ -33,6 +33,7 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     {
         console_error_panic_hook::set_once();
+        // Default window: dune buggy + bike lap (C/V/Q/E/R/F).
         run_window(false);
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -47,8 +48,10 @@ fn main() {
         } else if std::env::args().any(|a| a == "--win-demo-smoke") {
             win_demo_smoke();
         } else if win_demo_enabled() {
+            // Windows Niva seam pool (`--win-demo` / SILT_WIN_DEMO=1).
             run_window(true);
         } else {
+            // Default: cc0 buggy and bike on the demo track (C chase, V bike, Q/E/R/F orbit).
             run_window(false);
         }
     }
@@ -1071,7 +1074,7 @@ fn win_demo_pool_surface_y() -> f32 {
     silt::soil::SoilField::win_demo_pool_rim_height(0.22)
 }
 
-const WIN_DEMO_TIRE_SINK: f32 = 0.052;
+const WIN_DEMO_TIRE_SINK: f32 = 0.041;
 
 fn win_demo_hub_on_water(sink: f32) -> f32 {
     use silt::vehicle::WHEEL_RADIUS;
