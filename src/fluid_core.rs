@@ -14,7 +14,7 @@
 //! Terramechanics, support, and μ do not live here. Dust trail and the
 //! solver LOD call this module. They do not keep a second solver.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Wall time of one timed region. Absent on wasm so the solver does not read a clock there.
@@ -400,6 +400,32 @@ impl Scratch {
 
 thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::new());
+    /// Dust layers run together. Each one starts from a zero scratch so the
+    /// pressure halo does not depend on which layer ran last.
+    static ISOLATE_SCRATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+fn park_sheet_scratch() -> Scratch {
+    SCRATCH.with(|sc| sc.replace(Scratch::new()))
+}
+
+fn unpark_sheet_scratch(snap: Scratch) {
+    SCRATCH.with(|sc| {
+        *sc.borrow_mut() = snap;
+    });
+}
+
+struct DustScratchGuard;
+
+impl Drop for DustScratchGuard {
+    fn drop(&mut self) {
+        ISOLATE_SCRATCH.with(|flag| flag.set(false));
+    }
+}
+
+fn dust_scratch_guard() -> DustScratchGuard {
+    ISOLATE_SCRATCH.with(|flag| flag.set(true));
+    DustScratchGuard
 }
 
 /// Viscosity, gate, and bed for one sheet step. Sized to the coarse window
@@ -631,14 +657,7 @@ pub fn advect_dust_density(
     let gu = rel.dot(right);
     let gv = rel.dot(forward);
     let cell = 16.0 / RES as f32;
-    let n = RES * RES;
-    DUST_PLANE.with(|plane| {
-        let mut plane = plane.borrow_mut();
-        plane.fit(n);
-        advect_dust_plane(
-            vol, &mut plane, RES, LAYERS, n, cell, gu, gv, dt,
-        );
-    });
+    advect_dust_volume(vol, RES, LAYERS, cell, gu, gv, dt);
     // The caller books a positive return as settled without a ground cell.
     // Mass stays in `vol` and their slow stride settles it onto the map.
     0.0
@@ -784,40 +803,100 @@ fn step_down2(
     });
 }
 
-fn advect_dust_plane(
+/// Seven live dust layers share the workers. The inner 64² sheet stays on the
+/// worker that owns the layer. The ground-sheet scratch is put back afterwards
+/// so water still sees the buffer it left.
+fn advect_dust_volume(
     vol: &mut [f32],
-    plane: &mut DustPlane,
     res: usize,
     layers: usize,
-    _n: usize,
     cell: f32,
     gu: f32,
     gv: f32,
     dt: f32,
 ) {
+    let parked = park_sheet_scratch();
+    #[cfg(not(target_arch = "wasm32"))]
+    if rayon::current_num_threads() > 1 {
+        advect_dust_layers_par(vol, res, layers, cell, gu, gv, dt);
+        unpark_sheet_scratch(parked);
+        return;
+    }
     for layer in 0..layers {
+        advect_one_dust_layer(vol, layer, res, layers, cell, gu, gv, dt);
+    }
+    unpark_sheet_scratch(parked);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn advect_dust_layers_par(
+    vol: &mut [f32],
+    res: usize,
+    layers: usize,
+    cell: f32,
+    gu: f32,
+    gv: f32,
+    dt: f32,
+) {
+    let n = vol.len();
+    let ptr = ShareMut(vol.as_mut_ptr());
+    rayon::scope(|s| {
+        for layer in 0..layers {
+            s.spawn(move |_| {
+                // Layer `L` writes `ix + L * res + iz * res * layers` only.
+                // Those sets are disjoint, and the scope joins before `vol` ends.
+                let vol = unsafe { ptr.slice(n) };
+                advect_one_dust_layer(vol, layer, res, layers, cell, gu, gv, dt);
+            });
+        }
+    });
+}
+
+fn advect_one_dust_layer(
+    vol: &mut [f32],
+    layer: usize,
+    res: usize,
+    layers: usize,
+    cell: f32,
+    gu: f32,
+    gv: f32,
+    dt: f32,
+) {
+    let _isolate = dust_scratch_guard();
+    let n = res * res;
+    DUST_PLANE.with(|plane| {
+        let mut plane = plane.borrow_mut();
+        plane.fit(n);
+        let DustPlane {
+            h,
+            u,
+            v,
+            bed,
+            nu,
+            gate,
+        } = &mut *plane;
         let mut before = 0.0f64;
         for iz in 0..res {
             for ix in 0..res {
                 let src = ix + layer * res + iz * res * layers;
                 let cell_v = vol[src];
                 let local_x = -8.0 + (ix as f32 + 0.5) * cell;
-                plane.h[iz * res + ix] = cell_v;
-                plane.u[iz * res + ix] = gu;
-                plane.v[iz * res + ix] = gv * dust_stream_hold(local_x);
+                h[iz * res + ix] = cell_v;
+                u[iz * res + ix] = gu;
+                v[iz * res + ix] = gv * dust_stream_hold(local_x);
                 before += cell_v as f64;
             }
         }
         if before <= 0.0 {
-            continue;
+            return;
         }
         step_down2(
-            &mut plane.h,
-            &mut plane.u,
-            &mut plane.v,
-            &plane.bed,
-            &plane.nu,
-            &plane.gate,
+            h,
+            u,
+            v,
+            bed,
+            nu,
+            gate,
             res,
             cell,
             dt,
@@ -829,7 +908,7 @@ fn advect_dust_plane(
             0.0,
             true,
         );
-        let after = plane.h.iter().map(|c| *c as f64).sum::<f64>();
+        let after = h.iter().map(|c| *c as f64).sum::<f64>();
         let scale = if after > 0.0 {
             (before / after) as f32
         } else {
@@ -838,10 +917,10 @@ fn advect_dust_plane(
         for iz in 0..res {
             for ix in 0..res {
                 let src = ix + layer * res + iz * res * layers;
-                vol[src] = plane.h[iz * res + ix] * scale;
+                vol[src] = h[iz * res + ix] * scale;
             }
         }
-    }
+    });
 }
 
 /// Work boxes are `(i0, i1, j0, j1)` inclusive. A solid wet rectangle stays
@@ -1153,6 +1232,16 @@ fn step_sheet_scratch(
     solid: Option<&[u8]>,
     sc: &mut Scratch,
 ) {
+    if ISOLATE_SCRATCH.with(|flag| flag.replace(false)) {
+        sc.fit(res * res);
+        sc.a.fill(0.0);
+        sc.b.fill(0.0);
+        sc.c.fill(0.0);
+        sc.d.fill(0.0);
+        sc.e.fill(0.0);
+        sc.removed.fill(0.0);
+        sc.added.fill(0.0);
+    }
     // A mask does not glue separate tire disks into one rectangle. A single
     // connected sheet still returns the historical halo-3 box.
     // The 2 cm sheet under the tires has no body mask. One CFL pass uses the
@@ -1227,15 +1316,19 @@ fn substep(
     if let Some(mask) = solid {
         lift_solid_surface(&mut sc.a, h, mask, res, i0, i1, j0, j1, eps, &mut sc.e);
     }
-    blur_box(&sc.a, &mut sc.b, &mut sc.e, res, i0, i1, j0, j1, &GAUSS);
-    blur_box(&sc.a, &mut sc.c, &mut sc.e, res, i0, i1, j0, j1, &STEEP);
-    for j in j0..=j1 {
-        for i in i0..=i1 {
-            let idx = j * res + i;
-            let filtered = 0.62 * sc.b[idx] + 0.38 * sc.c[idx];
-            // The filter is the pressure. A share of the raw surface stays in
-            // the force so a broad rut still runs until the free surface is flat.
-            sc.d[idx] = 0.45 * filtered + 0.55 * sc.a[idx];
+    // Open wind never reads this pressure. Gravity and a walled sheet do.
+    let wind_open = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
+    if !wind_open {
+        blur_box(&sc.a, &mut sc.b, &mut sc.e, res, i0, i1, j0, j1, &GAUSS);
+        blur_box(&sc.a, &mut sc.c, &mut sc.e, res, i0, i1, j0, j1, &STEEP);
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                let filtered = 0.62 * sc.b[idx] + 0.38 * sc.c[idx];
+                // The filter is the pressure. A share of the raw surface stays in
+                // the force so a broad rut still runs until the free surface is flat.
+                sc.d[idx] = 0.45 * filtered + 0.55 * sc.a[idx];
+            }
         }
     }
     let p = &sc.d;
