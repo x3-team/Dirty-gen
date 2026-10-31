@@ -60,7 +60,7 @@ Valid: `VALID_GROUND` is set on every publish.
 
 Pore moisture, 0 dry to 1 saturated. Not the film thickness.
 
-Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness.
+Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness. With both, the texel is the greater of the two. That is how a wet tire track painted on the soil stays in this map after the sheet is attached. The sheet keeps its own moisture as well: pore moisture is parked with the ground cell when the window follows the Niva, and a disk raised along the drained track is the same channel.
 
 Valid: `VALID_MOISTURE` is set on every publish.
 
@@ -68,7 +68,7 @@ Valid: `VALID_MOISTURE` is set on every publish.
 
 Thickness of the standing water column and the slurry column, metres. They are separate. Ground height does not include them. The visible top of a wet cell is ground + slurry, with water on that.
 
-Writer: the fluid coarse cell when the sheet is attached (fine patch already restricted). Otherwise the soil `water` and `slurry` arrays. A bow drawn only onto the picture soil is not copied back into the sheet.
+Writer: the fluid coarse cell when the sheet is attached (fine patch already restricted). Otherwise the soil `water` and `slurry` arrays. A bow drawn only onto the picture soil is not copied back into the sheet. Water that drained off the body and the wheels back onto the tire track is this water channel, metres of film, not a second map.
 
 Valid: `VALID_FILM` is set on every publish.
 
@@ -257,3 +257,5 @@ Dry cells and any other non-finite sample are written as 0. Layout unchanged. Fo
 With the dust ledger, `step_vehicle_air` writes the field: the Niva body and wheels inject velocity, vorticity confinement leaves a wake, and wind advects the field. Without the ledger, the samples are the fluid sheet's horizontal dust velocity and a zero vertical channel. The header stays 96 bytes. Debug mode 14 shows air speed.
 
 Filling binding 1 for the puddle rut does not bump this version. G is the tire-force bed drop on wet sand under the Niva, A is the berm placed from that cut, and the film binding carries the water ponded into the groove. Layout unchanged.
+
+The wet tire track does not bump this version either. Binding 2, pore moisture, is the greater of the sheet moisture and the soil wetness, so the track left when the Niva drains is in the moisture map. Binding 3's water channel is the film that drain put back on the sheet. Same channels, same units, same resolution.
