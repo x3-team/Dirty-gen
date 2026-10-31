@@ -57,3 +57,11 @@ fn bc_rut_soft(xz: vec2<f32>) -> vec2<f32> {
 fn bc_foam_soft(xz: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(0.0);
 }
+
+fn bc_snow(xz: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(0.0);
+}
+
+fn bc_soil_mix(xz: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(0.0);
+}
