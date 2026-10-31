@@ -717,8 +717,14 @@ impl Dust {
 
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
+        // `transport_dust` already rebuilt the spans. The air flux is the only
+        // later writer of `vol`, and it runs on `AIR_FLUX_STRIDE`.
+        let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
+        let air_moved = !self.occupied.is_empty() && self.frame % stride == 0;
         self.solve_air(dt);
-        self.rebuild_rows_from_volume();
+        if air_moved {
+            self.rebuild_rows_from_volume();
+        }
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {

@@ -36,7 +36,7 @@ jobs:
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
-          cargo test --test e2e_niva -- --nocapture
+          cargo test --test e2e_niva -- --nocapture --test-threads=1
       - name: Scripted drive
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -47,6 +47,6 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release --test e2e_niva --test frame_bench -- --nocapture
+          cargo test --release -j1 --test e2e_niva --test frame_bench -- --nocapture --test-threads=1
           cargo test --release --test scripted_drive -- --nocapture
           cargo test --release --test turbidity -- --nocapture
