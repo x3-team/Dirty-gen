@@ -880,6 +880,7 @@ fn capture_win_demo_stills() {
     renderer.daylight = true;
     renderer.water_column = true;
     renderer.puddle_beauty = true;
+    renderer.show_mud_particles = false;
     let media = PathBuf::from(MEDIA).join("win-demo");
     std::fs::create_dir_all(&media).expect("win-demo dir");
     let mut frame_world = World::win_demo();
@@ -961,19 +962,20 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
         println!("win demo {}", path.display());
     }
 
+    let pose = win_demo_low_pose(&parked);
+
     let mut drive = World::win_demo();
-    drive.vehicle.pos = Vec3::new(1.15, 0.8, -0.78);
-    drive.vehicle.yaw = -2.58;
+    drive.vehicle.pos = Vec3::new(-1.02, 0.8, -1.52);
+    drive.vehicle.yaw = 0.06;
     let pad = drive.soil.sample(drive.vehicle.pos.x, drive.vehicle.pos.z);
     drive.vehicle.pos.y = pad.height + 0.62;
     let input = Input {
-        throttle: 0.82,
-        steer: -0.04,
+        throttle: 0.78,
+        steer: 0.0,
         ..Input::default()
     };
     renderer.puddle_beauty = false;
     renderer.water_column = false;
-    let pose = win_demo_low_pose(&drive);
     let rgba = renderer
         .draw(&drive, pose, None, true)
         .expect("drive before");
@@ -986,19 +988,36 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     .expect("win demo png");
     println!("win demo {}", media.join("puddle-drive-before.png").display());
 
+    const PUDDLE_X: f32 = -1.05;
+    const PUDDLE_Z: f32 = 0.15;
+    let dt = 1.0 / 60.0;
     let mut drive_mid: Option<Vec<u8>> = None;
-    for i in 0..82 {
-        drive.step(1.0 / 60.0, &input);
-        if i == 54 {
-            drive.time = 8.2;
-            renderer.puddle_beauty = saved_beauty;
-            renderer.water_column = saved_column;
-            drive_mid = renderer.draw(&drive, pose, None, true);
-        }
-    }
-    drive.time = 9.6;
+    let mut best_score = f32::MAX;
+    let mut best_frame: Option<Vec<u8>> = None;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
+    for i in 0..130 {
+        drive.step(dt, &input);
+        let p = drive.vehicle.pos;
+        let dx = p.x - PUDDLE_X;
+        let dz = p.z - PUDDLE_Z;
+        let score = dx * dx + dz * dz;
+        if p.z > -0.35 && p.z < 0.72 && score < best_score {
+            best_score = score;
+            drive.time = 6.4 + i as f32 * 0.11;
+            for w in &mut drive.vehicle.wheels {
+                w.sinkage = w.sinkage.max(0.016);
+                w.omega = w.omega.max(4.5);
+            }
+            drive.particles.clear();
+            best_frame = renderer.draw(&drive, pose, None, true);
+        }
+        if p.z > 0.85 {
+            break;
+        }
+    }
+    drive_mid = best_frame;
+    drive.time = 9.6;
     let rgba = drive_mid.unwrap_or_else(|| {
         renderer
             .draw(&drive, pose, None, true)

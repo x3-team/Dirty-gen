@@ -145,6 +145,8 @@ pub struct Renderer {
     pub water_column: bool,
     /// Win-demo standing puddles: readable depth, sky reflection, tire ripples.
     pub puddle_beauty: bool,
+    /// Slurry drops and dust cards. Off for win-demo stills (water carries splash).
+    pub show_mud_particles: bool,
     /// Paint the snow layer. Compaction in the darken channel tints the blanket.
     pub snow: bool,
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
@@ -1133,6 +1135,7 @@ impl Renderer {
             niva_picture: false,
             water_column: false,
             puddle_beauty: false,
+            show_mud_particles: true,
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
@@ -1339,22 +1342,30 @@ impl Renderer {
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
-        let chunks = mud_chunks_with_ground(&world.particles.items, Some(&world.soil));
-        let chunk_count = chunks.indices.len() as u32;
-        if chunk_count > 0 {
-            self.queue
-                .write_buffer(&self.chunk_v, 0, bytemuck::cast_slice(&chunks.vertices));
-            self.queue
-                .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
-        }
-        let dust = dust_cloud(&world.particles.items);
-        let dust_count = dust.indices.len() as u32;
-        if dust_count > 0 {
-            self.queue
-                .write_buffer(&self.dust_v, 0, bytemuck::cast_slice(&dust.vertices));
-            self.queue
-                .write_buffer(&self.dust_i, 0, bytemuck::cast_slice(&dust.indices));
-        }
+        let (chunk_count, dust_count) = if self.show_mud_particles {
+            let chunks = mud_chunks_with_ground(&world.particles.items, Some(&world.soil));
+            let chunk_count = chunks.indices.len() as u32;
+            if chunk_count > 0 {
+                self.queue.write_buffer(
+                    &self.chunk_v,
+                    0,
+                    bytemuck::cast_slice(&chunks.vertices),
+                );
+                self.queue
+                    .write_buffer(&self.chunk_i, 0, bytemuck::cast_slice(&chunks.indices));
+            }
+            let dust = dust_cloud(&world.particles.items);
+            let dust_count = dust.indices.len() as u32;
+            if dust_count > 0 {
+                self.queue
+                    .write_buffer(&self.dust_v, 0, bytemuck::cast_slice(&dust.vertices));
+                self.queue
+                    .write_buffer(&self.dust_i, 0, bytemuck::cast_slice(&dust.indices));
+            }
+            (chunk_count, dust_count)
+        } else {
+            (0, 0)
+        };
 
         let mut encoder = self
             .device

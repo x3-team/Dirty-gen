@@ -1092,10 +1092,11 @@ fn tire_wake_ripples(xz: vec2<f32>, t: f32) -> f32 {
         if (tire_on < 0.05) {
             continue;
         }
-        let ring = exp(-d * 2.8) * sin(d * 9.0 - t * 7.5 + f32(i) * 0.9);
-        let splash = exp(-d * 4.2) * sin(d * 14.0 - t * 11.0) * 0.012;
-        let amp = select(1.0, 2.15, beauty);
-        sum = sum + (ring * 0.022 + splash) * tire_on * amp;
+        let ring = exp(-d * 2.4) * sin(d * 10.5 - t * 9.0 + f32(i) * 0.9);
+        let splash = exp(-d * 3.6) * sin(d * 16.0 - t * 13.0) * 0.018;
+        let contact = tire_meta.z * 22.0;
+        let amp = select(1.0, 2.2 + contact, beauty);
+        sum = sum + (ring * 0.028 + splash) * tire_on * amp;
     }
     return sum;
 }
@@ -1153,7 +1154,9 @@ fn vs_water(in: TerrIn) -> WaterOut {
     let beauty = puddle_beauty_on();
     let rip_scale = select(1.0, 3.4, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
-    let wake = select(0.0, tire_wake_ripples(in.xz, frame.misc.x), beauty);
+    // Wake ripples stay in the normal on beauty pools; lifting the sheet here
+    // reads as blue spheres under the tires.
+    let wake = select(tire_wake_ripples(in.xz, frame.misc.x), 0.0, beauty);
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
     // cut the tire like a clip plane. The pond stays that blurred surface.
@@ -1217,6 +1220,15 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         discard;
     }
     let column_here = water_column(xz);
+    if (beauty) {
+        for (var ti: u32 = 0u; ti < 4u; ti = ti + 1u) {
+            let slot = ti * 2u;
+            let c = frame.tires[slot].xyz;
+            if (distance(xz, c.xz) < 0.32 && column_here < 0.035) {
+                discard;
+            }
+        }
+    }
     let n = select(ripple_normal(xz, frame.misc.x), puddle_normal(xz, frame.misc.x, column_here), beauty);
     let flat = normalize(vec3<f32>(n.x * 0.8, 1.0, n.z * 0.8));
     // Slope of the low sheet, not of the full column. A full-column normal
