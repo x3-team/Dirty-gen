@@ -6,10 +6,14 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 | --- | --- | --- |
 | Solver frame | ≤ 7 ms | `tests/frame_bench.rs`, `World::demo` at 1/60, release |
 | ThroughDrive solver sum | ≤ 7 ms | `tests/e2e_niva.rs` `DRIVE_SOLVER`, release. Subsystems of `ThroughDrive::step` at dt = 1/30, except the picture |
-| E2e step mean | ≤ 33.004 ms | `tests/e2e_niva.rs`, `dust.step_pads` then `fluid.step` at dt = 1/30, release |
+| E2e step mean | ≤ 11.820 ms | `tests/e2e_niva.rs`, `dust.step_pads` then `fluid.step` at dt = 1/30, release |
+| ThroughDrive dust | ≤ 1.0 ms | `DRIVE_DUST` in that release log |
+| ThroughDrive step p95 | ≤ 7 ms | `DRIVE_P95` in that release log |
 | Air step | ≤ 1.5 ms | same e2e air mean, release. Every build still requires `< 4` ms (`AIR_STEP_BUDGET_MS`) |
 
-33.004 ms is the release CI mean on AMD EPYC 7763, 4 cores (run 41202858950, commit 8a826c5). The log prints that mean and p95; it does not print a sample median. It replaces 37.477 ms, which was a Xeon measurement of 31.231 ms plus 20 percent and left about 12 percent under the CI mean. The cap is not the 7 ms frame budget, and it is not raised when the solver sum is still above 7 ms.
+11.820 ms is 15% over the release CI mean after #100, 10.278 ms on AMD EPYC 9V45, 4 cores (run 41218969837, commit 0cf4957). That is under the mean plus 20% (12.334) and under the previous cap of 33.004 ms, which was the EPYC 7763 mean on run 41202858950. The log prints the mean and p95; it does not print a sample median. The cap is not the 7 ms frame budget.
+
+The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
 
 A pull request that changes the solver prints, in the release CI log, the step count, the mean, p95, the hardware line, and the milliseconds of each subsystem (`DRIVE_*` from `ThroughDrive::step` at dt = 1/30).
 
