@@ -878,15 +878,11 @@ fn capture_beauty_crust(renderer: &mut Renderer, width: u32, height: u32, dir: &
     let path = dir.join("drying-crust.png");
     write_png(&path, width, height, &rgba).expect("still");
     println!("beauty still {}", path.display());
-    // The drying field from the puddle still's low side height and pitch
-    // (lens ~0.75 m up, looking down ~6 degrees), aimed at the field.
+    // The same low side pose as the puddle and the other scene stills.
     renderer.sun_override = Some(beauty_puddle_side_sun(&world));
-    let low = CameraPose {
-        eye: Vec3::new(6.2, 0.76, -2.4),
-        target: Vec3::new(0.8, 0.1, 3.4),
-        ortho_width: None,
-    };
-    let rgba = renderer.draw(&world, low, None, true).expect("readback");
+    let rgba = renderer
+        .draw(&world, beauty_puddle_side_camera(&world), None, true)
+        .expect("readback");
     renderer.sun_override = None;
     let path = dir.join("scene-crust.png");
     write_png(&path, width, height, &rgba).expect("still");

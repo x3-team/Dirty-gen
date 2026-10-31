@@ -1376,13 +1376,43 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Snow is its own layer. sun_dir.w selects it. Compaction is mat.b.
     // The ground albedo stays off so the blanket, the rut, and the berm are the field.
     if (frame.sun_dir.w > 0.5) {
-        let fresh = vec3<f32>(0.79, 0.83, 0.87);
-        let packed = vec3<f32>(0.47, 0.53, 0.60);
+        // Albedo held under ~0.75 so a sunlit face does not clip to a flat
+        // white sheet; the relief reads from the shading and the sky fill
+        // (blue from the HDRI) in the shadows.
+        // The frame's exposure is set for the sand; at snow's true 0.8 every
+        // sunlit face clipped to one white sheet. Held to ~0.5 here.
+        let fresh = vec3<f32>(0.4, 0.425, 0.46);
+        let packed = vec3<f32>(0.27, 0.3, 0.35);
         var albedo = mix(fresh, packed, darken);
-        let grain = noise(xz * 6.5);
-        albedo *= mix(0.93, 1.05, grain);
-        let rough_out = mix(0.96, 0.86, darken);
-        let lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
+        let fw_s = length(fwidth(xz));
+        let grain = mix(0.5, noise(xz * 6.5), 1.0 - smoothstep(0.05, 0.2, fw_s));
+        albedo *= mix(0.94, 1.04, grain);
+        let rough_out = mix(0.92, 0.8, darken);
+        // Cavity AO from the heightfield: the floor of a rut and the foot of
+        // a berm see less sky than the open blanket.
+        var ring = 0.0;
+        for (var k: i32 = 0; k < 8; k = k + 1) {
+            let a = f32(k) * 0.7854;
+            ring += terrain_height(xz + vec2<f32>(cos(a), sin(a)) * 0.35);
+        }
+        let cav = clamp((ring / 8.0 - in.world.y) / 0.07, 0.0, 1.0);
+        let ao_s = 1.0 - 0.6 * cav;
+        // Stronger relief in the shading normal: the berms and the rut walls
+        // are a few cm and vanished under the flat sky light.
+        var n_s = normalize(vec3<f32>(n.x * 1.8, n.y, n.z * 1.8));
+        // Wind-packed surface grain: a material texture in the normal only,
+        // faded where a pixel covers it.
+        let gq_s = xz * 3.0;
+        let gs0 = noise(gq_s) + 0.5 * noise(gq_s * 2.7);
+        let gsx = noise(gq_s + vec2<f32>(0.05, 0.0)) + 0.5 * noise((gq_s + vec2<f32>(0.05, 0.0)) * 2.7) - gs0;
+        let gsz = noise(gq_s + vec2<f32>(0.0, 0.05)) + 0.5 * noise((gq_s + vec2<f32>(0.0, 0.05)) * 2.7) - gs0;
+        n_s = normalize(n_s - vec3<f32>(gsx, 0.0, gsz) * 3.0 * (1.0 - smoothstep(0.03, 0.15, fw_s)));
+        // A cold tint in the shade: what the sun does not reach is lit by
+        // the blue sky only.
+        let sun_d = normalize(frame.sun_dir.xyz);
+        let shade_k = 1.0 - clamp(dot(n_s, sun_d) * 2.0, 0.0, 1.0);
+        albedo *= mix(vec3<f32>(1.0), vec3<f32>(0.86, 0.93, 1.06), shade_k * 0.6 + cav * 0.3);
+        let lit = shade_pbr(in.world, n_s, albedo, rough_out, 0.0, ao_s, vec3<f32>(0.0));
         return present(lit);
     }
 
@@ -1588,7 +1618,10 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     else if (kind == 1u) { wet_rough = 0.55; porosity = 0.3; }
     else if (kind == 2u) { wet_rough = 0.30; porosity = 0.25; }
     else if (kind == 3u) { wet_rough = 0.85; porosity = 0.1; }
-    let damp = smoothstep(0.3, 0.95, wet);
+    // On the beauty sand the published moisture sits near 0.75 over metres
+    // round the pool; read as damp it flattened and glossed all that sand
+    // into a grey halo. Sand only looks wet near saturation.
+    let damp = select(smoothstep(0.3, 0.95, wet), smoothstep(0.9, 0.99, wet), sand_field());
     // A film collects in the low half of the grain first.
     let hollow = 1.0 - smoothstep(0.3, 0.62, pack.b);
     var film = clamp(smoothstep(0.86, 1.0, wet) * hollow + shore * 0.6, 0.0, 1.0)
@@ -1675,11 +1708,11 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let wet_lum = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
         // Wet sand at ~0.5 of the dry albedo, a little more saturated; under
         // the film a shade lighter, so the shallows show a sandy bed.
-        let film_in = smoothstep(0.0005, 0.003, film_t);
+        let film_in = smoothstep(0.0, 0.0008, film_t);
         // Same grain, darker: wet sand at ~0.55 of the dry albedo, barely
         // more saturated, no brown cast (the old multiplier read as murk).
         let wet_col = max(mix(vec3<f32>(wet_lum), albedo, mix(1.05, 1.06, film_in)), vec3<f32>(0.0))
-            * mix(vec3<f32>(0.57, 0.55, 0.52), vec3<f32>(0.8, 0.77, 0.71), film_in);
+            * mix(vec3<f32>(0.57, 0.55, 0.52), vec3<f32>(0.87, 0.85, 0.8), film_in);
         albedo = mix(albedo, wet_col, soak);
         // A thin pale line of dried silt right where the film runs out, on
         // the land side only, broken along its length.
@@ -1794,6 +1827,16 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         let tide = smoothstep(0.55, 0.85, edge_c * (0.5 + wob)) * (1.0 - band * 0.5) * dry_side;
         albedo = mix(albedo, albedo * 1.1 + vec3<f32>(0.01, 0.009, 0.007), tide * 0.2);
     }
+    // The airborne plume (b6) shades the ground under it: optical depth
+    // toward the sun through the published volume, as a soft darkening.
+    if (bc_inside(xz) > 0.0) {
+        let sun_g = normalize(frame.sun_dir.xyz);
+        var od_g = 0.0;
+        for (var j: i32 = 0; j < 6; j = j + 1) {
+            od_g += bc_fog_at(in.world + sun_g * (0.2 + f32(j) * 0.5)) * 0.5;
+        }
+        albedo *= mix(1.0, 0.72, 1.0 - exp(-od_g * 60000.0 * 0.45));
+    }
     // Settled dust, metres. A tenth of a millimetre greys the soil, a couple
     // of millimetres hide it. Dust is matte and fills the grain.
     let dust_m = bc_dust_settled(xz);
@@ -1840,8 +1883,24 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
         emit = albedo * frame.sun_color.rgb * caustic * (sun_k + edge * 0.8) * 2.4;
     }
     if (frame.debug.x > 8.5) {
-        // 9: soil kind 10 (r), film 0-2 cm (g), albedo luminance (b).
-        return vec4<f32>(select(0.0, 1.0, kind == 10u), clamp((film_c.r + film_c.g) * 50.0, 0.0, 1.0), dot(albedo, vec3<f32>(0.33)), 1.0);
+        // 9: published moisture (r), film > 0 (g), the spread wet term (b).
+        return vec4<f32>(bc_moisture(xz, 0.0), select(0.0, 1.0, film_c.r + film_c.g > 0.0005), wet, 1.0);
+    }
+    // Mud on the sand until soil_mix exists: where the contract publishes
+    // slurry, or the pore moisture is saturated in a tire cut, the sand is
+    // a dark glossy slurry. Read from binding 3 G, binding 2 and binding 1 G.
+    if (sand_field() && bc_inside(xz) > 0.0) {
+        let fc_m = bc_film(xz);
+        let cut_m = bc_rut_soft(xz).x;
+        let mud_k = max(smoothstep(0.0003, 0.003, fc_m.g),
+            smoothstep(0.95, 0.995, bc_moisture(xz, 0.0)) * smoothstep(0.004, 0.02, cut_m)) * bc_inside(xz);
+        if (mud_k > 0.0) {
+            let lum_m = dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
+            let slurry_col = vec3<f32>(0.2, 0.15, 0.1) * (0.75 + 0.5 * lum_m);
+            albedo = mix(albedo, slurry_col, mud_k);
+            rough_out = mix(rough_out, 0.18, mud_k);
+            n = normalize(mix(n, n_geo, mud_k * 0.7));
+        }
     }
     // ---- Requested contract fields (docs/beauty/CONTRACT_REQUESTS.md). Dark
     // until the solver publishes them: both readers return 0 today.
@@ -2319,7 +2378,12 @@ fn vs_water(in: TerrIn) -> WaterOut {
         let thick = film.r + film.g;
         let lift = 0.0;
         let ground_c = bc_ground_soft(in.xz, local);
-        let y_c = ground_c + thick + rip * smoothstep(0.01, 0.04, thick) * 0.6 + lift;
+        // Level water stays level: ground and film through one filter, and
+        // never above the ground plus the unblurred film, so the blurred film
+        // does not climb the rut banks as a rounded tube.
+        let raw_f = bc_film(in.xz);
+        let y_lvl = min(bc_surface_soft(in.xz), ground_c + raw_f.r + raw_f.g);
+        let y_c = y_lvl + rip * smoothstep(0.01, 0.04, thick) * 0.6 + lift;
         y = mix(y, y_c, inside);
         d_out = mix(d_out, thick, inside);
         // Round a tire standing in the sheet, the drawn surface settles to the
@@ -2363,12 +2427,10 @@ fn ssr_view_depth(p: vec3<f32>) -> f32 {
 fn ssr_surface_normal(xz: vec2<f32>, column_c: f32, depth: f32) -> vec3<f32> {
     let n = ripple_normal(xz, frame.misc.x);
     let dc = 0.2;
-    let s0 = bc_ground_soft(xz, height_bilinear(xz)) + column_c;
-    let f_x = bc_film_soft(xz + vec2<f32>(dc, 0.0));
-    let f_z = bc_film_soft(xz + vec2<f32>(0.0, dc));
-    let sx = bc_ground_soft(xz + vec2<f32>(dc, 0.0), height_bilinear(xz + vec2<f32>(dc, 0.0))) + f_x.r + f_x.g;
-    let sz = bc_ground_soft(xz + vec2<f32>(0.0, dc), height_bilinear(xz + vec2<f32>(0.0, dc))) + f_z.r + f_z.g;
-    let c_n = normalize(vec3<f32>(-(sx - s0) / dc * 1.6, 1.0, -(sz - s0) / dc * 1.6));
+    let s0 = bc_surface_soft(xz);
+    let sx = bc_surface_soft(xz + vec2<f32>(dc, 0.0));
+    let sz = bc_surface_soft(xz + vec2<f32>(0.0, dc));
+    let c_n = normalize(vec3<f32>(-(sx - s0) / dc, 1.0, -(sz - s0) / dc));
     var nrm = normalize(c_n + vec3<f32>(n.x * 0.8, 0.0, n.z * 0.8));
     let t_now = frame.misc.x;
     let wv = frame.air[0].xz;
@@ -2405,7 +2467,7 @@ fn fs_water_ssr(in: WaterOut) -> SsrOut {
     if (inside < 0.5) {
         discard;
     }
-    let film_c = bc_film_soft(xz);
+    let film_c = bc_film(xz);
     let column_c = film_c.r + film_c.g;
     if (column_c < 0.003) {
         discard;
@@ -2516,7 +2578,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         || -stamp_bilinear(xz - ez) > 0.02;
     let free = frame.misc.w > 0.5 && in.depth > 0.04;
     let inside = bc_inside(xz);
-    let film_c = bc_film_soft(xz);
+    // The mask is the published depth itself (bilinear), not the blurred
+    // copy: the blur spread the sheet over the rut banks.
+    let film_c = bc_film(xz);
     var column_c = film_c.r + film_c.g;
     // Under and right round a tire the film map has a hole where the rubber
     // displaces the water; the sheet there stands at the solved level.
@@ -2566,13 +2630,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // and slurry thickness, metres. Outside it, the picture cache. The
     // surface is ground plus film, so a wave in the film tilts the normal.
     if (inside > 0.0) {
+        // Ground and film through one filter: two different kernels bent
+        // the level water in a narrow rut into a tube.
         let dc = 0.2;
-        let s0 = bc_ground_soft(xz, height_bilinear(xz)) + column_c;
-        let f_x = bc_film_soft(xz + vec2<f32>(dc, 0.0));
-        let f_z = bc_film_soft(xz + vec2<f32>(0.0, dc));
-        let sx = bc_ground_soft(xz + vec2<f32>(dc, 0.0), height_bilinear(xz + vec2<f32>(dc, 0.0))) + f_x.r + f_x.g;
-        let sz = bc_ground_soft(xz + vec2<f32>(0.0, dc), height_bilinear(xz + vec2<f32>(0.0, dc))) + f_z.r + f_z.g;
-        let c_n = normalize(vec3<f32>(-(sx - s0) / dc * 1.6, 1.0, -(sz - s0) / dc * 1.6));
+        let s0 = bc_surface_soft(xz);
+        let sx = bc_surface_soft(xz + vec2<f32>(dc, 0.0));
+        let sz = bc_surface_soft(xz + vec2<f32>(0.0, dc));
+        let c_n = normalize(vec3<f32>(-(sx - s0) / dc, 1.0, -(sz - s0) / dc));
         let c_n2 = normalize(c_n + vec3<f32>(n.x * 0.8, 0.0, n.z * 0.8));
         // select, not mix: the picture-cache slope can be NaN on the
         // through-drive field, and mix carries a NaN through a zero weight.
@@ -2777,8 +2841,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // millimetres of film at the edge thin it out.
     let fres = min((0.02 * w_ab.x + w_ab.y) * mix(1.0, 1.6, far_k), 0.95) * (1.0 - 0.6 * collar_t)
         * mix(0.25, 1.0, smoothstep(0.003, 0.012, depth))
-        // The near shallows are looked into: the sky film greyed the sand.
-        * mix(0.6, 1.0, far_k);
+        // The near shallows are looked into: the sky film greyed the sand,
+        // and a few cm in a rut read as a lilac tube.
+        * mix(0.6 * mix(0.45, 1.0, smoothstep(0.02, 0.08, depth)), 1.0, far_k);
     let refl_dir = reflect(-view, nrm);
     // The sky the water mirrors is the sky drawn behind it, at full radiance.
     // Same grade as the backdrop sky, so the mirror is not brighter than
@@ -2909,7 +2974,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // The body and the tires hide the sky from the water under them too.
     let w_ao = niva_ground_ao(in.world);
     // Under the body the sheet sees no sky: dark, and opaque enough to show it.
-    alpha = max(alpha, (1.0 - w_ao) * 0.75 * smoothstep(0.006, 0.03, depth));
+    alpha = max(alpha, (1.0 - w_ao) * 0.4 * smoothstep(0.01, 0.05, depth));
     // The silt surface round a tire still catches the sky: keep it lighter
     // than the rubber so the waterline reads. The bed below takes the full AO.
     var lit = (body * max(opacity, 1.0 - w_ao) * (1.0 - fres) + refl * fres) * w_ao / max(alpha, 1e-3) + sun_spec;
@@ -3021,8 +3086,13 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // thins over the last centimetre of view path in front of the tire, so
     // the waterline is a filtered line, not the pixel steps of two meshes.
     // The waterline at the rubber is the depth-diff fade alone, everywhere.
-    let soft_tire = smoothstep(0.0, 0.012, view_path);
-    let a_out = clamp(alpha, 0.0, 1.0) * smoothstep(edge_t, 0.0055, depth) * soft_tire;
+    // The sheet fades out where it meets anything standing in it: the
+    // rubber, and the bank where the terrain mesh cuts the surface (that
+    // cut was a hard black plate under the tire). The depth threshold is
+    // widened by fwidth so it stays a couple of pixels soft at any range.
+    let soft_tire = smoothstep(0.0, 0.05, view_path);
+    let d_fw = max(fwidth(depth), 1e-5);
+    let a_out = clamp(alpha, 0.0, 1.0) * smoothstep(edge_t - d_fw, 0.0055 + 2.0 * d_fw, depth) * soft_tire;
     // Beer-Lambert per channel on the bed seen through the water: the red
     // goes first, so shallow stays the sand's warm colour and the deeper
     // middle turns teal.
