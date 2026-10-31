@@ -713,7 +713,10 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     renderer.sand_field = true;
     // SILT_DEBUG_DEPTH=1: water coloured by depth, tire bottoms and
     // waterlines marked on the rubber.
-    renderer.debug_depth = std::env::var_os("SILT_DEBUG_DEPTH").is_some();
+    renderer.debug_depth = std::env::var("SILT_DEBUG_DEPTH")
+        .ok()
+        .map(|v| v.parse().unwrap_or(1.0))
+        .unwrap_or(0.0);
     // SILT_BEAUTY_FOG=1: the same drive through morning ground fog, under the
     // low sun with the headlamps on. The fog is picture only; the dust is the
     // published grid. Stills and video get a `fog-` prefix.

@@ -168,7 +168,7 @@ pub struct Renderer {
     /// day or dusk sun.
     pub sun_override: Option<Vec3>,
     /// Depth debug: water coloured by depth, tire bottoms marked.
-    pub debug_depth: bool,
+    pub debug_depth: f32,
     tire_water: [f32; 4],
     pub wind: Vec3,
     pub show_props: bool,
@@ -1360,7 +1360,7 @@ impl Renderer {
             fog: 0.0,
             fog_height: 1.4,
             sun_override: None,
-            debug_depth: false,
+            debug_depth: 0.0,
             tire_water: [-1000.0; 4],
             wind: Vec3::new(1.1, 0.0, -0.65),
             show_props: true,
@@ -1701,7 +1701,7 @@ impl Renderer {
                 Mat4::from_translation(Vec3::new(9.0, 9.0, 0.0)).to_cols_array_2d()
             },
             tire_water: self.tire_water,
-            debug: [if self.debug_depth { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            debug: [self.debug_depth, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
