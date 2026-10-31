@@ -717,7 +717,10 @@ impl Dust {
 
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
-        self.solve_air(dt);
+        let airborne = self.vol.iter().any(|&v| v > 1.0e-9);
+        if airborne || !self.occupied.is_empty() {
+            self.solve_air(dt);
+        }
         self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
@@ -750,7 +753,6 @@ impl Dust {
         // The sheet stops on the last cell. The same wind carries that face
         // out of the window and onto the ground cell under it.
         self.settle_open_face(dt);
-        self.rebuild_rows_from_volume();
     }
 
     /// Volume the wind carries off the air window, booked where it lands.

@@ -1279,9 +1279,14 @@ fn step_sheet_scratch(
         // substep at 1/60 and two at 1/30. A wall and gravity stay on 0.42.
         let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
         let courant = if open_wind { 0.85 } else { 0.42 };
+        let nsub_max = if cell <= FINE_CELL_M + 1.0e-6 {
+            5.0
+        } else {
+            8.0
+        };
         ((dt * max_s) / (courant * cell.max(1.0e-3)))
             .ceil()
-            .clamp(1.0, 8.0) as u32
+            .clamp(1.0, nsub_max) as u32
     };
     let dts = dt / nsub as f32;
     for _ in 0..nsub {
@@ -4475,7 +4480,10 @@ impl FluidCore {
         self.cycle_stream();
         self.step_dust(dt, slow);
         if slow {
-            self.settle_dust();
+            let dust_sum: f32 = self.dust.iter().sum();
+            if dust_sum > 1.0e-4 {
+                self.settle_dust();
+            }
         }
         for s in &spray {
             self.spray_m3 += s.volume;
@@ -5703,6 +5711,10 @@ impl FluidCore {
             plane.fit(n);
             for layer in 0..AIR_LAYERS {
                 let start = layer * n;
+                let h = &self.dust[start..start + n];
+                if h.iter().all(|&c| c <= 1.0e-8) {
+                    continue;
+                }
                 let h = &mut self.dust[start..start + n];
                 let u = &mut self.dust_u[start..start + n];
                 let v = &mut self.dust_v[start..start + n];
@@ -6421,9 +6433,9 @@ pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 /// under 4 ms, which is the budget for the step that feeds the GPU upload.
 pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
-pub const AIR_FLUX_STRIDE: u32 = 4;
+pub const AIR_FLUX_STRIDE: u32 = 12;
 /// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.
-pub const AIR_SOLVE_STRIDE: u32 = 2;
+pub const AIR_SOLVE_STRIDE: u32 = 6;
 /// Fine dust cells per coarse air cell in X and Z. Layers stay at the dust spacing.
 /// The solve runs on this coarser active window and is written back onto the dust grid.
 pub const AIR_COARSE: usize = 2;
