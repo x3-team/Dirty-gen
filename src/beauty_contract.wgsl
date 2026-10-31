@@ -43,6 +43,16 @@ struct BcHeader {
 @group(4) @binding(7) var bc_crust_tex: texture_2d<f32>;
 @group(4) @binding(8) var bc_wet_edge_tex: texture_2d<f32>;
 @group(4) @binding(9) var bc_foam_crest_tex: texture_2d<f32>;
+// Spray pieces (binding 10), SprayGpu x 4096, live count in the header.
+struct BcSpray {
+    pos_mass: vec4<f32>,
+    vel_age: vec4<f32>,
+    material: u32,
+    alive: u32,
+    pad0: u32,
+    pad1: u32,
+}
+@group(4) @binding(10) var<storage, read> bc_spray: array<BcSpray>;
 // Air velocity, m/s, same origin and cell as dust_fog (contract v2).
 @group(4) @binding(11) var bc_air_tex: texture_3d<f32>;
 
@@ -671,4 +681,42 @@ fn bc_surface_soft(xz: vec2<f32>) -> f32 {
         }
     }
     return acc / 16.0;
+}
+
+const BC_VALID_SPRAY: u32 = 512u; // 1 << 9, binding 10
+
+// Rings where the published water drops (spray materials 0, 4, 9) meet the
+// sheet: a drop at or just under the surface level `surf` is an impact, its
+// age the time since it crossed the level. Cauchy-Poisson rings after
+// Ultra-Water's impactWaves: k = g t^2 / (4 r^2), splash radius L, band
+// limited by the pixel (k_max). Returns the slope (dh/dx, dh/dz).
+fn bc_drop_rings(xz: vec2<f32>, surf: f32, k_max: f32) -> vec2<f32> {
+    if (!bc_has(BC_VALID_SPRAY)) {
+        return vec2<f32>(0.0);
+    }
+    let n = min(bc_header.spray_count, 512u);
+    var g = vec2<f32>(0.0);
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+        let s = bc_spray[i];
+        if (s.alive == 0u || !(s.material == 0u || s.material == 4u || s.material == 9u)) {
+            continue;
+        }
+        let dy = s.pos_mass.y - surf;
+        let vy = s.vel_age.y;
+        if (dy > 0.03 || vy > 0.0) {
+            continue;
+        }
+        let dv = xz - s.pos_mass.xz;
+        let r = length(dv) + 1e-3;
+        if (r > 0.6) {
+            continue;
+        }
+        let age = 0.08 + max(-dy, 0.0) / max(-vy, 0.5);
+        let l = 0.015;
+        let k = 9.81 * age * age / (4.0 * r * r);
+        let kl2 = k * k * l * l;
+        let amp = 0.0015 * 2.72 * kl2 * exp(-kl2 - k * k / (k_max * k_max) - 0.12 * age) * l / (l + r);
+        g += dv / r * (amp * k * sin(k * r));
+    }
+    return g;
 }

@@ -81,3 +81,7 @@ fn bc_turbidity(xz: vec2<f32>) -> f32 {
 fn bc_fog_water(p: vec3<f32>) -> f32 {
     return 0.0;
 }
+
+fn bc_drop_rings(xz: vec2<f32>, surf: f32, k_max: f32) -> vec2<f32> {
+    return vec2<f32>(0.0);
+}

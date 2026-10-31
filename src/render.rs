@@ -101,6 +101,11 @@ pub struct Renderer {
     /// shadow pass only.
     frame_near_buf: wgpu::Buffer,
     frame_near_bg: wgpu::BindGroup,
+    /// The frame mirrored about the pool's water level, for the planar
+    /// reflection of the Niva (wgpu water example / Ultra-Water).
+    frame_refl_buf: wgpu::Buffer,
+    frame_refl_bg: wgpu::BindGroup,
+    planar: Planar,
     env_tex: wgpu::Texture,
     env_sh: [[f32; 4]; 9],
     env_from_file: bool,
@@ -572,6 +577,30 @@ impl Renderer {
                 },
             ],
         });
+        let frame_refl_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame-refl"),
+            size: std::mem::size_of::<FrameData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_refl_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame-refl-bg"),
+            layout: &frame_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_refl_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&env_samp),
+                },
+            ],
+        });
         let model_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model-bg"),
             layout: &model_bgl,
@@ -936,6 +965,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Planar reflection of the Niva about the water level.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let water_groups: Vec<&wgpu::BindGroupLayout> = match &contract {
@@ -972,6 +1012,7 @@ impl Renderer {
         let (fog_half_view, fog_up_bg) = make_fog_half(&device, &fog_up_bgl, width, height);
         let (air_noise_view, air_samp) = make_air_noise(&device, &queue);
         let ssr = make_ssr(&device, width, height);
+        let planar = make_planar(&device, width, height, formats.depth);
         let post_bg = make_post_bg(
             &device,
             &post_bgl,
@@ -981,6 +1022,7 @@ impl Renderer {
             &air_samp,
             &ssr.a_view,
             &ssr.b_view,
+            &planar.view,
         );
         let post_bg_ssr = make_post_bg(
             &device,
@@ -991,6 +1033,7 @@ impl Renderer {
             &air_samp,
             &ssr.hist_a_view,
             &ssr.hist_b_view,
+            &planar.view,
         );
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
@@ -1418,6 +1461,9 @@ impl Renderer {
             frame_bg,
             frame_near_buf,
             frame_near_bg,
+            frame_refl_buf,
+            frame_refl_bg,
+            planar,
             env_tex,
             env_sh: [[0.0; 4]; 9],
             env_from_file: false,
@@ -1583,6 +1629,7 @@ impl Renderer {
         self.scene_copy = scene_copy;
         self.scene_copy_view = scene_copy_view;
         self.ssr = make_ssr(&self.device, width, height);
+        self.planar = make_planar(&self.device, width, height, self.depth_format);
         self.ssr_hist_valid = 0.0;
         self.post_bg = make_post_bg(
             &self.device,
@@ -1593,6 +1640,7 @@ impl Renderer {
             &self.air_samp,
             &self.ssr.a_view,
             &self.ssr.b_view,
+            &self.planar.view,
         );
         self.post_bg_ssr = make_post_bg(
             &self.device,
@@ -1603,6 +1651,7 @@ impl Renderer {
             &self.air_samp,
             &self.ssr.hist_a_view,
             &self.ssr.hist_b_view,
+            &self.planar.view,
         );
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
@@ -1880,6 +1929,24 @@ impl Renderer {
         frame_near.light_vp = frame.light_vp_near;
         self.queue
             .write_buffer(&self.frame_near_buf, 0, bytemuck::bytes_of(&frame_near));
+        // Planar reflection about the water level the tires stand in (the
+        // solved sheet's level, tire_waterlines). No standing water: no pass.
+        let levels: Vec<f32> = self.tire_water.iter().copied().filter(|w| *w > -100.0).collect();
+        let refl_level = (!levels.is_empty() && std::env::var_os("SILT_NO_PLANAR").is_none())
+            .then(|| levels.iter().sum::<f32>() / levels.len() as f32);
+        if let Some(h) = refl_level {
+            let mirror = Mat4::from_translation(Vec3::new(0.0, h, 0.0))
+                * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+                * Mat4::from_translation(Vec3::new(0.0, -h, 0.0));
+            let mut frame_refl = frame;
+            let vp_r = view_proj * mirror;
+            frame_refl.view_proj = vp_r.to_cols_array_2d();
+            frame_refl.inv_view_proj = vp_r.inverse().to_cols_array_2d();
+            frame_refl.cam_pos = vec4(Vec3::new(cam.eye.x, 2.0 * h - cam.eye.y, cam.eye.z), 1.0);
+            frame_refl.debug = [frame.debug[0], 1.0, h, 0.0];
+            self.queue
+                .write_buffer(&self.frame_refl_buf, 0, bytemuck::bytes_of(&frame_refl));
+        }
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
@@ -2017,6 +2084,37 @@ impl Renderer {
             self.draw_vehicle(&mut pass);
         }
 
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("planar"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.planar.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.planar.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if refl_level.is_some() {
+                pass.set_bind_group(0, &self.frame_refl_bg, &[]);
+                pass.set_bind_group(1, &self.tex_bg, &[]);
+                pass.set_bind_group(3, &self.paint_bg, &[]);
+                // The mirror flips the winding: draw both faces.
+                pass.set_pipeline(&self.pipe_mesh_double);
+                self.draw_vehicle(&mut pass);
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -3669,6 +3767,7 @@ fn make_post_bg(
     air_samp: &wgpu::Sampler,
     ssr_a: &wgpu::TextureView,
     ssr_b: &wgpu::TextureView,
+    planar: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("post"),
@@ -3698,8 +3797,51 @@ fn make_post_bg(
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(ssr_b),
             },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(planar),
+            },
         ],
     })
+}
+
+/// Target for the planar reflection: the Niva drawn mirrored about the
+/// water level, same format as the frame so the mesh pipelines draw into it.
+struct Planar {
+    view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+}
+
+fn make_planar(device: &wgpu::Device, width: u32, height: u32, depth_format: wgpu::TextureFormat) -> Planar {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("planar"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("planar-depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: depth_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    Planar {
+        view: color.create_view(&Default::default()),
+        depth_view: depth.create_view(&Default::default()),
+    }
 }
 
 /// Half-resolution screen-space reflection of the water: the traced

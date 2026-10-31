@@ -80,6 +80,9 @@ struct Model {
 // B: x = view depth, y/z = normal xz, w = 1 where the sheet was traced.
 @group(2) @binding(5) var ssr_a_tex: texture_2d<f32>;
 @group(2) @binding(6) var ssr_b_tex: texture_2d<f32>;
+// The Niva mirrored about the water level (planar reflection, render.rs),
+// alpha 0 where nothing was drawn.
+@group(2) @binding(7) var planar_tex: texture_2d<f32>;
 
 @group(1) @binding(0) var height_tex: texture_2d<f32>;
 @group(1) @binding(1) var mat_tex: texture_2d<f32>;
@@ -2712,6 +2715,10 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Faded where a pixel spans the chop: at the grazing view it aliased into
     // bright speckles round the tires.
     nrm = normalize(nrm + wheel_ripples(xz, in.world.y, t_now) * calm_or_film(depth) * (1.0 - smoothstep(0.003, 0.01, w_fw)));
+    // Rings where the published drops land (Ultra-Water's impact rings on
+    // the contract spray buffer), band-limited to the pixel.
+    let drop_g = bc_drop_rings(xz, in.world.y, 2.0 / max(w_fw, 1e-3));
+    nrm = normalize(nrm - vec3<f32>(drop_g.x, 0.0, drop_g.y) * smoothstep(0.003, 0.006, depth));
     // Running water combs into streaks along the current.
     if (speed > 0.05) {
         let along = flow / speed;
@@ -2847,6 +2854,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         // The near shallows are looked into: the sky film greyed the sand,
         // and a few cm in a rut read as a lilac tube.
         * mix(0.6 * mix(0.45, 1.0, smoothstep(0.02, 0.08, depth)), 1.0, far_k);
+    // Ultra-Water's Fresnel for what the screen trace finds (the Niva):
+    // Schlick with a roughness-aware F90 (Lagarde), no damping for the near
+    // shallows, so the body mirrors in the sheet in front of it.
+    let f90 = max(1.0 - 0.7 * sqrt(w_rough * w_rough), 0.02);
+    let f_uw = (0.02 + (f90 - 0.02) * pow(1.0 - ndv, 5.0)) * (1.0 - 0.6 * collar_t);
     let refl_dir = reflect(-view, nrm);
     // The sky the water mirrors is the sky drawn behind it, at full radiance.
     // Same grade as the backdrop sky, so the mirror is not brighter than
@@ -2951,7 +2963,12 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         * smoothstep(0.003, 0.008, nmax - depth) * (1.0 - smoothstep(0.0008, 0.002, nmin)) * inside;
     let torn = smoothstep(0.3, 0.55, noise(xz * 14.0 + vec2<f32>(t_now * 0.2, 0.0)) * 0.7 + noise(xz * 41.0) * 0.3);
     let shore = max(shore_band * (1.0 - smoothstep(0.008, 0.016, depth)) * clumps, edge_line * torn);
-    let foam_amt = clamp(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), max(shore * (1.0 - near_tire) * 0.25, 0.0)), 0.0, 1.0);
+    // Contact foam at the waterline (Ultra-Water): where the published depth
+    // runs out against the bank, but only where the contract says the water
+    // is working there (published foam or flow), so a still pool has none.
+    let uw_contact = (1.0 - smoothstep(0.003, 0.012, depth)) * smoothstep(0.003, 0.008, nmax - depth)
+        * max(fc.r, smoothstep(0.05, 0.35, speed)) * torn;
+    let foam_amt = clamp(max(max(max(max(fc.r, crest_lace), max(max(churn, race), wake)), max(shore * (1.0 - near_tire) * 0.25, 0.0)), uw_contact * 0.9), 0.0, 1.0);
     // Foam is a net of bubble walls, not a blotch: cell borders of a
     // drifting Voronoi, gated by the lace.
     let bubbles = 1.0 - smoothstep(0.0, 0.12, cell_border(lace_p * 2.2));
@@ -3017,13 +3034,28 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     // Half-res trace, accumulated over frames, upscaled by depth and
     // normal and blurred by the ripple roughness. Where it found nothing the
     // weight is low and the env (IBL) reflection already in out_rgb stays.
-    let ssr = ssr_upsample(in.clip.xy, ssr_view_depth(in.world), nrm, w_rough);
+    let ssr0 = ssr_upsample(in.clip.xy, ssr_view_depth(in.world), nrm, w_rough);
+    // Planar reflection of the Niva (wgpu water example, Ultra-Water): the
+    // mirrored body at this pixel, shifted by the ripple slope and smeared
+    // toward and away from the lens by the roughness.
+    let pl_dims = vec2<f32>(textureDimensions(planar_tex));
+    var pl = vec4<f32>(0.0);
+    for (var k: i32 = -2; k <= 2; k = k + 1) {
+        let off = vec2<f32>(nrm.x, nrm.z) * 0.02 * vec2<f32>(1.0, 0.6)
+            + vec2<f32>(0.0, f32(k) * (1.0 + w_rough * 40.0)) / pl_dims;
+        let puv_p = clamp(in.clip.xy / pl_dims + off, vec2<f32>(0.0), vec2<f32>(1.0));
+        pl += textureSampleLevel(planar_tex, air_samp, puv_p, 0.0) * (3.0 - abs(f32(k)));
+    }
+    pl /= 9.0;
+    // The planar image wins where it has the body; the screen trace keeps
+    // the rest (the bank, the far scene).
+    let pl_rgb = pl.rgb / max(pl.a, 1e-3);
+    let ssr = vec4<f32>(mix(ssr0.rgb, pl_rgb, pl.a), max(ssr0.a * (1.0 - pl.a), pl.a));
     if (ssr.a > 0.0) {
         // Near the Niva the sheet mirrors the sills, body and tires with its
         // Fresnel weight, blurred by the stretched rays; elsewhere a trace.
         let near_car = 1.0 - smoothstep(0.4, 2.2, max(length(xz - frame.air[1].xz) - 1.2, 0.0));
-        let k = ssr.a * (1.0 - foam) * calm_or_film(depth)
-            * min(fres * mix(1.0, 1.25, near_car), 0.7);
+        let k = ssr.a * (1.0 - foam) * smoothstep(0.003, 0.006, depth) * min(f_uw, 0.85);
         out_rgb = mix(out_rgb, ssr.rgb * 0.92 * mix(1.0, w_ao, 0.35), clamp(k / max(alpha, 0.05), 0.0, 1.0));
         alpha = max(alpha, k);
     }
@@ -3138,8 +3170,14 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         let line = 1.0 - smoothstep(0.5, 1.5, cm);
         return vec4<f32>(mix(dst * 0.7 + ramp * 0.3, vec3<f32>(0.0), line * 0.6), 1.0);
     }
+    // The Niva's mirror image also lies in the thin edge of the sheet,
+    // where the water itself has faded out (3-5.5 mm of published film):
+    // only the trace's hits, at Ultra-Water's Fresnel, no sky sheen.
+    let thin_k = smoothstep(0.003, 0.004, depth) * (1.0 - clamp(a_out, 0.0, 1.0)) * soft_tire * (1.0 - foam);
+    let sheen = clamp(ssr.a * min(f_uw, 0.85) * thin_k, 0.0, 0.85);
     // The bed under the car sees little sky either.
-    return vec4<f32>(dst * tint * (1.0 - a_out) * mix(1.0, w_ao, 0.7) + out_rgb * a_out, 1.0);
+    let base = dst * tint * (1.0 - a_out) * mix(1.0, w_ao, 0.7) + out_rgb * a_out;
+    return vec4<f32>(mix(base, ssr.rgb * 0.92 * mix(1.0, w_ao, 0.35), sheen), 1.0);
 }
 
 // A film thinner than a few millimetres breaks the mirror into a sheen.
@@ -3599,6 +3637,11 @@ fn spray_strip(in: MeshOut) -> vec4<f32> {
 
 @fragment
 fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
+    // Planar reflection pass: what lies under the water level is not
+    // mirrored (the oblique clip plane of three's Reflector).
+    if (frame.debug.y > 0.5 && in.world.y < frame.debug.z) {
+        discard;
+    }
     let mesh_fw = length(fwidth(in.world.xz));
     if (in.panel > 49.9 && in.panel < 54.99) {
         return spray_strip(in);
