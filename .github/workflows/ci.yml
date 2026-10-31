@@ -36,6 +36,7 @@ jobs:
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
+          export RAYON_NUM_THREADS=1
           cargo test --test puddle_shore -- --test-threads=1 --nocapture
       - name: Niva acceptance through-drive
         run: |
@@ -48,4 +49,5 @@ jobs:
           export CXX=g++ CC=gcc
           unset DISPLAY
           cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
+          export RAYON_NUM_THREADS=1
           cargo test --release --test puddle_shore -- --test-threads=1 --nocapture

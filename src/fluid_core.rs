@@ -2354,7 +2354,7 @@ fn transport_open(
     #[cfg(not(target_arch = "wasm32"))]
     // Each row or column still writes the same edges. A wide sheet, including
     // the 2 cm window, splits across those rows. The dust plane stays narrow.
-    if i1 - i0 >= 31 && j1 - j0 >= 47 && res > SERIAL_SHEET_MAX {
+    if i1 - i0 >= 31 && j1 - j0 >= 47 && res > SERIAL_SHEET_MAX && res != FINE_RES {
         transport_open_par(
             h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, bed, frac_cap, sc,
         );
