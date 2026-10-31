@@ -6435,7 +6435,7 @@ pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
 pub const AIR_FLUX_STRIDE: u32 = 14;
 /// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.
-pub const AIR_SOLVE_STRIDE: u32 = 11;
+pub const AIR_SOLVE_STRIDE: u32 = 10;
 /// Fine dust cells per coarse air cell in X and Z. Layers stay at the dust spacing.
 /// The solve runs on this coarser active window and is written back onto the dust grid.
 pub const AIR_COARSE: usize = 2;
