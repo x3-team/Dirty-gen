@@ -15,6 +15,8 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 
 The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
 
+The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
+
 A pull request that changes the solver prints, in the release CI log, the step count, the mean, p95, the hardware line, and the milliseconds of each subsystem (`DRIVE_*` from `ThroughDrive::step` at dt = 1/30).
 
 ## CI, commit 8a826c5
