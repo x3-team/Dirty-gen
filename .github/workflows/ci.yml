@@ -1,11 +1,19 @@
 name: ci
 
+# One run per pull request update. A push of the same commit does not
+# start a second copy, and a merge to main does not run this workflow.
 on:
-  push:
   pull_request:
+    types: [opened, synchronize]
+    paths-ignore:
+      - "docs/**/*.md"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  creek:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,3 +37,9 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test e2e_niva -- --nocapture
+      - name: Release solver budget
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          unset DISPLAY
+          cargo test --release --test e2e_niva --test frame_bench -- --nocapture
