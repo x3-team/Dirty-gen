@@ -1947,8 +1947,11 @@ fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
             fwd = fwd.normalize();
         }
         let live = wheel.sinkage > 0.003 && wheel.normal > 1.0;
+        let spin = wheel.omega.abs();
+        // Odd slot w carries wheel spin (rad/s) when driving; otherwise 1/0 live flag.
+        let active = if spin > 0.35 { spin } else if live { 1.0 } else { 0.0 };
         out[i * 2] = [center.x, center.y, center.z, WHEEL_RADIUS];
-        out[i * 2 + 1] = [fwd.x, fwd.z, wheel.sinkage, if live { 1.0 } else { 0.0 }];
+        out[i * 2 + 1] = [fwd.x, fwd.z, wheel.sinkage, active];
     }
     out
 }

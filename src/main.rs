@@ -931,8 +931,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let parked_yaw = -1.88_f32;
     let mut parked = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut parked, px + 0.36, pz + 0.04, parked_yaw);
+    win_demo_calm_wheels_in_pool(&mut parked);
     parked.soil.win_demo_still_touchup();
-    parked.time = 2.0;
+    parked.time = 1.2;
     let pose = win_demo_low_pose(&parked);
 
     let saved_beauty = renderer.puddle_beauty;
@@ -952,10 +953,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     println!("win demo {}", media.join("puddle-low-before.png").display());
 
     let mut driven = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut driven, px + 0.48, pz + 0.26, parked_yaw);
-    win_demo_stage_wheels_in_pool(&mut driven);
+    win_demo_seat_vehicle_in_seam(&mut driven, px + 0.52, pz + 0.30, parked_yaw);
+    win_demo_stage_bow_in_pool(&mut driven);
     driven.soil.win_demo_still_touchup();
-    driven.time = 11.8;
+    driven.time = 12.6;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
     let rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
@@ -992,7 +993,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.water_column = saved_column;
     renderer.show_mud_drops = false;
     renderer.show_mud_particles = false;
-    wheel.time = 8.35;
+    win_demo_stage_bow_in_pool(&mut wheel);
+    wheel.time = 9.2;
     wheel.soil.win_demo_still_touchup();
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
@@ -1027,9 +1029,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
 
     let mut drive = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut drive, px + 0.42, pz + 0.18, -2.58);
-    win_demo_stage_wheels_in_pool(&mut drive);
+    win_demo_stage_bow_in_pool(&mut drive);
     drive.soil.win_demo_still_touchup();
-    drive.time = 10.8;
+    drive.time = 11.4;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
     // Shader rings/bow/splash only — particle ribbons cut holes in the flat pool mesh.
@@ -1094,13 +1096,27 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
 }
 
 fn win_demo_stage_wheels_in_pool(world: &mut World) {
-    for (i, wh) in world.vehicle.wheels.iter_mut().enumerate() {
-        wh.sinkage = 0.046;
-        wh.omega = 7.8;
+    win_demo_stage_bow_in_pool(world);
+}
+
+fn win_demo_calm_wheels_in_pool(world: &mut World) {
+    for wh in world.vehicle.wheels.iter_mut() {
+        wh.sinkage = 0.048;
+        wh.omega = 0.0;
         wh.normal = 4800.0;
-        wh.compression = 0.22;
+        wh.compression = 0.08;
         wh.in_water = true;
-        let _ = i;
+    }
+}
+
+fn win_demo_stage_bow_in_pool(world: &mut World) {
+    for (i, wh) in world.vehicle.wheels.iter_mut().enumerate() {
+        let front = i < 2;
+        wh.sinkage = 0.048;
+        wh.omega = if front { 11.0 } else { 0.0 };
+        wh.normal = 4800.0;
+        wh.compression = if front { 0.26 } else { 0.10 };
+        wh.in_water = true;
     }
 }
 

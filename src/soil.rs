@@ -7616,7 +7616,36 @@ impl SoilField {
     pub fn win_demo_still_touchup(&mut self) {
         self.win_demo_chassis_pool_flat();
         self.win_demo_hero_spike_cleanup();
+        self.win_demo_flatten_rear_mound();
         self.rebuild_height();
+    }
+
+    /// Spoil spike beside the rear-left tire on the hero seam pad (stills only).
+    fn win_demo_flatten_rear_mound(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if x > -0.35 || x < -1.65 || z < -0.45 || z > 0.55 {
+                    continue;
+                }
+                let idx = j * res + i;
+                self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                self.bed[idx] = bed;
+                self.initial_height[idx] = bed;
+                self.sync(idx);
+            }
+        }
     }
 
     /// Berms and tread spikes in the side-camera frustum, hero pad only.
@@ -7678,6 +7707,17 @@ impl SoilField {
                     self.bed[idx] = bed;
                     self.initial_height[idx] = bed;
                     self.sync(idx);
+                }
+                if x > -1.62 && x < -0.48 && z > -0.08 && z < 0.82 {
+                    self.placed[idx] = 0.0;
+                    self.loose[idx] = 0.0;
+                    self.tread_amp[idx] = 0.0;
+                    self.crust[idx] = 0.0;
+                    if self.height[idx] > bed - 0.002 {
+                        self.bed[idx] = bed;
+                        self.initial_height[idx] = bed;
+                        self.sync(idx);
+                    }
                 }
             }
         }
