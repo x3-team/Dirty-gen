@@ -4756,29 +4756,37 @@ impl FluidCore {
     }
 
     fn settle_turbid(&mut self, dt: f32) {
+        let res = WINDOW_RES;
         let area = COARSE_CELL_M * COARSE_CELL_M;
         let keep = (-dt / SILT_SETTLE_S).exp();
         let mut settled = 0.0f32;
-        for idx in 0..self.turbid.len() {
-            let h = self.water[idx] + self.slurry[idx];
-            let column = if self.turbid[idx].is_finite() {
-                self.turbid[idx].max(0.0)
-            } else {
-                0.0
-            };
-            if column <= 0.0 {
-                self.turbid[idx] = 0.0;
-                continue;
+        let Some((i0, i1, j0, j1)) = turbid_span(&self.turbid, res) else {
+            return;
+        };
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                let idx = row + i;
+                let h = self.water[idx] + self.slurry[idx];
+                let column = if self.turbid[idx].is_finite() {
+                    self.turbid[idx].max(0.0)
+                } else {
+                    0.0
+                };
+                if column <= 0.0 {
+                    self.turbid[idx] = 0.0;
+                    continue;
+                }
+                // A dry cell cannot hold silt. What was in it has landed.
+                if !h.is_finite() || h < 1.0e-5 {
+                    settled += column * area;
+                    self.turbid[idx] = 0.0;
+                    continue;
+                }
+                let stay = column * keep;
+                settled += (column - stay) * area;
+                self.turbid[idx] = stay;
             }
-            // A dry cell cannot hold silt. What was in it has landed.
-            if !h.is_finite() || h < 1.0e-5 {
-                settled += column * area;
-                self.turbid[idx] = 0.0;
-                continue;
-            }
-            let stay = column * keep;
-            settled += (column - stay) * area;
-            self.turbid[idx] = stay;
         }
         if settled.is_finite() {
             self.turbid_settled_m3 += settled;
@@ -4882,44 +4890,47 @@ impl FluidCore {
         let rx = fz;
         let rz = -fx;
         let reach = radius * 1.15 + COARSE_CELL_M;
-        let (i0, i1) = index_span(self.origin[0], COARSE_CELL_M, WINDOW_RES, push.x, reach);
-        let (j0, j1) = index_span(self.origin[1], COARSE_CELL_M, WINDOW_RES, push.z, reach);
+        let reach2 = reach * reach;
         let slip_v = speed * slip;
-        for j in j0..j1 {
-            for i in i0..i1 {
-                let idx = j * WINDOW_RES + i;
-                let h = self.water[idx];
-                if !h.is_finite() || h < 0.004 {
-                    continue;
-                }
-                let x = self.origin[0] + (i as f32 + 0.5) * COARSE_CELL_M;
-                let z = self.origin[1] + (j as f32 + 0.5) * COARSE_CELL_M;
-                let dx = x - push.x;
-                let dz = z - push.z;
-                let along = dx * fx + dz * fz;
-                let lat = dx * rx + dz * rz;
-                let dist = dx.hypot(dz);
-                let film = self.uw[idx].hypot(self.vw[idx]);
-                let film = if film.is_finite() { film } else { 0.0 };
-                // The free surface cuts the tire on this ring. Inside the
-                // ring the tread is under water; outside it is in the air.
-                let immerse = h.min(radius * 0.9);
-                let r_line = (2.0 * radius * immerse - immerse * immerse).max(0.0).sqrt();
-                let band = 1.0
-                    - ((dist - r_line).abs() / (COARSE_CELL_M * 1.35)).clamp(0.0, 1.0);
-                if band > 0.0 {
-                    let motion = slip_v.max(speed * 0.45).max(film);
-                    let prod = breaking_foam(motion, h) * band;
-                    self.add_foam(idx, prod, dt);
-                }
-                // Submerged contact. Slip shears the bed and lifts it.
-                let on_patch = lat.abs() <= push.width * 0.55 + COARSE_CELL_M * 0.35
-                    && along >= -radius * 0.55
-                    && along <= radius * 0.35;
-                if on_patch && h > 0.02 {
-                    let shear_v = slip_v.max(film * 0.35);
-                    self.lift_silt(idx, shear_v, dt, area, 0.015, 6.0);
-                }
+        let cell = COARSE_CELL_M;
+        let wet: Vec<u32> = self.wet_idx.clone();
+        for &id in &wet {
+            let idx = id as usize;
+            let h = self.water[idx];
+            if !h.is_finite() || h < 0.004 {
+                continue;
+            }
+            let i = idx % WINDOW_RES;
+            let j = idx / WINDOW_RES;
+            let x = self.origin[0] + (i as f32 + 0.5) * cell;
+            let z = self.origin[1] + (j as f32 + 0.5) * cell;
+            let dx = x - push.x;
+            let dz = z - push.z;
+            if dx * dx + dz * dz > reach2 {
+                continue;
+            }
+            let along = dx * fx + dz * fz;
+            let lat = dx * rx + dz * rz;
+            let dist = dx.hypot(dz);
+            let film = self.uw[idx].hypot(self.vw[idx]);
+            let film = if film.is_finite() { film } else { 0.0 };
+            // The free surface cuts the tire on this ring. Inside the
+            // ring the tread is under water; outside it is in the air.
+            let immerse = h.min(radius * 0.9);
+            let r_line = (2.0 * radius * immerse - immerse * immerse).max(0.0).sqrt();
+            let band = 1.0 - ((dist - r_line).abs() / (cell * 1.35)).clamp(0.0, 1.0);
+            if band > 0.0 {
+                let motion = slip_v.max(speed * 0.45).max(film);
+                let prod = breaking_foam(motion, h) * band;
+                self.add_foam(idx, prod, dt);
+            }
+            // Submerged contact. Slip shears the bed and lifts it.
+            let on_patch = lat.abs() <= push.width * 0.55 + cell * 0.35
+                && along >= -radius * 0.55
+                && along <= radius * 0.35;
+            if on_patch && h > 0.02 {
+                let shear_v = slip_v.max(film * 0.35);
+                self.lift_silt(idx, shear_v, dt, area, 0.015, 6.0);
             }
         }
     }
@@ -4971,23 +4982,33 @@ impl FluidCore {
     }
 
     fn clear_dry_tracers(&mut self) {
+        let res = WINDOW_RES;
         let area = COARSE_CELL_M * COARSE_CELL_M;
-        for idx in 0..self.foam.len() {
+        for &id in &self.wet_idx {
+            let idx = id as usize;
             let h = self.water[idx] + self.slurry[idx];
-            if !h.is_finite() || h < 1.0e-5 {
+            if !h.is_finite() || h < 0.004 {
                 self.foam[idx] = 0.0;
-                if self.turbid[idx] > 0.0 {
-                    self.turbid_settled_m3 += self.turbid[idx] * area;
+            } else if !self.foam[idx].is_finite() {
+                self.foam[idx] = 0.0;
+            }
+        }
+        let Some((i0, i1, j0, j1)) = turbid_span(&self.turbid, res) else {
+            return;
+        };
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                let idx = row + i;
+                let h = self.water[idx] + self.slurry[idx];
+                if !h.is_finite() || h < 1.0e-5 {
+                    if self.turbid[idx] > 0.0 {
+                        self.turbid_settled_m3 += self.turbid[idx] * area;
+                        self.turbid[idx] = 0.0;
+                    }
+                } else if !self.turbid[idx].is_finite() {
                     self.turbid[idx] = 0.0;
                 }
-            } else if h < 0.004 {
-                self.foam[idx] = 0.0;
-            }
-            if !self.foam[idx].is_finite() {
-                self.foam[idx] = 0.0;
-            }
-            if !self.turbid[idx].is_finite() {
-                self.turbid[idx] = 0.0;
             }
         }
     }
