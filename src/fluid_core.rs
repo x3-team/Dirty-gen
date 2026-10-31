@@ -3981,6 +3981,8 @@ pub struct FluidCore {
     entrained_m3: f32,
     /// Cubic metres that left the live column and stayed in the account.
     settled_suspended_m3: f32,
+    /// True when any coarse cell still carries suspended depth.
+    susp_live: bool,
     last_parts: StepParts,
     fine_origin: [f32; 2],
     fine_water: Vec<f32>,
@@ -4058,6 +4060,7 @@ impl FluidCore {
             susp_next: vec![0.0; n],
             entrained_m3: 0.0,
             settled_suspended_m3: 0.0,
+            susp_live: false,
             last_parts: StepParts::default(),
             fine_origin: [0.0, 0.0],
             fine_water: vec![0.0; fine_n],
@@ -4680,7 +4683,6 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
-        self.last_pushes = pushes.clone();
         self.refine(&pushes);
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
@@ -4694,13 +4696,14 @@ impl FluidCore {
         }
         self.cycle_stream();
         let sus_tick = ProfTick::start();
+        self.step_dust(dt, slow);
         self.step_fog(dt);
         self.step_suspended(dt, &pushes);
         let suspended_ms = sus_tick.ms() as f32;
-        self.step_dust(dt, slow);
+        self.last_pushes = pushes;
         if slow {
-            self.settle_fog();
             self.settle_dust();
+            self.settle_fog();
         }
         for s in &spray {
             self.spray_m3 += s.volume;
@@ -4941,7 +4944,7 @@ impl FluidCore {
                         vorticity: 0.35,
                     },
                     1.0e-8,
-                    false,
+                    true,
                 );
             }
         });
@@ -5624,6 +5627,9 @@ impl FluidCore {
     }
 
     fn step_pair(&mut self, dt: f32, fine: bool) {
+        if fine && !self.fine_on {
+            return;
+        }
         let prep = ProfTick::start();
         let (res, cell) = if fine {
             (FINE_RES, FINE_CELL_M)
@@ -6194,7 +6200,7 @@ impl FluidCore {
                         vorticity: 0.35,
                     },
                     1.0e-6,
-                    false,
+                    true,
                 );
             }
         });
@@ -6250,7 +6256,7 @@ impl FluidCore {
         }
         let before = self.entrained_m3;
         self.entrain_wake(pushes, dt);
-        if self.entrained_m3 <= before && !self.susp.iter().any(|s| *s > 1.0e-8) {
+        if self.entrained_m3 <= before && !self.susp_live {
             return;
         }
         self.advect_suspended(dt);
@@ -6310,6 +6316,7 @@ impl FluidCore {
                     }
                     self.susp[idx] += add;
                     self.entrained_m3 += add * area;
+                    self.susp_live = true;
                 }
             }
         }
@@ -6334,6 +6341,7 @@ impl FluidCore {
             }
         }
         if i0 > i1 {
+            self.susp_live = false;
             return;
         }
         i0 = i0.saturating_sub(1);
@@ -6341,7 +6349,6 @@ impl FluidCore {
         i1 = (i1 + 1).min(res - 1);
         j1 = (j1 + 1).min(res - 1);
 
-        self.susp_next.copy_from_slice(&self.susp);
         for j in j0..=j1 {
             for i in i0..=i1 {
                 self.susp_next[j * res + i] = 0.0;
@@ -6394,12 +6401,13 @@ impl FluidCore {
                 }
             }
         }
+        let mut live = false;
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let idx = j * res + i;
                 let mut s = self.susp_next[idx];
                 if !s.is_finite() || s <= 0.0 {
-                    self.susp_next[idx] = 0.0;
+                    self.susp[idx] = 0.0;
                     continue;
                 }
                 let w = self.water[idx];
@@ -6410,11 +6418,13 @@ impl FluidCore {
                     self.settled_suspended_m3 += (s - w) * area;
                     s = w;
                 }
-                self.susp_next[idx] = s;
+                if s > 1.0e-8 {
+                    live = true;
+                }
+                self.susp[idx] = s;
             }
         }
-        // Cells outside the box were copied and not rewritten. Swap the whole grid.
-        std::mem::swap(&mut self.susp, &mut self.susp_next);
+        self.susp_live = live;
     }
 
     fn shift_coarse(&mut self, new_origin: [f32; 2]) {
@@ -6540,6 +6550,9 @@ impl FluidCore {
                 self.settled[idx] = slot.dust;
                 self.moisture[idx] = slot.moisture;
                 self.susp[idx] = slot.susp;
+                if slot.susp > 1.0e-8 {
+                    self.susp_live = true;
+                }
             }
         });
     }
@@ -6615,6 +6628,7 @@ impl FluidCore {
         self.us = us;
         self.vs = vs;
         self.settled = settled;
+        self.susp_live = susp.iter().any(|s| *s > 1.0e-8);
         self.susp = susp;
         self.bed = bed;
         self.moisture = moisture;
