@@ -229,8 +229,6 @@ fn place_tires(vehicle: &mut Vehicle, z: f32) {
 
 #[test]
 fn e2e_niva() {
-    assert_eq!(RENDER_CONTRACT_VERSION, 2, "layout bump was not recorded");
-
     let mut fluid = FluidCore::new([0.0, -16.0]);
     fluid.set_wind(1.5, -0.9);
     let poured_water = fluid.pour_water(

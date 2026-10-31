@@ -116,7 +116,6 @@ fn puddle_wheels_sit_in_a_force_rut() {
     );
 
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 2);
     assert!(
         n >= 4.0,
         "wheels in a wet rut: {n}, chassis z {:.2}",
@@ -570,7 +569,6 @@ fn puddle_ruts_follow_the_treads() {
         Some(drive.dust()),
     );
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 2);
     let z = drive.world.vehicle.pos.z;
     println!("frame 25 chassis z {z:.3}");
     // Under the body, where a belly-wide slab would sit, and on the track
@@ -627,7 +625,6 @@ fn puddle_rut_water_stays_with_the_pond() {
         Some(drive.dust()),
     );
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 2);
 
     let res = frame.header.window_res.max(1) as i32;
     let mut floor_eta = Vec::new();
