@@ -17,4 +17,10 @@ jobs:
           # rustc links meshopt with lld, which does not search gcc's lib dir
           # when cc is clang. Point it at libstdc++ wherever g++ keeps it.
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
           cargo test --test creek -- --nocapture
+      - name: Niva puddle rut
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test puddle_rut -- --nocapture

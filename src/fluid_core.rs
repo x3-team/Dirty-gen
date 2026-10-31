@@ -1695,6 +1695,93 @@ impl FluidCore {
         self.water[idx] += volume / area;
     }
 
+    /// Fill tire cuts up to the free surface of the pond beside them.
+    ///
+    /// A cut is a bed sitting more than 12 mm below the plane the sheet was
+    /// poured on. Water thickness in that cut grows until bed + water matches
+    /// the surrounding surface. The same cubic metres leave the still sheet,
+    /// so the pond is not refilled from nowhere. Berms (a raised bed) are
+    /// left alone. Returns the cubic metres moved.
+    pub fn pond_ruts(&mut self) -> f32 {
+        self.restrict_fine();
+        let n = WINDOW_RES;
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut still = vec![false; n * n];
+        let mut eta_of = vec![0.0_f32; n * n];
+        for idx in 0..n * n {
+            let bed = self.bed[idx];
+            let water = self.water[idx];
+            if bed.is_finite() && water.is_finite() && bed > -0.008 && bed < 0.03 && water > 0.018 {
+                still[idx] = true;
+                eta_of[idx] = bed + water;
+            }
+        }
+        let rad = 10i32;
+        let mut needs: Vec<(usize, f32)> = Vec::new();
+        let mut total_need = 0.0_f32;
+        for j in 0..n {
+            for i in 0..n {
+                let idx = j * n + i;
+                let bed = self.bed[idx];
+                let water = self.water[idx];
+                if !bed.is_finite() || !water.is_finite() || bed >= -0.012 {
+                    continue;
+                }
+                let mut sum = 0.0_f32;
+                let mut count = 0.0_f32;
+                let j0 = (j as i32 - rad).max(0) as usize;
+                let j1 = ((j as i32 + rad).min(n as i32 - 1)) as usize;
+                let i0 = (i as i32 - rad).max(0) as usize;
+                let i1 = ((i as i32 + rad).min(n as i32 - 1)) as usize;
+                for jj in j0..=j1 {
+                    for ii in i0..=i1 {
+                        let nidx = jj * n + ii;
+                        if still[nidx] {
+                            sum += eta_of[nidx];
+                            count += 1.0;
+                        }
+                    }
+                }
+                if count < 1.0 {
+                    continue;
+                }
+                let extra = ((sum / count) - bed - water).max(0.0);
+                if extra > 1.0e-4 {
+                    needs.push((idx, extra));
+                    total_need += extra * area;
+                }
+            }
+        }
+        if total_need <= 1.0e-8 {
+            return 0.0;
+        }
+        let mut donors: Vec<(usize, f32)> = Vec::new();
+        let mut total_room = 0.0_f32;
+        for idx in 0..n * n {
+            if !still[idx] {
+                continue;
+            }
+            let room = (self.water[idx] - 0.012).max(0.0);
+            if room > 1.0e-4 {
+                donors.push((idx, room));
+                total_room += room * area;
+            }
+        }
+        if total_room <= 1.0e-8 {
+            return 0.0;
+        }
+        let scale = (total_room / total_need).min(1.0);
+        let moved = total_need * scale;
+        for (idx, extra) in &needs {
+            self.water[*idx] += extra * scale;
+        }
+        for (idx, room) in &donors {
+            let give = moved * (*room * area) / total_room;
+            self.water[*idx] = (self.water[*idx] - give / area).max(0.0);
+        }
+        moved
+    }
+
     fn take_column(&mut self, x: f32, z: f32, volume: f32, water: bool) -> f32 {
         if volume <= 0.0 {
             return 0.0;
