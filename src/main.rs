@@ -44,6 +44,8 @@ fn main() {
             capture(&rest);
         } else if std::env::args().any(|a| a == "--win-demo-shot") {
             capture_win_demo_stills();
+        } else if std::env::args().any(|a| a == "--win-demo-smoke") {
+            win_demo_smoke();
         } else if win_demo_enabled() {
             run_window(true);
         } else {
@@ -817,6 +819,39 @@ fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     let path = PathBuf::from(MEDIA).join("slurry-belly-proof.png");
     write_png(&path, width, height, &rgba).expect("belly still");
     println!("belly {}", path.display());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn win_demo_smoke() {
+    use silt::soil::SurfaceKind;
+    use silt::world::Input;
+
+    let mut world = World::win_demo();
+    let sand0 = world.soil.sample(2.2, 0.0);
+    let mud0 = world.soil.sample(-2.2, 0.0);
+    let puddle0 = world.soil.sample(-2.35, -0.95);
+    assert_eq!(sand0.kind(), SurfaceKind::Sand, "sand patch");
+    assert_eq!(mud0.kind(), SurfaceKind::WetMud, "mud patch");
+    assert!(
+        puddle0.water > 0.02,
+        "puddle water {:.4}",
+        puddle0.water
+    );
+    let drive = Input {
+        throttle: 0.45,
+        steer: 0.08,
+        ..Input::default()
+    };
+    for _ in 0..180 {
+        world.step(1.0 / 60.0, &drive);
+    }
+    println!(
+        "WIN_DEMO_SMOKE ok pos=({:.2},{:.2},{:.2}) speed={:.2}",
+        world.vehicle.pos.x,
+        world.vehicle.pos.y,
+        world.vehicle.pos.z,
+        world.vehicle.speed()
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]

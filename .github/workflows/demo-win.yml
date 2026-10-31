@@ -25,14 +25,12 @@ jobs:
       - name: Smoke launch
         shell: pwsh
         run: |
-          $proc = Start-Process -FilePath ".\target\release\silt.exe" -ArgumentList "--win-demo" -PassThru
-          Start-Sleep -Seconds 5
-          if ($proc.HasExited) {
-            Write-Error "silt.exe exited early with code $($proc.ExitCode)"
+          .\target\release\silt.exe --win-demo-smoke
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "win-demo-smoke failed with code $LASTEXITCODE"
             exit 1
           }
-          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-          Write-Host "smoke ok pid=$($proc.Id)"
+          Write-Host "smoke ok"
 
       - name: Package zip
         shell: pwsh
@@ -44,6 +42,7 @@ jobs:
 
           Run: silt.exe --win-demo
           WASD drive, R reset, mouse orbit, wheel zoom.
+          CI smoke: silt.exe --win-demo-smoke
           "@ | Set-Content -Encoding utf8 pkg\README.txt
           Compress-Archive -Path pkg\* -DestinationPath silt-win-demo.zip -Force
 
