@@ -52,7 +52,7 @@ Solid ground is bed + placed. Rut is how far the bed sits below the height the c
 
 Writer: the soil heightfield at the texel centre. Off that 40 m soil square, bed comes from the fluid sheet when it is attached, and rut and placed are 0.
 
-Under the puddle the same channels carry a tire-force rut. On wet sand the bed drops by the Bekker depth of the tire's normal and shear, and the spoil is the berm in placed. G is that bed drop. A is the berm. Water is not in this binding; the film binding holds the sheet, including the water that ponds into the cut so the free surface stays with the puddle. Ground is still bed + placed, and the visible top of the wet cell is still ground + slurry, with water on that. No new channel, unit, or resolution. Version stays 2.
+Under the puddle the same channels carry a tire-force rut. On wet sand the bed drops by the Bekker depth of the tire's normal and shear, and the spoil is the berm in placed. G is that bed drop. A is the berm. Both follow the two treads: a groove about a tread wide, falling off at the edges, with the ground between the wheels left alone. The puddle shore is a bank in the same bed. The floor stays where it was, and the bank rises until it stands above the water. The height the cell started at rises with the bank, so the bank is not a rut. G stays the tire cut. Water is not in this binding; the film binding holds the sheet. On the floor the column is the standing depth. On the bank it falls to 0, short of the crest, so the shore is that slope and not a wall of water on a flat bed. The free surface stays with the puddle, including the water that ponds into the cut. Ground is still bed + placed, and the visible top of the wet cell is still ground + slurry, with water on that. No new channel, unit, or resolution. Version stays 2.
 
 Valid: `VALID_GROUND` is set on every publish.
 
@@ -60,13 +60,13 @@ Valid: `VALID_GROUND` is set on every publish.
 
 Pore moisture, 0 dry to 1 saturated. Not the film thickness.
 
-Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness. With both, the texel is the greater of the two. That is how a wet tire track painted on the soil stays in this map after the sheet is attached. The sheet keeps its own moisture as well: pore moisture is parked with the ground cell when the window follows the Niva, and a disk raised along the drained track is the same channel.
+Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness. With both, the texel is the greater of the two. That is how a wet tire track painted on the soil stays in this map after the sheet is attached. The sheet keeps its own moisture as well: pore moisture is parked with the ground cell when the window follows the Niva, and a disk raised along the drained track is the same channel. Around the puddle the same channel is a wet band: saturated on the floor, still wet on the bank past the shoreline, then back to the pad. A hard step from saturated to the pad is not that band.
 
 Valid: `VALID_MOISTURE` is set on every publish.
 
 ### Water and slurry — binding 3
 
-Thickness of the standing water column and the slurry column, metres. They are separate. Ground height does not include them. The visible top of a wet cell is ground + slurry, with water on that.
+Thickness of the standing water column and the slurry column, metres. They are separate. Ground height does not include them. The visible top of a wet cell is ground + slurry, with water on that. Ground here is the pressed bed plus placed spoil. The water column is measured from that surface, not from the height the cell had before the tire. In a rut that opens into the puddle, pressed ground plus the water column does not rise above the puddle surface. Adding the same column to the original height would stand the rut up by the depth of the cut.
 
 Writer: the fluid coarse cell when the sheet is attached (fine patch already restricted). Otherwise the soil `water` and `slurry` arrays. A bow drawn only onto the picture soil is not copied back into the sheet. Water that drained off the body and the wheels back onto the tire track is this water channel, metres of film, not a second map.
 
@@ -78,7 +78,7 @@ Horizontal velocity of the film, metres per second, world +X and +Z. Thickness-w
 
 Writer: the fluid sheet. `header.flow_source` is 1 when that sheet was attached and 0 when it was not. Without the sheet the texels are 0 and `VALID_FLOW` is clear. Those zeros are not a measured still surface.
 
-A dry cell, film under 0.01 mm, is 0 even if the stored velocity is not. A sample that is not finite is written as 0. The same rule covers every map and the spray buffer: no NaN, no Inf.
+A dry cell, film under 0.01 mm, publishes `(0, 0)`. It does not publish NaN, even when the stored velocity is not finite. A sample that is not finite is written as 0. The same rule covers every map and the spray buffer: no NaN, no Inf.
 
 Valid: `VALID_FLOW` only when `flow_source` is 1, after `FluidCore::step`.
 
@@ -154,13 +154,13 @@ Valid: `VALID_WET_EDGE` on every publish.
 
 Foam is a fraction from 0 to 1. Crest is a height in metres.
 
-Foam is 0 when the film is thinner than 4 mm. Otherwise it is the maximum of three readings of the same sheet, each from 0 to 1:
+Foam is 0 when the film is thinner than 4 mm. A dry cell, film under 0.01 mm, publishes foam 0. It does not publish NaN. Otherwise foam is the maximum of three readings of the same sheet, each from 0 to 1:
 
 - Froude: a smoothstep of `speed / sqrt(9.81 * thickness)` from 0.85 to 1.45. Speed 0 stays 0.
 - Wave crest: a smoothstep of how far the film stands above the mean of its four in-window neighbours, from 4 mm to 18 mm.
 - Tires: the wet footprint of a tire that shoved the sheet on this step, full near the contact and 0 at 1.45 tire radii.
 
-Crest is the placed berm, metres, plus that same film excess. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. A non-finite foam or crest sample is written as 0.
+Crest is the placed berm, metres, plus that same film excess. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. On a dry cell the crest is that berm when the berm is finite, and 0 when there is no berm. A non-finite foam or crest sample is written as 0, not NaN.
 
 Writer: the publisher, from flow, film, placed height, and the tire shoves of the step that just ran. It does not feed back into the solver. This field did not exist on the sheet before version 1.
 
@@ -258,4 +258,10 @@ With the dust ledger, `step_vehicle_air` writes the field: the Niva body and whe
 
 Filling binding 1 for the puddle rut does not bump this version. G is the tire-force bed drop on wet sand under the Niva, A is the berm placed from that cut, and the film binding carries the water ponded into the groove. Layout unchanged.
 
+The puddle shore does not bump this version either. The bank is a rise in the bed already in binding 1, and the height the cell started at rises with it, so the bank is not a rut. Binding 3's water channel is the standing depth on the floor and falls to 0 on that bank, short of the crest. Binding 2 carries a wet band past that shoreline, the same pore-moisture channel. G and A stay the tire cut and the berm, each about a tread wide, and the ground between the wheels stays empty. Same channels, same units, same resolution.
+
 The wet tire track does not bump this version either. Binding 2, pore moisture, is the greater of the sheet moisture and the soil wetness, so the track left when the Niva drains is in the moisture map. Binding 3's water channel is the film that drain put back on the sheet. Same channels, same units, same resolution.
+
+The rut's water surface does not bump this version either. Binding 1 R stays the pressed ground, bed plus placed. Binding 3 R is the water column on that ground. A rut connected to the puddle is filled up to the puddle surface and no higher. The original height is not the datum. Same channels, same units, same resolution.
+
+Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is set where the sheet is a wave or a tire footprint, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.

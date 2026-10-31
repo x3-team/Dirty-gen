@@ -615,6 +615,9 @@ pub struct SoilField {
     /// Cubic metres that left a contact and have not been placed yet.
     /// A snapshot does not carry this. Land it before saving.
     pub airborne: f32,
+    /// One puddle stamp uses a tread-width falloff instead of the flat lane.
+    /// Not stored in a snapshot. The lane stamp stays a step for every other caller.
+    pub tread_profile: bool,
     /// One slurry thickness, metres. Soil that left the bed plus the water
     /// that left the column. The mesh adds this to the solid. It is not a
     /// second surface.
@@ -1168,6 +1171,7 @@ impl SoilField {
             tread_ang: vec![0.0; n],
             tread_lat: vec![0.0; n],
             airborne: 0.0,
+            tread_profile: false,
             slurry: vec![0.0; n],
             cloud: vec![0.0; n],
             crust: vec![0.0; n],
@@ -2296,12 +2300,32 @@ impl SoilField {
         };
         let sigma = (width * 0.42).max(self.cell * 0.34);
         // Flat floor, then a broken step. A ramped shoulder smeared the cut
-        // lip and the placed berm into one slope.
-        let half_w = if lane { self.cell * 1.15 } else { sigma * 1.6 };
-        let lip_band = if lane { self.cell * 1.05 } else { 0.0 };
+        // lip and the placed berm into one slope. The puddle tread is the
+        // exception: a flat ribbon wider than the tire reads as a slab.
+        let tread = lane && self.tread_profile;
+        let tread_core = (width * 0.42).max(self.cell * 0.45);
+        // Reaches the contract cell just outside the tread, and stops short of
+        // the centreline. A longer outer flank on only one side left the other
+        // track as a step: the 0.20 m sample past the core went from the floor
+        // to zero.
+        let tread_edge = tread_core + self.cell * 2.75;
+        let half_w = if tread {
+            tread_edge
+        } else if lane {
+            self.cell * 1.15
+        } else {
+            sigma * 1.6
+        };
+        let lip_band = if tread {
+            0.0
+        } else if lane {
+            self.cell * 1.05
+        } else {
+            0.0
+        };
         // Spoil sits in the cell against the lip. A wider band flattened
         // the pile into the crust, so the berm disappeared beside the step.
-        let berm_band = self.cell * 0.9;
+        let berm_band = if tread { self.cell * 2.4 } else { self.cell * 0.9 };
         // The contact chord, in world XZ. A ribbon of a couple of cells
         // past the tire cuts the slope in front of the hub, and that cut
         // walks up the mesh on the next step.
@@ -2359,13 +2383,31 @@ impl SoilField {
                 // the surface sits below the hub, measured in world Y.
                 // On the contact it equals the sink. A column up the slope
                 // is higher, ahead of the hub, and is not this tire's rut.
-                let penetration = self.height[idx] - (center.y - radius);
+                // The puddle tread measures that on the solid bed. The sheet
+                // on a flat floor is not a slope, and skipping it left the
+                // contract cell ahead of the hub uncut.
+                let column = if tread {
+                    self.bed[idx] + self.placed[idx]
+                } else {
+                    self.height[idx]
+                };
+                let penetration = column - (center.y - radius);
                 let up_the_slope = penetration > sinkage + 0.03 && lz.abs() > self.cell * 0.5;
                 if up_the_slope {
                     continue;
                 }
                 let ax = lx.abs();
-                let across = if lane {
+                let across = if tread {
+                    if ax <= tread_core {
+                        1.0
+                    } else if ax >= tread_edge {
+                        0.0
+                    } else {
+                        let t = (ax - tread_core) / (tread_edge - tread_core).max(1.0e-3);
+                        let s = t * t * (3.0 - 2.0 * t);
+                        1.0 - s
+                    }
+                } else if lane {
                     if ax <= half_w {
                         1.0
                     } else {
@@ -2375,7 +2417,9 @@ impl SoilField {
                     (-0.5 * (lx / sigma.max(0.02)).powi(2)).exp()
                 };
 
-                if across > 0.2 {
+                // The tread tail is shallow. The lane lip still starts at 0.2,
+                // or a scuff would claim the shoulder.
+                if across > if tread { 0.12 } else { 0.2 } {
                     // Scuffs do not claim a pass and do not reset the gap, or
                     // the lane stamp in the same step would stay on pass 1.
                     let passes = if lane {
@@ -2462,8 +2506,29 @@ impl SoilField {
                         clods[n_clod] = idx;
                         n_clod += 1;
                     }
-                } else if ax > half_w + lip_band && ax <= half_w + lip_band + berm_band && along > 0.25
-                {
+                } else if {
+                    // The tread berm sits in the contract cell beside the
+                    // groove. Starting it at tread_edge parks the pile past
+                    // that cell, and the shoulder disappears from the map.
+                    let start = if tread {
+                        tread_core + self.cell * 2.55
+                    } else {
+                        half_w + lip_band
+                    };
+                    let end = if tread {
+                        start + self.cell * 1.35
+                    } else {
+                        half_w + lip_band + berm_band
+                    };
+                    ax > start && ax <= end && along > 0.25
+                } {
+                    // Spoil inside both tires lands on the centreline and
+                    // joins into one berm between the tracks.
+                    // Any spoil closer to the centreline than the tire becomes
+                    // the band between the tracks.
+                    if tread && cx.abs() + 0.06 < center.x.abs() {
+                        continue;
+                    }
                     if n_berm < berms.len() {
                         berms[n_berm] = idx;
                         n_berm += 1;
@@ -6154,6 +6219,7 @@ impl SoilField {
             tread_ang,
             tread_lat,
             airborne: 0.0,
+            tread_profile: false,
             slurry,
             cloud: vec![0.0; n],
             crust,
