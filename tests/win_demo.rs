@@ -84,4 +84,21 @@ fn win_demo_seam_heights_stay_bounded() {
         "seam hub height pyramid {:.3}",
         hub.height
     );
+    let mut max_h = 0.0_f32;
+    let mut xi = 0;
+    while xi < 24 {
+        let mut zi = 0;
+        while zi < 24 {
+            let x = -0.92 + xi as f32 * 0.04;
+            let z = -0.22 + zi as f32 * 0.04;
+            max_h = max_h.max(world.soil.sample(x, z).height);
+            zi += 1;
+        }
+        xi += 1;
+    }
+    assert!(
+        max_h < 0.235,
+        "hero pad bump {:.3}",
+        max_h
+    );
 }

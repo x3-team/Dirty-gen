@@ -7496,7 +7496,6 @@ impl SoilField {
             }
         }
         field.win_demo_seam_pan();
-        field.win_demo_left_view_lip();
         field.rebuild_height();
         field
     }
@@ -7524,6 +7523,12 @@ impl SoilField {
                 let dz = (z - sz) / srz;
                 let r = (dx * dx + dz * dz).sqrt();
                 let idx = j * res + i;
+                let in_core = r <= 1.15;
+                let bed_feather = if r <= 1.15 {
+                    1.0
+                } else {
+                    smooth01(1.38, 1.05, r)
+                };
                 self.placed[idx] = 0.0;
                 self.loose[idx] = 0.0;
                 self.tread_amp[idx] = 0.0;
@@ -7531,19 +7536,18 @@ impl SoilField {
                 self.tread_lat[idx] = 0.0;
                 self.crust[idx] = 0.0;
                 self.crack[idx] = 0.0;
-                let in_core = r <= 1.08;
-                if in_core {
-                    self.bed[idx] = bed;
-                    self.initial_height[idx] = bed;
+                if bed_feather > 0.02 {
+                    self.bed[idx] = lerp(self.bed[idx], bed, bed_feather);
+                    self.initial_height[idx] = self.bed[idx];
                 }
-                let seam_water = if r <= 1.0 {
-                    let core = (1.0 - r).max(0.0);
-                    0.045 + core * 0.155
+                let seam_water = if r <= 1.15 {
+                    let core = (1.0 - r / 1.15).max(0.0);
+                    0.05 + core * 0.17
                 } else {
                     0.0
                 };
                 if seam_water > 0.0 {
-                    self.water[idx] = seam_water.max(self.water[idx]);
+                    self.water[idx] = self.water[idx].max(seam_water);
                 }
                 let film = 0.0015 + seam_water * 0.006;
                 if in_core {
@@ -7560,37 +7564,121 @@ impl SoilField {
                 self.sync(idx);
             }
         }
+        self.win_demo_hero_spike_cleanup();
+        self.win_demo_chassis_pool_flat();
     }
 
-    /// Sand–mud lip and berm left of the hero pool in the side camera. Does not
-    /// touch the far playground puddles at −2.35.
-    pub fn win_demo_left_view_lip(&mut self) {
+    /// Flat bed + standing water under every still pose (no center berm between tires).
+    pub fn win_demo_chassis_pool_flat(&mut self) {
         let res = self.res;
         let cell = self.cell;
         let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        let poses = [
+            (-0.69_f32, 0.19_f32, 1.12_f32, 0.68_f32),
+            (-0.57_f32, 0.41_f32, 1.14_f32, 0.82_f32),
+            (-0.69_f32, 0.21_f32, 1.12_f32, 0.68_f32),
+            (-1.05_f32, -0.43_f32, 1.14_f32, 0.76_f32),
+            (-0.63_f32, 0.33_f32, 1.12_f32, 0.74_f32),
+        ];
         for j in 0..res {
             for i in 0..res {
                 let x = (i as f32 + 0.5) * cell - half;
                 let z = (j as f32 + 0.5) * cell - half;
-                if x > 0.48 || x < -1.82 || z < -1.08 || z > 1.52 {
+                let mut hit = false;
+                for (cx, cz, rx, rz) in poses {
+                    let ux = (x - cx).abs() / rx;
+                    let uz = (z - cz).abs() / rz;
+                    if ux <= 1.0 && uz <= 1.0 {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
                     continue;
                 }
                 let idx = j * res + i;
                 self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.bed[idx] = bed;
+                self.initial_height[idx] = bed;
+                self.water[idx] = self.water[idx].max(0.14);
+                self.slurry[idx] = 0.002;
+                self.wetness[idx] = 1.0;
+                self.kind[idx] = SurfaceKind::WetMud as u8;
+                self.sync(idx);
+            }
+        }
+    }
+
+    /// Re-flatten hero pad after vehicle placement for still captures.
+    pub fn win_demo_still_touchup(&mut self) {
+        self.win_demo_chassis_pool_flat();
+        self.win_demo_hero_spike_cleanup();
+        self.rebuild_height();
+    }
+
+    /// Berms and tread spikes in the side-camera frustum, hero pad only.
+    fn win_demo_hero_spike_cleanup(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if x > 0.52 || x < -2.05 || z < -1.12 || z > 1.52 {
+                    continue;
+                }
+                let idx = j * res + i;
+                self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
                 self.tread_amp[idx] = 0.0;
                 self.tread_ang[idx] = 0.0;
                 self.tread_lat[idx] = 0.0;
                 self.crust[idx] = 0.0;
                 self.crack[idx] = 0.0;
-                let blend = smooth01(0.42, -2.05, x);
-                if blend < 0.04 {
-                    continue;
+                if x > -1.55 && x < 0.28 && z > -0.62 && z < 0.88 && self.height[idx] > bed + 0.004 {
+                    self.bed[idx] = bed;
+                    self.initial_height[idx] = bed;
+                    self.sync(idx);
                 }
-                let target = 0.22_f32;
-                self.bed[idx] = lerp(self.bed[idx], target, blend * 0.94);
-                self.slurry[idx] = self.slurry[idx].min(0.0035);
-                self.initial_height[idx] = self.bed[idx];
-                self.sync(idx);
+                if x > -1.55 && x < -0.62 && z > 0.12 && z < 0.92 {
+                    self.placed[idx] = 0.0;
+                    self.bed[idx] = bed;
+                    self.initial_height[idx] = bed;
+                    self.sync(idx);
+                }
+                let dx = (x + 1.05) / 1.32;
+                let dz = (z - 0.15) / 1.02;
+                let r = (dx * dx + dz * dz).sqrt();
+                if r <= 1.12 {
+                    self.bed[idx] = bed;
+                    self.slurry[idx] = 0.002;
+                    self.initial_height[idx] = bed;
+                    self.sync(idx);
+                } else if self.height[idx] > bed + 0.014 {
+                    self.slurry[idx] = 0.002;
+                    if self.kind[idx] == SurfaceKind::Sand as u8 && x > -1.82 && x < 0.22 {
+                        self.bed[idx] = lerp(self.bed[idx], bed, 0.98);
+                        self.initial_height[idx] = self.bed[idx];
+                        self.sync(idx);
+                    } else if x > -1.92 && x < 0.35 && z > -0.55 && z < 0.95 {
+                        self.bed[idx] = lerp(self.bed[idx], bed, 0.85);
+                        self.initial_height[idx] = self.bed[idx];
+                        self.sync(idx);
+                    } else {
+                        self.sync(idx);
+                    }
+                }
+                if x > -1.92 && x < -0.28 && z > -0.62 && z < 0.92 && self.height[idx] > bed + 0.006 {
+                    self.placed[idx] = 0.0;
+                    self.bed[idx] = bed;
+                    self.initial_height[idx] = bed;
+                    self.sync(idx);
+                }
             }
         }
     }

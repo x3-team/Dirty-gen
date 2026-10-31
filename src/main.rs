@@ -930,14 +930,15 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let (px, pz) = WIN_DEMO_SEAM_PUDDLE;
     let parked_yaw = -1.88_f32;
     let mut parked = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut parked, px + 0.38, pz - 0.02, parked_yaw);
-    parked.time = 1.4;
+    win_demo_seat_vehicle_in_seam(&mut parked, px + 0.36, pz + 0.04, parked_yaw);
+    parked.soil.win_demo_still_touchup();
+    parked.time = 2.0;
     let pose = win_demo_low_pose(&parked);
 
     let saved_beauty = renderer.puddle_beauty;
     let saved_column = renderer.water_column;
-    renderer.puddle_beauty = false;
-    renderer.water_column = false;
+    renderer.puddle_beauty = true;
+    renderer.water_column = true;
     let rgba = renderer
         .draw(&parked, pose, None, true)
         .expect("puddle before");
@@ -951,9 +952,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     println!("win demo {}", media.join("puddle-low-before.png").display());
 
     let mut driven = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut driven, px + 0.52, pz + 0.22, parked_yaw);
+    win_demo_seat_vehicle_in_seam(&mut driven, px + 0.48, pz + 0.26, parked_yaw);
     win_demo_stage_wheels_in_pool(&mut driven);
-    driven.time = 11.2;
+    driven.soil.win_demo_still_touchup();
+    driven.time = 11.8;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
     let rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
@@ -966,8 +968,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let pose = win_demo_low_pose(&driven);
 
     let mut wheel = World::win_demo();
-    win_demo_seat_vehicle_in_seam(&mut wheel, px + 0.35, pz - 0.04, -2.58);
-    wheel.time = 7.2;
+    win_demo_seat_vehicle_in_seam(&mut wheel, px + 0.36, pz + 0.06, parked_yaw);
+    wheel.soil.win_demo_still_touchup();
+    wheel.time = 2.2;
     let pose = win_demo_low_pose(&wheel);
 
     renderer.puddle_beauty = false;
@@ -990,6 +993,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.show_mud_drops = false;
     renderer.show_mud_particles = false;
     wheel.time = 8.35;
+    wheel.soil.win_demo_still_touchup();
     let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     write_png(
         &media.join("puddle-wheel.png"),
@@ -1024,6 +1028,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     let mut drive = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut drive, px + 0.42, pz + 0.18, -2.58);
     win_demo_stage_wheels_in_pool(&mut drive);
+    drive.soil.win_demo_still_touchup();
     drive.time = 10.8;
     renderer.puddle_beauty = saved_beauty;
     renderer.water_column = saved_column;
@@ -1064,21 +1069,21 @@ fn win_demo_seat_vehicle_in_seam(world: &mut World, x: f32, z: f32, yaw: f32) {
     world.vehicle.roll = 0.0;
     let liquid = win_demo_pool_liquid(&world.soil, x, z);
     let pad = world.soil.sample(x, z);
-    let sink = 0.042 + liquid.min(0.22) * 0.06;
+    let sink = 0.052 + liquid.min(0.22) * 0.08;
     for wh in world.vehicle.wheels.iter_mut() {
         wh.sinkage = sink;
         wh.in_water = liquid > 0.02;
         wh.omega = 0.0;
         wh.normal = 5200.0;
     }
-    world.vehicle.pos = Vec3::new(x, pad.height + WHEEL_RADIUS * 0.95, z);
-    for _ in 0..32 {
+    world.vehicle.pos = Vec3::new(x, pad.height + WHEEL_RADIUS * 0.66, z);
+    for _ in 0..36 {
         let mut max_drop = 0.0_f32;
         for i in 0..4 {
             let local = world.vehicle.wheel_center_local(i);
             let hub = world.vehicle.pos + world.vehicle.orientation() * local;
             let ground = world.soil.sample(hub.x, hub.z);
-            let target = ground.height + WHEEL_RADIUS * 0.82 - sink * 0.12;
+            let target = ground.height + WHEEL_RADIUS * (0.52 - sink * 0.20);
             max_drop = max_drop.max(hub.y - target);
         }
         if max_drop < 0.0015 {
