@@ -711,6 +711,9 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     // SILT_BEAUTY_DUSK=1 keeps the low dusk sun.
     renderer.daylight = std::env::var_os("SILT_BEAUTY_DUSK").is_none();
     renderer.sand_field = true;
+    // SILT_DEBUG_DEPTH=1: water coloured by depth, tire bottoms and
+    // waterlines marked on the rubber.
+    renderer.debug_depth = std::env::var_os("SILT_DEBUG_DEPTH").is_some();
     // SILT_BEAUTY_FOG=1: the same drive through morning ground fog, under the
     // low sun with the headlamps on. The fog is picture only; the dust is the
     // published grid. Stills and video get a `fog-` prefix.
@@ -757,6 +760,9 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
                         Some(drive.dust()),
                     )
                     .expect("readback");
+                if std::env::var_os("SILT_BEAUTY_PROBE").is_some() {
+                    probe_waterline(&drive);
+                }
                 let path = dir.join(format!("{tag}{name}.png"));
                 write_png(&path, width, height, &rgba).expect("still");
                 println!("beauty still {} at z {z:.1}", path.display());
@@ -851,6 +857,36 @@ fn capture_beauty_crust(renderer: &mut Renderer, width: u32, height: u32, dir: &
     let path = dir.join("drying-crust.png");
     write_png(&path, width, height, &rgba).expect("still");
     println!("beauty still {}", path.display());
+}
+
+/// Prints, per wheel, the carcass bottom against the soil and the solved
+/// film round it, so the waterline on the rubber can be checked in numbers.
+fn probe_waterline(drive: &silt::ThroughDrive) {
+    let v = &drive.world.vehicle;
+    let ori = v.orientation();
+    for i in 0..4 {
+        let c = v.pos + ori * v.wheel_center_local(i);
+        let bottom = c.y - silt::vehicle::WHEEL_RADIUS;
+        let mut line = format!("wheel {i}: bottom {bottom:.3} sink {:.3}", v.wheels[i].sinkage);
+        for (lbl, dx, dz) in [("c", 0.0, 0.0), ("out", 0.3, 0.0), ("in", -0.3, 0.0), ("fw", 0.0, 0.45), ("bk", 0.0, -0.45)] {
+            let (x, z) = (c.x + dx, c.z + dz);
+            let soil = drive.world.soil.sample(x, z).height;
+            let g = drive.fluid.sample(x, z);
+            let film = g.water_m + g.slurry_m;
+            let surf = soil + film;
+            line += &format!(" | {lbl} soil {soil:.3} film {film:.3} surf-bottom {:+.3}", surf - bottom);
+        }
+        println!("{line}");
+        let mut ruts = format!("  rut behind wheel {i}:");
+        for back in [0.5f32, 1.0, 2.0, 3.0] {
+            for lat in [-0.3f32, -0.15, 0.0, 0.15, 0.3] {
+                let s = drive.world.soil.sample(c.x + lat, c.z - back);
+                ruts += &format!(" {:+.3}/{:.3}", s.height, s.rut);
+            }
+            ruts += " ||";
+        }
+        println!("{ruts}");
+    }
 }
 
 fn vehicle_axes(world: &World) -> (Vec3, Vec3, Vec3) {

@@ -52,6 +52,11 @@ struct FrameData {
     /// Near shadow cascade: a tight ortho round the Niva, drawn into the
     /// right half of the shadow atlas. The far cascade is `light_vp`.
     light_vp_near: [[f32; 4]; 4],
+    /// Water surface height at each tire, metres: soil plus the solved film
+    /// round the carcass. Below -100 when no sheet was given.
+    tire_water: [f32; 4],
+    /// x: 1 draws the depth debug (water by depth, tire bottoms marked).
+    debug: [f32; 4],
 }
 
 #[repr(C)]
@@ -162,6 +167,9 @@ pub struct Renderer {
     /// A still can place the sun (unit vector toward it); None keeps the
     /// day or dusk sun.
     pub sun_override: Option<Vec3>,
+    /// Depth debug: water coloured by depth, tire bottoms marked.
+    pub debug_depth: bool,
+    tire_water: [f32; 4],
     pub wind: Vec3,
     pub show_props: bool,
     /// Horizon skirt and filler outside the heightfield. Off for solver proof stills.
@@ -1352,6 +1360,8 @@ impl Renderer {
             fog: 0.0,
             fog_height: 1.4,
             sun_override: None,
+            debug_depth: false,
+            tire_water: [-1000.0; 4],
             wind: Vec3::new(1.1, 0.0, -0.65),
             show_props: true,
             show_environment: true,
@@ -1547,6 +1557,10 @@ impl Renderer {
             fluid,
             dust,
         );
+        self.tire_water = match fluid {
+            Some(fluid) => tire_waterlines(world, fluid),
+            None => [-1000.0; 4],
+        };
         if let Some(gpu) = &self.contract {
             gpu.upload(&self.queue, &self.contract_cpu);
         }
@@ -1686,6 +1700,8 @@ impl Renderer {
                 // No near cascade: a matrix that maps everything off the map.
                 Mat4::from_translation(Vec3::new(9.0, 9.0, 0.0)).to_cols_array_2d()
             },
+            tire_water: self.tire_water,
+            debug: [if self.debug_depth { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
@@ -2379,6 +2395,33 @@ impl Renderer {
         pass.set_index_buffer(self.dust_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
     }
+}
+
+/// Mean water surface on a ring just outside each carcass: soil height plus
+/// the solved water and slurry. Read only; the sheet is the solver's.
+pub fn tire_waterlines(world: &World, fluid: &silt::fluid_core::FluidCore) -> [f32; 4] {
+    let v = &world.vehicle;
+    let ori = v.orientation();
+    let mut out = [-1000.0; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        let c = v.pos + ori * v.wheel_center_local(i);
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let (x, z) = (c.x + a.cos() * 0.32, c.z + a.sin() * 0.45);
+            let g = fluid.sample(x, z);
+            let film = g.water_m + g.slurry_m;
+            if film > 0.004 {
+                sum += world.soil.sample(x, z).height + film;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            *o = sum / n;
+        }
+    }
+    out
 }
 
 fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
