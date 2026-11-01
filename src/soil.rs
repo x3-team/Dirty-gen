@@ -704,6 +704,10 @@ pub struct SoilField {
     pub crust: Vec<f32>,
     /// Crack opening, metres. A shader reads this. It does not move the bed.
     pub crack: Vec<f32>,
+    /// Row band the capillary step runs next. See [`crate::wick`].
+    wick_band: usize,
+    /// Shrinkage-fracture lattice of the skin. It writes [`Self::crack`].
+    pub skin: crate::skin::SkinLattice,
     /// Cubic metres of skin written onto the field, including what later left.
     /// Not solid mass. The bed, the placed pile, and the cloud stay out of it.
     skin_grown_m3: f64,
@@ -1317,6 +1321,8 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust: vec![0.0; n],
             crack: vec![0.0; n],
+            wick_band: 0,
+            skin: crate::skin::SkinLattice::default(),
             skin_grown_m3: 0.0,
             skin_lost_m3: 0.0,
             mix: vec![0.0; n * MIX_CHANNELS],
@@ -1509,6 +1515,38 @@ impl SoilField {
         self.wetness = wet;
         self.base_wetness = base_wet;
         self.mix_ready = true;
+    }
+
+    /// Slurry conductance of one cell, as [`slurry_flow_conduct`]. On a
+    /// material joint the slurry is a blend: its viscosity is the log mean
+    /// (Arrhenius mixing rule) of the mud, sand, and grass-topsoil slurries,
+    /// weighted by their shares. Grass topsoil slurries like silt. Gravel
+    /// does not slurry and is left out of the blend. Off a joint this is
+    /// [`slurry_flow_conduct`] of the cell's kind.
+    pub fn slurry_conduct_at(&self, idx: usize, moisture: f32) -> f32 {
+        let kind = SurfaceKind::from_u8(self.kind[idx]);
+        if !self.mix_ready || !mixes_as_slurry(kind) {
+            return slurry_flow_conduct(kind, moisture);
+        }
+        let mix = self.mix_texel(idx);
+        let peak = mix.iter().cloned().fold(0.0f32, f32::max);
+        if peak >= 0.999 {
+            return slurry_flow_conduct(kind, moisture);
+        }
+        let parts = [
+            (mix[MIX_MUD], SurfaceKind::WetMud),
+            (mix[MIX_SAND], SurfaceKind::Sand),
+            (mix[MIX_GRASS], SurfaceKind::Silt),
+        ];
+        let total: f32 = parts.iter().map(|p| p.0.max(0.0)).sum();
+        if total < 0.05 {
+            return slurry_flow_conduct(kind, moisture);
+        }
+        let ln_visc: f32 = parts
+            .iter()
+            .map(|(w, k)| w.max(0.0) / total * slurry_viscosity(*k, moisture).max(0.05).ln())
+            .sum();
+        (22.0 / ln_visc.exp()).clamp(0.02, 3.0)
     }
 
     /// Mud, sand, gravel, grass at one cell. A field that has not been
@@ -4162,9 +4200,8 @@ impl SoilField {
         if head_slurry[recv] <= 1.0e-4 && !self.in_rut_or_hole(recv) {
             return;
         }
-        let kind = SurfaceKind::from_u8(self.kind[donor]);
         let moisture = self.wetness[donor].clamp(0.08, 0.92);
-        let conduct = slurry_flow_conduct(kind, moisture);
+        let conduct = self.slurry_conduct_at(donor, moisture);
         let mut depth = head * conduct * dt / dx.max(1.0e-3) * 0.55;
         depth = depth.min(head * 0.48).min(budget[donor]);
         if depth <= 1.0e-6 {
@@ -6096,6 +6133,7 @@ impl SoilField {
     pub fn step_moisture(&mut self, dt: f32, rain: f32) {
         let dt = dt.max(0.0);
         let rain = rain.max(0.0);
+        self.wick_pores(dt);
         let n = self.wetness.len();
         for idx in 0..n {
             let kind = SurfaceKind::from_u8(self.kind[idx]);
@@ -6142,6 +6180,26 @@ impl SoilField {
             }
             self.bake_crust(idx, next, dt, rain);
         }
+        self.fracture_skin();
+    }
+
+    /// Capillary pore water across soil joints. See [`crate::wick`]. Water
+    /// past a cell's surface hold is free water: that cell is a pond.
+    fn wick_pores(&mut self, dt: f32) {
+        let kind = &self.kind;
+        crate::wick::wick(
+            &mut self.wetness,
+            &mut self.water,
+            &self.height,
+            |idx| {
+                let k = SurfaceKind::from_u8(kind[idx]);
+                (crate::wick::class_of(k), water_hold(k))
+            },
+            self.res,
+            self.cell,
+            dt,
+            &mut self.wick_band,
+        );
     }
 
     /// Grow or soak the skin on one cell. The bed and the placed pile stay.
@@ -6173,25 +6231,46 @@ impl SoilField {
         self.commit_skin(idx, thickness, opening);
     }
 
-    fn next_crack(&self, idx: usize, thickness: f32, opening: f32, dt: f32) -> f32 {
+    /// A skin under the onset is still plastic: its fissure closes. A plate
+    /// keeps its opening here; [`Self::fracture_skin`] sets it after the sweep.
+    fn next_crack(&self, _idx: usize, thickness: f32, opening: f32, dt: f32) -> f32 {
         if thickness <= CRACK_ONSET_M {
             return (opening - CRACK_CLOSE * dt).max(0.0);
         }
-        let (x, z) = self.cell_xz(idx);
-        let mask = crack_mask(x, z);
-        if mask < 0.12 {
-            return (opening - CRACK_CLOSE * 0.25 * dt).max(0.0);
+        opening
+    }
+
+    /// Shrinkage fracture over the whole field. Each skin wants to shrink by
+    /// the moisture it lost below [`REWET_AT`], the wet ground holds it, and
+    /// edges past their tensile strength break. See [`crate::skin`].
+    fn fracture_skin(&mut self) {
+        if !self.crust.iter().any(|t| *t > CRACK_ONSET_M) && self.skin.fissures == 0 {
+            return;
         }
-        let skin = ((thickness - CRACK_ONSET_M) / (CRUST_MAX_M - CRACK_ONSET_M)).clamp(0.0, 1.0);
-        let plate = if self.passes[idx] > 0 {
-            let age = ((self.rest[idx] - 0.40) / 12.0).clamp(0.0, 1.0);
-            0.55 + 0.45 * age
-        } else {
-            0.40
-        };
-        let target = CRACK_MAX_M * skin * mask * plate;
-        let a = 1.0 - (-0.09 * dt).exp();
-        lerp(opening, target, a).clamp(0.0, CRACK_MAX_M)
+        let cells: Vec<crate::skin::SkinCell> = (0..self.crust.len())
+            .map(|idx| crate::skin::SkinCell {
+                thickness: finite_or_zero(self.crust[idx]),
+                strain: crate::skin::free_strain(self.wetness[idx], REWET_AT),
+            })
+            .collect();
+        let mut opening = self.crack.clone();
+        self.skin.step(
+            self.res,
+            self.cell,
+            CRACK_ONSET_M,
+            CRUST_MAX_M,
+            &cells,
+            &mut opening,
+        );
+        for idx in 0..opening.len() {
+            let cap = CRACK_MAX_M.min(self.crust[idx].max(0.0));
+            let o = finite_or_zero(opening[idx]);
+            self.crack[idx] = if self.crust[idx] > CRACK_ONSET_M {
+                o.min(cap)
+            } else {
+                o.min(self.crack[idx])
+            };
+        }
     }
 
     /// Store the skin. Thickness stays at or under [`CRUST_CAP_M`]. Opening
@@ -6538,6 +6617,8 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust,
             crack,
+            wick_band: 0,
+            skin: crate::skin::SkinLattice::default(),
             skin_grown_m3,
             skin_lost_m3: 0.0,
             mix,
@@ -7739,6 +7820,250 @@ impl SoilField {
         field
     }
 
+    /// Flat pad for the Windows playable demo: dry sand on +X, wet mud on −X,
+    /// two shallow puddles in the mud lane.
+    pub fn win_playground() -> Self {
+        let mut field = Self::flat(0.22);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        let puddles = [
+            (-2.35_f32, -0.95_f32, 1.05_f32, 0.72_f32, 0.11_f32),
+            (-2.35_f32, 1.30_f32, 1.05_f32, 0.72_f32, 0.11_f32),
+        ];
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let mut h = field.height[idx];
+                for (cx, cz, rx, rz, depth) in puddles {
+                    h -= bowl(x, z, cx, cz, rx, rz, depth);
+                }
+                field.height[idx] = h;
+                field.bed[idx] = h;
+                field.initial_height[idx] = h;
+            }
+        }
+        let water_line = -0.018;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let h = field.height[idx];
+                let sand = smooth01(-0.25, 0.55, x);
+                let mud = 1.0 - sand;
+                let mut water = 0.0;
+                if h < water_line {
+                    water = (water_line - h).min(0.28);
+                }
+                field.water[idx] = water;
+                if sand > 0.55 {
+                    field.kind[idx] = SurfaceKind::Sand as u8;
+                    field.wetness[idx] = lerp(0.14, 0.24, sand);
+                    field.base_wetness[idx] = 0.12;
+                    field.loose[idx] = 0.008;
+                    field.roughness[idx] = 0.92;
+                    field.darken[idx] = 0.03;
+                } else if mud > 0.55 {
+                    field.kind[idx] = SurfaceKind::WetMud as u8;
+                    field.wetness[idx] = if water > 0.02 {
+                        1.0
+                    } else {
+                        lerp(0.72, 0.88, mud)
+                    };
+                    field.base_wetness[idx] = 0.78;
+                    field.loose[idx] = if water > 0.02 { 0.018 } else { 0.02 };
+                    field.roughness[idx] = if water > 0.02 { 0.08 } else { 0.42 };
+                    field.darken[idx] = if water > 0.02 {
+                        0.24
+                    } else if water > 0.006 {
+                        0.18
+                    } else {
+                        0.10
+                    };
+                } else {
+                    field.kind[idx] = SurfaceKind::Undisturbed as u8;
+                    field.wetness[idx] = 0.38;
+                    field.base_wetness[idx] = 0.32;
+                    field.loose[idx] = 0.0;
+                    field.roughness[idx] = 0.78;
+                    field.darken[idx] = 0.05;
+                }
+                field.slurry[idx] = slurry_soil_depth(field.water[idx], field.wetness[idx]);
+                let _ = z;
+            }
+        }
+        field.win_demo_seam_pan();
+        field.rebuild_height();
+        field
+    }
+
+    /// Flat pool surface matches the pad grade (lip is wet soil, not a raised berm).
+    pub fn win_demo_pool_rim_height(field_bed: f32) -> f32 {
+        field_bed
+    }
+
+    fn win_demo_bowl_bed(r: f32, field_bed: f32) -> f32 {
+        if r > 1.38 {
+            return field_bed;
+        }
+        let core = (1.0_f32 - r / 1.28).max(0.0);
+        let rim = smooth01(0.78, 1.22, r);
+        let bowl = field_bed - core * core * 0.25;
+        lerp(bowl, field_bed, rim)
+    }
+
+    /// Hero seam pool: one bowl carve + standing water. No follow-up flatten passes.
+    pub fn win_demo_seam_pan(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.32_f32, 1.02_f32);
+        let field = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let dx = (x - sx) / srx;
+                let dz = (z - sz) / srz;
+                let r = (dx * dx + dz * dz).sqrt();
+                if r > 1.42 {
+                    continue;
+                }
+                let idx = j * res + i;
+                let feather = smooth01(1.42, 1.05, r);
+                if feather < 0.02 {
+                    continue;
+                }
+                self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                let bowl_h = Self::win_demo_bowl_bed(r, field);
+                self.bed[idx] = lerp(self.bed[idx], bowl_h, feather);
+                self.initial_height[idx] = self.bed[idx];
+                let core = (1.0_f32 - r / 1.28).max(0.0);
+                let seam_water = (0.04 + core * core * 0.22) * feather;
+                if seam_water > 0.0 {
+                    self.water[idx] = self.water[idx].max(seam_water);
+                }
+                self.slurry[idx] = 0.0015 + seam_water * 0.006;
+                if seam_water > 0.02 {
+                    self.kind[idx] = SurfaceKind::WetMud as u8;
+                    self.wetness[idx] = 1.0;
+                    self.darken[idx] = self.darken[idx].max(0.28);
+                    self.roughness[idx] = self.roughness[idx].min(0.08);
+                } else if r > 0.92 && r < 1.38 {
+                    self.wetness[idx] = self.wetness[idx].max(0.65);
+                    self.darken[idx] = self.darken[idx].max(0.22);
+                }
+                self.sync(idx);
+            }
+        }
+    }
+
+    /// Stills only: strip spoil spikes inside the pool (no bed re-sculpt).
+    pub fn win_demo_still_touchup(&mut self) {
+        self.win_demo_clear_pool_spoil();
+        self.rebuild_height();
+    }
+
+    /// Strip tread/spoil spikes inside the hero bowl before still capture.
+    fn win_demo_clear_pool_spoil(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let dx = (x + 1.05) / 1.32;
+                let dz = (z - 0.15) / 1.02;
+                let r = (dx * dx + dz * dz).sqrt();
+                if r > 1.38 {
+                    continue;
+                }
+                let idx = j * res + i;
+                if self.placed[idx] > 0.001
+                    || self.loose[idx] > 0.004
+                    || self.tread_amp[idx] > 0.001
+                {
+                    self.placed[idx] = 0.0;
+                    self.loose[idx] = 0.0;
+                    self.tread_amp[idx] = 0.0;
+                    self.sync(idx);
+                }
+            }
+        }
+    }
+
+    /// Berms and tread spikes in the side-camera frustum, hero pad only.
+    #[allow(dead_code)]
+    fn win_demo_hero_spike_cleanup(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if x > 0.52 || x < -2.05 || z < -1.12 || z > 1.52 {
+                    continue;
+                }
+                let idx = j * res + i;
+                self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                let dx = (x + 1.05) / 1.58;
+                let dz = (z - 0.15) / 1.22;
+                let r = (dx * dx + dz * dz).sqrt();
+                let bowl_h = Self::win_demo_bowl_bed(r, bed);
+                if r <= 1.32 && self.height[idx] > bowl_h + 0.001 {
+                    self.bed[idx] = bowl_h;
+                    self.placed[idx] = 0.0;
+                    self.loose[idx] = 0.0;
+                    self.slurry[idx] = 0.002;
+                    self.initial_height[idx] = self.bed[idx];
+                    self.sync(idx);
+                } else if self.height[idx] > bed + 0.014 {
+                    self.slurry[idx] = 0.002;
+                    if self.kind[idx] == SurfaceKind::Sand as u8 && x > -1.82 && x < 0.22 {
+                        self.bed[idx] = lerp(self.bed[idx], bed, 0.98);
+                        self.initial_height[idx] = self.bed[idx];
+                        self.sync(idx);
+                    } else if x > -1.92 && x < 0.35 && z > -0.55 && z < 0.95 {
+                        self.bed[idx] = lerp(self.bed[idx], bed, 0.85);
+                        self.initial_height[idx] = self.bed[idx];
+                        self.sync(idx);
+                    } else {
+                        self.sync(idx);
+                    }
+                }
+                if x > -1.92 && x < -0.28 && z > -0.62 && z < 0.92 && self.height[idx] > bed + 0.006 {
+                    self.placed[idx] = 0.0;
+                    self.bed[idx] = if r <= 1.32 {
+                        Self::win_demo_bowl_bed(r, bed)
+                    } else {
+                        bed
+                    };
+                    self.initial_height[idx] = self.bed[idx];
+                    self.sync(idx);
+                }
+            }
+        }
+    }
+
     /// Flat pad with clay, silt, and sand strips. Each strip holds four moisture
     /// bands along Z so the Niva can sit on damp clay while the readout compares
     /// dry, damp, saturated, and pooled traction on all three soils.
@@ -8249,36 +8574,6 @@ pub fn track_harden_mul(crust: f32, crack: f32, passes: u8, rest: f32) -> f32 {
     1.0 + 1.8 * skin * age * (1.0 - 0.35 * open)
 }
 
-/// 1 on a shrinkage fissure, 0 inside the polygon. World metres.
-pub fn crack_mask(x: f32, z: f32) -> f32 {
-    let scale = 0.48_f32;
-    let fx = x / scale;
-    let fz = z / scale;
-    let ix = fx.floor() as i32;
-    let iz = fz.floor() as i32;
-    let mut best = f32::MAX;
-    let mut second = f32::MAX;
-    for dj in -1..=1 {
-        for di in -1..=1 {
-            let gx = (ix + di) as f32;
-            let gz = (iz + dj) as f32;
-            let jx = hash2(gx, gz) - 0.5;
-            let jz = hash2(gx + 4.2, gz + 1.7) - 0.5;
-            let cx = gx + 0.5 + jx * 0.8;
-            let cz = gz + 0.5 + jz * 0.8;
-            let d = (fx - cx).hypot(fz - cz);
-            if d < best {
-                second = best;
-                best = d;
-            } else if d < second {
-                second = d;
-            }
-        }
-    }
-    let gap = (second - best).max(0.0);
-    (1.0 - gap / 0.11).clamp(0.0, 1.0)
-}
-
 /// RGBA8 texel for a shader. R is crust thickness, G is crack opening.
 /// B is unused. A is opaque so a sampler can tell a written cell from empty.
 pub fn crust_shader_texel(thickness: f32, crack: f32) -> [u8; 4] {
@@ -8440,6 +8735,10 @@ fn bog_bowl(x: f32, z: f32, cx: f32, cz: f32, rad: f32, depth: f32) -> f32 {
     let shore = smooth01(1.0, 0.8, d);
     let floor = smooth01(0.8, 0.4, d);
     (shore * 0.35 + floor * 0.65) * depth
+}
+
+fn finite_or_zero(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 fn hash2(x: f32, y: f32) -> f32 {
@@ -9532,6 +9831,57 @@ mod tests {
         }
     }
 
+    /// A puddle on mud beside dry sand: the sand is fed by capillarity about
+    /// a cell out and dries past that, so the joint has a damp band that
+    /// fades, not a hard step.
+    #[test]
+    fn a_mud_sand_joint_grows_a_damp_band_in_the_sand() {
+        let mut soil = SoilField::flat(0.2);
+        let res = soil.res;
+        let seam = res / 2;
+        for idx in 0..res * res {
+            let i = idx % res;
+            soil.water[idx] = 0.0;
+            if i < seam {
+                soil.kind[idx] = SurfaceKind::WetMud as u8;
+                soil.wetness[idx] = 0.92;
+                soil.water[idx] = 0.03;
+            } else {
+                soil.kind[idx] = SurfaceKind::Sand as u8;
+                soil.wetness[idx] = 0.06;
+            }
+        }
+        let row = res / 2;
+        for _ in 0..5 {
+            for _ in 0..16 {
+                // The mud is a puddle bed: its pond is kept topped up.
+                for j in 0..res {
+                    for i in 0..seam {
+                        soil.water[j * res + i] = soil.water[j * res + i].max(0.03);
+                    }
+                }
+                soil.advance_weather(0.25, 0.0);
+            }
+        }
+        let w = |i: usize| soil.wetness[row * res + i];
+        let profile: Vec<String> = (seam - 4..seam + 8).map(|i| format!("{:.2}", w(i))).collect();
+        eprintln!("joint wetness mud|sand {}", profile.join(" "));
+        let far = w(res - 10);
+        assert!(w(seam) > far + 0.10, "no damp band, {} vs far {far}", w(seam));
+        assert!(w(seam + 1) > far + 0.01, "the band stops at the joint, {}", w(seam + 1));
+        assert!(
+            w(seam) >= w(seam + 1) && w(seam + 1) >= w(seam + 2),
+            "the band does not fade into the sand"
+        );
+        assert!(w(seam + 5) < far + 0.02, "the whole sand got wet, {}", w(seam + 5));
+        assert!(w(seam - 1) > 0.9, "the puddle bed dried, {}", w(seam - 1));
+        for i in 0..res {
+            if i < seam {
+                assert_eq!(soil.kind[row * res + i], SurfaceKind::WetMud as u8);
+            }
+        }
+    }
+
     #[test]
     fn gravel_drains_and_sand_and_silt_keep_their_states() {
         let mut soil = SoilField::flat(0.2);
@@ -9873,6 +10223,27 @@ mod tests {
         assert_eq!(pre_crust.crust[crust_cell], 0.0);
         assert_eq!(pre_crust.crack[crust_cell], 0.0);
         assert!((pre_crust.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn joint_slurry_runs_between_its_two_materials() {
+        let mut soil = SoilField::flat(0.7);
+        let idx = soil.idx_at(0.0, 0.0).expect("cell");
+        soil.kind[idx] = SurfaceKind::WetMud as u8;
+        let m = 0.6;
+        let clay = slurry_flow_conduct(SurfaceKind::WetMud, m);
+        let sand = slurry_flow_conduct(SurfaceKind::Sand, m);
+        // Not blended yet: the kind alone.
+        assert_eq!(soil.slurry_conduct_at(idx, m), clay);
+        soil.mix_ready = true;
+        let base = idx * MIX_CHANNELS;
+        soil.mix[base..base + MIX_CHANNELS].copy_from_slice(&[0.5, 0.5, 0.0, 0.0]);
+        let half = soil.slurry_conduct_at(idx, m);
+        assert!(half > clay && half < sand, "clay {clay} joint {half} sand {sand}");
+        let eta = (slurry_viscosity(SurfaceKind::WetMud, m) * slurry_viscosity(SurfaceKind::Sand, m)).sqrt();
+        assert!((half - (22.0 / eta).clamp(0.02, 3.0)).abs() < 1.0e-4, "log mean {half}");
+        soil.mix[base..base + MIX_CHANNELS].copy_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(soil.slurry_conduct_at(idx, m), clay);
     }
 
     #[test]
