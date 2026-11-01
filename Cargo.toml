@@ -15,7 +15,7 @@ env_logger = "0.11"
 glam = { version = "0.29", features = ["bytemuck"] }
 png = "0.17"
 pollster = "0.4"
-wgpu = "23"
+wgpu = { version = "23", features = ["counters"] }
 winit = "0.30"
 gltf = { version = "1.4.1", default-features = false, features = ["utils", "names", "extensions"] }
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -36,6 +36,14 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console", "Document", "Element", "HtmlCanvasElement", "Location", "Response", "Window"] }
 web-time = "1"
 wgpu = { version = "23", features = ["webgl"] }
+
+[dev-dependencies]
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+png = "0.17"
+# Same naga as wgpu 23: the GPU budget test validates the WGSL and emits
+# GLSL ES 3.00, the code the WebGL2 build runs.
+naga = { version = "23.1", features = ["wgsl-in", "glsl-out"] }
+regex-lite = "0.1"
 
 [workspace]
 resolver = "2"

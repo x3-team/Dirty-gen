@@ -14,6 +14,7 @@ pub mod ford;
 pub mod lod;
 pub mod particles;
 pub mod patch;
+pub mod quality;
 pub mod render_contract;
 pub mod snow;
 pub mod snow_track;
