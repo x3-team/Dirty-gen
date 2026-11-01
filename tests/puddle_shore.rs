@@ -14,6 +14,8 @@ use silt::fluid_core::{FluidCore, COARSE_CELL_M, FINE_CELL_M, WINDOW_RES};
 use silt::world::ThroughDrive;
 
 const FILM_M: f32 = 0.004;
+/// North edge of the bay analysis; the slurry ruts start at z = -8.75.
+const BAY_NORTH_Z: f32 = -8.8;
 const STEP_BUDGET_MS: f32 = 7.0;
 const WATER_BUDGET_MS: f32 = 6.0;
 /// Relative water, slurry, and spray. Half a percent of the larger volume.
@@ -72,6 +74,18 @@ fn mask_stats(depth: &[f32], cell: f32) -> MaskStats {
         area_m2: area,
         cells,
     }
+}
+
+/// Zero every cell north of the bay's bank, z >= BAY_NORTH_Z.
+fn bay_only(depth: &[f32], origin_z: f32) -> Vec<f32> {
+    let mut out = depth.to_vec();
+    for j in 0..WINDOW_RES {
+        let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
+        if z >= BAY_NORTH_Z {
+            out[j * WINDOW_RES..(j + 1) * WINDOW_RES].fill(0.0);
+        }
+    }
+    out
 }
 
 fn live_films(fluid: &FluidCore) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -258,9 +272,14 @@ fn crop_of(a: &[f32], b: &[f32]) -> (usize, usize, usize, usize) {
 #[test]
 fn puddle_shore_follows_relief() {
     let mut drive = ThroughDrive::new();
-    let (water, slurry, film) = live_films(&drive.fluid);
-    let before = drive.shore_before();
-    assert_eq!(before.len(), film.len());
+    let (water, slurry, film_all) = live_films(&drive.fluid);
+    assert_eq!(drive.shore_before().len(), film_all.len());
+    // The shore is the bay. The slurry ruts start past its north bank and are
+    // not part of the contour.
+    let (_, oz0, _) = drive.fluid.window_bounds();
+    let film = bay_only(&film_all, oz0);
+    let before_bay = bay_only(drive.shore_before(), oz0);
+    let before = &before_bay[..];
 
     for (name, grid) in [("water", &water), ("slurry", &slurry)] {
         for (k, v) in grid.iter().enumerate() {
