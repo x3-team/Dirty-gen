@@ -927,6 +927,18 @@ fn win_demo_low_pose(world: &World) -> CameraPose {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn print_win_demo_ellipse_pixels(label: &str, rgba: &[u8], width: u32) {
+    let probes = [(640_u32, 446_u32), (620, 460), (660, 430)];
+    for (x, y) in probes {
+        let i = ((y * width + x) * 4) as usize;
+        println!(
+            "win demo ellipse {label} ({x},{y}) rgb=({}, {}, {})",
+            rgba[i], rgba[i + 1], rgba[i + 2]
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, media: &Path) {
     use silt::world::Input;
 
@@ -978,13 +990,12 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.water_column = true;
     let _ = renderer.draw(&wheel, pose, None, true);
     let _ = renderer.draw(&wheel, pose, None, true);
-    renderer.win_demo_pool_reflect_debug = false;
-    let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     renderer.win_demo_pool_reflect_debug = true;
     let debug_rgba = renderer
         .draw(&wheel, pose, None, true)
         .expect("wheel reflect debug");
     renderer.win_demo_pool_reflect_debug = false;
+    let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
     if !renderer.win_demo_reflect_rgba.is_empty() {
         write_png(
             &media.join("reflect_rt.png"),
@@ -1011,6 +1022,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     )
     .expect("win demo png");
     println!("win demo {}", media.join("puddle-wheel.png").display());
+    print_win_demo_ellipse_pixels("puddle-reflect-debug", &debug_rgba, width);
+    print_win_demo_ellipse_pixels("puddle-wheel", &rgba, width);
 
     let mut parked = World::win_demo();
     win_demo_seat_vehicle_in_seam(&mut parked, px + 0.36, pz + 0.04, parked_yaw);

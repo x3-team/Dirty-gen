@@ -1142,11 +1142,11 @@ fn win_demo_seam_column(xz: vec2<f32>) -> f32 {
     let dx = (xz.x - c.x) / 1.32;
     let dz = (xz.y - c.y) / 1.02;
     let r = sqrt(dx * dx + dz * dz);
-    if (r > 1.22) {
+    if (r > 1.40) {
         return 0.0;
     }
     let core = clamp(1.0 - r / 1.15, 0.0, 1.0);
-    let edge = smoothstep(1.22, 0.88, r);
+    let edge = smoothstep(1.40, 0.88, r);
     return (0.05 + core * core * 0.22) * edge;
 }
 
@@ -1154,7 +1154,7 @@ fn win_demo_in_pool(xz: vec2<f32>) -> bool {
     let c = beauty_seam_center();
     let dx = (xz.x - c.x) / 1.32;
     let dz = (xz.y - c.y) / 1.02;
-    return sqrt(dx * dx + dz * dz) < 1.22;
+    return sqrt(dx * dx + dz * dz) < 1.40;
 }
 
 fn beauty_seam_weight(xz: vec2<f32>) -> f32 {
@@ -1267,30 +1267,23 @@ fn pool_reflect_mirror_world(world: vec4<f32>) -> vec4<f32> {
 
 fn pool_reflect_uv(x: f32, z: f32) -> vec2<f32> {
     let level = win_demo_pool_level();
-    var p = vec3<f32>(x, level, z);
-    var vp = frame.view_proj;
-    if ((render_flags() & 8u) != 0u) {
-        vp = frame.reflect_view_proj;
-        p.y = 2.0 * level - p.y;
-    }
-    let clip = vp * vec4<f32>(p, 1.0);
+    let clip = frame.reflect_view_proj * vec4<f32>(x, level, z, 1.0);
     if (clip.w <= 0.02) {
         return vec2<f32>(-1.0, -1.0);
     }
-    var uv = clip.xy / clip.w;
-    var u = uv.x * 0.5 + 0.5;
-    var v = 0.5 - uv.y * 0.5;
-    // Reflected-camera RT is viewed from below; flip V so plane samples hit Niva texels.
-    if ((render_flags() & 8u) != 0u) {
-        v = 1.0 - v;
-    }
-    return vec2<f32>(u, v);
+    let ndc = clip.xy / clip.w;
+    return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 + ndc.y * 0.5);
 }
 
 fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
     if (uv.x < 0.005 || uv.x > 0.995 || uv.y < 0.005 || uv.y > 0.995) {
         return vec3<f32>(0.0);
     }
+    let dims = textureDimensions(pool_reflect_tex);
+    let tc = vec2<i32>(
+        i32(clamp(uv.x, 0.0, 1.0) * f32(dims.x - 1u)),
+        i32(clamp(uv.y, 0.0, 1.0) * f32(dims.y - 1u)),
+    );
     return textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
 }
 
@@ -1721,31 +1714,11 @@ fn shade_seam_pool(
     let t = frame.misc.x;
     var nrm = normalize(puddle_normal(xz, t, column_here));
     if (win_demo_flat_terrain()) {
-        let planar = pool_planar_reflect_sample(in.world);
-        let reflect_ready = pool_reflect_ready();
-        let planar_l = length(planar);
-        let sky_l = length(vec3<f32>(0.77, 0.79, 0.81));
-        let planar_subject = planar_l > 0.03 && planar_l < sky_l * 0.92;
-        if (reflect_ready && planar_subject) {
-            let c = beauty_seam_center();
-            let dx = (xz.x - c.x) / 1.32;
-            let dz = (xz.y - c.y) / 1.02;
-            let r = sqrt(dx * dx + dz * dz);
-            let edge_a = smoothstep(1.26, 0.68, r);
-            let core_a = smoothstep(1.05, 0.42, r);
-            let alpha = max(edge_a * 0.92, core_a * 0.97);
-            var col = pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-            if (frame.reflect_flags.y < 0.5) {
-                let sun = normalize(frame.sun_dir.xyz);
-                let ndl = clamp(dot(normalize(vec3<f32>(0.0, 1.0, 0.0)), sun), 0.0, 1.0);
-                let body = vec3<f32>(0.05, 0.34, 0.52) * (0.12 + 0.88 * ndl);
-                col = mix(col, body, 0.05);
-            }
-            return vec4<f32>(pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), alpha);
-        }
         if (frame.reflect_flags.y > 0.5) {
+            let planar = pool_planar_reflect_sample(in.world);
             return vec4<f32>(pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 0.96);
         }
+        let reflect_ready = pool_reflect_ready();
         let bow = beauty_bow_wave(xz, t);
         let driven = smoothstep(4.0, 5.5, t);
         let ripple_mix = clamp(0.12 + max(bow, 0.0) * 3.2 * (0.35 + driven * 0.65), 0.12, 0.58);
@@ -1758,7 +1731,7 @@ fn shade_seam_pool(
         let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
         let water_tint = vec3<f32>(0.05, 0.34, 0.52);
         let body = water_tint * (0.12 + 0.88 * ndl);
-        var reflect_col = planar;
+        var reflect_col = pool_planar_reflect_sample(in.world);
         let refl_dir = reflect(-view, nrm);
         if (length(reflect_col) < 0.02 && !reflect_ready) {
             reflect_col = sky_reflect(refl_dir);
@@ -1777,9 +1750,12 @@ fn shade_seam_pool(
         let dx = (xz.x - c.x) / 1.32;
         let dz = (xz.y - c.y) / 1.02;
         let r = sqrt(dx * dx + dz * dz);
-        let edge_a = smoothstep(1.26, 0.68, r);
+        let edge_a = smoothstep(1.40, 0.68, r);
         let core_a = smoothstep(1.05, 0.42, r);
-        let alpha = max(edge_a * 0.92, core_a * 0.97);
+        var alpha = max(edge_a * 0.92, core_a * 0.97);
+        if (reflect_ready && win_demo_in_pool(xz)) {
+            alpha = max(alpha, 0.94);
+        }
         let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
         let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
         return vec4<f32>(gamma, alpha);
