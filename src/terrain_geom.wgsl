@@ -22,7 +22,8 @@ struct TerrainGeom {
 }
 
 // Fine track field from the solver, rgba32float, not filterable.
-// R: surface offset (m) over the bilinear 20 cm ground at the texel centre.
+// R: absolute surface height (m). The solver publishes an offset over
+// contract ground; set_track_fine adds that ground on upload.
 // G: snow depth, B: compaction, A: lug depth. Only R moves the ground.
 @group(1) @binding(10) var track_fine_tex: texture_2d<f32>;
 @group(1) @binding(11) var<uniform> tgeom: TerrainGeom;
@@ -80,7 +81,7 @@ fn tg_fine_load(ij: vec2<i32>) -> f32 {
     return textureLoad(track_fine_tex, c, 0).r;
 }
 
-// x: offset (m), y: weight (1 inside the window, 0 past its feathered edge).
+// x: surface height (m), y: weight (1 inside the window, 0 past its feathered edge).
 fn tg_fine(xz: vec2<f32>) -> vec2<f32> {
     if (tgeom.recon.y < 0.5) {
         return vec2<f32>(0.0);
@@ -104,8 +105,8 @@ fn tg_fine(xz: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(mix(mix(a, b, f.x), mix(c, d, f.x), f.y), w);
 }
 
-// Called by height_raw with its bilinear read. The fine field is defined
-// over that bilinear ground, so inside its window the base is bilinear.
+// Called by height_raw with its bilinear read. Inside the fine window the
+// published surface wins, feathered into the 20 cm ground at the rim.
 fn tg_refine(xz: vec2<f32>, bilinear: f32) -> f32 {
     var h = bilinear;
     if (tgeom.recon.x > 0.5) {
@@ -113,7 +114,7 @@ fn tg_refine(xz: vec2<f32>, bilinear: f32) -> f32 {
     }
     let fine = tg_fine(xz);
     if (fine.y > 0.0) {
-        h = mix(h, bilinear + fine.x, fine.y);
+        h = mix(h, fine.x, fine.y);
     }
     return h;
 }

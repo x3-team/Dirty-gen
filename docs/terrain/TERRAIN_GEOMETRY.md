@@ -61,10 +61,14 @@ is exactly the 20 cm reconstruction.
 Reading the field (agreed with the solver thread, numbers pending the
 contract):
 
-- R: surface offset in metres over the **bilinear** 20 cm contract ground at
-  the fine texel centre, lugs included. 0 where no tile is written.
+- R: surface offset in metres over contract ground (bed + placed, binding 1
+  R) at the fine texel centre, lugs and snow included. The whole window is
+  valid; untouched cells carry the virgin surface.
+- `set_track_fine` takes a `ground(x, z)` callback (contract ground,
+  bilinear) and uploads ground + R, so the drawn surface does not depend on
+  what the 20 cm height map holds (the snow capture keeps the snow top there).
 - G snow depth, B compaction, A lug depth: not geometry; left for shading.
-- Inside the window the ground is `bilinear + R`, feathered over 25 cm into
+- Inside the window the ground is that surface, feathered over 25 cm into
   the cubic 20 cm ground at the window edge.
 - The renderer allocates 640 × 640 (`TRACK_FINE_RES`). Change that constant
   if the contract settles on another size.

@@ -203,8 +203,19 @@ impl TerrainGeometry {
 
     /// Publish the solver's fine track field. `texels` is rgba per texel,
     /// row-major with i along +X and j along +Z, `res * res * 4` floats.
+    /// R is the surface offset over contract ground (bed + placed, binding 1
+    /// R) at the texel centre. `ground(x, z)` must return that contract
+    /// ground, bilinear. The texture stores the absolute surface (ground + R),
+    /// so the drawn height does not depend on what the 20 cm height map holds
+    /// (the snow capture keeps the snow top there).
     /// Ignored on the packed path, which has no float textures.
-    pub fn set_track_fine(&mut self, queue: &wgpu::Queue, window: TrackFineWindow, texels: &[f32]) {
+    pub fn set_track_fine(
+        &mut self,
+        queue: &wgpu::Queue,
+        window: TrackFineWindow,
+        texels: &[f32],
+        ground: impl Fn(f32, f32) -> f32,
+    ) {
         if !self.fine_float || window.res == 0 || window.res > TRACK_FINE_RES {
             return;
         }
@@ -212,10 +223,20 @@ impl TerrainGeometry {
         if texels.len() < n {
             return;
         }
-        let clean: Vec<f32> = texels[..n]
+        let res = window.res as usize;
+        let mut clean: Vec<f32> = texels[..n]
             .iter()
             .map(|v| if v.is_finite() { *v } else { 0.0 })
             .collect();
+        for j in 0..res {
+            let z = window.origin[1] + (j as f32 + 0.5) * window.cell;
+            for i in 0..res {
+                let x = window.origin[0] + (i as f32 + 0.5) * window.cell;
+                let g = ground(x, z);
+                let k = (j * res + i) * 4;
+                clean[k] += if g.is_finite() { g } else { 0.0 };
+            }
+        }
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.fine_tex,
