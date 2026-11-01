@@ -38,10 +38,13 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> V {
     return o;
 }
 
-// The scene shaders write gamma(1 - exp(-1.08 c)). Undo it.
+// The display value is gamma(ACES fit(c)) (`aces_fit` in shader.wgsl). Undo it.
 fn decode(s: vec3<f32>) -> vec3<f32> {
-    let m = pow(clamp(s, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
-    return -log(max(vec3<f32>(1.0) - m, vec3<f32>(1.0 / 400.0))) / 1.08;
+    let m = min(pow(clamp(s, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2)), vec3<f32>(0.999));
+    let qa = vec3<f32>(2.51) - 2.43 * m;
+    let qb = vec3<f32>(0.03) - 0.59 * m;
+    let qc = -0.14 * m;
+    return (-qb + sqrt(max(qb * qb - 4.0 * qa * qc, vec3<f32>(0.0)))) / (2.0 * qa);
 }
 
 fn luma(c: vec3<f32>) -> f32 {
@@ -50,8 +53,9 @@ fn luma(c: vec3<f32>) -> f32 {
 
 // The display-encoded value, what the edge blend and grade were tuned on.
 fn encode(c: vec3<f32>) -> vec3<f32> {
-    let m = vec3<f32>(1.0) - exp(-max(c, vec3<f32>(0.0)) * 1.08);
-    return pow(m, vec3<f32>(1.0 / 2.2));
+    let x = max(c, vec3<f32>(0.0));
+    let m = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return pow(clamp(m, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 }
 
 fn raw(uv: vec2<f32>) -> vec3<f32> {
