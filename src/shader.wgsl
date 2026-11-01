@@ -1438,7 +1438,9 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
         let dims = vec2<f32>(textureDimensions(niva_base));
         let dx = dpdx(in.uv) * dims.x;
         let dy = dpdy(in.uv) * dims.y;
-        let max_lod = max(f32(textureNumLevels(niva_base)) - 1.0, 0.0);
+        // Full mip chain (render.rs mip_count): last level = floor(log2(side)).
+        // textureNumLevels has no GLSL ES 3.00 form and breaks WebGL2.
+        let max_lod = floor(log2(max(dims.x, dims.y)));
         let lod = clamp(0.5 * log2(max(dot(dx, dx), dot(dy, dy))), 0.0, max_lod);
         let base = textureSampleLevel(niva_base, paint_samp, in.uv, layer, lod);
         let mr = textureSampleLevel(niva_mr, paint_samp, in.uv, layer, lod);
