@@ -8,20 +8,22 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 | ThroughDrive solver sum | ≤ 7 ms | `tests/e2e_niva.rs` `DRIVE_SOLVER`, release. Subsystems of `ThroughDrive::step` at dt = 1/30, except the picture |
 | E2e step mean | ≤ 11.820 ms | `tests/e2e_niva.rs`, `dust.step_pads` then `fluid.step` at dt = 1/30, release |
 | ThroughDrive dust | ≤ 1.0 ms | `DRIVE_DUST` in that release log |
+| ThroughDrive water | ≤ 2.0 ms | `DRIVE_WATER` in that release log |
 | ThroughDrive step p95 | ≤ 7 ms | `DRIVE_P95` in that release log |
+| Solver water | ≤ 2.0 ms | `tests/frame_bench.rs` `SOLVER_WATER`, `Soil::step_water` at 1/60, release |
 | Air step | ≤ 1.5 ms | same e2e air mean, release. Every build still requires `< 4` ms (`AIR_STEP_BUDGET_MS`) |
 
 11.820 ms is 15% over the release CI mean after #100, 10.278 ms on AMD EPYC 9V45, 4 cores (run 41218969837, commit 0cf4957). That is under the mean plus 20% (12.334) and under the previous cap of 33.004 ms, which was the EPYC 7763 mean on run 41202858950. The log prints the mean and p95; it does not print a sample median. The cap is not the 7 ms frame budget.
 
 ## Same-runner gate
 
-Release CI builds this pull request and the base commit and runs both in this job. On a pull request the base is `pull_request.base.sha`. On a push to main it is `github.event.before`. A `workflow_dispatch`, or a push whose parent sha is empty, runs the absolute caps once. A missing base sha does not fail the job by itself.
+Release CI runs on pull requests only. A push to main does not start this workflow.
 
-Base samples are collected first. One warmup round is discarded, then 4 measured rounds. Warmup plus measured is at most 9. `k_runner` for a metric is that base median divided by main's release measurement on AMD EPYC 9V45, 4 cores (run 41218969837, commit 0cf4957): e2e step 10.278 ms, air 0.177 ms, drive solver 3.547 ms, drive p95 4.748 ms, drive dust 0.917 ms, solver frame 2.496 ms. Fog has no sample in that run, so it uses the e2e factor.
+The job builds this pull request and pinned commit `f97aed4a6b628b626ba0371e08e582a5db413b4b`, then runs both in this job. That commit passed the flat caps in run 41231677339 (e2e 10.347 ms, air 0.191 ms, dust 0.748 ms, solver 3.741 ms, water 0.565 ms, solver water 0.450 ms). `dfc05d4` is the merge of that same tree and is not the pin.
 
-The head fails when its median is above `cap × k_runner`. It also fails when its median is above the printed cap and the base median is inside that cap. The printed caps stay `E2E_BUDGET ms=11.820`, `E2E_AIR_BUDGET ms=1.500`, `DRIVE_SOLVER_BUDGET ms=7.000`, `DRIVE_P95_BUDGET ms=7.000`, `DRIVE_DUST_BUDGET ms=1.000`, `SOLVER_FRAME` with `budget=7`, and `FOG_STEP_BUDGET ms=7.000`. A head budget panic fails the job. The base binary is the pinned commit and still asserts the unscaled cap, so on a slow runner it can exit 101. That exit is not a pass.
+Base samples are collected first. One warmup round is discarded, then 4 measured rounds. Warmup plus measured is at most 9. The caps stay flat: `E2E_BUDGET ms=11.820`, `E2E_AIR_BUDGET ms=1.500`, `DRIVE_SOLVER_BUDGET ms=7.000`, `DRIVE_P95_BUDGET ms=7.000`, `DRIVE_DUST_BUDGET ms=1.000`, `DRIVE_WATER_BUDGET ms=2.000`, `SOLVER_FRAME` with `budget=7`, `SOLVER_WATER` with `budget=2.000`, and `FOG_STEP_BUDGET ms=7.000`. A base or head median above its cap fails. `k_runner` is the median of head/base. It fails above 1.10. A median of exactly 1.10 passes. `k_runner` does not scale a cap.
 
-The same samples fail when the median of head/base, or of head against the fixed reference commit `dfc05d445de19cbaa431d27bbc27fdb09036f638`, is above 1.10. A median of exactly 1.10 passes. While the pull request base is that commit, the drift samples are the base samples. Debug CI still runs the acceptance checks. The release job still requires `fine_open` and `fluid_sheet_fog_is_not_dust_and_closes_the_ledger` to pass.
+A base process that exits non-zero fails the job with `base_exit`. That includes exit 101. It is not a measurement. A head process that exits non-zero fails the job. Debug CI still runs the acceptance checks. The release job still requires `fine_open` and `fluid_sheet_fog_is_not_dust_and_closes_the_ledger` to pass.
 
 The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
 
@@ -82,4 +84,4 @@ Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger g
 
 ## Fog on the shared air grid
 
-Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.
+Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, water ≤ 2.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.

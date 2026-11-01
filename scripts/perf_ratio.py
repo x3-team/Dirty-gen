@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
 """Same-runner release gate for e2e_niva, frame_bench, and the fog step.
 
-Build this tree and the base commit, then run both on this machine.
-Base samples come first, so the runner scale is fixed before the head runs.
-Discard warmup rounds. Fail when any of these is true:
+Build this tree and the pinned base, then run both on this machine.
+Discard warmup rounds. Absolute caps are flat. Nothing multiplies them.
 
-- the head median is above cap * k_runner
-- the head median is above the printed cap while the base median is inside it
-- the median of head/base is above 1.10
-- the median of head/drift is above 1.10
+Fail when any of these is true:
 
-k_runner is the base median divided by main's release measurement on the
-EPYC 9V45 runner (run 41218969837, commit 0cf4957). Fog uses the e2e factor.
-A head process that exits non-zero fails the job. The base binary still
-asserts the unscaled cap, so a slow runner can exit 101; that exit is not
-a pass.
+- the base process exits non-zero (a budget panic is an error)
+- the head process exits non-zero
+- a base or head median is above its flat cap
+- k_runner, the median of head/base, is above 1.10
 
-The printed caps stay at these digits. Do not raise them:
+k_runner is only the paired head/base comparison. It does not scale a cap.
 
-    E2E_BUDGET ms=11.820
-    E2E_AIR_BUDGET ms=1.500
-    DRIVE_SOLVER_BUDGET ms=7.000
-    DRIVE_P95_BUDGET ms=7.000
-    DRIVE_DUST_BUDGET ms=1.000
-    SOLVER_FRAME budget=7
-    FOG_STEP_BUDGET ms=7.000
-
-An empty PERF_BASE_SHA (push with no parent, or workflow_dispatch) runs the
-absolute caps once and does not fail just because the sha is missing.
-Pairs, warmup plus measured, are at most 9.
+The pinned base is f97aed4 (run 41231677339), which passed these caps.
+dfc05d4 is that same tree and is not the pin. Pairs are at most 9.
 """
 
 from __future__ import annotations
@@ -48,25 +34,19 @@ LIMIT = 1.10
 DEFAULT_WARMUP = 1
 DEFAULT_MEASURED = 4
 MAX_PAIRS = 9
-# main at the moment this gate landed. Same 1.10 drift bar as the PR base.
-DRIFT_SHA = "dfc05d445de19cbaa431d27bbc27fdb09036f638"
-# Release log of run 41218969837, commit 0cf4957, AMD EPYC 9V45, 4 cores.
-REF_COMMIT = "0cf4957fd29255f9c984b227fb2f02d3b84549d9"
-REF_9V45 = {
-    "E2E_MEAN": 10.278,
-    "E2E_AIR": 0.177,
-    "DRIVE_SOLVER": 3.547,
-    "DRIVE_P95": 4.748,
-    "DRIVE_DUST": 0.917,
-    "SOLVER_FRAME": 2.496,
-}
+# Release CI run 41231677339 passed the flat caps on this commit.
+# e2e 10.347, air 0.191, dust 0.748, solver 3.741, water 0.565,
+# solver water 0.450, frame 2.517, fog step 0.766.
+PINNED_BASE_SHA = "f97aed4a6b628b626ba0371e08e582a5db413b4b"
 CAPS = {
     "E2E_MEAN": 11.820,
-    "E2E_AIR": 1.500,
+    "E2E_AIR": 1.5,
     "DRIVE_SOLVER": 7.0,
     "DRIVE_P95": 7.0,
     "DRIVE_DUST": 1.0,
+    "DRIVE_WATER": 2.0,
     "SOLVER_FRAME": 7.0,
+    "SOLVER_WATER": 2.0,
     "FOG_STEP": 7.0,
 }
 METRICS = (
@@ -75,7 +55,9 @@ METRICS = (
     "DRIVE_SOLVER",
     "DRIVE_P95",
     "DRIVE_DUST",
+    "DRIVE_WATER",
     "SOLVER_FRAME",
+    "SOLVER_WATER",
     "FOG_STEP",
 )
 ABSOLUTE_CAP_PRINTS = (
@@ -84,6 +66,11 @@ ABSOLUTE_CAP_PRINTS = (
     "DRIVE_SOLVER_BUDGET ms=7.000",
     "DRIVE_P95_BUDGET ms=7.000",
     "DRIVE_DUST_BUDGET ms=1.000",
+)
+WATER_CAP_PRINTS = (
+    "DRIVE_WATER_BUDGET ms=2.000",
+    "SOLVER_WATER ms=",
+    "budget=2.000",
 )
 FOG_CAP_PRINT = "FOG_STEP_BUDGET ms=7.000"
 FRAME_BUDGET_RE = re.compile(r"SOLVER_FRAME ms=[0-9]+(?:\.[0-9]+)? budget=7(?:\.0+)?(?:\s|$)")
@@ -94,12 +81,11 @@ METRIC_RE = {
     "DRIVE_SOLVER": re.compile(r"DRIVE_SOLVER ms=([0-9]+(?:\.[0-9]+)?)"),
     "DRIVE_P95": re.compile(r"DRIVE_P95 ms=([0-9]+(?:\.[0-9]+)?)"),
     "DRIVE_DUST": re.compile(r"DRIVE_DUST ms=([0-9]+(?:\.[0-9]+)?)"),
+    "DRIVE_WATER": re.compile(r"DRIVE_WATER ms=([0-9]+(?:\.[0-9]+)?)"),
     "SOLVER_FRAME": re.compile(r"SOLVER_FRAME ms=([0-9]+(?:\.[0-9]+)?)"),
+    "SOLVER_WATER": re.compile(r"SOLVER_WATER ms=([0-9]+(?:\.[0-9]+)?)"),
     "FOG_STEP": re.compile(r"step_mean_ms ([0-9]+(?:\.[0-9]+)?)"),
 }
-BUDGET_PANIC_RE = re.compile(
-    r"^(DRIVE_SOLVER|DRIVE_P95|DRIVE_DUST|SOLVER_FRAME|e2e step|air step|FOG_STEP)\b.*\bover\b"
-)
 ZERO_SHA = "0" * 40
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = (
@@ -115,7 +101,8 @@ def median(values: list[float]) -> float:
     return float(statistics.median(values))
 
 
-def paired_median(base: list[float], head: list[float]) -> float:
+def k_runner(base: list[float], head: list[float]) -> float:
+    """Paired head/base factor. This is the only use of k_runner."""
     if len(base) != len(head) or not base:
         raise SystemExit(f"pair length {len(base)} vs {len(head)}")
     ratios = []
@@ -126,36 +113,8 @@ def paired_median(base: list[float], head: list[float]) -> float:
     return median(ratios)
 
 
-def runner_k(base_med: float, key: str, e2e_k: float) -> float:
-    ref = REF_9V45.get(key)
-    if ref is None:
-        return e2e_k
-    if not math.isfinite(ref) or ref <= 0.0:
-        raise SystemExit(f"bad 9V45 reference for {key}")
-    return base_med / ref
-
-
-def cap_limit(base_med: float, key: str, k: float) -> float:
-    cap = CAPS[key]
-    scaled = cap * k
-    if base_med <= cap:
-        return min(scaled, cap)
-    return scaled
-
-
-def cap_failure(base_med: float, head_med: float, key: str, e2e_k: float) -> tuple[bool, float, float, str]:
-    k = runner_k(base_med, key, e2e_k)
-    limit = cap_limit(base_med, key, k)
-    cap = CAPS[key]
-    if base_med <= cap and head_med > cap:
-        return True, k, limit, "head_over_cap_base_inside"
-    if head_med > limit:
-        return True, k, limit, "scaled_cap"
-    return False, k, limit, "pass"
-
-
-def head_exit_fails(code: int) -> bool:
-    """A head budget panic is a failure. Do not treat exit 101 as a pass."""
+def exit_fails(code: int) -> bool:
+    """Any non-zero exit is a gate error. Do not treat 101 as a pass."""
     return code != 0
 
 
@@ -177,10 +136,6 @@ def panic_messages(text: str) -> list[str]:
     return messages
 
 
-def unexpected_panics(text: str) -> list[str]:
-    return [message for message in panic_messages(text) if BUDGET_PANIC_RE.match(message) is None]
-
-
 def parse_metrics(text: str) -> dict[str, float]:
     clean = strip_ansi(text)
     found: dict[str, float] = {}
@@ -192,11 +147,15 @@ def parse_metrics(text: str) -> dict[str, float]:
     return found
 
 
-def assert_absolute_caps(text: str, *, fog_budget: bool) -> None:
+def assert_absolute_caps(text: str, *, fog_budget: bool, water_budget: bool) -> None:
     clean = strip_ansi(text)
     missing = [token for token in ABSOLUTE_CAP_PRINTS if token not in clean]
     if fog_budget and FOG_CAP_PRINT not in clean:
         missing.append(FOG_CAP_PRINT)
+    if water_budget:
+        for token in WATER_CAP_PRINTS:
+            if token not in clean:
+                missing.append(token)
     if missing:
         raise SystemExit("absolute cap print missing or changed: " + ", ".join(missing))
     if FRAME_BUDGET_RE.search(clean) is None:
@@ -220,67 +179,53 @@ def pair_counts() -> tuple[int, int]:
 def evaluate(
     samples_base: dict[str, list[float]],
     samples_head: dict[str, list[float]],
-    samples_drift: dict[str, list[float]],
     extra: list[str] | None = None,
 ) -> list[str]:
     failed: list[str] = []
-    e2e_base = median(samples_base["E2E_MEAN"])
-    e2e_k = e2e_base / REF_9V45["E2E_MEAN"]
     print(
         "PERF_ABSOLUTE_CAPS "
         "E2E_MEAN=11.820 E2E_AIR=1.500 DRIVE_SOLVER=7 DRIVE_P95=7 "
-        "DRIVE_DUST=1 SOLVER_FRAME=7 FOG_STEP=7"
+        "DRIVE_DUST=1 DRIVE_WATER=2 SOLVER_FRAME=7 SOLVER_WATER=2 FOG_STEP=7"
     )
     print(
-        "PERF_RULE fail when head > cap * k_runner; "
-        "k_runner = base median / 9V45 main reference; "
-        "also fail when head > cap and base <= cap; "
-        f"fail when paired median > {LIMIT:.2f} against base and against {DRIFT_SHA}"
+        "PERF_RULE flat caps; fail when base or head median > cap; "
+        f"k_runner is the paired head/base median and fails above {LIMIT:.2f}; "
+        "k_runner does not scale a cap"
     )
-    print(f"PERF_REFERENCE commit={REF_COMMIT} run=41218969837 k_e2e={e2e_k:.4f}")
     for key in METRICS:
         base = samples_base[key]
         head = samples_head[key]
-        drift = samples_drift[key]
         base_med = median(base)
         head_med = median(head)
-        cap_fail, k, limit, cap_reason = cap_failure(base_med, head_med, key, e2e_k)
-        ratio_fail, ratio = ratio_over(base, head)
-        drift_fail, drift_ratio = ratio_over(drift, head)
+        cap = CAPS[key]
+        ratio = k_runner(base, head)
         ratios = [h / b for b, h in zip(base, head)]
-        if cap_fail:
-            failed.append(f"{key}:cap")
+        cap_bits = []
+        if base_med > cap:
+            cap_bits.append("base")
+            failed.append(f"{key}:base_cap")
+        if head_med > cap:
+            cap_bits.append("head")
+            failed.append(f"{key}:head_cap")
+        ratio_fail = ratio > LIMIT
         if ratio_fail:
             failed.append(f"{key}:base_ratio")
-        if drift_fail:
-            failed.append(f"{key}:drift")
+        cap_result = "fail" if cap_bits else "pass"
         print(
             f"PERF_CAP metric={key} base_median={base_med:.3f} head_median={head_med:.3f} "
-            f"reference={'e2e' if key not in REF_9V45 else f'{REF_9V45[key]:.3f}'} k={k:.4f} "
-            f"cap={CAPS[key]:.3f} limit={limit:.3f} reason={cap_reason} "
-            f"result={'fail' if cap_fail else 'pass'}"
+            f"cap={cap:.3f} over={','.join(cap_bits) if cap_bits else 'none'} result={cap_result}"
         )
         print(
-            f"PERF_RATIO metric={key} main_median={base_med:.3f} "
-            f"head_median={head_med:.3f} paired_median={ratio:.4f} "
-            f"limit={LIMIT:.2f} result={'fail' if ratio_fail else 'pass'}"
+            f"PERF_RATIO metric={key} k_runner={ratio:.4f} limit={LIMIT:.2f} "
+            f"result={'fail' if ratio_fail else 'pass'}"
         )
-        print(
-            f"PERF_DRIFT metric={key} sha={DRIFT_SHA} paired_median={drift_ratio:.4f} "
-            f"limit={LIMIT:.2f} result={'fail' if drift_fail else 'pass'}"
-        )
-        print(f"PERF_SAMPLES metric={key} main={fmt(base)} head={fmt(head)} paired={fmt(ratios)}")
+        print(f"PERF_SAMPLES metric={key} base={fmt(base)} head={fmt(head)} paired={fmt(ratios)}")
     if extra:
         failed.extend(extra)
     print("PERF_GATE result=" + ("fail" if failed else "pass"))
     if failed:
         print("PERF_GATE failed " + ",".join(failed))
     return failed
-
-
-def ratio_over(base: list[float], head: list[float]) -> tuple[bool, float]:
-    ratio = paired_median(base, head)
-    return ratio > LIMIT, ratio
 
 
 def blank_samples() -> dict[str, list[float]]:
@@ -374,23 +319,17 @@ def run_test(executable: str, selector: str, env: dict[str, str]) -> tuple[int, 
     return proc.returncode, text
 
 
-def run_suite(bins: dict[str, str], side: str, round_index: int, env: dict[str, str], *, strict: bool) -> tuple[str, list[str]]:
+def run_suite(bins: dict[str, str], side: str, round_index: int, env: dict[str, str]) -> tuple[str, list[str]]:
     parts: list[str] = []
     fatals: list[str] = []
     for name, selector in SUITES:
         print(f"PERF_RUN side={side} round={round_index} test={name}", flush=True)
         code, text = run_test(bins[name], selector, env)
         print(f"PERF_RUN_EXIT side={side} round={round_index} test={name} code={code}", flush=True)
-        if strict and head_exit_fails(code):
+        if exit_fails(code):
             message = panic_messages(text)
             detail = message[0] if message else "no panic line"
             fatals.append(f"{side} {name} exit {code}: {detail}")
-        elif not strict:
-            bad = unexpected_panics(text)
-            if bad:
-                raise SystemExit(f"non-budget failure in {side} {name}: " + " | ".join(bad[:4]))
-            if code != 0 and not panic_messages(text):
-                raise SystemExit(f"{side} {name} exited {code} without a budget panic")
         parts.append(text)
     return "\n".join(parts), fatals
 
@@ -421,32 +360,23 @@ def prepare_tree(sha: str, dest: Path) -> Path:
     return dest
 
 
-def limit_env(samples_base: dict[str, list[float]], stretch: str) -> dict[str, str]:
-    e2e_k = median(samples_base["E2E_MEAN"]) / REF_9V45["E2E_MEAN"]
-    extra: dict[str, str] = {}
-    for key in METRICS:
-        k = runner_k(median(samples_base[key]), key, e2e_k)
-        extra[f"PERF_LIMIT_{key}"] = f"{cap_limit(median(samples_base[key]), key, k):.6f}"
-    if stretch:
-        extra["PERF_STRETCH"] = stretch
-    return child_env(extra)
-
-
 def collect_side(
     bins: dict[str, str],
     side: str,
     rounds: int,
     env: dict[str, str],
     *,
-    strict: bool,
     fog_budget: bool,
+    water_budget: bool,
 ) -> tuple[dict[str, list[float]], list[str]]:
     samples = blank_samples()
     fatals: list[str] = []
     for round_index in range(rounds):
-        text, found = run_suite(bins, side, round_index, env, strict=strict)
+        text, found = run_suite(bins, side, round_index, env)
         fatals.extend(found)
-        assert_absolute_caps(text, fog_budget=fog_budget)
+        if found:
+            continue
+        assert_absolute_caps(text, fog_budget=fog_budget, water_budget=water_budget)
         metrics = parse_metrics(text)
         for key in METRICS:
             samples[key].append(metrics[key])
@@ -464,29 +394,11 @@ def prove_stretch() -> str:
     return f"{factor:.4f}"
 
 
-def run_caps_only() -> int:
-    print("PERF_MODE caps-only", flush=True)
-    print("PERF_BASE sha= absent; absolute caps only", flush=True)
-    env = child_env()
-    bins = cargo_bins(ROOT, ROOT / "target", Path(tempfile.gettempdir()) / "silt-perf-head")
-    run_must_pass(bins["e2e_niva"], "fine_open", env)
-    run_must_pass(bins["fog_air"], "fluid_sheet_fog_is_not_dust_and_closes_the_ledger", env)
-    text, fatals = run_suite(bins, "head", 0, env, strict=True)
-    assert_absolute_caps(text, fog_budget=True)
-    if fatals:
-        print("PERF_HEAD_PANIC " + " | ".join(fatals))
-        print("PERF_GATE result=fail")
-        return 1
-    metrics = parse_metrics(text)
-    failed = [key for key in METRICS if metrics[key] > CAPS[key]]
-    for key in METRICS:
-        status = "fail" if key in failed else "pass"
-        print(
-            f"PERF_CAP metric={key} head={metrics[key]:.3f} cap={CAPS[key]:.3f} "
-            f"k=1 result={status}"
-        )
-    print("PERF_GATE result=" + ("fail" if failed else "pass"))
-    return 1 if failed else 0
+def fail_gate(reason: str, detail: str) -> int:
+    print(detail)
+    print("PERF_GATE result=fail")
+    print(f"PERF_GATE failed {reason}")
+    return 1
 
 
 def run_gate(sha: str) -> int:
@@ -494,11 +406,9 @@ def run_gate(sha: str) -> int:
     stretch = prove_stretch()
     print(f"PERF_MODE ratio pairs={warmup + measured} warmup={warmup} measured={measured}", flush=True)
     print(f"PERF_BASE sha={sha}", flush=True)
-    print(f"PERF_DRIFT sha={DRIFT_SHA}", flush=True)
+    print(f"PERF_DRIFT sha={sha} source=base", flush=True)
     os.chdir(ROOT)
     base_dir = Path(tempfile.gettempdir()) / "silt-perf-base"
-    drift_dir = Path(tempfile.gettempdir()) / "silt-perf-drift"
-    prepared = [base_dir]
     try:
         prepare_tree(sha, base_dir)
         shared = ROOT / "target"
@@ -507,146 +417,168 @@ def run_gate(sha: str) -> int:
         plain = child_env()
         run_must_pass(head_bins["e2e_niva"], "fine_open", plain)
         run_must_pass(head_bins["fog_air"], "fluid_sheet_fog_is_not_dust_and_closes_the_ledger", plain)
-        base_all, _base_fatals = collect_side(
-            base_bins, "base", warmup + measured, plain, strict=False, fog_budget=False
+        base_all, base_fatals = collect_side(
+            base_bins,
+            "base",
+            warmup + measured,
+            plain,
+            fog_budget=False,
+            water_budget=False,
         )
+        if base_fatals:
+            return fail_gate("base_exit", "PERF_BASE_ERROR " + " | ".join(base_fatals))
+        if any(len(values) != warmup + measured for values in base_all.values()):
+            return fail_gate("base_exit", "PERF_BASE_ERROR incomplete base samples")
         samples_base = {key: values[warmup:] for key, values in base_all.items()}
-        head_env = limit_env(samples_base, stretch)
+        head_env = child_env({"PERF_STRETCH": stretch} if stretch else None)
         head_all, head_fatals = collect_side(
-            head_bins, "head", warmup + measured, head_env, strict=True, fog_budget=True
+            head_bins,
+            "head",
+            warmup + measured,
+            head_env,
+            fog_budget=True,
+            water_budget=True,
         )
-        samples_head = {key: values[warmup:] for key, values in head_all.items()}
-        if sha == DRIFT_SHA:
-            print("PERF_DRIFT source=base", flush=True)
-            samples_drift = samples_base
-        else:
-            prepare_tree(DRIFT_SHA, drift_dir)
-            prepared.append(drift_dir)
-            drift_bins = cargo_bins(drift_dir, shared, Path(tempfile.gettempdir()) / "silt-perf-driftbins")
-            drift_all, _drift_fatals = collect_side(
-                drift_bins, "drift", warmup + measured, plain, strict=False, fog_budget=False
-            )
-            samples_drift = {key: values[warmup:] for key, values in drift_all.items()}
-        print(f"PERF_PAIRS measured={measured} warmup={warmup} total={warmup + measured} max={MAX_PAIRS}")
-        extra: list[str] = []
         if head_fatals:
             print("PERF_HEAD_PANIC " + " | ".join(head_fatals))
-            extra.append("head_panic")
-        failed = evaluate(samples_base, samples_head, samples_drift, extra)
+            return fail_gate("head_panic", "PERF_HEAD_ERROR head exited non-zero")
+        if any(len(values) != warmup + measured for values in head_all.values()):
+            return fail_gate("head_panic", "PERF_HEAD_ERROR incomplete head samples")
+        samples_head = {key: values[warmup:] for key, values in head_all.items()}
+        print(f"PERF_PAIRS measured={measured} warmup={warmup} total={warmup + measured} max={MAX_PAIRS}")
+        extra = ["head_panic"] if head_fatals else []
+        failed = evaluate(samples_base, samples_head, extra)
         return 1 if failed else 0
     finally:
-        for path in prepared:
-            subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=ROOT, check=False)
+        subprocess.run(["git", "worktree", "remove", "--force", str(base_dir)], cwd=ROOT, check=False)
+
+
+def under_cap() -> dict[str, list[float]]:
+    return {
+        "E2E_MEAN": [10.2, 10.1, 10.3, 10.0],
+        "E2E_AIR": [0.19, 0.18, 0.20, 0.19],
+        "DRIVE_SOLVER": [3.7, 3.6, 3.8, 3.7],
+        "DRIVE_P95": [5.0, 4.9, 5.1, 5.0],
+        "DRIVE_DUST": [0.75, 0.74, 0.76, 0.75],
+        "DRIVE_WATER": [0.56, 0.55, 0.57, 0.56],
+        "SOLVER_FRAME": [2.5, 2.4, 2.6, 2.5],
+        "SOLVER_WATER": [0.45, 0.44, 0.46, 0.45],
+        "FOG_STEP": [0.77, 0.76, 0.78, 0.77],
+    }
 
 
 def self_test() -> None:
-    base = {key: [10.0, 10.2, 9.9, 10.1] for key in METRICS}
-    head = {key: [10.0, 10.1, 10.2, 9.8] for key in METRICS}
-    # Inside the reference scale this is a tie. Use the 9V45-shaped case below for caps.
-    assert ratio_over(base["E2E_MEAN"], head["E2E_MEAN"])[0] is False
+    base = under_cap()
+    head = under_cap()
+    assert evaluate(base, head) == []
+    assert abs(k_runner(base["E2E_MEAN"], head["E2E_MEAN"]) - 1.0) < 0.05
 
-    slow_base = {
-        "E2E_MEAN": [19.173, 19.080, 19.267, 19.325],
-        "E2E_AIR": [0.349, 0.348, 0.350, 0.347],
-        "DRIVE_SOLVER": [7.337, 7.300, 7.360, 7.340],
-        "DRIVE_P95": [9.106, 9.050, 9.180, 9.120],
-        "DRIVE_DUST": [1.367, 1.363, 1.370, 1.365],
-        "SOLVER_FRAME": [4.129, 4.113, 4.160, 4.108],
-        "FOG_STEP": [1.401, 1.390, 1.410, 1.388],
-    }
-    slow_head = {
-        "E2E_MEAN": [19.327, 19.187, 19.434, 19.283],
-        "E2E_AIR": [0.348, 0.347, 0.349, 0.346],
-        "DRIVE_SOLVER": [7.391, 7.360, 7.400, 7.380],
-        "DRIVE_P95": [9.174, 9.100, 9.200, 9.150],
-        "DRIVE_DUST": [1.404, 1.398, 1.407, 1.399],
-        "SOLVER_FRAME": [4.000, 3.983, 4.018, 3.992],
-        "FOG_STEP": [1.388, 1.380, 1.400, 1.390],
-    }
-    assert evaluate(slow_base, slow_head, slow_base) == []
+    stretched = {key: list(values) for key, values in head.items()}
+    stretched["E2E_MEAN"] = [value * 1.12 for value in base["E2E_MEAN"]]
+    failed = evaluate(base, stretched)
+    assert "E2E_MEAN:base_ratio" in failed
+    assert "E2E_MEAN:head_cap" not in failed
+    assert "E2E_MEAN:base_cap" not in failed
 
-    stretched = {key: [value * 1.12 for value in values] for key, values in slow_head.items()}
-    failed = evaluate(slow_base, stretched, slow_base)
-    assert any(item.endswith(":base_ratio") for item in failed)
-    assert any(item.endswith(":drift") for item in failed)
-
-    # Base inside the cap, head over the cap, ratio still under 1.10.
-    inside = {key: list(values) for key, values in slow_base.items()}
-    over = {key: list(values) for key, values in slow_head.items()}
-    inside["SOLVER_FRAME"] = [4.0, 4.0, 4.0, 4.0]
-    over["SOLVER_FRAME"] = [4.2, 4.2, 4.2, 7.2]
-    # median of head frame is 4.2; force every sample over the cap.
-    over["SOLVER_FRAME"] = [7.2, 7.2, 7.2, 7.2]
-    failed = evaluate(inside, over, inside)
-    assert "SOLVER_FRAME:cap" in failed
-
-    # Head above cap * k while both sides are over the printed cap.
-    huge = {key: [value * 1.20 for value in values] for key, values in slow_base.items()}
-    # 20% over base is above 1.10. Also check the e2e scaled cap:
-    # limit = 11.820 * (19.173/10.278) ≈ 22.05, and 19.173*1.20 ≈ 23.0.
-    failed = evaluate(slow_base, huge, slow_base)
-    assert "E2E_MEAN:cap" in failed
+    over_head = {key: list(values) for key, values in head.items()}
+    over_head["E2E_MEAN"] = [12.0, 12.0, 12.0, 12.0]
+    failed = evaluate(base, over_head)
+    assert "E2E_MEAN:head_cap" in failed
     assert "E2E_MEAN:base_ratio" in failed
 
-    exactly = [10.0, 10.0, 10.0, 10.0]
-    fail, ratio = ratio_over(exactly, [value * LIMIT for value in exactly])
-    assert not fail and abs(ratio - LIMIT) < 1e-12
-    fail, ratio = ratio_over(exactly, [value * LIMIT + 0.02 for value in exactly])
-    assert fail and ratio > LIMIT
+    over_base = {key: list(values) for key, values in base.items()}
+    over_base["DRIVE_DUST"] = [1.05, 1.05, 1.05, 1.05]
+    under_head = {key: list(values) for key, values in head.items()}
+    under_head["DRIVE_DUST"] = [0.99, 0.99, 0.99, 0.99]
+    failed = evaluate(over_base, under_head)
+    assert "DRIVE_DUST:base_cap" in failed
+    assert "DRIVE_DUST:head_cap" not in failed
 
-    assert head_exit_fails(101)
-    assert head_exit_fails(1)
-    assert not head_exit_fails(0)
+    slow_base = {key: list(values) for key, values in base.items()}
+    slow_head = {key: list(values) for key, values in head.items()}
+    slow_base["E2E_MEAN"] = [19.173, 19.080, 19.267, 19.325]
+    slow_head["E2E_MEAN"] = [19.327, 19.187, 19.434, 19.283]
+    slow_base["DRIVE_DUST"] = [1.367, 1.363, 1.370, 1.365]
+    slow_head["DRIVE_DUST"] = [1.404, 1.398, 1.407, 1.399]
+    slow_base["DRIVE_SOLVER"] = [7.337, 7.300, 7.360, 7.340]
+    slow_head["DRIVE_SOLVER"] = [7.391, 7.360, 7.400, 7.380]
+    slow_base["DRIVE_P95"] = [9.106, 9.050, 9.180, 9.120]
+    slow_head["DRIVE_P95"] = [9.174, 9.100, 9.200, 9.150]
+    failed = evaluate(slow_base, slow_head)
+    assert "E2E_MEAN:base_cap" in failed and "E2E_MEAN:head_cap" in failed
+    assert "DRIVE_DUST:base_cap" in failed and "DRIVE_SOLVER:base_cap" in failed
+    assert not any(item.endswith(":base_ratio") for item in failed)
+
+    water = {key: list(values) for key, values in base.items()}
+    water_head = {key: list(values) for key, values in head.items()}
+    water_head["DRIVE_WATER"] = [2.1, 2.1, 2.1, 2.1]
+    water_head["SOLVER_WATER"] = [2.1, 2.1, 2.1, 2.1]
+    failed = evaluate(water, water_head)
+    assert "DRIVE_WATER:head_cap" in failed
+    assert "SOLVER_WATER:head_cap" in failed
+
+    exactly = [10.0, 10.0, 10.0, 10.0]
+    ratio = k_runner(exactly, [value * LIMIT for value in exactly])
+    assert abs(ratio - LIMIT) < 1e-12
+    assert not (ratio > LIMIT)
+    assert k_runner(exactly, [value * LIMIT + 0.02 for value in exactly]) > LIMIT
+
+    assert exit_fails(101)
+    assert exit_fails(1)
+    assert not exit_fails(0)
 
     fixture = """
-E2E_MEAN ms=18.842
-E2E_P95 ms=37.564
+E2E_MEAN ms=10.347
+E2E_P95 ms=12.000
 E2E_BUDGET ms=11.820
-E2E_AIR ms=0.334
+E2E_AIR ms=0.191
 E2E_AIR_BUDGET ms=1.500
-DRIVE_SOLVER ms=7.122
-DRIVE_P95 ms=9.380
-DRIVE_DUST ms=1.400
+DRIVE_SOLVER ms=3.741
+DRIVE_P95 ms=5.010
+DRIVE_DUST ms=0.748
+DRIVE_WATER ms=0.565
+DRIVE_WATER_BUDGET ms=2.000
 DRIVE_SOLVER_BUDGET ms=7.000
 DRIVE_P95_BUDGET ms=7.000
 DRIVE_DUST_BUDGET ms=1.000
-SOLVER_FRAME ms=4.026 budget=7 frames=180
-step_mean_ms 1.200
+SOLVER_FRAME ms=2.517 budget=7 frames=180
+SOLVER_WATER ms=0.450 budget=2.000
+step_mean_ms 0.766
 FOG_STEP_BUDGET ms=7.000
-thread 'e2e_niva' panicked at tests/e2e_niva.rs:890:5:
-DRIVE_SOLVER 7.122 ms over 7
 """
     metrics = parse_metrics(fixture)
-    assert metrics["E2E_MEAN"] == 18.842
-    assert metrics["FOG_STEP"] == 1.200
-    assert unexpected_panics(fixture) == []
-    assert_absolute_caps(fixture, fog_budget=True)
-    assert head_exit_fails(101)
+    assert metrics["E2E_MEAN"] == 10.347
+    assert metrics["DRIVE_WATER"] == 0.565
+    assert metrics["SOLVER_WATER"] == 0.450
+    assert metrics["FOG_STEP"] == 0.766
+    assert_absolute_caps(fixture, fog_budget=True, water_budget=True)
     try:
-        assert_absolute_caps(fixture.replace("E2E_BUDGET ms=11.820", "E2E_BUDGET ms=12.000"), fog_budget=True)
+        assert_absolute_caps(fixture.replace("E2E_BUDGET ms=11.820", "E2E_BUDGET ms=12.000"), fog_budget=True, water_budget=True)
     except SystemExit as exc:
         assert "11.820" in str(exc)
     else:
         raise AssertionError("raised cap was accepted")
+    try:
+        assert_absolute_caps(fixture.replace("budget=2.000", "budget=3.000"), fog_budget=True, water_budget=True)
+    except SystemExit as exc:
+        assert "2.000" in str(exc)
+    else:
+        raise AssertionError("raised water cap was accepted")
 
 
-def normalized_base_sha() -> str:
+def resolve_base_sha() -> str:
     sha = os.environ.get("PERF_BASE_SHA", "").strip()
-    if sha == ZERO_SHA:
-        return ""
+    if not sha or sha == ZERO_SHA:
+        return PINNED_BASE_SHA
     return sha
 
 
 def main() -> int:
     self_test()
-    if "--self-test" in sys.argv:
-        print("PERF_SELF_TEST pass")
-        return 0
     print("PERF_SELF_TEST pass")
-    sha = normalized_base_sha()
-    if not sha:
-        return run_caps_only()
-    return run_gate(sha)
+    if "--self-test" in sys.argv:
+        return 0
+    return run_gate(resolve_base_sha())
 
 
 if __name__ == "__main__":

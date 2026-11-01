@@ -316,10 +316,9 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
 
     #[cfg(not(debug_assertions))]
     {
-        let limit = release_limit(FOG_STEP_BUDGET_MS, "PERF_LIMIT_FOG_STEP");
         assert!(
-            step_mean <= limit,
-            "FOG_STEP {step_mean:.3} ms over {limit}, max {step_max:.3}"
+            step_mean <= FOG_STEP_BUDGET_MS,
+            "FOG_STEP {step_mean:.3} ms over {FOG_STEP_BUDGET_MS}, max {step_max:.3}"
         );
     }
 }
@@ -339,15 +338,6 @@ fn stretch_hold(started: Instant) {
     while spin.elapsed() < extra {
         std::hint::spin_loop();
     }
-}
-
-#[cfg(not(debug_assertions))]
-fn release_limit(cap: f64, key: &str) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(cap)
 }
 
 #[test]

@@ -1,18 +1,12 @@
 name: ci
 
-# Pull requests compare against the base commit. A push to main compares
-# against github.event.before. workflow_dispatch with no parent runs the
-# absolute caps only. A missing base sha is not itself a failure.
+# One run per pull request update. A push of the same commit does not
+# start a second copy, and a merge to main does not run this workflow.
 on:
   pull_request:
     types: [opened, synchronize]
     paths-ignore:
       - "docs/**/*.md"
-  push:
-    branches: [main]
-    paths-ignore:
-      - "docs/**/*.md"
-  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -48,7 +42,9 @@ jobs:
           cargo test --test e2e_niva -- --nocapture
       - name: Release solver budget
         env:
-          PERF_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before || '' }}
+          # f97aed4 passed the flat caps in run 41231677339. dfc05d4 is that
+          # same tree and is not the pin: an exit 101 from the base is an error.
+          PERF_BASE_SHA: f97aed4a6b628b626ba0371e08e582a5db413b4b
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc

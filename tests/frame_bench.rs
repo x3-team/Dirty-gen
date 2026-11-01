@@ -6,6 +6,8 @@ use silt::{demo_drive, World};
 
 /// Whole solver frame. Do not raise this.
 const SOLVER_FRAME_BUDGET_MS: f64 = 7.0;
+/// `Soil::step_water` at 1/60. Do not raise this.
+const SOLVER_WATER_BUDGET_MS: f64 = 2.0;
 
 #[test]
 fn baseline_solver_frame() {
@@ -29,10 +31,9 @@ fn baseline_solver_frame() {
     let _ = std::io::Write::flush(&mut std::io::stderr());
     #[cfg(not(debug_assertions))]
     {
-        let limit = release_limit(SOLVER_FRAME_BUDGET_MS, "PERF_LIMIT_SOLVER_FRAME");
         assert!(
-            ms <= limit,
-            "SOLVER_FRAME {ms:.3} ms over {limit}"
+            ms <= SOLVER_FRAME_BUDGET_MS,
+            "SOLVER_FRAME {ms:.3} ms over {SOLVER_FRAME_BUDGET_MS}"
         );
     }
 
@@ -43,7 +44,15 @@ fn baseline_solver_frame() {
         soil.step_water(1.0 / 60.0);
     }
     let water_ms = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
-    eprintln!("SOLVER_WATER ms={water_ms:.3}");
+    eprintln!("SOLVER_WATER ms={water_ms:.3} budget={SOLVER_WATER_BUDGET_MS:.3}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(
+            water_ms <= SOLVER_WATER_BUDGET_MS,
+            "SOLVER_WATER {water_ms:.3} ms over {SOLVER_WATER_BUDGET_MS}"
+        );
+    }
 }
 
 fn stretch_hold(started: Instant) {
@@ -63,11 +72,3 @@ fn stretch_hold(started: Instant) {
     }
 }
 
-#[cfg(not(debug_assertions))]
-fn release_limit(cap: f64, key: &str) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(cap)
-}
