@@ -100,6 +100,23 @@ flat white, the water still has no detail or glints (there are no HDR
 highlights to bloom), the mud is still a texture without relief. That is
 layers 1–3, not layer 5.
 
+## Route scoring cross-check (PR #147, docs/ROUTE.md)
+
+The full-route scoring thread found these rendering-led failures. Each one
+maps to a thread below:
+
+| Route finding | Layer | Thread |
+| --- | --- | --- |
+| Spray and slurry drawn as tall vertical cards over the roof, dark rectangular slabs at the wheels (worst on the route) | Particles | 3 (water v2) takes spray: soft, camera-facing, lit sprites with depth fade; slabs need a look at chunk meshes |
+| Flat grey-blue water, no sun glints, no foam lines on the swash | Fluid shading + HDR | 1 (HDR for glints) and 3 |
+| White jagged fringes around river rocks at the waterline | Fluid shading | 3 (depth-fade foam instead of the hard edge band) |
+| Snow: ruts vanish when backlit, no sparkle, no blue shadow | AO + materials | 2 (sparkle, detail normal) and 4 (GTAO, sky fill) |
+| Mud without wet gloss | Materials | 2 (Lagarde wet model from contract moisture) |
+
+This moves particles/spray up from medium-low: in motion along the route it
+is the most visible defect. Open question from that thread: whether the
+dusk puddle fails because of sheet depth or water shading.
+
 ## Free assets and tools (Vitalii, 2026-11-01)
 
 Every thread starts from existing free material, not from scratch, and
