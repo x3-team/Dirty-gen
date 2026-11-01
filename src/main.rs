@@ -11,6 +11,8 @@ mod post;
 #[cfg(not(target_arch = "wasm32"))]
 mod bench;
 #[cfg(not(target_arch = "wasm32"))]
+mod route_bench;
+#[cfg(not(target_arch = "wasm32"))]
 mod frame_bench;
 mod render;
 mod terrain_draw;
@@ -1614,6 +1616,8 @@ fn capture(args: &[String]) {
     let mut bench_out: Option<PathBuf> = None;
     let mut bench_scenes = PathBuf::from("bench/scenes.txt");
     let mut terrain_proof: Option<PathBuf> = None;
+    let mut route_out: Option<PathBuf> = None;
+    let mut route_scenes = PathBuf::from("bench/route.txt");
     let mut kept: Vec<String> = Vec::with_capacity(args.len());
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1621,6 +1625,10 @@ fn capture(args: &[String]) {
             "--bench" => bench_out = Some(PathBuf::from(it.next().expect("--bench <dir>"))),
             "--bench-scenes" => {
                 bench_scenes = PathBuf::from(it.next().expect("--bench-scenes <file>"))
+            }
+            "--route" => route_out = Some(PathBuf::from(it.next().expect("--route <dir>"))),
+            "--route-scenes" => {
+                route_scenes = PathBuf::from(it.next().expect("--route-scenes <file>"))
             }
             "--terrain-proof" => {
                 terrain_proof = Some(PathBuf::from(it.next().expect("--terrain-proof <dir>")))
@@ -1654,6 +1662,10 @@ fn capture(args: &[String]) {
     );
     if let Some(dir) = terrain_proof {
         capture_terrain(&mut renderer, &parsed, &dir);
+        return;
+    }
+    if let Some(out) = route_out {
+        route_bench::run(&mut renderer, parsed.width, parsed.height, &out, &route_scenes);
         return;
     }
     if let Some(out) = bench_out {
