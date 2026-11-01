@@ -1,55 +1,72 @@
-//! GPU timestamp queries for one frame.
+//! GPU timestamp queries, one begin/end pair per render pass.
 //!
-//! Query 0 is the start of the shadow pass. Query 1 is the end of the last
-//! pass in the frame. Queries 2 and 3 are reserved for a pool reflect pass.
-//! This tree does not encode that pass, so reflect milliseconds are never
+//! [`GpuTime::pass`] hands a render pass its timestamp writes and records the
+//! pass label. After submit the resolved ticks go to one of three readback
+//! buffers, so the window never waits on the GPU: [`GpuTime::poll`] returns
+//! the newest finished frame, a frame or two late. [`GpuTime::read`] waits,
+//! for the benchmark and `capture --gpu-time`.
+//!
+//! The frame time is the first pass begin to the last pass end. It does not
+//! include present or the compositor.
+//!
+//! This tree encodes no pool reflect pass, so reflect milliseconds are never
 //! printed.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use wgpu::AdapterInfo;
 
-pub const Q_FRAME_BEGIN: u32 = 0;
-pub const Q_FRAME_END: u32 = 1;
-/// Pool reflect pass. Unused: this tree does not encode one.
-#[allow(dead_code)]
-pub const Q_REFLECT_BEGIN: u32 = 2;
-/// Pool reflect pass. Unused: this tree does not encode one.
-#[allow(dead_code)]
-pub const Q_REFLECT_END: u32 = 3;
-const QUERY_COUNT: u32 = 4;
+/// Passes timed per frame. Extra passes run untimed.
+pub const MAX_PASSES: usize = 24;
+const QUERY_COUNT: u32 = (MAX_PASSES * 2) as u32;
 const QUERY_BYTES: u64 = 8;
-const RESOLVE_BYTES: u64 = 256;
+const RESOLVE_BYTES: u64 = QUERY_COUNT as u64 * QUERY_BYTES;
+const RING: usize = 3;
 
 /// This tree does not encode `win-demo-pool-reflect`.
 const REFLECT_PASS_ENCODED: bool = false;
 
 pub const UNCOLLECTED_NOTE: &str = "GPU_TIME_NOTE milliseconds were not collected";
 
+#[derive(Clone, Debug, Default)]
 pub struct GpuSample {
     pub frame_ms: Option<f64>,
-    /// Set only when a reflect pass wrote queries 2 and 3. Nothing in this
-    /// tree does that.
+    /// Never set in this tree; see [`reflect_report`].
     #[allow(dead_code)]
     pub reflect_ms: Option<f64>,
+    /// Milliseconds per labelled pass, in encode order.
+    pub passes: Vec<(&'static str, f64)>,
 }
 
 impl GpuSample {
     pub fn empty() -> Self {
-        Self {
-            frame_ms: None,
-            reflect_ms: None,
-        }
+        Self::default()
     }
+}
+
+const IDLE: u8 = 0;
+const COPIED: u8 = 1;
+const MAPPING: u8 = 2;
+const READY: u8 = 3;
+const FAILED: u8 = 4;
+
+struct Slot {
+    buf: wgpu::Buffer,
+    labels: RefCell<Vec<&'static str>>,
+    state: Arc<AtomicU8>,
+    /// Frame counter at copy time, so `poll` returns the newest.
+    frame: Cell<u64>,
 }
 
 pub struct GpuTime {
     query: wgpu::QuerySet,
     resolve: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    ring: Vec<Slot>,
     period_ns: f32,
-    frame_written: Cell<bool>,
-    reflect_written: Cell<bool>,
+    labels: RefCell<Vec<&'static str>>,
+    frame: Cell<u64>,
 }
 
 impl GpuTime {
@@ -72,115 +89,157 @@ impl GpuTime {
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpu-time-read"),
-            size: RESOLVE_BYTES,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let ring = (0..RING)
+            .map(|_| Slot {
+                buf: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("gpu-time-read"),
+                    size: RESOLVE_BYTES,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                labels: RefCell::new(Vec::new()),
+                state: Arc::new(AtomicU8::new(IDLE)),
+                frame: Cell::new(0),
+            })
+            .collect();
         Some(Self {
             query,
             resolve,
-            readback,
+            ring,
             period_ns,
-            frame_written: Cell::new(false),
-            reflect_written: Cell::new(false),
+            labels: RefCell::new(Vec::with_capacity(MAX_PASSES)),
+            frame: Cell::new(0),
         })
     }
 
-    pub fn note_frame(&self) {
-        self.frame_written.set(true);
-    }
-
-    /// The pool reflect pass wrote queries 2 and 3 in this frame.
-    #[allow(dead_code)]
-    pub fn mark_reflect(&self) {
-        self.reflect_written.set(true);
-    }
-
-    #[allow(dead_code)]
-    pub fn reflect_writes(&self) -> wgpu::RenderPassTimestampWrites<'_> {
-        wgpu::RenderPassTimestampWrites {
-            query_set: &self.query,
-            beginning_of_pass_write_index: Some(Q_REFLECT_BEGIN),
-            end_of_pass_write_index: Some(Q_REFLECT_END),
+    /// Timestamp writes for the next pass. `None` once [`MAX_PASSES`] passes
+    /// are timed in this frame.
+    pub fn pass(&self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        let mut labels = self.labels.borrow_mut();
+        if labels.len() >= MAX_PASSES {
+            return None;
         }
+        let i = labels.len() as u32;
+        labels.push(label);
+        Some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.query,
+            beginning_of_pass_write_index: Some(2 * i),
+            end_of_pass_write_index: Some(2 * i + 1),
+        })
     }
 
+    /// Resolve this frame's queries into a free readback slot. A frame with
+    /// no free slot (GPU three frames behind) is dropped, not waited on.
     pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        // Unwritten queries are not resolved. Reflect slots stay out until
-        // [`GpuTime::mark_reflect`] says the pass wrote them.
-        let count = if self.reflect_written.get() {
-            QUERY_COUNT
-        } else if self.frame_written.get() {
-            2
-        } else {
+        let mut labels = self.labels.borrow_mut();
+        if labels.is_empty() {
+            return;
+        }
+        let Some(slot) = self
+            .ring
+            .iter()
+            .find(|s| s.state.load(Ordering::Acquire) == IDLE)
+        else {
+            labels.clear();
             return;
         };
+        let count = labels.len() as u32 * 2;
         encoder.resolve_query_set(&self.query, 0..count, &self.resolve, 0);
         encoder.copy_buffer_to_buffer(
             &self.resolve,
             0,
-            &self.readback,
+            &slot.buf,
             0,
             count as u64 * QUERY_BYTES,
         );
+        *slot.labels.borrow_mut() = std::mem::take(&mut *labels);
+        self.frame.set(self.frame.get() + 1);
+        slot.frame.set(self.frame.get());
+        slot.state.store(COPIED, Ordering::Release);
     }
 
+    /// Call after `queue.submit` of the encoder passed to [`GpuTime::resolve`].
+    pub fn after_submit(&self) {
+        for slot in &self.ring {
+            if slot.state.load(Ordering::Acquire) != COPIED {
+                continue;
+            }
+            slot.state.store(MAPPING, Ordering::Release);
+            let state = slot.state.clone();
+            slot.buf.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                state.store(if res.is_ok() { READY } else { FAILED }, Ordering::Release);
+            });
+        }
+    }
+
+    /// Newest finished frame without waiting. `None` while none is ready.
+    pub fn poll(&self, device: &wgpu::Device) -> Option<GpuSample> {
+        let _ = device.poll(wgpu::Maintain::Poll);
+        self.collect()
+    }
+
+    /// Wait for every frame in flight and return the newest.
     pub fn read(&self, device: &wgpu::Device) -> GpuSample {
-        if !self.frame_written.get() {
-            return GpuSample::empty();
-        }
-        let slice = self.readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
         let _ = device.poll(wgpu::Maintain::Wait);
-        if rx.recv().ok().and_then(|res| res.ok()).is_none() {
-            self.frame_written.set(false);
-            self.reflect_written.set(false);
-            return GpuSample::empty();
-        }
-        let frame_ms;
-        let reflect_ms;
-        {
-            let data = slice.get_mapped_range();
-            let ticks = |index: usize| -> u64 {
-                let offset = index * QUERY_BYTES as usize;
-                u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+        self.collect().unwrap_or_default()
+    }
+
+    fn collect(&self) -> Option<GpuSample> {
+        let mut best: Option<(u64, GpuSample)> = None;
+        for slot in &self.ring {
+            match slot.state.load(Ordering::Acquire) {
+                READY => {}
+                FAILED => {
+                    slot.state.store(IDLE, Ordering::Release);
+                    continue;
+                }
+                _ => continue,
+            }
+            let sample = {
+                let data = slot.buf.slice(..).get_mapped_range();
+                let ticks = |index: usize| -> u64 {
+                    let offset = index * QUERY_BYTES as usize;
+                    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+                };
+                let labels = slot.labels.borrow();
+                let mut passes = Vec::with_capacity(labels.len());
+                let mut first = u64::MAX;
+                let mut last = 0u64;
+                for (i, label) in labels.iter().enumerate() {
+                    let (b, e) = (ticks(2 * i), ticks(2 * i + 1));
+                    if let Some(ms) = ticks_to_ms(b, e, self.period_ns) {
+                        passes.push((*label, ms));
+                        first = first.min(b);
+                        last = last.max(e);
+                    }
+                }
+                GpuSample {
+                    frame_ms: if last > first {
+                        ticks_to_ms(first, last, self.period_ns)
+                    } else {
+                        None
+                    },
+                    reflect_ms: None,
+                    passes,
+                }
             };
-            frame_ms = ticks_to_ms(ticks(0), ticks(1), self.period_ns);
-            reflect_ms = if self.reflect_written.get() {
-                ticks_to_ms(ticks(2), ticks(3), self.period_ns)
-            } else {
-                None
-            };
+            slot.buf.unmap();
+            slot.state.store(IDLE, Ordering::Release);
+            let frame = slot.frame.get();
+            if best.as_ref().map(|(f, _)| frame > *f).unwrap_or(true) {
+                best = Some((frame, sample));
+            }
         }
-        self.readback.unmap();
-        self.frame_written.set(false);
-        self.reflect_written.set(false);
-        GpuSample {
-            frame_ms,
-            reflect_ms,
-        }
+        best.map(|(_, s)| s)
     }
 }
 
+/// Timestamp writes for one pass when the clock is armed.
 pub fn pass_timestamps<'a>(
     clock: Option<&'a GpuTime>,
-    begin: Option<u32>,
-    end: Option<u32>,
+    label: &'static str,
 ) -> Option<wgpu::RenderPassTimestampWrites<'a>> {
-    let clock = clock?;
-    if begin.is_none() && end.is_none() {
-        return None;
-    }
-    Some(wgpu::RenderPassTimestampWrites {
-        query_set: &clock.query,
-        beginning_of_pass_write_index: begin,
-        end_of_pass_write_index: end,
-    })
+    clock?.pass(label)
 }
 
 fn ticks_to_ms(begin: u64, end: u64, period_ns: f32) -> Option<f64> {
