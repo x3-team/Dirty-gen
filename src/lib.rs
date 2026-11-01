@@ -16,6 +16,7 @@ pub mod render_contract;
 pub mod snow;
 pub mod soil;
 pub mod vehicle;
+pub mod wick;
 pub mod world;
 
 pub use world::{
