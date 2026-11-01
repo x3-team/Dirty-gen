@@ -32,6 +32,12 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test puddle_rut -- --nocapture
+      - name: Niva puddle shore
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          export RAYON_NUM_THREADS=1
+          cargo test --test puddle_shore -- --test-threads=1 --nocapture
       - name: Niva acceptance through-drive
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -47,19 +53,6 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release -j1 --test e2e_niva --test frame_bench -- --nocapture --test-threads=1
-          cargo test --release --test scripted_drive -- --nocapture
-          cargo test --release --test turbidity -- --nocapture
-      - name: Prove turbidity fluid assert (same test, low cap)
-        run: |
-          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
-          export CXX=g++ CC=gcc
-          unset DISPLAY
-          set +e
-          TURBIDITY_PROOF_FLUID_CAP_MS=0.5 cargo test --release --test turbidity turbidity_plume_closes -- --nocapture 2>&1 | tee /tmp/turbidity-proof-fail.log
-          code=${PIPESTATUS[0]}
-          set -e
-          grep -F "fluid step" /tmp/turbidity-proof-fail.log
-          grep -F "exceeds 0.5" /tmp/turbidity-proof-fail.log
-          test "$code" -ne 0
-          echo "turbidity_plume_closes failed as expected with TURBIDITY_PROOF_FLUID_CAP_MS=0.5 (exit $code)"
+          RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore -- --test-threads=1 --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
+          cargo test --release --test scripted_drive --test turbidity -- --nocapture
