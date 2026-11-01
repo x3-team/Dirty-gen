@@ -1062,6 +1062,7 @@ impl Default for Contact {
                 crack: 0.0,
                 passes: 0,
                 rest: 0.0,
+                mix: [0.0; 4],
             },
             speed: 0.0,
             fling: 0.0,

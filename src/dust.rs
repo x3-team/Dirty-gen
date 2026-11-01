@@ -2,7 +2,7 @@
 //!
 //! This is the dust-trail API (`Dust`, `inject_dust`, `step_pads`, `set_wind`).
 //! The cubic metres live here. Advection is `fluid_core::advect_dust_density`:
-//! the shared upwind flux, pressure filter, and vorticity confinement.
+//! donor-cell upwind on cells that hold volume. Empty layers are not visited.
 //! The same grid carries air velocity. `step_vehicle_air` injects the Niva
 //! body and wheels, confines the wake, and `advect_density_by_air` moves
 //! dust on that residual. Fog is a second scalar on this grid. It is advected

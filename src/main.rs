@@ -6,7 +6,13 @@ mod cc0;
 mod gpu_time;
 mod mesh;
 mod niva;
+mod overlay;
+#[cfg(not(target_arch = "wasm32"))]
+mod bench;
+#[cfg(not(target_arch = "wasm32"))]
+mod frame_bench;
 mod render;
+mod terrain_draw;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
@@ -40,7 +46,25 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         let mut args = std::env::args().skip(1);
-        if args.next().as_deref() == Some("capture") {
+        let first = args.next();
+        if first.as_deref() == Some("bench") {
+            let rest: Vec<String> = args.collect();
+            frame_bench::run_bench(frame_bench::parse_bench(&rest));
+            return;
+        }
+        if first.as_deref() == Some("budget") {
+            let rest: Vec<String> = args.collect();
+            frame_bench::run_budget(&rest);
+            return;
+        }
+        if first.as_deref() == Some("--quality") {
+            if let Some(q) = args.next() {
+                std::env::set_var("SILT_QUALITY", q);
+            }
+            run_window();
+            return;
+        }
+        if first.as_deref() == Some("capture") {
             let rest: Vec<String> = args.collect();
             if rest.iter().any(|arg| arg == "--gpu-time") {
                 gpu_time_report();
@@ -102,6 +126,26 @@ struct App {
     acc: f32,
     last: Instant,
     srgb: bool,
+    /// F3. Perf overlay in the top-left corner.
+    overlay: bool,
+    perf: PerfWindow,
+}
+
+/// Rolling half-second of frame numbers for the overlay.
+struct PerfWindow {
+    wall_ms: Vec<f64>,
+    sim_ms: Vec<f64>,
+    encode_ms: Vec<f64>,
+    gpu: Option<GpuLines>,
+    draws: (u32, u64),
+    since: Instant,
+    last_frame: Option<Instant>,
+}
+
+#[derive(Default)]
+struct GpuLines {
+    frame: Vec<f64>,
+    passes: Vec<(&'static str, Vec<f64>)>,
 }
 
 impl ApplicationHandler for App {
@@ -140,6 +184,29 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::KeyC) => self.chase_cam = !self.chase_cam,
                         PhysicalKey::Code(KeyCode::KeyV) => self.drive_bike = !self.drive_bike,
                         PhysicalKey::Code(KeyCode::Backspace) => self.world.reset_vehicle(),
+                        PhysicalKey::Code(KeyCode::F3) => {
+                            self.overlay = !self.overlay;
+                            if !self.overlay {
+                                if let Some(r) = self.renderer.as_mut() {
+                                    r.set_overlay_text(None);
+                                }
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::F4) => {
+                            if let Some(r) = self.renderer.as_mut() {
+                                let next = r.quality().preset.next();
+                                silt::quality::set_active(next);
+                                if !r.set_quality(next.quality()) {
+                                    eprintln!(
+                                        "quality {}: shadow {} applies on next start (SILT_QUALITY={})",
+                                        next.name(),
+                                        next.quality().shadow_res,
+                                        next.name()
+                                    );
+                                }
+                                self.overlay = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -202,7 +269,16 @@ impl App {
         );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).expect("surface");
-        let (_instance, adapter, device, queue) = open_adapter(false, Some(&surface));
+        let (adapter, device, queue) =
+            render::open_for_surface(&instance, &surface).unwrap_or_else(|e| panic!("{e}"));
+        let software = !gpu_time::is_hardware_gpu(&adapter.get_info());
+        let requested = std::env::var("SILT_QUALITY").ok();
+        let preset = silt::quality::auto_preset(requested.as_deref(), false, software);
+        silt::quality::set_active(preset);
+        eprintln!(
+            "quality {} (SILT_QUALITY=low|medium|high, F4 cycles, F3 overlay)",
+            preset.name()
+        );
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -242,6 +318,8 @@ impl App {
             scene,
         );
         renderer.set_present_format(format);
+        renderer.resize(config.width, config.height);
+        renderer.enable_gpu_time();
         self.window = Some(window);
         self.surface = Some(surface);
         self.config = Some(config);
@@ -273,6 +351,7 @@ impl App {
             self.orbit_pitch = (self.orbit_pitch - dt * 0.7).max(-0.35);
         }
         self.acc += dt;
+        let sim_t0 = Instant::now();
         let step = 1.0 / 60.0;
         while self.acc >= step {
             // The page opens on the lap: buggy and bike both chase the loop.
@@ -292,6 +371,7 @@ impl App {
             self.world.step(step, &buggy_input);
             self.acc -= step;
         }
+        let sim_ms = sim_t0.elapsed().as_secs_f64() * 1e3;
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -327,8 +407,15 @@ impl App {
             }
         };
         let view = frame.texture.create_view(&Default::default());
+        let enc_t0 = Instant::now();
+        render::take_draw_stats();
         renderer.draw(&self.world, pose, Some((&view, self.srgb)), false);
+        let draws = render::take_draw_stats();
+        let encode_ms = enc_t0.elapsed().as_secs_f64() * 1e3;
         frame.present();
+        if self.overlay {
+            self.perf.record(renderer, sim_ms, encode_ms, draws);
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -373,6 +460,111 @@ impl App {
         self.surface = Some(ready.surface);
         self.renderer = Some(ready.renderer);
         true
+    }
+}
+
+impl PerfWindow {
+    fn record(&mut self, r: &mut Renderer, sim_ms: f64, encode_ms: f64, draws: (u32, u64)) {
+        let now = Instant::now();
+        if let Some(last) = self.last_frame {
+            self.wall_ms.push((now - last).as_secs_f64() * 1e3);
+        }
+        self.last_frame = Some(now);
+        self.sim_ms.push(sim_ms);
+        self.encode_ms.push(encode_ms);
+        self.draws = draws;
+        if let Some(s) = r.poll_gpu_time() {
+            let g = self.gpu.get_or_insert_with(GpuLines::default);
+            if let Some(ms) = s.frame_ms {
+                g.frame.push(ms);
+            }
+            for (label, ms) in s.passes {
+                match g.passes.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, v)) => v.push(ms),
+                    None => g.passes.push((label, vec![ms])),
+                }
+            }
+        }
+        if (now - self.since).as_secs_f32() < 0.5 {
+            return;
+        }
+        self.since = now;
+        let lines = self.lines(r);
+        r.set_overlay_text(Some(&lines));
+        self.wall_ms.clear();
+        self.sim_ms.clear();
+        self.encode_ms.clear();
+        if let Some(g) = self.gpu.as_mut() {
+            g.frame.clear();
+            for (_, v) in g.passes.iter_mut() {
+                v.clear();
+            }
+        }
+    }
+
+    fn lines(&self, r: &Renderer) -> Vec<String> {
+        let mean = |v: &[f64]| {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f64>() / v.len() as f64
+            }
+        };
+        let q = r.quality();
+        let (iw, ih) = r.internal_size();
+        let wall = mean(&self.wall_ms);
+        let budget = silt::quality::GPU_FRAME_BUDGET_MS as f64;
+        let mut out = vec![
+            format!(
+                "{} {}  render {}x{}",
+                r.adapter_name.chars().take(24).collect::<String>(),
+                q.preset.name(),
+                iw,
+                ih
+            ),
+            format!(
+                "FPS {:.0}  frame {:.1} ms",
+                if wall > 0.0 { 1000.0 / wall } else { 0.0 },
+                wall
+            ),
+            format!(
+                "CPU sim {:.2}  encode {:.2} ms",
+                mean(&self.sim_ms),
+                mean(&self.encode_ms)
+            ),
+        ];
+        match &self.gpu {
+            Some(g) if !g.frame.is_empty() => {
+                let m = mean(&g.frame);
+                out.push(format!(
+                    "{}GPU {m:.2} ms / {budget:.1}",
+                    if m > budget { "!" } else { "" }
+                ));
+                for (label, v) in &g.passes {
+                    if v.is_empty() {
+                        continue;
+                    }
+                    let pm = mean(v);
+                    let b = silt::quality::pass_budget(q.preset, label);
+                    let over = matches!(b, Some(b) if b > 0.0 && pm > b as f64);
+                    out.push(format!(
+                        "{} {:<13}{:>6.2} / {}",
+                        if over { "!" } else { "" },
+                        label,
+                        pm,
+                        b.map(|b| format!("{b:.1}")).unwrap_or_else(|| "-".into())
+                    ));
+                }
+            }
+            _ => out.push("GPU timestamps n/a".into()),
+        }
+        out.push(format!(
+            "draws {}  tris {}k",
+            self.draws.0,
+            self.draws.1 / 1000
+        ));
+        out.push("F3 overlay  F4 preset".into());
+        out
     }
 }
 
@@ -456,6 +648,16 @@ fn run_window() {
         acc: 0.0,
         last: Instant::now(),
         srgb: false,
+        overlay: false,
+        perf: PerfWindow {
+            wall_ms: Vec::new(),
+            sim_ms: Vec::new(),
+            encode_ms: Vec::new(),
+            gpu: None,
+            draws: (0, 0),
+            since: Instant::now(),
+            last_frame: None,
+        },
     };
     #[cfg(target_arch = "wasm32")]
     {
@@ -795,6 +997,26 @@ fn gpu_time_report() {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn capture(args: &[String]) {
+    // The UE5 bench owns its two flags, the terrain proof its one; the rest
+    // goes through parse_capture.
+    let mut bench_out: Option<PathBuf> = None;
+    let mut bench_scenes = PathBuf::from("bench/scenes.txt");
+    let mut terrain_proof: Option<PathBuf> = None;
+    let mut kept: Vec<String> = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--bench" => bench_out = Some(PathBuf::from(it.next().expect("--bench <dir>"))),
+            "--bench-scenes" => {
+                bench_scenes = PathBuf::from(it.next().expect("--bench-scenes <file>"))
+            }
+            "--terrain-proof" => {
+                terrain_proof = Some(PathBuf::from(it.next().expect("--terrain-proof <dir>")))
+            }
+            _ => kept.push(arg.clone()),
+        }
+    }
+    let args = &kept[..];
     let parsed = parse_capture(args);
     if parsed.software {
         prepare_software_vulkan();
@@ -818,6 +1040,14 @@ fn capture(args: &[String]) {
         formats,
         scene,
     );
+    if let Some(dir) = terrain_proof {
+        capture_terrain(&mut renderer, &parsed, &dir);
+        return;
+    }
+    if let Some(out) = bench_out {
+        bench::run(&mut renderer, parsed.width, parsed.height, &out, &bench_scenes);
+        return;
+    }
     if args.iter().any(|s| s == "--through-drive") {
         renderer.show_bike = false;
         renderer.show_props = false;
@@ -3093,20 +3323,14 @@ fn stitch_side_by_side(left: &[u8], right: &[u8], half_w: u32, height: u32) -> V
 }
 
 
+/// Snow blanket with the four turn circles and the Niva parked on the
+/// straight ruts. Shared by the snow-ruts proof and the UE5 bench.
 #[cfg(not(target_arch = "wasm32"))]
-fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
+fn snow_ruts_world() -> (World, silt::snow::SnowScene) {
     use silt::particles::Particles;
     use silt::snow::niva_snow_scene;
     use silt::soil::SoilField;
     use silt::vehicle::WHEEL_RADIUS;
-
-    renderer.daylight = true;
-    renderer.show_props = false;
-    renderer.show_environment = false;
-    renderer.show_bike = false;
-    renderer.niva_picture = true;
-    renderer.water_column = false;
-    renderer.snow = true;
 
     let scene = niva_snow_scene();
     let mut world = World::flat(0.1);
@@ -3146,6 +3370,20 @@ fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
     surface /= 4.0;
     let bottom = world.vehicle.wheel_center_local(0).y - WHEEL_RADIUS;
     world.vehicle.pos.y = surface - bottom;
+    (world, scene)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = false;
+    renderer.snow = true;
+
+    let (world, scene) = snow_ruts_world();
 
     let r = &scene.report;
     println!(
@@ -5556,6 +5794,15 @@ fn force_webgl() -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn web_query_value(key: &str) -> Option<String> {
+    let query = web_sys::window()?.location().search().ok()?;
+    query.split(['?', '&']).find_map(|part| {
+        let (k, v) = part.trim().split_once('=')?;
+        (k == key).then(|| v.to_string())
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
 fn backend_label(info: &wgpu::AdapterInfo) -> String {
     let kind = match info.backend {
         wgpu::Backend::BrowserWebGpu => "WebGPU",
@@ -5649,6 +5896,14 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
     };
     surface.configure(&device, &config);
     let formats = render::gpu_formats(&adapter);
+    // `?quality=low|medium|high`; WebGL2 defaults to low, WebGPU to medium.
+    let preset = silt::quality::auto_preset(
+        web_query_value("quality").as_deref(),
+        info.backend == wgpu::Backend::Gl,
+        false,
+    );
+    silt::quality::set_active(preset);
+    web_sys::console::log_1(&format!("silt quality {}", preset.name()).into());
     set_web_status("грунт…");
     let scene = cc0::load().await;
     let mut renderer = Renderer::new(
@@ -5661,6 +5916,7 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
         scene,
     );
     renderer.set_present_format(format);
+    renderer.resize(config.width, config.height);
     Ok(WebGpu {
         surface,
         config,
@@ -5668,4 +5924,129 @@ async fn build_web_gpu(window: std::sync::Arc<Window>) -> Result<WebGpu, String>
         srgb: format.is_srgb(),
         label,
     })
+}
+
+/// Ground geometry proof. The same frames drawn with the old uniform grid
+/// and bilinear height ("before"), with the LOD tree and the monotone cubic
+/// ("after"), and with the LOD levels and triangle grid tinted ("lod").
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_terrain(renderer: &mut Renderer, parsed: &CaptureArgs, dir: &Path) {
+    use silt::soil::{rut_depth_from_force, SoilField, SurfaceKind, HARD_PASS_NORMAL, HARD_PASS_PUSH};
+
+    std::fs::create_dir_all(dir).expect("terrain proof dir");
+    let mut shots: Vec<(String, CameraPose)> = Vec::new();
+
+    // Two force ruts in wet clay beside a parked Niva (the force proof scene).
+    let world = {
+        renderer.daylight = true;
+        renderer.show_props = false;
+        renderer.show_bike = false;
+        renderer.niva_picture = true;
+        let mut soil = SoilField::mud_pad();
+        let want = rut_depth_from_force(
+            HARD_PASS_NORMAL,
+            HARD_PASS_PUSH,
+            0.38,
+            0.28,
+            SurfaceKind::WetMud,
+            0.82,
+            0.02,
+            0.0,
+        );
+        soil.roll_with_force(
+            Vec3::new(0.0, 0.0, -1.2),
+            Vec3::new(0.0, 0.0, 1.2),
+            want.max(0.012),
+            0.0,
+            HARD_PASS_NORMAL,
+            HARD_PASS_PUSH,
+        );
+        let bed = soil.max_rut_depth();
+        let mut world = World::wet_clay();
+        for side in [-0.74_f32, 0.74] {
+            world.soil.roll_with_force(
+                Vec3::new(side, 0.0, -2.6),
+                Vec3::new(side, 0.0, 1.8),
+                bed.max(0.012),
+                0.0,
+                HARD_PASS_NORMAL,
+                HARD_PASS_PUSH,
+            );
+        }
+        world.vehicle.pos = Vec3::new(0.0, 0.8, 0.15);
+        world.vehicle.yaw = 0.0;
+        world.vehicle.vel = Vec3::ZERO;
+        let ori = world.vehicle.orientation();
+        let mut seated = 0.0_f32;
+        for i in 0..4 {
+            let local = ori * world.vehicle.wheel_center_local(i);
+            let ground = world
+                .soil
+                .sample(world.vehicle.pos.x + local.x, world.vehicle.pos.z + local.z)
+                .height;
+            seated += ground + 0.38 - local.y;
+        }
+        world.vehicle.pos.y = seated / 4.0;
+        silence_chunks(&mut world);
+        let fwd = world.vehicle.forward();
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let p = world.vehicle.pos;
+        let rut = p - fwd * 2.1 + right * 0.74;
+        let g = world.soil.sample(rut.x, rut.z).height;
+        let target = Vec3::new(rut.x, g, rut.z);
+        // Down the rut from behind, eye over the groove: walls and floor.
+        let along = CameraPose {
+            eye: target - fwd * 2.2 + right * 0.3 + Vec3::Y * 0.85,
+            target: target + fwd * 1.4,
+            ortho_width: None,
+        };
+        // Across both ruts from the side: the cross profile and the berms.
+        let across = CameraPose {
+            eye: target + right * 2.2 - fwd * 0.6 + Vec3::Y * 0.6,
+            target: target - right * 1.2,
+            ortho_width: None,
+        };
+        let mid = CameraPose {
+            eye: target - fwd * 2.8 + right * 2.4 + Vec3::Y * 1.4,
+            target: target + fwd * 0.9 - right * 0.4,
+            ortho_width: None,
+        };
+        println!("terrain proof: force rut bed {bed:.3} m");
+        shots.push(("rut-along".into(), along));
+        shots.push(("rut-across".into(), across));
+        shots.push(("rut-mid".into(), mid));
+        world
+    };
+    let world = &world;
+
+    for (name, pose) in &shots {
+        let pose = lift_camera(world, *pose);
+        for (tag, lod, cubic, debug) in [
+            ("before", false, false, false),
+            ("after", true, true, false),
+            ("lod", true, true, true),
+        ] {
+            renderer.terrain_geom.lod = lod;
+            renderer.terrain_geom.cubic = cubic;
+            renderer.terrain_geom.debug = debug;
+            let t0 = Instant::now();
+            let rgba = renderer.draw(world, pose, None, true).expect("readback");
+            let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            let dest = dir.join(format!("{name}-{tag}.png"));
+            write_png(&dest, parsed.width, parsed.height, &rgba).expect("terrain still");
+            let tris = if lod {
+                renderer.terrain_geom.view_triangles()
+            } else {
+                2 * 1528 * 1528
+            };
+            let shadow = if lod {
+                renderer.terrain_geom.shadow_triangles()
+            } else {
+                tris
+            };
+            println!(
+                "terrain {name} {tag}: {tris} ground triangles in view, {shadow} in the shadow pass, draw {ms:.0} ms"
+            );
+        }
+    }
 }
