@@ -1039,7 +1039,95 @@ fn water_bed(xz: vec2<f32>) -> f32 {
     ) * 0.2;
 }
 
+// Open water: a river or a sea shore. The solved column is the free surface,
+// bed + depth, not a film on the bed. A dry vertex next to the water carries
+// the neighbour's surface flat into the bank, so the shoreline is where that
+// surface meets the ground and the depth test cuts it.
+fn open_eta(xz: vec2<f32>) -> vec2<f32> {
+    let column = water_column(xz);
+    return vec2<f32>(height_bilinear(xz) + column, column);
+}
+
+fn open_water_vertex(in: TerrIn) -> WaterOut {
+    let here = open_eta(in.xz);
+    let bed = here.x - here.y;
+    let wet = smoothstep(0.004, 0.03, here.y);
+    let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.03, 0.2, here.y) * 0.6;
+    var y = bed - 0.04;
+    if (here.y > 0.004) {
+        y = here.x + rip * wet;
+    } else {
+        let e = frame.params.z;
+        var best = -1.0e6;
+        for (var k = 0; k < 8; k = k + 1) {
+            let a = f32(k) * 0.7853982;
+            let n = open_eta(in.xz + vec2<f32>(cos(a), sin(a)) * e);
+            if (n.y > 0.004) {
+                best = max(best, n.x);
+            }
+        }
+        if (best > -1.0e5) {
+            y = best;
+        }
+    }
+    let world = vec3<f32>(in.xz.x, y, in.xz.y);
+    var o: WaterOut;
+    o.clip = frame.view_proj * vec4<f32>(world, 1.0);
+    o.world = world;
+    o.ij = in.ij;
+    o.depth = here.y;
+    return o;
+}
+
+fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
+    let xz = in.world.xz;
+    // Depth of water over the ground under this fragment.
+    let d = in.world.y - height_bilinear(xz);
+    if (d <= 0.0) {
+        discard;
+    }
+    // Surface slope from the solved column (bow, wake, swell), plus ripples.
+    let de = 0.2;
+    let e0 = open_eta(xz);
+    let ex = open_eta(xz + vec2<f32>(de, 0.0));
+    let ez = open_eta(xz + vec2<f32>(0.0, de));
+    var gx = 0.0;
+    var gz = 0.0;
+    if (ex.y > 0.004 && e0.y > 0.004) {
+        gx = clamp((ex.x - e0.x) / de, -0.6, 0.6);
+    }
+    if (ez.y > 0.004 && e0.y > 0.004) {
+        gz = clamp((ez.x - e0.x) / de, -0.6, 0.6);
+    }
+    let r = ripple_normal(xz, frame.misc.x);
+    let nrm = normalize(vec3<f32>(-gx * 1.6 + r.x * 0.5, 1.0, -gz * 1.6 + r.z * 0.5));
+    let view = normalize(frame.cam_pos.xyz - in.world);
+    let sun = normalize(frame.sun_dir.xyz);
+    let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
+    let fres = 0.02 + 0.98 * pow(1.0 - ndotv, 5.0);
+    let refl = sky_color(reflect(-view, nrm));
+    // River water: clear in the shallows, olive-brown with depth. The ground
+    // under it is the terrain pass; alpha is how much of it the column hides.
+    let path = d / max(ndotv, 0.25);
+    let t = exp(-path * 3.2);
+    let lit = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
+    let scatter = vec3<f32>(0.075, 0.095, 0.07) * (0.35 + 1.4 * lit) + bed_col * 0.08;
+    let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 220.0)
+        * shadow_factor(in.world, nrm);
+    let shore = smoothstep(0.0, 0.025, d);
+    let hide = 1.0 - t * (1.0 - fres);
+    let alpha = clamp(hide * shore, 0.0, 1.0);
+    var col = (scatter * (1.0 - t) * (1.0 - fres) + refl * fres) / max(hide, 1.0e-3);
+    col += frame.sun_color.rgb * spec * 2.5 / max(alpha, 0.05);
+    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
+    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    return vec4<f32>(gamma, max(alpha, min(spec * 2.0, 1.0) * shore));
+}
+
 fn water_vertex(in: TerrIn) -> WaterOut {
+    if (frame.misc.w > 1.5) {
+        return open_water_vertex(in);
+    }
     let local = height_bilinear(in.xz);
     let dug = max(-stamp_bilinear(in.xz), 0.0);
     let depth = covered_depth(in.xz);
@@ -1088,6 +1176,9 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         textureSample(ground_diff, ground_samp, uv3, 3),
         textureSample(ground_diff, ground_samp, uv4, 4),
     ).rgb;
+    if (frame.misc.w > 1.5) {
+        return open_water_fragment(in, bed);
+    }
     let own = mat_bilinear(xz).g * 0.34;
     let dug = max(-stamp_bilinear(xz), 0.0);
     // A cut keeps film and slurry on the soil mesh. Dilated water on the lip
