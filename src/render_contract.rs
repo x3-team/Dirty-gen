@@ -960,32 +960,11 @@ impl ContractGpu {
             wgpu::TextureFormat::Rg32Float,
             2,
         )?;
-let fog = map3(
+        let fog = map3(
             device,
             "contract-fog",
             wgpu::TextureFormat::R32Float,
             1,
-        )?;
-        let crust = map2(
-            device,
-            "contract-crust",
-            res,
-            wgpu::TextureFormat::Rg32Float,
-            2,
-        )?;
-        let wet_edge = map2(
-            device,
-            "contract-wet-edge",
-            res,
-            wgpu::TextureFormat::R32Float,
-            1,
-        )?;
-        let foam = map2(
-            device,
-            "contract-foam-crest",
-            res,
-            wgpu::TextureFormat::Rg32Float,
-            2,
         )?;
         let soil_mix = map2(
             device,
