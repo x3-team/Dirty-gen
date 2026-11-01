@@ -55,6 +55,8 @@ struct BcSpray {
 @group(4) @binding(10) var<storage, read> bc_spray: array<BcSpray>;
 // Air velocity, m/s, same origin and cell as dust_fog (contract v2).
 @group(4) @binding(11) var bc_air_tex: texture_3d<f32>;
+// Solver mist, water volume fraction on the air grid (contract v5, #106).
+@group(4) @binding(12) var bc_fog_mist_tex: texture_3d<f32>;
 
 const BC_VALID_MOISTURE: u32 = 2u;
 const BC_VALID_FILM: u32 = 4u;
@@ -186,7 +188,14 @@ const FOG_SIGMA: f32 = 60000.0;
 // Plumes look denser than the cell mean: the dust rides in clumps.
 // 0.45: the plume read as an opaque wall at 1.2.
 const FOG_CLUMP: f32 = 0.45;
-const FOG_STEPS: i32 = 40;
+// Steps and shadow taps come from the quality preset (docs/GPU_BUDGET.md,
+// #126): pipeline overrides, the high preset as the default.
+override QUALITY_FOG_STEPS: i32 = 40;
+override QUALITY_FOG_SHADOW_STEPS: i32 = 3;
+// Air layers the march reads, from the ground up. The grid has 16 (4 m).
+override QUALITY_AIR_LAYERS: i32 = 16;
+// Water droplets of mist, radius ~10 micrometres: 1.5 / r per volume fraction.
+const MIST_SIGMA: f32 = 150000.0;
 // Ground fog past this distance is integrated in closed form, so the steps
 // stay where the swirls are.
 const FOG_MARCH_M: f32 = 40.0;
@@ -201,6 +210,32 @@ fn fog_tap(i: vec3<i32>) -> f32 {
     }
     let v = textureLoad(bc_dust_fog, i, 0).r;
     return select(0.0, max(v, 0.0), abs(v) < 1.0e4);
+}
+
+// Solver mist (binding 12), same grid and index as dust.
+fn mist_tap(i: vec3<i32>) -> f32 {
+    let res = vec3<i32>(i32(bc_header.air_res), i32(bc_header.air_layers), i32(bc_header.air_res));
+    if (any(i < vec3<i32>(0)) || any(i >= res)) {
+        return 0.0;
+    }
+    let v = textureLoad(bc_fog_mist_tex, i, 0).r;
+    return select(0.0, max(v, 0.0), abs(v) < 1.0e4);
+}
+
+// Mist volume fraction at a world point, trilinear.
+fn bc_mist_at(p: vec3<f32>) -> f32 {
+    let cell = vec3<f32>(bc_header.air_cell_x, bc_header.air_cell_y, bc_header.air_cell_z);
+    let origin = vec3<f32>(bc_header.air_origin_x, bc_header.air_origin_y, bc_header.air_origin_z);
+    let t = (p - origin) / max(cell, vec3<f32>(1e-4)) - vec3<f32>(0.5);
+    let i0 = vec3<i32>(floor(t));
+    let f = t - floor(t);
+    var acc = 0.0;
+    for (var k: i32 = 0; k < 8; k = k + 1) {
+        let o = vec3<i32>(k & 1, (k >> 1u) & 1, (k >> 2u) & 1);
+        let w = mix(1.0 - f.x, f.x, f32(o.x)) * mix(1.0 - f.y, f.y, f32(o.y)) * mix(1.0 - f.z, f.z, f32(o.z));
+        acc += mist_tap(i0 + o) * w;
+    }
+    return acc;
 }
 
 // Volume fraction at a world point, trilinear over the published texels.
@@ -233,19 +268,32 @@ fn bc_fog_near(p: vec3<f32>) -> f32 {
     return fog_tap(vec3<i32>(floor((p - origin) / max(cell, vec3<f32>(1e-4)))));
 }
 
-// The plume as the picture draws it: the published cell, plus what the cells
-// below and upwind hold, so dust lifts and trails downwind of where the
-// ledger counts it. Picture only; the ledger's volume is not changed.
+// The plume as the solver publishes it. Since the air grid is 4 m tall and
+// the wake lifts dust itself (16 layers), the picture no longer moves dust
+// up or downwind of the cell that holds it.
 fn fog_plume(p: vec3<f32>) -> f32 {
-    // Upwind along the published air (b11): what that air carried here
-    // in the last ~0.4 s and ~1 s.
-    let wind = air_velocity(p);
-    let c = bc_fog_at(p);
-    var s = bc_fog_at(p - wind * 0.4 - vec3<f32>(0.0, 0.3, 0.0));
-    s += bc_fog_at(p - wind * 1.0 - vec3<f32>(0.0, 0.6, 0.0));
-    s += bc_fog_at(p + vec3<f32>(0.55, -0.35, 0.3));
-    s += bc_fog_at(p + vec3<f32>(-0.4, -0.35, -0.55));
-    return max(c, c * 0.5 + s * 0.2);
+    return bc_fog_at(p);
+}
+
+// Extinction, 1/m, of the published dust (x) and mist (y) at `p`: the cell
+// means, faded at the side walls of the window so the plume does not end on
+// a ruled edge. No picture detail.
+fn air_sigma(p: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+    if (any(p < bmin) || any(p > bmax)) {
+        return vec2<f32>(0.0);
+    }
+    let wall = min(min(p.x - bmin.x, bmax.x - p.x), min(p.z - bmin.z, bmax.z - p.z));
+    // The 4 m lid: what the wake mixed up to it thins over the top 0.75 m.
+    let fade = smoothstep(0.0, 3.0, wall) * (1.0 - smoothstep(bmax.y - 0.75, bmax.y, p.y));
+    return vec2<f32>(bc_fog_at(p) * FOG_SIGMA * FOG_CLUMP, bc_mist_at(p) * MIST_SIGMA) * fade;
+}
+
+// `air_sigma` over two trilinear taps half a cell apart on a diagonal of the
+// plane: the published cells stop printing as blocks where neighbouring
+// columns ride the lee at different speeds. For the view samples only.
+fn air_sigma_soft(p: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+    let h = 0.5 * vec3<f32>(bc_header.air_cell_x, bc_header.air_cell_y * 0.5, -bc_header.air_cell_z);
+    return 0.5 * (air_sigma(p + h, bmin, bmax) + air_sigma(p - h, bmin, bmax));
 }
 
 // ---------------------------------------------------------------------------
@@ -403,11 +451,12 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let rd = normalize(seg);
     let inv = vec3<f32>(1.0) / select(rd, vec3<f32>(1e-6), abs(rd) < vec3<f32>(1e-6));
 
-    // The published dust box, lifted 1 m for the plume (see fog_plume).
+    // The published air box, up to the layers this preset reads.
     let cell = vec3<f32>(bc_header.air_cell_x, bc_header.air_cell_y, bc_header.air_cell_z);
     let bmin = vec3<f32>(bc_header.air_origin_x, bc_header.air_origin_y, bc_header.air_origin_z);
-    let bmax = bmin + cell * vec3<f32>(f32(bc_header.air_res), f32(bc_header.air_layers), f32(bc_header.air_res));
-    let bmax_l = bmax + vec3<f32>(0.0, 1.0, 0.0);
+    let layers = f32(min(i32(bc_header.air_layers), max(QUALITY_AIR_LAYERS, 1)));
+    let bmax = bmin + cell * vec3<f32>(f32(bc_header.air_res), layers, f32(bc_header.air_res));
+    let bmax_l = bmax;
     var t_near = 1e9;
     var t_far = 0.0;
     if (has_dust) {
@@ -461,51 +510,94 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Steps bunch up near the camera (t grows with the square of the step
     // index), and shorten inside a dense plume so one step never jumps from
     // clear air to opaque.
-    var t = t_near + range * pow(jitter / f32(FOG_STEPS), 2.0);
+    let steps = max(QUALITY_FOG_STEPS, 4);
+    let fsteps = f32(steps);
+    var t = t_near + range * pow(jitter / fsteps, 2.0);
     var dt = 0.0;
-    for (var k: i32 = 0; k < FOG_STEPS + 16; k = k + 1) {
+    // Sky light is from above and the sand below bounces the sun.
+    let ground_bounce = DUST_ALBEDO * frame.sun_color.rgb * max(sun.y, 0.0) * 0.12 * frame.env.y;
+    for (var k: i32 = 0; k < steps + 16; k = k + 1) {
         t += dt;
         if (t >= t_far) {
             break;
         }
         let u = sqrt(max(t - t_near, 0.0) / range);
-        dt = max(range * (2.0 * u + 1.0 / f32(FOG_STEPS)) / f32(FOG_STEPS), 0.05);
+        dt = max(range * (2.0 * u + 1.0 / fsteps) / fsteps, 0.05);
         let p = ro + rd * t;
-        var dust = 0.0;
-        if (has_dust && all(p >= bmin) && all(p <= bmax_l)) {
-            let wall = min(min(p.x - bmin.x, bmax.x - p.x), min(p.z - bmin.z, bmax.z - p.z));
-            // Thins out upward over the top two metres and at the walls, so
-            // the plume melts into the air instead of ending on a ruled edge.
-            let fade = smoothstep(0.0, 5.0, wall) * (1.0 - smoothstep(bmax.y - 2.0, bmax_l.y, p.y));
-            dust = fog_plume(p) * FOG_SIGMA * FOG_CLUMP * fade;
+        var dm = vec2<f32>(0.0);
+        if (has_dust) {
+            dm = air_sigma_soft(p, bmin, bmax);
         }
-        let fog = ground_fog(p);
+        let dust = dm.x;
+        let mist = dm.y;
+        let fog = ground_fog(p) + mist;
         if (dust + fog < 1e-3) {
             continue;
         }
         // The solver gives the big shape; the curl noise carried by the air
-        // adds the swirls. Fog keeps more of its body than a dust plume.
-        let v = air_velocity(p);
+        // adds the swirls. Detail erodes the thin rim of a plume harder than
+        // its core, so edges go wispy and the body stays a body.
+        // The air solve runs on 0.25 x 0.5 x 0.25 m blocks copied onto the
+        // fine grid, so its velocity steps at every block face; carried by
+        // that, the noise tore into rectangles. Two taps one block apart on a
+        // diagonal turn each step into a ramp.
+        let o = vec3<f32>(bc_header.air_cell_x * 2.0, bc_header.air_cell_y * 2.0, -bc_header.air_cell_z * 2.0) * 0.5;
+        let v = 0.5 * (air_velocity(p + o) + air_velocity(p - o));
         let detail = air_detail(p, v, t_now, 0.32);
-        let s_dust = dust * detail;
+        let core = 1.0 - exp(-dust * 0.6);
+        let s_dust = dust * mix(detail, 0.6 + 0.4 * detail, core);
         let s_fog = fog * mix(1.0, detail, 0.7);
         let sigma = s_dust + s_fog;
         dt = min(dt, max(0.9 / max(sigma, 1e-4), 0.08));
         let wd = s_dust / max(sigma, 1e-6);
-        // Self-shadow toward the sun: three coarse dust steps, and the fog
-        // column above the point in closed form.
+        // Self-shadow toward the sun through the published grid: taps 0.4,
+        // 0.9, 1.9 m long (doubling), so a 3 m column darkens its far side.
+        // The point's own detail scales the first tap.
         var od = 0.0;
-        if (dust > 0.0) {
-            for (var j: i32 = 1; j <= 3; j = j + 1) {
-                od += bc_fog_at(p + sun * (f32(j) * 0.35)) * FOG_SIGMA * FOG_CLUMP * 0.35;
+        if (has_dust) {
+            var s0 = 0.0;
+            var len = 0.4;
+            for (var j: i32 = 0; j < QUALITY_FOG_SHADOW_STEPS; j = j + 1) {
+                let q = p + sun * (s0 + 0.5 * len);
+                let a = air_sigma(q, bmin, bmax);
+                od += (a.x + a.y) * len * select(1.0, detail, j == 0);
+                s0 += len;
+                len *= 2.2;
             }
         }
-        od += fog * fog_h / max(sun.y, 0.08);
-        let sun_t = max(exp(-od), 0.3 * exp(-od * 0.12));
-        let phase = mix(fog_phase, dust_phase, wd);
+        od += ground_fog(p) * fog_h / max(sun.y, 0.08);
+        // Multiple scattering, after Wrenninge et al.: each octave sees a
+        // thinner medium and a rounder phase, so the lit core glows instead
+        // of going flat grey behind its first metre.
+        var ms = 0.0;
+        var a_o = 1.0;
+        var b_o = 1.0;
+        var c_o = 1.0;
+        for (var o: i32 = 0; o < 3; o = o + 1) {
+            let ph = mix(mix(hg_phase(mu, 0.8 * c_o), hg_phase(mu, 0.2 * c_o), 0.45), hg_phase(mu, 0.55 * c_o), wd);
+            ms += a_o * ph * exp(-od * b_o);
+            a_o *= 0.5;
+            b_o *= 0.4;
+            c_o *= 0.5;
+        }
+        ms *= 12.566371;
+        // Powder: the sunward rim of a dense puff is darker than its inside,
+        // where light has scattered in from all sides.
+        let powder = 0.6 + 0.4 * (1.0 - exp(-sigma * 0.8));
+        // Sky through the plume above the point: dark undersides, bright tops.
+        var od_up = 0.0;
+        if (has_dust) {
+            let a1 = air_sigma(p + vec3<f32>(0.0, 0.5, 0.0), bmin, bmax);
+            let a2 = air_sigma(p + vec3<f32>(0.0, 1.5, 0.0), bmin, bmax);
+            od_up = (a1.x + a1.y) * 0.8 + (a2.x + a2.y) * 1.2;
+        }
+        let sky_vis = exp(-od_up * 0.5);
         // Lifted off the ground so the shadow map's texels do not print as acne.
-        let lit = shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0));
-        var l_in = frame.sun_color.rgb * 1.25 * phase * sun_t * lit + sky;
+        // Two taps a step apart along the ray: the map's texels no longer
+        // print as bricks through a thin plume.
+        let lit = 0.5 * (shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0))
+            + shadow_factor(p - rd * (0.5 * dt) + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0)));
+        var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
         if (lamp_on > 0.0) {
             for (var i: i32 = 0; i < 2; i = i + 1) {
                 let b = lamp_beam(i, p);
@@ -553,7 +645,16 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 @fragment
 fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let full = vec2<f32>(textureDimensions(fog_half)) * 2.0;
-    let c = textureSampleLevel(fog_half, fog_half_samp, frag.xy / full, 0.0);
+    // Four bilinear taps half a half-res texel apart: a 4 x 4 tent over the
+    // march, which melts the per-pixel jitter of the steps into a smooth
+    // gradient. Premultiplied, so a thin rim does not bleed dark.
+    let uv = frag.xy / full;
+    let e = vec2<f32>(1.0) / full;
+    var c = textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(-e.x, -e.y), 0.0);
+    c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, -e.y), 0.0);
+    c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(-e.x, e.y), 0.0);
+    c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, e.y), 0.0);
+    c *= 0.25;
     if (c.a < 0.002) {
         discard;
     }
@@ -665,7 +766,7 @@ fn bc_fog_water(p: vec3<f32>) -> f32 {
     if (bc_header.version < 5u || !bc_has(BC_VALID_FOG)) {
         return 0.0;
     }
-    return 0.0;
+    return bc_mist_at(p);
 }
 
 // Free-surface height, ground + water + slurry, through one 3 x 3 binomial.
