@@ -156,6 +156,10 @@ pub struct Vehicle {
     /// Snow under each tire from the fine snow track, when one is attached.
     /// It replaces the soil height and mechanics for that tire only.
     pub snow_ground: [Option<crate::snow_track::SnowGround>; 4],
+    /// Snow under the belly: force and torque about `pos`, world frame,
+    /// from the last belly press. The snow track sets it; zero off snow.
+    pub snow_belly_force: Vec3,
+    pub snow_belly_torque: Vec3,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +217,8 @@ impl Vehicle {
             engine_stalled: false,
             adhesion: Adhesion::default(),
             snow_ground: [None; 4],
+            snow_belly_force: Vec3::ZERO,
+            snow_belly_torque: Vec3::ZERO,
         }
     }
 
@@ -747,7 +753,8 @@ impl Vehicle {
         }
         force.x += self.water_push_n.x;
         force.z += self.water_push_n.z;
-        let mut torque_local = Vec3::ZERO;
+        force += self.snow_belly_force;
+        let mut torque_local = ori.inverse() * self.snow_belly_torque;
         let held = self.jump_hold > 0.0;
         if self.jump_hold > 0.0 {
             self.jump_hold = (self.jump_hold - dt).max(0.0);
