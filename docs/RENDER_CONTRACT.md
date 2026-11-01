@@ -97,10 +97,10 @@ Airborne dust and fog as a volume fraction, cubic metres of dust per cubic metre
 
 | | Ledger (`dust_source` 1) | Fluid air (`dust_source` 2) |
 |---|---|---|
-| Size | 128 × 8 × 128 | 128 × 8 × 128 |
+| Size | 128 × 16 × 128 | 128 × 16 × 128; the sheet fills layers 0–7, layers 8–15 are 0 |
 | Cell | 0.125 m × 0.25 m × 0.125 m | `(40/128)` m × 0.25 m × `(40/128)` m |
-| Coverage | 16 m × 2 m × 16 m, vehicle frame | the 40 m window |
-| Index | `x + layer * 128 + z * 128 * 8` | same index after conversion |
+| Coverage | 16 m × 4 m × 16 m, vehicle frame | the 40 m window, 2 m tall |
+| Index | `x + layer * 128 + z * 128 * 16` | same index after conversion |
 
 Texel centre is `air_origin + (i + 0.5) * air_cell`. `air_origin` is the corner of texel (0, 0, 0), Y up. The ledger origin moves with the Niva. The fluid-air fallback stores a depth in metres in each slab and publishes `depth / 0.25`.
 
@@ -112,22 +112,24 @@ Valid: `VALID_DUST_FOG` under the same rule as settled dust. `dust_source` 0 mea
 
 ### Air velocity — binding 11
 
-World air velocity on the same 128 × 8 × 128 grid as `dust_fog`. Same origin and cell: `header.air_origin_*`, `header.air_cell_*`. Texel centre is `air_origin + (i + 0.5) * air_cell`.
+World air velocity on the same 128 × 16 × 128 grid as `dust_fog`. Same origin and cell: `header.air_origin_*`, `header.air_cell_*`. Texel centre is `air_origin + (i + 0.5) * air_cell`.
 
 | | |
 |---|---|
 | Format | `rgba32float` 3D |
-| Index | `(x + layer * 128 + z * 128 * 8) * 4` |
+| Index | `(x + layer * 128 + z * 128 * 16) * 4` |
 | R | velocity +X, east, m/s |
 | G | velocity +Y, up, m/s |
 | B | velocity +Z, north, m/s |
 | A | 0 |
-| Resolution | 128 × 8 × 128 |
+| Resolution | 128 × 16 × 128 |
 | Cell | the `dust_fog` cell for this `dust_source` |
 
-The step is 2.5D. Advection and vorticity confinement run in the horizontal plane of each layer. The vertical channel is stored. Wheel spin writes it. The horizontal step does not advect between layers.
+The velocity step is 2.5D. Advection and vorticity confinement run in the horizontal plane of each layer. The vertical channel is stored. Wheel spin writes it. The horizontal step does not advect between layers.
 
-Writer, when `dust_source` is 1: `step_vehicle_air` on the dust ledger, packed by `Dust::write_air_velocity`. The Niva body and the four wheels inject velocity. Vorticity confinement rolls the wake. Wind relaxes the field toward the free stream outside the solids. The solve runs on a 0.25 m × 0.50 m × 0.25 m active window around the Niva and is copied onto this 128 × 8 × 128 grid. This grid is valid after `Dust::step` / `Dust::step_pads`. Before the first air step the samples are 0.
+Dust and fog do move between layers. On the ledger, each column exchanges with its neighbours above and below: upwind along G, plus eddy diffusion K = 0.15 m × |v − free stream| wherever the wake residual is at least 0.3 m/s (`dust::mix_vertical`). The wake lifts a dry plume to the 4 m ceiling; still air does not mix. Dust falls at 0.24 m/s on the slow stride as before. Horizontally both scalars ride the relative wind (`dust::shift_layers`): below the roof (1.58 m) with the lee hold, above it by whole cells. Mass that crosses the window edge is booked as settled where it left.
+
+Writer, when `dust_source` is 1: `step_vehicle_air` on the dust ledger, packed by `Dust::write_air_velocity`. The Niva body and the four wheels inject velocity. Vorticity confinement rolls the wake. Wind relaxes the field toward the free stream outside the solids. The solve runs on a 0.25 m × 0.50 m × 0.25 m active window around the Niva and is copied onto this 128 × 16 × 128 grid. This grid is valid after `Dust::step` / `Dust::step_pads`. Before the first air step the samples are 0.
 
 Writer, when `dust_source` is 2 and the ledger is absent: `FluidCore::write_air_velocity`. R and B are that sheet's horizontal dust velocity, G is 0. That path does not run the body wake.
 
@@ -135,7 +137,7 @@ Valid: `VALID_AIR` when `dust_source` is 1 or 2, the same publishes as `dust_fog
 
 ### Fog — binding 12
 
-Suspended water, as a volume fraction, cubic metres of water per cubic metre of air. Not dust. Not clamped. Same 128 × 8 × 128 grid, origin, and cell as `dust_fog` and `air_velocity`. Index `x + layer * 128 + z * 128 * 8`.
+Suspended water, as a volume fraction, cubic metres of water per cubic metre of air. Not dust. Not clamped. Same 128 × 16 × 128 grid, origin, and cell as `dust_fog` and `air_velocity`. Index `x + layer * 128 + z * 128 * 16`.
 
 | | Ledger (`dust_source` 1) | Fluid air (`dust_source` 2) |
 |---|---|---|
@@ -271,7 +273,7 @@ Dry cells and any other non-finite sample are written as 0. Layout unchanged. Fo
 
 ### 2
 
-`air_velocity`, binding 11, `rgba32float` 3D, 128 × 8 × 128. R, G, B are world velocity in m/s (+X, +Y, +Z). A is 0. Same origin and cell as `dust_fog`. `VALID_AIR` is bit 10, set when `dust_source` is 1 or 2.
+`air_velocity`, binding 11, `rgba32float` 3D, 128 × 16 × 128. R, G, B are world velocity in m/s (+X, +Y, +Z). A is 0. Same origin and cell as `dust_fog`. `VALID_AIR` is bit 10, set when `dust_source` is 1 or 2.
 
 With the dust ledger, `step_vehicle_air` writes the field: the Niva body and wheels inject velocity, vorticity confinement leaves a wake, and wind advects the field. Without the ledger, the samples are the fluid sheet's horizontal dust velocity and a zero vertical channel. The header stays 96 bytes. Debug mode 14 shows air speed.
 
@@ -287,6 +289,6 @@ Dry cells of flow and foam do not bump this version either. Binding 4 on a dry c
 
 ### 5
 
-`fog`, binding 12, `r32float` 3D, 128 × 8 × 128. R is the water volume fraction, m³/m³. Same origin and cell as `dust_fog` and `air_velocity`. `VALID_FOG` is bit 13 (`1 << 13`), set when `dust_source` is 1 or 2. Bits 11 and 12 are not this channel.
+`fog`, binding 12, `r32float` 3D, 128 × 16 × 128. R is the water volume fraction, m³/m³. Same origin and cell as `dust_fog` and `air_velocity`. `VALID_FOG` is bit 13 (`1 << 13`), set when `dust_source` is 1 or 2. Bits 11 and 12 are not this channel.
 
 `dust_fog` and `air_velocity` are unchanged. Fog does not replace either channel and it does not add a velocity. With the dust ledger, `inject_fog` writes the scalar and the existing wind step plus `advect_density_by_air` move it. Without the ledger, `FluidCore::inject_fog` takes the water and the same wind step moves the slab. The header stays 96 bytes. Debug mode 15 shows this channel. Debug mode 13 remains airborne dust.

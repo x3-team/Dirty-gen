@@ -12,6 +12,7 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS, WHEEL_WID
 use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
+use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime, Q_FRAME_BEGIN, Q_FRAME_END};
 use crate::mesh::{
     bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_split,
     spray_from_contract, terrain_mesh,
@@ -231,6 +232,8 @@ pub struct Renderer {
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
     pub debug_mode: u32,
+    /// Set by [`Renderer::enable_gpu_time`]. Absent for the window and for captures.
+    gpu_time: Option<GpuTime>,
 }
 
 pub struct GpuFormats {
@@ -328,6 +331,66 @@ pub fn open_adapter(
     ))
     .expect("request_device");
     (instance, adapter, device, queue)
+}
+
+/// Open an adapter for `capture --gpu-time`. Missing adapter is an error the
+/// caller prints, not a panic. Timestamp queries are requested when the
+/// adapter offers them.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn try_open_adapter(
+    software: bool,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: if software {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all()
+        },
+        ..Default::default()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: software,
+        compatible_surface: surface,
+    }))
+    .ok_or_else(|| {
+        format!(
+            "no wgpu adapter (software={software}). For lavapipe set VK_DRIVER_FILES to lvp_icd.json and unset DISPLAY."
+        )
+    })?;
+    let info = adapter.get_info();
+    println!(
+        "wgpu adapter: {} {:?} {:?}",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = open_timed_device(&adapter)?;
+    Ok((instance, adapter, device, queue))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_timed_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        let timed = wgpu::DeviceDescriptor {
+            label: Some("silt"),
+            required_features: wgpu::Features::TIMESTAMP_QUERY,
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        };
+        if let Ok(pair) = pollster::block_on(adapter.request_device(&timed, None)) {
+            return Ok(pair);
+        }
+    }
+    pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("silt"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .map_err(|err| format!("request_device: {err}"))
 }
 
 impl Renderer {
@@ -1570,6 +1633,27 @@ impl Renderer {
             ssr_hist_valid: 0.0,
             debug_contract: false,
             debug_mode: 0,
+            gpu_time: None,
+        }
+    }
+
+    /// Arm timestamp queries. The window leaves this off.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn enable_gpu_time(&mut self) -> bool {
+        if self.gpu_time.is_none() {
+            self.gpu_time = GpuTime::try_new(&self.device, &self.queue);
+        }
+        self.gpu_time.is_some()
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn take_gpu_time(&mut self) -> GpuSample {
+        let Self {
+            gpu_time, device, ..
+        } = self;
+        match gpu_time {
+            Some(clock) => clock.read(device),
+            None => GpuSample::empty(),
         }
     }
 
@@ -1995,6 +2079,17 @@ impl Renderer {
                 .write_buffer(&self.dust_i, 0, bytemuck::cast_slice(&dust.indices));
         }
 
+        // Queries 0 and 1 bracket the frame. Queries 2 and 3 are reserved for a
+        // pool reflect pass, which this tree does not encode. The clock is out
+        // of `self` for the frame: a reflect pass added here calls
+        // `clock.mark_reflect()` after it.
+        let debug_pass =
+            self.debug_contract && self.pipe_debug.is_some() && self.contract.is_some();
+        let end_on_blit = present.is_some();
+        let end_on_debug = debug_pass && !end_on_blit;
+        let end_on_main = !end_on_blit && !debug_pass;
+        let clock = self.gpu_time.take();
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2002,6 +2097,7 @@ impl Renderer {
             });
 
         {
+            let shadow_time = pass_timestamps(clock.as_ref(), Some(Q_FRAME_BEGIN), None);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2020,7 +2116,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: shadow_time,
                 occlusion_query_set: None,
             });
             pass.set_viewport(0.0, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
@@ -2116,6 +2212,15 @@ impl Renderer {
             }
         }
         {
+            let main_time = pass_timestamps(
+                clock.as_ref(),
+                None,
+                if end_on_main {
+                    Some(Q_FRAME_END)
+                } else {
+                    None
+                },
+            );
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2134,7 +2239,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: main_time,
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.frame_bg, &[]);
@@ -2395,6 +2500,15 @@ impl Renderer {
 
         if self.debug_contract {
             if let (Some(pipe), Some(gpu)) = (&self.pipe_debug, &self.contract) {
+                let debug_time = pass_timestamps(
+                    clock.as_ref(),
+                    None,
+                    if end_on_debug {
+                        Some(Q_FRAME_END)
+                    } else {
+                        None
+                    },
+                );
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("contract-debug"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2411,7 +2525,7 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: debug_time,
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(pipe);
@@ -2424,6 +2538,15 @@ impl Renderer {
         }
 
         if let Some((view, srgb)) = present {
+            let blit_time = pass_timestamps(
+                clock.as_ref(),
+                None,
+                if end_on_blit {
+                    Some(Q_FRAME_END)
+                } else {
+                    None
+                },
+            );
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2435,7 +2558,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: blit_time,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(if srgb {
@@ -2471,7 +2594,12 @@ impl Renderer {
             );
         }
 
+        if let Some(clock) = clock.as_ref() {
+            clock.note_frame();
+            clock.resolve(&mut encoder);
+        }
         self.queue.submit(Some(encoder.finish()));
+        self.gpu_time = clock;
 
         if !readback {
             return None;

@@ -5,6 +5,7 @@
 mod air_noise;
 mod cc0;
 mod env;
+mod gpu_time;
 mod mesh;
 mod niva;
 mod render;
@@ -43,7 +44,11 @@ fn main() {
         let mut args = std::env::args().skip(1);
         if args.next().as_deref() == Some("capture") {
             let rest: Vec<String> = args.collect();
-            capture(&rest);
+            if rest.iter().any(|arg| arg == "--gpu-time") {
+                gpu_time_report();
+            } else {
+                capture(&rest);
+            }
         } else {
             run_window();
         }
@@ -1067,6 +1072,67 @@ fn capture_belly_shelf(renderer: &mut Renderer, width: u32, height: u32) {
     let path = PathBuf::from(MEDIA).join("slurry-belly-proof.png");
     write_png(&path, width, height, &rgba).expect("belly still");
     println!("belly {}", path.display());
+}
+
+/// Release GPU times. Prints milliseconds only from a hardware adapter with
+/// timestamp queries. Software adapters and a missing GPU exit 0 without a
+/// millisecond number. This tree has no pool reflect pass.
+#[cfg(not(target_arch = "wasm32"))]
+fn gpu_time_report() {
+    println!("CPU {}", gpu_time::host_cpu_line());
+    let opened = render::try_open_adapter(false, None);
+    let Ok((_instance, adapter, device, queue)) = opened else {
+        println!("GPU_ADAPTER none");
+        for line in gpu_time::early_report("no-adapter") {
+            println!("{line}");
+        }
+        return;
+    };
+    let info = adapter.get_info();
+    println!("GPU_ADAPTER {}", info.name);
+    println!("GPU_BACKEND {:?}", info.backend);
+    println!("GPU_DEVICE_TYPE {:?}", info.device_type);
+    if !gpu_time::is_hardware_gpu(&info) {
+        for line in gpu_time::early_report("software-adapter") {
+            println!("{line}");
+        }
+        return;
+    }
+    let formats = render::gpu_formats(&adapter);
+    eprintln!("loading cc0 ground and the dune buggy");
+    let scene = cc0::load();
+    let mut renderer = Renderer::new(device, queue, info.name.clone(), 1280, 720, formats, scene);
+    if !renderer.enable_gpu_time() {
+        for line in gpu_time::early_report("no-timestamp-query") {
+            println!("{line}");
+        }
+        return;
+    }
+    let mut world = World::demo();
+    const WARMUP: u32 = 5;
+    const MEASURED: u32 = 30;
+    let mut samples = Vec::with_capacity(MEASURED as usize);
+    let mut reflect_ms = None;
+    for index in 0..(WARMUP + MEASURED) {
+        let input = demo_drive(&world);
+        world.step(1.0 / 60.0, &input);
+        let cam = demo_camera(world.time, world.vehicle.pos, world.vehicle.yaw);
+        let _ = renderer.draw(&world, cam, None, false);
+        let sample = renderer.take_gpu_time();
+        reflect_ms = sample.reflect_ms;
+        if index >= WARMUP {
+            if let Some(ms) = sample.frame_ms {
+                samples.push(ms);
+            }
+        }
+    }
+    if samples.is_empty() {
+        println!("{}", gpu_time::frame_uncollected("timestamp-unread"));
+    } else {
+        let mean = samples.iter().copied().sum::<f64>() / samples.len() as f64;
+        println!("{}", gpu_time::frame_milliseconds(mean, samples.len()));
+    }
+    println!("{}", gpu_time::reflect_report(reflect_ms));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
