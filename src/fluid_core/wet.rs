@@ -624,6 +624,7 @@ impl FluidCore {
                     vz: t.vel[2] * 0.6 + nz * out_s,
                     volume: take * area,
                     kind: 0,
+                    murk: 0.0,
                 });
             }
         }

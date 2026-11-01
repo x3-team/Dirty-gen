@@ -405,7 +405,7 @@ fn legs_and_impacts_foam_and_splash_but_a_resting_buoy_does_not() {
     let behind = Vec2::new(w.pos.x, w.pos.z) - w.forward() * 0.8;
     let trail = foam_near(&fluid, behind.x, behind.y, 0.4);
     let far = foam_near(&fluid, 0.0, 3.5, 0.4);
-    let wade_spray = fluid.spray_m3();
+    let wade_spray = fluid.spray_thrown_m3();
     println!(
         "wade foam: at legs {:.3} trail {:.3} away {:.3} spray {:.2} l water+spray {:.5} -> {:.5}",
         at_legs / n,
@@ -435,7 +435,7 @@ fn legs_and_impacts_foam_and_splash_but_a_resting_buoy_does_not() {
         ring = ring.max(foam_near(f, 0.0, 0.0, 0.5));
         drops_up = drops_up.max(f.spray_drops().iter().filter(|d| d.vel[1] > 0.5).count());
     });
-    let crown = fluid.spray_m3();
+    let crown = fluid.spray_thrown_m3();
     println!("impact: foam {:.3} crown {:.2} l rising drops {}", ring, crown * 1000.0, drops_up);
     assert!(ring > 0.15, "no foam ring at the impact");
     assert!(crown > 2.0e-4 && crown < 0.01, "impact drops {crown} m3");
@@ -450,14 +450,14 @@ fn legs_and_impacts_foam_and_splash_but_a_resting_buoy_does_not() {
     bodies.items.push(Body::ball(Vec3::new(0.3, 0.6 + 0.10, -0.2), 0.18, 6.0, true));
     let mut imprint = Imprint::new();
     run(&mut bodies, &mut fluid, &mut imprint, 4.0, |_, _, _| {});
-    let s0 = fluid.spray_m3();
+    let s0 = fluid.spray_thrown_m3();
     let mut calm = 0.0f32;
     run(&mut bodies, &mut fluid, &mut imprint, 3.0, |_, f, _| {
         calm = calm.max(foam_near(f, 0.3, -0.2, 0.5));
     });
-    println!("buoy at rest: foam {:.4} drops {:.2e} m3", calm, fluid.spray_m3() - s0);
+    println!("buoy at rest: foam {:.4} drops {:.2e} m3", calm, fluid.spray_thrown_m3() - s0);
     assert!(calm < 0.02, "resting buoy foams");
-    assert!(fluid.spray_m3() - s0 < 1.0e-7, "resting buoy splashes");
+    assert!(fluid.spray_thrown_m3() - s0 < 1.0e-7, "resting buoy splashes");
 }
 
 #[test]

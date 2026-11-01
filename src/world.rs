@@ -4242,6 +4242,9 @@ impl DriveParts {
     }
 }
 
+/// Scripted through-drive speed, m/s, when the chassis velocity is not set.
+const DRIVE_SPEED_FALLBACK: f32 = 8.0;
+
 pub struct ThroughDrive {
     pub world: World,
     pub fluid: FluidCore,
@@ -4679,7 +4682,7 @@ impl ThroughDrive {
         self.ribbon_tick = self.ribbon_tick.wrapping_add(1);
         other_ms += tick.ms();
         let spray = self.fluid.step(dt);
-        self.report.spray_m3 = self.fluid.spray_m3();
+        self.report.spray_m3 = self.fluid.spray_thrown_m3();
         let tick = ProfTick::start();
         self.spawn_spray(&spray, forward);
         // The cut is already on the bed. Pond water into it so the free
@@ -4813,10 +4816,17 @@ impl ThroughDrive {
             self.coat.shed += shed;
             if shed > 1.0e-7 {
                 let right = Vec3::new(forward.z, 0.0, -forward.x);
-                self.world.particles.throw_spin_ribbons(
-                    center + Vec3::Y * 0.25,
+                // `center` is the contact at y = 0; the hub is one radius
+                // over the ground under it.
+                let radius = crate::vehicle::WHEEL_RADIUS;
+                let along = self.world.vehicle.vel.dot(forward).abs();
+                let speed = if along > 0.1 { along } else { DRIVE_SPEED_FALLBACK };
+                self.world.particles.throw_tread_mud(
+                    Vec3::new(center.x, sample.height + radius, center.z),
                     forward,
                     right,
+                    speed,
+                    radius,
                     shed,
                 );
             }

@@ -193,6 +193,7 @@ pub struct Renderer {
     pipe_dust: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
+    pipe_splash: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -1179,6 +1180,22 @@ impl Renderer {
             true,
             None,
         );
+        let pipe_splash = pipeline(
+            &device,
+            &shader,
+            &solo_layout,
+            "vs_particle",
+            Some("fs_splash"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
         let pipe_shadow_terrain = pipeline(
             &device,
             &shader,
@@ -1389,7 +1406,7 @@ impl Renderer {
         });
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("particles"),
-            size: (6144 * std::mem::size_of::<ParticleVertex>()) as u64,
+            size: (SPLASH_MAX_SPRITES * 6 * std::mem::size_of::<ParticleVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1503,6 +1520,7 @@ impl Renderer {
             pipe_mesh_double,
             pipe_dust,
             pipe_particle,
+            pipe_splash,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
@@ -1899,6 +1917,18 @@ impl Renderer {
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
+        let splash_count = if self.show_mud_particles {
+            let cap = (silt::quality::active().max_particles as usize).min(SPLASH_MAX_SPRITES);
+            let drops = fluid.map(|f| f.spray_drops()).unwrap_or(&[]);
+            let verts = crate::mesh::splash_sprites(drops, &world.particles.items, cam.eye, world.vehicle.vel, cap);
+            if !verts.is_empty() {
+                self.queue
+                    .write_buffer(&self.particles, 0, bytemuck::cast_slice(&verts));
+            }
+            verts.len() as u32
+        } else {
+            0
+        };
         let (chunk_count, dust_count) = if self.show_mud_particles {
             let chunks = mud_chunks_with_ground(
                 &world.particles.items,
@@ -2091,6 +2121,8 @@ impl Renderer {
                 pass.set_pipeline(&self.pipe_mesh_blend);
                 pass.set_bind_group(3, &self.paint_bg, &[]);
                 self.draw_glass(&mut pass);
+                // Last in the pass: it switches to the frame-only layout.
+                self.draw_splash(&mut pass, splash_count);
             }
         }
         if water_ssr {
@@ -2221,6 +2253,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+            self.draw_splash(&mut pass, splash_count);
         }
 
         // The window alone needs no 8-bit copy: the blit tone-maps on the way.
@@ -2847,6 +2880,19 @@ impl Renderer {
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
         count_draw(count);
+    }
+
+    /// Splash sprites are world-space quads with the frame group only. The
+    /// caller's pipeline and group 2 are restored after.
+    fn draw_splash(&self, pass: &mut wgpu::RenderPass<'_>, vertices: u32) {
+        if vertices == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipe_splash);
+        pass.set_bind_group(0, &self.frame_bg, &[]);
+        pass.set_vertex_buffer(0, self.particles.slice(..));
+        pass.draw(0..vertices, 0..1);
+        count_draw(vertices);
     }
 
     fn draw_dust(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -4063,3 +4109,6 @@ fn debug_contract_view_reads_the_published_maps() {
     assert!(px[3] == 255, "debug view did not cover the centre {px:?}");
     assert!(px[0] > 0, "ground ramp was empty {px:?}");
 }
+
+/// Splash sprites the vertex buffer holds (the `high` preset cap).
+const SPLASH_MAX_SPRITES: usize = 12000;
