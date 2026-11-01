@@ -178,15 +178,11 @@ Valid: `VALID_WET_EDGE` on every publish.
 
 Foam is a fraction from 0 to 1. Crest is a height in metres.
 
-Foam is 0 when the film is thinner than 4 mm. A dry cell, film under 0.01 mm, publishes foam 0. It does not publish NaN. Otherwise foam is the maximum of three readings of the same sheet, each from 0 to 1:
+Foam is 0 when the film is thinner than 4 mm. A dry cell, film under 0.01 mm, publishes foam 0. It does not publish NaN. Otherwise foam is the sheet's own fraction, 0 to 1, copied from the coarse window. The sheet builds that fraction where the free surface cuts a moving tire, where the film runs onto the shore, where the film's own Froude number is breaking, and where the film stands above its neighbours (a crest, smoothstep from 4 mm to 18 mm). The amount follows the shear and the impact, and the source shuts off as the fraction approaches 0.85, so a sustained breaker does not fill the cell to 1. A tire that is not moving adds none. The fraction is then carried with the film and decays. Only cells with at least 4 mm of film are visited. It is not a disc under the tire, and the publisher does not paint it.
 
-- Froude: a smoothstep of `speed / sqrt(9.81 * thickness)` from 0.85 to 1.45. Speed 0 stays 0.
-- Wave crest: a smoothstep of how far the film stands above the mean of its four in-window neighbours, from 4 mm to 18 mm.
-- Tires: the wet footprint of a tire that shoved the sheet on this step, full near the contact and 0 at 1.45 tire radii.
+Crest is the placed berm, metres, plus how far the film stands above the mean of its four in-window neighbours. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. On a dry cell the crest is that berm when the berm is finite, and 0 when there is no berm. A non-finite foam or crest sample is written as 0, not NaN.
 
-Crest is the placed berm, metres, plus that same film excess. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. On a dry cell the crest is that berm when the berm is finite, and 0 when there is no berm. A non-finite foam or crest sample is written as 0, not NaN.
-
-Writer: the publisher, from flow, film, placed height, and the tire shoves of the step that just ran. It does not feed back into the solver. This field did not exist on the sheet before version 1.
+Writer: the fluid sheet, then the publisher. The publisher does not feed the fraction back into the solver. Stirred silt is a separate column on that sheet, metres of bed soil lifted by the same shear. It is not this binding and it is not the standing slurry pour.
 
 Valid: `VALID_FOAM` on every publish. Without a fluid sheet, foam is 0. Crest from placed soil is still real.
 
@@ -290,7 +286,7 @@ The wet tire track does not bump this version either. Binding 2, pore moisture, 
 
 The rut's water surface does not bump this version either. Binding 1 R stays the pressed ground, bed plus placed. Binding 3 R is the water column on that ground. A rut connected to the puddle is filled up to the puddle surface and no higher. The original height is not the datum. Same channels, same units, same resolution.
 
-Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is set where the sheet is a wave or a tire footprint, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.
+Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is the sheet fraction at the tire waterline, along the shore, and on a breaking crest, advected and decaying, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.
 
 ### 5
 
@@ -307,3 +303,5 @@ Binding 4, `flow`, is `rgba32float`. R and G stay the flow vector, metres per se
 The wheel lifts solids behind the contact. The column advects with the flow vector. Dry water publishes 0, not NaN. Suspended mass is in the volume ledger: the live column, the part that settled out of a dry or over-full cell, and the part parked off the window. Those three sum to the volume the wheels lifted. `VALID_TURBIDITY` is bit 11, set with the fluid sheet. The header stays 96 bytes. Debug mode 5 reads the stored speed. Debug mode 16 reads turbidity.
 
 Filling binding 7 from the soil drying arrays does not bump this version. R is crust thickness in metres, at most 0.05. G is crack opening in metres and does not exceed the thickness. The dry spell writes those arrays on clay. The bed, the placed pile, and the cloud stay put, so the skin is not extra solid mass and a fissure is not a cut. Sand and silt stay at 0. A dry-crust kind with empty arrays stays at 0. Same channels, same units, same resolution.
+
+Filling foam from the sheet does not bump this version. The channel, the unit, and the resolution are unchanged. A footprint mask is not the writer.

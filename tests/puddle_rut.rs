@@ -917,3 +917,217 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
         "gap between the tracks rut {gap_rut:.6} berm {gap_berm:.6}"
     );
 }
+
+/// Foam and stirred silt in the puddle. Both sit on the tire and on the
+/// shore. Silt far from that source stays put. Dry cells stay 0.
+#[test]
+fn puddle_foam_and_silt_at_the_tire_and_the_shore() {
+    let mut drive = ThroughDrive::new();
+    let dt = 1.0 / 30.0;
+    while drive.world.vehicle.pos.z < -14.05 {
+        drive.step(dt);
+    }
+    let mut frame = ContractFrame::new();
+    publish(
+        &mut frame,
+        &drive.world.soil,
+        &drive.world.particles.items,
+        [drive.world.vehicle.pos.x, drive.world.vehicle.pos.z],
+        drive.world.vehicle.pos.z,
+        1,
+        Some(&drive.fluid),
+        Some(drive.dust()),
+    );
+
+    let mut foam_wheel = 0.0f32;
+    let mut silt_wheel = 0.0f32;
+    let mut contract_foam_wheel = 0.0f32;
+    for i in 0..4 {
+        let bottom = tire_bottom(&drive.world.vehicle, i);
+        for dz in [-0.6_f32, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6] {
+            for dx in [-0.6_f32, -0.3, 0.0, 0.3, 0.6] {
+                let x = bottom.x + dx;
+                let z = bottom.z + dz;
+                if dx.hypot(dz) > 0.7 {
+                    continue;
+                }
+                let (foam, silt) = drive.fluid.foam_turbid_at(x, z);
+                foam_wheel = foam_wheel.max(foam);
+                silt_wheel = silt_wheel.max(silt);
+                if let Some(cell) = sample_at(&frame, x, z) {
+                    contract_foam_wheel = contract_foam_wheel.max(cell_foam(&frame, x, z));
+                    let _ = cell;
+                }
+            }
+        }
+    }
+
+    let mut foam_edge = 0.0f32;
+    let mut silt_edge = 0.0f32;
+    let mut contract_foam_edge = 0.0f32;
+    let mut edge_n = 0u32;
+    let mut z = -18.0_f32;
+    while z <= -15.7 {
+        let mut x = -1.8_f32;
+        while x <= 1.81 {
+            if let Some(cell) = sample_at(&frame, x, z) {
+                if (0.008..0.05).contains(&cell.water) {
+                    let (foam, silt) = drive.fluid.foam_turbid_at(x, z);
+                    foam_edge = foam_edge.max(foam);
+                    silt_edge = silt_edge.max(silt);
+                    contract_foam_edge = contract_foam_edge.max(cell_foam(&frame, x, z));
+                    edge_n += 1;
+                }
+            }
+            x += 0.2;
+        }
+        z += 0.2;
+    }
+
+    let z_car = drive.world.vehicle.pos.z;
+    let (_, far_silt) = drive.fluid.foam_turbid_at(9.0, z_car);
+    let (_, far_south) = drive.fluid.foam_turbid_at(0.0, z_car - 12.0);
+    let gap = drive.fluid.silt_book_gap();
+    let nans = nan_count(&frame);
+    let mut dry_bad = 0u32;
+    let mut wet_n = 0u32;
+    let mut hot_n = 0u32;
+    let n = frame.header.window_res as usize * frame.header.window_res as usize;
+    for idx in 0..n {
+        let film = frame.film[idx * 2] + frame.film[idx * 2 + 1];
+        let foam = frame.foam_crest[idx * 2];
+        if film < 1.0e-5 && foam != 0.0 {
+            dry_bad += 1;
+        }
+        if !foam.is_finite() {
+            dry_bad += 1;
+        }
+        if film >= 0.004 {
+            wet_n += 1;
+            if foam >= 0.99 {
+                hot_n += 1;
+            }
+        }
+    }
+    let hot_frac = hot_n as f32 / wet_n.max(1) as f32;
+
+    println!(
+        "foam wheel {foam_wheel:.4} contract {contract_foam_wheel:.4}  silt wheel {silt_wheel:.5} m\n\
+         foam edge {foam_edge:.4} contract {contract_foam_edge:.4}  silt edge {silt_edge:.5} m  edge cells {edge_n}\n\
+         far silt {far_silt:.6}  south silt {far_south:.6}  book gap {gap:.6} m3  stirred {:.6} m3  dry bad {dry_bad}  NaN {nans}\n\
+         foam >= 0.99 on {hot_n}/{wet_n} wet cells ({hot_frac:.4})",
+        drive.fluid.stirred_m3()
+    );
+
+    assert!(foam_wheel > 0.05, "foam at the tire {foam_wheel}");
+    assert!(
+        contract_foam_wheel > 0.05,
+        "contract foam at the tire {contract_foam_wheel}"
+    );
+    assert!(silt_wheel > 1.0e-4, "silt at the tire {silt_wheel}");
+    assert!(edge_n > 0, "the shore band was empty");
+    assert!(foam_wheel < 0.99, "foam at the tire saturated {foam_wheel}");
+    assert!(foam_edge > 0.02, "foam on the shore {foam_edge}");
+    assert!(foam_edge < 0.99, "foam on the shore saturated {foam_edge}");
+    assert!(
+        hot_frac < 0.02,
+        "foam >= 0.99 on {hot_frac:.4} of the wet cells ({hot_n}/{wet_n})"
+    );
+    assert!(
+        contract_foam_edge > 0.02,
+        "contract foam on the shore {contract_foam_edge}"
+    );
+    assert!(silt_edge > 1.0e-4, "silt on the shore {silt_edge}");
+    assert_eq!(far_silt, 0.0, "silt grew far from the tires");
+    assert_eq!(far_south, 0.0, "silt grew south of the puddle");
+    assert!(gap < 1.0e-3, "silt book gap {gap}");
+    assert_eq!(dry_bad, 0, "dry foam {dry_bad}");
+    assert_eq!(nans, 0, "NaN {nans}");
+
+    dump_tracer_maps(&drive, &frame);
+}
+
+fn cell_foam(frame: &ContractFrame, x: f32, z: f32) -> f32 {
+    let res = frame.header.window_res.max(1) as i32;
+    let i = ((x - frame.header.origin_x) / frame.header.cell_m).floor() as i32;
+    let j = ((z - frame.header.origin_z) / frame.header.cell_m).floor() as i32;
+    if i < 0 || j < 0 || i >= res || j >= res {
+        return 0.0;
+    }
+    frame.foam_crest[(j as usize * res as usize + i as usize) * 2]
+}
+
+fn dump_tracer_maps(drive: &ThroughDrive, frame: &ContractFrame) {
+    let dir = std::path::Path::new(
+        "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/foam-turbidity",
+    );
+    if std::fs::create_dir_all(dir).is_err() {
+        eprintln!("tracer maps were not written; {dir:?} is not writable");
+        return;
+    }
+    let res = frame.header.window_res.max(1);
+    let foam = drive.fluid.foam_grid();
+    let silt = drive.fluid.turbid_grid();
+    let mut foam_rgba = vec![0u8; (res * res * 4) as usize];
+    let mut silt_rgba = vec![0u8; (res * res * 4) as usize];
+    for j in 0..res {
+        for i in 0..res {
+            let src = j as usize * res as usize + i as usize;
+            // North at the top of the image.
+            let row = (res - 1 - j) as usize;
+            let dst = (row * res as usize + i as usize) * 4;
+            let f = foam.get(src).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let g = (f * 255.0).round() as u8;
+            foam_rgba[dst] = g;
+            foam_rgba[dst + 1] = g;
+            foam_rgba[dst + 2] = g;
+            foam_rgba[dst + 3] = 255;
+            let t = silt.get(src).copied().unwrap_or(0.0).max(0.0);
+            let u = (t / 0.012).clamp(0.0, 1.0);
+            let s = (u.sqrt() * 255.0).round() as u8;
+            silt_rgba[dst] = s;
+            silt_rgba[dst + 1] = (s as f32 * 0.62).round() as u8;
+            silt_rgba[dst + 2] = (s as f32 * 0.28).round() as u8;
+            silt_rgba[dst + 3] = 255;
+        }
+    }
+    let foam_path = dir.join("foam.png");
+    let silt_path = dir.join("turbidity.png");
+    write_rgba(&foam_path, res, res, &foam_rgba);
+    write_rgba(&silt_path, res, res, &silt_rgba);
+    assert_png(&foam_path, res, true);
+    assert_png(&silt_path, res, true);
+    println!("foam map {}", foam_path.display());
+    println!("turbidity map {}", silt_path.display());
+}
+
+fn write_rgba(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {
+    let file = std::fs::File::create(path).unwrap_or_else(|err| panic!("create {}: {err}", path.display()));
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .unwrap_or_else(|err| panic!("header {}: {err}", path.display()))
+        .write_image_data(rgba)
+        .unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
+}
+
+fn assert_png(path: &std::path::Path, res: u32, want_ink: bool) {
+    let bytes = std::fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    assert!(bytes.len() > 32, "{} is tiny", path.display());
+    assert_eq!(&bytes[..8], &[137, 80, 78, 71, 13, 10, 26, 10], "not a png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder
+        .read_info()
+        .unwrap_or_else(|err| panic!("decode {}: {err}", path.display()));
+    assert_eq!(reader.info().width, res);
+    assert_eq!(reader.info().height, res);
+    let mut image = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut image)
+        .unwrap_or_else(|err| panic!("frame {}: {err}", path.display()));
+    let pixels = &image[..info.buffer_size()];
+    let ink = pixels.chunks(4).any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0);
+    assert_eq!(ink, want_ink, "ink in {}", path.display());
+}

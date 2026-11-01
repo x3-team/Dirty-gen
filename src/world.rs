@@ -4474,7 +4474,11 @@ impl ThroughDrive {
         // surface stays with the puddle instead of falling into the groove,
         // then scrape any column that still stands above that surface.
         self.fluid.pond_ruts();
-        seat_rut_sheet(&mut self.fluid, &self.world.soil);
+        if seat_rut_sheet(&mut self.fluid, &self.world.soil) {
+            // The seat can raise a crest the sheet step did not see. Foam from
+            // that impact goes on the sheet, then the publisher only copies it.
+            self.fluid.note_surface_foam(dt);
+        }
         mirror_fluid(&self.fluid, &mut self.world.soil);
         if (-18.6..-11.5).contains(&z) {
             // One crescent ahead of the bumper, wider than the body.
@@ -5468,25 +5472,27 @@ fn pull_substrate(fluid: &mut FluidCore, soil: &SoilField) {
 }
 
 /// Rut water sits on the pressed ground and does not rise above the pond.
-fn seat_rut_sheet(fluid: &mut FluidCore, soil: &SoilField) {
+fn seat_rut_sheet(fluid: &mut FluidCore, soil: &SoilField) -> bool {
     // Skip before `seat_rut_water` restricts the fine patch. A dry coarse
     // sheet with no tire cut has nothing to cap. A live fine patch stays,
     // because the coarse samples can be stale, and a sheet that still holds
     // water is seated even when the rut has not changed.
     if fluid.coarse_sheet_is_dry() && !window_has_rut(fluid, soil) {
-        return;
+        return false;
     }
     let (col, row) = coarse_soil_axes(fluid, soil);
     let res = soil.res;
-    fluid.seat_rut_water(|i, j, _x, _z| {
-        let (Some(si), Some(sj)) = (col[i], row[j]) else {
-            return (0.0, false);
-        };
-        let idx = sj * res + si;
-        let pressed = soil.bed[idx] + soil.placed[idx];
-        let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
-        (pressed, rut > 0.012)
-    });
+    fluid
+        .seat_rut_water(|i, j, _x, _z| {
+            let (Some(si), Some(sj)) = (col[i], row[j]) else {
+                return (0.0, false);
+            };
+            let idx = sj * res + si;
+            let pressed = soil.bed[idx] + soil.placed[idx];
+            let rut = (soil.initial_height[idx] - soil.bed[idx]).max(0.0);
+            (pressed, rut > 0.012)
+        })
+        .is_some()
 }
 
 /// A tire cut inside the fluid window. Samples the same coarse centres the seat uses.
