@@ -7,6 +7,7 @@ mod gpu_time;
 mod mesh;
 mod niva;
 mod overlay;
+mod post;
 #[cfg(not(target_arch = "wasm32"))]
 mod bench;
 #[cfg(not(target_arch = "wasm32"))]
