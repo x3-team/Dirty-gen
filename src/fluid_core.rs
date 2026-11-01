@@ -4446,6 +4446,9 @@ pub struct FluidCore {
     fine_us: Vec<f32>,
     fine_vs: Vec<f32>,
     fine_bed: Vec<f32>,
+    /// The fine bed the slurry sheet reads. It differs from `fine_bed` only on
+    /// closed cells, where each sheet meets a wall at its own coarse surface.
+    fine_bed_slurry: Vec<f32>,
     fine_moisture: Vec<f32>,
     fine_grain: Vec<u8>,
     fine_on: bool,
@@ -4570,6 +4573,7 @@ impl FluidCore {
             fine_us: vec![0.0; fine_n],
             fine_vs: vec![0.0; fine_n],
             fine_bed: vec![0.0; fine_n],
+            fine_bed_slurry: vec![0.0; fine_n],
             fine_moisture: vec![0.0; fine_n],
             fine_grain: vec![Grain::Other as u8; fine_n],
             fine_on: false,
@@ -7424,6 +7428,7 @@ impl FluidCore {
                     bed,
                 } = &mut *scratch;
                 let bed = &bed[..n];
+                let bed_slurry: &[f32] = if fine { &self.fine_bed_slurry[..n] } else { bed };
                 let nu_w = &nu_w[..n];
                 let nu_s = &mut nu_s[..n];
                 let gate = &gate[..n];
@@ -7483,7 +7488,7 @@ impl FluidCore {
                         slurry,
                         us,
                         vs,
-                        bed,
+                        bed_slurry,
                         nu_s,
                         gate,
                         res,
@@ -7791,9 +7796,22 @@ impl FluidCore {
             let nhit = acc.hits.len();
             for h in 0..nhit {
                 let (fidx, cidx) = acc.hits[h];
+                self.fine_moisture[fidx] = self.moisture[cidx];
+                self.fine_grain[fidx] = self.grain[cidx];
                 if self.fine_hold[cidx] != 1 {
+                    // A fine cell the patch does not hold carries no fluid. Its
+                    // ground is the free surface of its coarse column (water and
+                    // slurry each at their own), not the bed left from an older
+                    // patch position. Dry ground there was a slope the held edge
+                    // drained down every step: in deep water a hole followed the
+                    // patch. Fluid a tire throws over the rim still lands there
+                    // and goes back to that coarse column.
+                    self.fine_bed[fidx] = self.bed[cidx] + self.water[cidx];
+                    self.fine_bed_slurry[fidx] = self.bed[cidx] + self.slurry[cidx];
                     continue;
                 }
+                self.fine_bed[fidx] = self.bed[cidx];
+                self.fine_bed_slurry[fidx] = self.bed[cidx];
                 self.fine_water[fidx] = self.water[cidx];
                 self.fine_slurry[fidx] = self.slurry[cidx];
                 self.fine_uw[fidx] = self.uw[cidx];
@@ -10652,6 +10670,55 @@ mod tests {
             "dry ground gained moisture {}",
             fluid.sample(6.0, 6.0).moisture
         );
+    }
+
+    /// A still tire in 40 cm of water. The 2 cm patch must not drain the cells
+    /// it holds into its own rim, or a hole follows the patch.
+    #[test]
+    fn fine_patch_leaves_no_hole_in_deep_water() {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        fluid.pour_water(-6.0, 6.0, -6.0, 6.0, 0.40);
+        let before = fluid.ledger().total_m3;
+        let dt = 1.0 / 30.0;
+        for _ in 0..30 {
+            fluid.push_tire(TirePush {
+                x: 0.0,
+                z: 0.0,
+                forward_x: 0.0,
+                forward_z: 1.0,
+                radius: 0.01,
+                width: 0.01,
+                speed: 0.0,
+                slip: 0.0,
+            });
+            fluid.step(dt);
+        }
+        let after = fluid.ledger().total_m3;
+        assert!(
+            (after - before).abs() < 1.0e-3 * before,
+            "volume {before} -> {after}"
+        );
+        // Inside the patch and around its rim the surface stays at the pond
+        // level. Before the wet columns were held, cells under the patch fell
+        // to about 17 cm.
+        let mut lowest = f32::MAX;
+        let mut at = (0.0, 0.0);
+        let mut z = -2.0f32;
+        while z <= 2.0 {
+            let mut x = -2.0f32;
+            while x <= 2.0 {
+                if x.hypot(z) >= 0.5 {
+                    let s = fluid.sample(x, z);
+                    if s.water_m < lowest {
+                        lowest = s.water_m;
+                        at = (x, z);
+                    }
+                }
+                x += 0.1;
+            }
+            z += 0.1;
+        }
+        assert!(lowest > 0.37, "hole {lowest:.4} m at {at:?}");
     }
 
     #[test]
