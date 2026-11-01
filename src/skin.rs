@@ -449,6 +449,16 @@ mod tests {
             let plates = plate_sizes(&lat, res);
             let mean_plate = plates.iter().sum::<usize>() as f32 / plates.len().max(1) as f32;
             eprintln!("plates {} mean cells {mean_plate:.1}", plates.len());
+            if let Ok(dir) = std::env::var("SKIN_PGM") {
+                // Broken-edge bits per cell, row by row. For eyes, not asserts.
+                let bits: String = (0..res * res)
+                    .map(|idx| {
+                        let b = u8::from(lat.is_broken(idx, true)) + 2 * u8::from(lat.is_broken(idx, false));
+                        char::from(b'0' + b)
+                    })
+                    .collect();
+                let _ = std::fs::write(format!("{dir}/skin-{thickness}.txt"), bits);
+            }
             if std::env::var("SKIN_ASCII").is_ok() {
                 for j in 0..24 {
                     let mut row = String::new();
