@@ -160,9 +160,9 @@ Valid: `VALID_FOG` under the same rule as `dust_fog` and `air_velocity`. `dust_s
 
 Crust thickness and crack opening, both metres. Opening is the gap in the crust, not a second height and not a colour.
 
-Writer: the soil crust state. This sheet has no thickness or opening arrays, so both channels are 0 and `VALID_CRUST` is still set. A dry-crust soil kind is not a stand-in for either channel. When those arrays exist, the same binding carries them in metres. That fill does not bump the version.
+Writer: the soil `crust` and `crack` arrays, copied at the texel centre. R is thickness. G is opening. They are separate fields from the dry spell: opening is not a copy of thickness, and neither channel is added to ground height. Thickness is at most 0.05 m. Opening does not exceed that thickness. Off the soil square both channels are 0, because the fluid sheet has no thickness or opening arrays of its own and does not replace the soil sample. A dry-crust soil kind is not a stand-in for either channel. Cells that have not dried stay 0. This fill does not bump the version.
 
-Valid: every publish, including the zeros.
+Valid: every publish. A zero cell is a valid sample of ground that has no skin.
 
 ### Wet / dry edge — binding 8
 
@@ -305,3 +305,5 @@ Turbidity, from #99 (written as version 3 on its branch; fog had already taken 5
 Binding 4, `flow`, is `rgba32float`. R and G stay the flow vector, metres per second, +X and +Z. B is the flow speed, `hypot(vx, vz)`. A is turbidity, suspended-solids concentration in the water, 0..1.
 
 The wheel lifts solids behind the contact. The column advects with the flow vector. Dry water publishes 0, not NaN. Suspended mass is in the volume ledger: the live column, the part that settled out of a dry or over-full cell, and the part parked off the window. Those three sum to the volume the wheels lifted. `VALID_TURBIDITY` is bit 11, set with the fluid sheet. The header stays 96 bytes. Debug mode 5 reads the stored speed. Debug mode 16 reads turbidity.
+
+Filling binding 7 from the soil drying arrays does not bump this version. R is crust thickness in metres, at most 0.05. G is crack opening in metres and does not exceed the thickness. The dry spell writes those arrays on clay. The bed, the placed pile, and the cloud stay put, so the skin is not extra solid mass and a fissure is not a cut. Sand and silt stay at 0. A dry-crust kind with empty arrays stays at 0. Same channels, same units, same resolution.
