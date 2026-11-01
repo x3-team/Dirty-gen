@@ -7820,6 +7820,250 @@ impl SoilField {
         field
     }
 
+    /// Flat pad for the Windows playable demo: dry sand on +X, wet mud on −X,
+    /// two shallow puddles in the mud lane.
+    pub fn win_playground() -> Self {
+        let mut field = Self::flat(0.22);
+        let res = field.res;
+        let cell = field.cell;
+        let half = field.size * 0.5;
+        let puddles = [
+            (-2.35_f32, -0.95_f32, 1.05_f32, 0.72_f32, 0.11_f32),
+            (-2.35_f32, 1.30_f32, 1.05_f32, 0.72_f32, 0.11_f32),
+        ];
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let mut h = field.height[idx];
+                for (cx, cz, rx, rz, depth) in puddles {
+                    h -= bowl(x, z, cx, cz, rx, rz, depth);
+                }
+                field.height[idx] = h;
+                field.bed[idx] = h;
+                field.initial_height[idx] = h;
+            }
+        }
+        let water_line = -0.018;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let idx = j * res + i;
+                let h = field.height[idx];
+                let sand = smooth01(-0.25, 0.55, x);
+                let mud = 1.0 - sand;
+                let mut water = 0.0;
+                if h < water_line {
+                    water = (water_line - h).min(0.28);
+                }
+                field.water[idx] = water;
+                if sand > 0.55 {
+                    field.kind[idx] = SurfaceKind::Sand as u8;
+                    field.wetness[idx] = lerp(0.14, 0.24, sand);
+                    field.base_wetness[idx] = 0.12;
+                    field.loose[idx] = 0.008;
+                    field.roughness[idx] = 0.92;
+                    field.darken[idx] = 0.03;
+                } else if mud > 0.55 {
+                    field.kind[idx] = SurfaceKind::WetMud as u8;
+                    field.wetness[idx] = if water > 0.02 {
+                        1.0
+                    } else {
+                        lerp(0.72, 0.88, mud)
+                    };
+                    field.base_wetness[idx] = 0.78;
+                    field.loose[idx] = if water > 0.02 { 0.018 } else { 0.02 };
+                    field.roughness[idx] = if water > 0.02 { 0.08 } else { 0.42 };
+                    field.darken[idx] = if water > 0.02 {
+                        0.24
+                    } else if water > 0.006 {
+                        0.18
+                    } else {
+                        0.10
+                    };
+                } else {
+                    field.kind[idx] = SurfaceKind::Undisturbed as u8;
+                    field.wetness[idx] = 0.38;
+                    field.base_wetness[idx] = 0.32;
+                    field.loose[idx] = 0.0;
+                    field.roughness[idx] = 0.78;
+                    field.darken[idx] = 0.05;
+                }
+                field.slurry[idx] = slurry_soil_depth(field.water[idx], field.wetness[idx]);
+                let _ = z;
+            }
+        }
+        field.win_demo_seam_pan();
+        field.rebuild_height();
+        field
+    }
+
+    /// Flat pool surface matches the pad grade (lip is wet soil, not a raised berm).
+    pub fn win_demo_pool_rim_height(field_bed: f32) -> f32 {
+        field_bed
+    }
+
+    fn win_demo_bowl_bed(r: f32, field_bed: f32) -> f32 {
+        if r > 1.38 {
+            return field_bed;
+        }
+        let core = (1.0_f32 - r / 1.28).max(0.0);
+        let rim = smooth01(0.78, 1.22, r);
+        let bowl = field_bed - core * core * 0.25;
+        lerp(bowl, field_bed, rim)
+    }
+
+    /// Hero seam pool: one bowl carve + standing water. No follow-up flatten passes.
+    pub fn win_demo_seam_pan(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let (sx, sz, srx, srz) = (-1.05_f32, 0.15_f32, 1.32_f32, 1.02_f32);
+        let field = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let dx = (x - sx) / srx;
+                let dz = (z - sz) / srz;
+                let r = (dx * dx + dz * dz).sqrt();
+                if r > 1.42 {
+                    continue;
+                }
+                let idx = j * res + i;
+                let feather = smooth01(1.42, 1.05, r);
+                if feather < 0.02 {
+                    continue;
+                }
+                self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                let bowl_h = Self::win_demo_bowl_bed(r, field);
+                self.bed[idx] = lerp(self.bed[idx], bowl_h, feather);
+                self.initial_height[idx] = self.bed[idx];
+                let core = (1.0_f32 - r / 1.28).max(0.0);
+                let seam_water = (0.04 + core * core * 0.22) * feather;
+                if seam_water > 0.0 {
+                    self.water[idx] = self.water[idx].max(seam_water);
+                }
+                self.slurry[idx] = 0.0015 + seam_water * 0.006;
+                if seam_water > 0.02 {
+                    self.kind[idx] = SurfaceKind::WetMud as u8;
+                    self.wetness[idx] = 1.0;
+                    self.darken[idx] = self.darken[idx].max(0.28);
+                    self.roughness[idx] = self.roughness[idx].min(0.08);
+                } else if r > 0.92 && r < 1.38 {
+                    self.wetness[idx] = self.wetness[idx].max(0.65);
+                    self.darken[idx] = self.darken[idx].max(0.22);
+                }
+                self.sync(idx);
+            }
+        }
+    }
+
+    /// Stills only: strip spoil spikes inside the pool (no bed re-sculpt).
+    pub fn win_demo_still_touchup(&mut self) {
+        self.win_demo_clear_pool_spoil();
+        self.rebuild_height();
+    }
+
+    /// Strip tread/spoil spikes inside the hero bowl before still capture.
+    fn win_demo_clear_pool_spoil(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                let dx = (x + 1.05) / 1.32;
+                let dz = (z - 0.15) / 1.02;
+                let r = (dx * dx + dz * dz).sqrt();
+                if r > 1.38 {
+                    continue;
+                }
+                let idx = j * res + i;
+                if self.placed[idx] > 0.001
+                    || self.loose[idx] > 0.004
+                    || self.tread_amp[idx] > 0.001
+                {
+                    self.placed[idx] = 0.0;
+                    self.loose[idx] = 0.0;
+                    self.tread_amp[idx] = 0.0;
+                    self.sync(idx);
+                }
+            }
+        }
+    }
+
+    /// Berms and tread spikes in the side-camera frustum, hero pad only.
+    #[allow(dead_code)]
+    fn win_demo_hero_spike_cleanup(&mut self) {
+        let res = self.res;
+        let cell = self.cell;
+        let half = self.size * 0.5;
+        let bed = 0.22_f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = (i as f32 + 0.5) * cell - half;
+                let z = (j as f32 + 0.5) * cell - half;
+                if x > 0.52 || x < -2.05 || z < -1.12 || z > 1.52 {
+                    continue;
+                }
+                let idx = j * res + i;
+                self.placed[idx] = 0.0;
+                self.loose[idx] = 0.0;
+                self.tread_amp[idx] = 0.0;
+                self.tread_ang[idx] = 0.0;
+                self.tread_lat[idx] = 0.0;
+                self.crust[idx] = 0.0;
+                self.crack[idx] = 0.0;
+                let dx = (x + 1.05) / 1.58;
+                let dz = (z - 0.15) / 1.22;
+                let r = (dx * dx + dz * dz).sqrt();
+                let bowl_h = Self::win_demo_bowl_bed(r, bed);
+                if r <= 1.32 && self.height[idx] > bowl_h + 0.001 {
+                    self.bed[idx] = bowl_h;
+                    self.placed[idx] = 0.0;
+                    self.loose[idx] = 0.0;
+                    self.slurry[idx] = 0.002;
+                    self.initial_height[idx] = self.bed[idx];
+                    self.sync(idx);
+                } else if self.height[idx] > bed + 0.014 {
+                    self.slurry[idx] = 0.002;
+                    if self.kind[idx] == SurfaceKind::Sand as u8 && x > -1.82 && x < 0.22 {
+                        self.bed[idx] = lerp(self.bed[idx], bed, 0.98);
+                        self.initial_height[idx] = self.bed[idx];
+                        self.sync(idx);
+                    } else if x > -1.92 && x < 0.35 && z > -0.55 && z < 0.95 {
+                        self.bed[idx] = lerp(self.bed[idx], bed, 0.85);
+                        self.initial_height[idx] = self.bed[idx];
+                        self.sync(idx);
+                    } else {
+                        self.sync(idx);
+                    }
+                }
+                if x > -1.92 && x < -0.28 && z > -0.62 && z < 0.92 && self.height[idx] > bed + 0.006 {
+                    self.placed[idx] = 0.0;
+                    self.bed[idx] = if r <= 1.32 {
+                        Self::win_demo_bowl_bed(r, bed)
+                    } else {
+                        bed
+                    };
+                    self.initial_height[idx] = self.bed[idx];
+                    self.sync(idx);
+                }
+            }
+        }
+    }
+
     /// Flat pad with clay, silt, and sand strips. Each strip holds four moisture
     /// bands along Z so the Niva can sit on damp clay while the readout compares
     /// dry, damp, saturated, and pooled traction on all three soils.
