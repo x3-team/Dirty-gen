@@ -76,7 +76,7 @@ Grid for the bench smoke scene: 60 × 76 × 60 = 274k cells, 8 cm.
 The 12 ms frame (docs/GPU_BUDGET.md) is already 11.7 ms full, so smoke comes
 out of the `dust-volume` row: it is drawn in the same half-resolution march.
 Knobs: grid cell,
-`jacobi_iters`, and the `QUALITY_SMOKE_STEPS` / `QUALITY_SMOKE_DETAIL` /
-`SMOKE_SHADOW_STEPS` overrides (WGSL defaults 64 / 2 / 24, within the 64-step
-lint). Detail 1 octave on `medium` and 0 on `low` would cut the march cost
+`jacobi_iters`, the march's `QUALITY_FOG_STEPS`, and the
+`QUALITY_SMOKE_DETAIL` / `SMOKE_SHADOW_STEPS` overrides (WGSL defaults 2 / 24,
+within the 64-step lint). Detail 1 octave on `medium` and 0 on `low` would cut the march cost
 roughly in half and to a third.
