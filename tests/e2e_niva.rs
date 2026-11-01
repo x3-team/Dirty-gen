@@ -757,8 +757,11 @@ fn e2e_niva() {
         (dry_emitted - 0.009188).abs() < 2.0e-4,
         "dry dust {dry_emitted:.6} m3"
     );
+    // 16-layer air (dust.rs): the wake lifts the dry plume up to 4 m and it
+    // rides the relative wind off the window, so more of it lands on the wet
+    // track behind. The 8-layer sheet read 0.001519 here and 0.002941 on the map.
     assert!(
-        (settled_wet as f64 - 0.001519).abs() < 1.5e-4,
+        (settled_wet as f64 - 0.001739).abs() < 1.5e-4,
         "settled on the wet track {settled_wet:.6} before {settled_wet_before:.6}"
     );
     assert!(
@@ -772,7 +775,7 @@ fn e2e_niva() {
         dust.dust_air_m3()
     );
     assert!(
-        (track_dust_map as f64 - 0.002941).abs() < 5.0e-4,
+        (track_dust_map as f64 - 0.003424).abs() < 5.0e-4,
         "contract dust on the wet track {track_dust_map:.6}"
     );
     assert_eq!(wet_lift, 0.0, "wet lift {wet_lift}");
