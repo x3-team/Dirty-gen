@@ -296,6 +296,16 @@ fn air_sigma_soft(p: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
     return 0.5 * (air_sigma(p + h, bmin, bmax) + air_sigma(p - h, bmin, bmax));
 }
 
+// `air_sigma` blurred over a disc of radius r, for light paths only: two
+// taps on a diagonal turned by the pixel's jitter. Light that reaches a point
+// has crossed a cone, not a line, so the shadow should not print the solver's
+// cells; the half-res tent then averages the turns of neighbouring pixels.
+fn air_sigma_cone(p: vec3<f32>, r: f32, turn: f32, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+    let a = turn * 6.2831853;
+    let h = vec3<f32>(cos(a), 0.6 * sin(a * 1.7), sin(a)) * r;
+    return 0.5 * (air_sigma(p + h, bmin, bmax) + air_sigma(p - h, bmin, bmax));
+}
+
 // ---------------------------------------------------------------------------
 // Air velocity. Contract v2 publishes `air_velocity` from the solver; v1 does
 // not, so `bc_air_published` returns w = 0 and the picture builds the air from
@@ -523,7 +533,10 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let u = sqrt(max(t - t_near, 0.0) / range);
         dt = max(range * (2.0 * u + 1.0 / fsteps) / fsteps, 0.05);
-        let p = ro + rd * t;
+        // Each sample sits at the pixel's jitter inside its own step. With
+        // the jitter only on the first step, near-level rays of a row took
+        // their samples at the same depths and the plume printed as lines.
+        let p = ro + rd * max(t + dt * (jitter - 0.5), t_near);
         var dm = vec2<f32>(0.0);
         if (has_dust) {
             dm = air_sigma_soft(p, bmin, bmax);
@@ -553,13 +566,18 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         // Self-shadow toward the sun through the published grid: taps 0.4,
         // 0.9, 1.9 m long (doubling), so a 3 m column darkens its far side.
         // The point's own detail scales the first tap.
+        // Turns for the light cones: smooth in the world, so they neither
+        // print as a pixel pattern nor line up along screen rows.
+        let turn = textureSampleLevel(air_noise, air_samp, p * 0.12 + vec3<f32>(0.21, 0.47, 0.13), 0.0).xyz * 3.0;
         var od = 0.0;
         if (has_dust) {
             var s0 = 0.0;
             var len = 0.4;
             for (var j: i32 = 0; j < QUALITY_FOG_SHADOW_STEPS; j = j + 1) {
-                let q = p + sun * (s0 + 0.5 * len);
-                let a = air_sigma(q, bmin, bmax);
+                // Jittered along the tap so layer faces do not line up into
+                // stripes, and widened with distance like the cone of light.
+                let q = p + sun * (s0 + (0.25 + 0.5 * fract(turn.y + f32(j) * 0.618)) * len);
+                let a = air_sigma_cone(q, 0.15 + 0.35 * (s0 + 0.5 * len), turn.x + f32(j) * 0.37, bmin, bmax);
                 od += (a.x + a.y) * len * select(1.0, detail, j == 0);
                 s0 += len;
                 len *= 2.2;
@@ -577,27 +595,27 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             let ph = mix(mix(hg_phase(mu, 0.8 * c_o), hg_phase(mu, 0.2 * c_o), 0.45), hg_phase(mu, 0.55 * c_o), wd);
             ms += a_o * ph * exp(-od * b_o);
             a_o *= 0.5;
-            b_o *= 0.4;
+            b_o *= 0.5;
             c_o *= 0.5;
         }
         ms *= 12.566371;
         // Powder: the sunward rim of a dense puff is darker than its inside,
         // where light has scattered in from all sides.
-        let powder = 0.6 + 0.4 * (1.0 - exp(-sigma * 0.8));
+        let powder = 0.45 + 0.55 * (1.0 - exp(-sigma * 0.8));
         // Sky through the plume above the point: dark undersides, bright tops.
         var od_up = 0.0;
         if (has_dust) {
-            let a1 = air_sigma(p + vec3<f32>(0.0, 0.5, 0.0), bmin, bmax);
-            let a2 = air_sigma(p + vec3<f32>(0.0, 1.5, 0.0), bmin, bmax);
+            let a1 = air_sigma_cone(p + vec3<f32>(0.0, 0.5, 0.0), 0.35, turn.z, bmin, bmax);
+            let a2 = air_sigma_cone(p + vec3<f32>(0.0, 1.5, 0.0), 0.8, turn.z + 0.25, bmin, bmax);
             od_up = (a1.x + a1.y) * 0.8 + (a2.x + a2.y) * 1.2;
         }
-        let sky_vis = exp(-od_up * 0.5);
+        let sky_vis = exp(-od_up * 0.9);
         // Lifted off the ground so the shadow map's texels do not print as acne.
         // Two taps a step apart along the ray: the map's texels no longer
         // print as bricks through a thin plume.
         let lit = 0.5 * (shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0))
             + shadow_factor(p - rd * (0.5 * dt) + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0)));
-        var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
+        var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky * mix(0.75, 1.0, 1.0 - wd) * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
         if (lamp_on > 0.0) {
             for (var i: i32 = 0; i < 2; i = i + 1) {
                 let b = lamp_beam(i, p);
@@ -654,7 +672,14 @@ fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, -e.y), 0.0);
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(-e.x, e.y), 0.0);
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, e.y), 0.0);
-    c *= 0.25;
+    // A wider ring, turned 45 degrees: the march's interleaved jitter repeats
+    // over a few half-res texels, and a dense plume printed it as hatching.
+    let r = 3.0 * e;
+    var w = textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(r.x, 0.0), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv - vec2<f32>(r.x, 0.0), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(0.0, r.y), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv - vec2<f32>(0.0, r.y), 0.0);
+    c = c * 0.15 + w * 0.1;
     if (c.a < 0.002) {
         discard;
     }
