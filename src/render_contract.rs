@@ -10,13 +10,18 @@
 use bytemuck::Zeroable;
 
 use crate::dust::{DensityTexture, Dust, AIR_DY_M, SETTLED_CELL_M};
-use crate::fluid_core::{FluidCore, AIR_LAYERS, AIR_RES, COARSE_CELL_M, WINDOW_RES};
+use crate::fluid_core::{FluidCore, AIR_LAYERS as SHEET_AIR_SLABS, AIR_RES, COARSE_CELL_M, WINDOW_RES};
+
+/// Published air layers: the dust ledger's 16 × 0.25 m. The fluid-sheet
+/// fallback has 8 slabs of the same height and fills the bottom half.
+const AIR_LAYERS: usize = crate::dust::AIR_LAYERS as usize;
 use crate::particles::Particle;
+use crate::snow_track::{SnowTrack, TRACK_CELL_M, TRACK_RES};
 use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 8;
+pub const RENDER_CONTRACT_VERSION: u32 = 11;
 
 /// Floats per flow texel: vx, vz, speed, turbidity.
 pub const FLOW_CHANNELS: usize = 4;
@@ -73,6 +78,7 @@ pub const VALID_AIR: u32 = 1 << 10;
 pub const VALID_TURBIDITY: u32 = 1 << 11;
 pub const VALID_MIX: u32 = 1 << 12;
 pub const VALID_SNOW: u32 = 1 << 14;
+pub const VALID_TRACK_FINE: u32 = 1 << 15;
 pub const VALID_FOG: u32 = 1 << 13;
 
 pub const BIND_HEADER: u32 = 0;
@@ -90,8 +96,13 @@ pub const BIND_AIR: u32 = 11;
 pub const BIND_FOG: u32 = 12;
 pub const BIND_MIX: u32 = 13;
 pub const BIND_SNOW: u32 = 14;
+pub const BIND_TRACK_FINE: u32 = 15;
 
-/// Uniform header. 96 bytes. Layout matches `ContractHeader` in the WGSL.
+/// Fine deformation window, texels per side. 640 × 2.5 cm = 16 m.
+pub const TRACK_FINE_CELLS: u32 = TRACK_RES as u32;
+pub const TRACK_FINE_CELL_M: f32 = TRACK_CELL_M;
+
+/// Uniform header. 112 bytes. Layout matches `ContractHeader` in the WGSL.
 ///
 /// `debug_mode` is a viewer selector written by the renderer. It is not a
 /// solver map. Adding or retuning a solver map still bumps the version.
@@ -122,6 +133,13 @@ pub struct ContractHeader {
     pub flow_source: u32,
     pub dust_source: u32,
     pub debug_mode: u32,
+    /// Fine window (binding 15) minimum corner, world X and Z, metres.
+    pub fine_origin_x: f32,
+    pub fine_origin_z: f32,
+    /// Fine texel size, metres. 0 when binding 15 is not published.
+    pub fine_cell_m: f32,
+    /// Fine texels per side. 0 when binding 15 is not published.
+    pub fine_res: u32,
 }
 
 /// One spray slot. 48 bytes. `pos_mass.w` is kilograms. `vel_age.w` is age in seconds.
@@ -154,6 +172,9 @@ pub struct ContractFrame {
     pub soil_mix: Vec<f32>,
     /// Snow column. RGBA: height m, density kg/m³, compaction 0..1, 0.
     pub snow: Vec<f32>,
+    /// Fine deformation window, binding 15. RGBA: surface over contract
+    /// ground m, snow depth m, compaction 0..1, print depth m.
+    pub track_fine: Vec<f32>,
     pub spray: Vec<SprayGpu>,
 }
 
@@ -176,6 +197,7 @@ impl ContractFrame {
             fog: vec![0.0; air],
             soil_mix: vec![0.0; n * 4],
             snow: vec![0.0; n * 4],
+            track_fine: vec![0.0; (TRACK_FINE_CELLS * TRACK_FINE_CELLS * 4) as usize],
             spray: vec![SprayGpu::zeroed(); SPRAY_CAPACITY as usize],
         }
     }
@@ -560,7 +582,7 @@ pub fn publish_with_snow(
     } else if let Some(fluid) = fluid {
         let (origin, cell) = fluid.air_window();
         for iz in 0..AIR_RES {
-            for layer in 0..AIR_LAYERS {
+            for layer in 0..SHEET_AIR_SLABS {
                 for ix in 0..AIR_RES {
                     let depth = fluid.air_depth(ix, layer, iz);
                     let frac = if AIR_DY_M > 0.0 {
@@ -589,9 +611,9 @@ pub fn publish_with_snow(
             fog_valid = true;
         }
     } else if let Some(fluid) = fluid {
-        fluid.write_air_velocity(&mut out.air_velocity);
+        fluid.write_air_velocity(&mut out.air_velocity, AIR_LAYERS);
         for iz in 0..AIR_RES {
-            for layer in 0..AIR_LAYERS {
+            for layer in 0..SHEET_AIR_SLABS {
                 for ix in 0..AIR_RES {
                     let depth = fluid.fog_depth(ix, layer, iz);
                     let frac = if AIR_DY_M > 0.0 { depth / AIR_DY_M } else { 0.0 };
@@ -737,7 +759,79 @@ pub fn publish_with_snow(
         flow_source,
         dust_source,
         debug_mode,
+        fine_origin_x: 0.0,
+        fine_origin_z: 0.0,
+        fine_cell_m: 0.0,
+        fine_res: 0,
     };
+}
+
+/// A field that can write fine deformation texels on the global 2.5 cm grid.
+///
+/// `fine_texel` returns `[R, G, B, A]` for global cell `(gi, gj)` (cell centre
+/// `(g + 0.5) * TRACK_FINE_CELL_M`): R top surface over contract ground, m;
+/// G snow depth, m; B compaction of the material R reports, 0..1; A lug or
+/// sole print depth, m. `None` means this writer has nothing there.
+pub trait FineDeform {
+    fn fine_texel(&self, gi: i32, gj: i32) -> Option<[f32; 4]>;
+}
+
+impl FineDeform for SnowTrack {
+    fn fine_texel(&self, gi: i32, gj: i32) -> Option<[f32; 4]> {
+        let c = self.get(gi, gj);
+        Some([c.surface() - c.bed, c.depth, c.compaction(), c.lug])
+    }
+}
+
+/// Fill binding 15 around `center` and set its header fields and valid bit.
+/// Call after [`publish`] / [`publish_with_snow`], which clear them.
+///
+/// Writers combine per texel: a texel with snow on it (G > 0) comes from the
+/// first writer that reports snow, so snow lies over soil prints. Otherwise
+/// the first writer with a non-zero texel wins. With no writer the texel is
+/// 0. Every texel in the window is valid. Does not step any solver.
+pub fn publish_track_fine(out: &mut ContractFrame, center: [f32; 2], writers: &[&dyn FineDeform]) {
+    let res = TRACK_FINE_CELLS as i32;
+    let cell = TRACK_FINE_CELL_M;
+    let gi0 = (center[0] / cell).floor() as i32 - res / 2;
+    let gj0 = (center[1] / cell).floor() as i32 - res / 2;
+    out.track_fine.fill(0.0);
+    if writers.is_empty() {
+        out.header.valid &= !VALID_TRACK_FINE;
+        out.header.fine_cell_m = 0.0;
+        out.header.fine_res = 0;
+        return;
+    }
+    for j in 0..res {
+        for i in 0..res {
+            let (gi, gj) = (gi0 + i, gj0 + j);
+            let mut pick: Option<[f32; 4]> = None;
+            let mut soil: Option<[f32; 4]> = None;
+            for w in writers {
+                let Some(t) = w.fine_texel(gi, gj) else {
+                    continue;
+                };
+                if t[1] > 0.0 {
+                    pick = Some(t);
+                    break;
+                }
+                if soil.is_none() && t.iter().any(|v| *v != 0.0) {
+                    soil = Some(t);
+                }
+            }
+            if let Some(t) = pick.or(soil) {
+                let k = ((j * res + i) * 4) as usize;
+                for c in 0..4 {
+                    out.track_fine[k + c] = finite0(t[c]);
+                }
+            }
+        }
+    }
+    out.header.fine_origin_x = gi0 as f32 * cell;
+    out.header.fine_origin_z = gj0 as f32 * cell;
+    out.header.fine_cell_m = cell;
+    out.header.fine_res = TRACK_FINE_CELLS;
+    out.header.valid |= VALID_TRACK_FINE;
 }
 
 /// Row bytes padded to the copy alignment. `channels` is floats per texel.
@@ -818,6 +912,7 @@ pub fn contract_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
             float_entry(BIND_FOG, wgpu::TextureViewDimension::D3),
             float_entry(BIND_MIX, wgpu::TextureViewDimension::D2),
             float_entry(BIND_SNOW, wgpu::TextureViewDimension::D2),
+            float_entry(BIND_TRACK_FINE, wgpu::TextureViewDimension::D2),
         ],
     })
 }
@@ -852,6 +947,7 @@ pub struct ContractGpu {
     foam: Map2,
     soil_mix: Map2,
     snow: Map2,
+    track_fine: Map2,
 }
 
 impl ContractGpu {
@@ -863,7 +959,7 @@ impl ContractGpu {
             let _ = device.poll(wgpu::Maintain::Wait);
             let err = pollster::block_on(device.pop_error_scope());
             if let Some(err) = err {
-                eprintln!("render contract textures unavailable: {err}");
+                eprintln!("render contract textures unavailable: {err:?}");
                 return None;
             }
         }
@@ -960,37 +1056,30 @@ impl ContractGpu {
             wgpu::TextureFormat::Rg32Float,
             2,
         )?;
-let fog = map3(
+        let fog = map3(
             device,
             "contract-fog",
             wgpu::TextureFormat::R32Float,
             1,
         )?;
-        let crust = map2(
-            device,
-            "contract-crust",
-            res,
-            wgpu::TextureFormat::Rg32Float,
-            2,
-        )?;
-        let wet_edge = map2(
-            device,
-            "contract-wet-edge",
-            res,
-            wgpu::TextureFormat::R32Float,
-            1,
-        )?;
-        let foam = map2(
-            device,
-            "contract-foam-crest",
-            res,
-            wgpu::TextureFormat::Rg32Float,
-            2,
-        )?;
         let soil_mix = map2(
             device,
             "contract-soil-mix",
             res,
+            wgpu::TextureFormat::Rgba32Float,
+            4,
+        )?;
+        let snow = map2(
+            device,
+            "contract-snow",
+            res,
+            wgpu::TextureFormat::Rgba32Float,
+            4,
+        )?;
+        let track_fine = map2(
+            device,
+            "contract-track-fine",
+            TRACK_FINE_CELLS,
             wgpu::TextureFormat::Rgba32Float,
             4,
         )?;
@@ -1012,33 +1101,8 @@ let fog = map3(
                 bind_tex(BIND_AIR, &air_velocity.view),
                 bind_tex(BIND_FOG, &fog.view),
                 bind_tex(BIND_MIX, &soil_mix.view),
-            ],
-        });
-        let snow = map2(
-            device,
-            "contract-snow",
-            res,
-            wgpu::TextureFormat::Rgba32Float,
-            4,
-        )?;
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("render-contract-bg"),
-            layout: &layout,
-            entries: &[
-                bind_buf(BIND_HEADER, header.as_entire_binding()),
-                bind_tex(BIND_GROUND, &ground.view),
-                bind_tex(BIND_MOISTURE, &moisture.view),
-                bind_tex(BIND_FILM, &film.view),
-                bind_tex(BIND_FLOW, &flow.view),
-                bind_tex(BIND_DUST_SETTLED, &dust_settled.view),
-                bind_tex(BIND_DUST_FOG, &dust_fog.view),
-                bind_tex(BIND_CRUST, &crust.view),
-                bind_tex(BIND_WET_EDGE, &wet_edge.view),
-                bind_tex(BIND_FOAM, &foam.view),
-                bind_buf(BIND_SPRAY, spray.as_entire_binding()),
-                bind_tex(BIND_AIR, &air_velocity.view),
-                bind_tex(BIND_FOG, &fog.view),
                 bind_tex(BIND_SNOW, &snow.view),
+                bind_tex(BIND_TRACK_FINE, &track_fine.view),
             ],
         });
         Some(Self {
@@ -1058,6 +1122,7 @@ let fog = map3(
             foam,
             soil_mix,
             snow,
+            track_fine,
         })
     }
 
@@ -1076,6 +1141,10 @@ let fog = map3(
         write_map3(queue, &self.dust_fog, &frame.dust_fog);
         write_map3(queue, &self.air_velocity, &frame.air_velocity);
         write_map2(queue, &self.snow, &frame.snow, WINDOW_CELLS);
+        // 6.5 MB. Only when the solver published it this frame.
+        if frame.header.valid & VALID_TRACK_FINE != 0 {
+            write_map2(queue, &self.track_fine, &frame.track_fine, TRACK_FINE_CELLS);
+        }
     }
 }
 
@@ -1289,7 +1358,10 @@ mod tests {
             "bump the WGSL constant with the Rust version"
         );
         assert!(wgsl.contains("docs/RENDER_CONTRACT.md"));
-        assert_eq!(std::mem::size_of::<ContractHeader>(), 96);
+        assert_eq!(std::mem::size_of::<ContractHeader>(), 112);
+        assert!(wgsl.contains("@group(0) @binding(15)"));
+        assert_eq!(VALID_TRACK_FINE, 1 << 15);
+        assert_eq!(BIND_TRACK_FINE, 15);
         assert_eq!(std::mem::size_of::<SprayGpu>(), 48);
         assert!(wgsl.contains("@group(0) @binding(0)"));
         assert!(wgsl.contains("@group(0) @binding(10)"));
@@ -1669,5 +1741,67 @@ mod tests {
             slot.pos_mass.iter().all(|c| c.is_finite())
                 && slot.vel_age.iter().all(|c| c.is_finite())
         })
+    }
+
+    #[test]
+    fn track_fine_publishes_the_snow_window_and_lays_snow_over_prints() {
+        use crate::snow_track::{cell_of, TirePress};
+        use glam::Vec2;
+        let mut track = SnowTrack::new(0.25, 0.0);
+        track.drift = 0.0;
+        for k in 0..60 {
+            let z = k as f32 * 0.01;
+            track.begin_step();
+            track.press(&TirePress {
+                center: Vec3::new(0.0, 0.25 - 0.08 + 0.38, z),
+                forward: Vec2::new(0.0, 1.0),
+                radius: 0.38,
+                width: 0.28,
+                normal_n: 2850.0,
+                slip: 0.0,
+                omega: 6.0,
+                spin: z / 0.38,
+                v_long: 2.0,
+                v_lat: 0.0,
+                dt: 1.0 / 120.0,
+                index: 0,
+            });
+        }
+        struct Print;
+        impl FineDeform for Print {
+            fn fine_texel(&self, gi: i32, gj: i32) -> Option<[f32; 4]> {
+                (gi == 100 && gj == 100).then_some([-0.02, 0.0, 0.5, 0.02])
+            }
+        }
+        let mut out = ContractFrame::new();
+        out.header.valid = VALID_GROUND;
+        publish_track_fine(&mut out, [0.0, 0.3], &[&track, &Print]);
+        let h = out.header;
+        assert!(h.valid & VALID_TRACK_FINE != 0 && h.valid & VALID_GROUND != 0);
+        assert_eq!(h.fine_res, TRACK_FINE_CELLS);
+        assert_eq!(h.fine_cell_m, TRACK_FINE_CELL_M);
+        fn at(out: &ContractFrame, x: f32, z: f32) -> [f32; 4] {
+            let h = out.header;
+            let i = ((x - h.fine_origin_x) / h.fine_cell_m).floor() as usize;
+            let j = ((z - h.fine_origin_z) / h.fine_cell_m).floor() as usize;
+            let k = (j * h.fine_res as usize + i) * 4;
+            [out.track_fine[k], out.track_fine[k + 1], out.track_fine[k + 2], out.track_fine[k + 3]]
+        }
+        // In the rut: pressed snow, packed.
+        let rut = at(&out, 0.0, 0.3);
+        let c = track.get(cell_of(0.0), cell_of(0.3));
+        assert_eq!(rut[0], c.surface());
+        assert!(rut[0] < 0.20 && rut[2] > 0.0, "{rut:?}");
+        // Virgin blanket is published too, not 0.
+        assert!((at(&out, 5.0, 5.0)[0] - 0.25).abs() < 1.0e-6);
+        // The print writer sits under the snow there, so snow wins.
+        let x = (100.0 + 0.5) * TRACK_FINE_CELL_M;
+        assert!((at(&out, x, x)[1] - 0.25).abs() < 1.0e-6);
+        // Alone, the print writer is the texel; elsewhere 0.
+        publish_track_fine(&mut out, [0.0, 0.3], &[&Print]);
+        assert_eq!(at(&out, x, x), [-0.02, 0.0, 0.5, 0.02]);
+        assert_eq!(at(&out, 0.0, 0.3), [0.0; 4]);
+        publish_track_fine(&mut out, [0.0, 0.3], &[]);
+        assert_eq!(out.header.valid & VALID_TRACK_FINE, 0);
     }
 }

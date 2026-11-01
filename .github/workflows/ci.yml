@@ -32,6 +32,11 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test puddle_rut -- --nocapture
+      - name: Turbid cloud settles
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test turbid_settle -- --nocapture
       - name: Niva crust and cracks
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -58,6 +63,11 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test snow_maps -- --nocapture
+      - name: Windows demo playground
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test win_demo -- --nocapture
       - name: Release solver budget
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -65,7 +75,7 @@ jobs:
           unset DISPLAY
           RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore one_fine_substep_matches_eight -- --nocapture
           cargo test --release --test puddle_shore puddle_shore_follows_relief -- --nocapture
-          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive --test bodies -- --nocapture
           cargo test --release --test scripted_drive --test turbidity -- --nocapture
           cargo test --release --test crust_cracks -- --nocapture
           cargo test --release --test puddle_rut -- --nocapture
@@ -91,6 +101,14 @@ jobs:
           export CXX=g++ CC=gcc
           cargo test --release --test gpu_budget -- --nocapture
           cargo test --release --lib quality::
+      - name: Render contract reaches the GPU
+        run: |
+          # Builds the contract bind group on lavapipe, uploads a publish and
+          # draws the debug view. Fails if any binding is missing or doubled.
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          unset DISPLAY
+          cargo test --release --bin silt debug_contract_view -- --nocapture
       - name: Draw calls and memory per preset
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"

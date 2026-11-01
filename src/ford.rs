@@ -400,6 +400,20 @@ impl FordDrive {
         vehicle.update_steer(0.0, dt);
         let throttle = ((self.pace_m_s - vehicle.speed()) * 1.2 + 0.25).clamp(0.0, 1.0);
         let contacts = vehicle.compute_contacts(&self.world.soil, throttle, 0.0, dt);
+        // Wheels in the water stir the bed: the sheet lifts silt aft of each
+        // contact and foams where the surface cuts the tire. Next step's input.
+        for c in contacts.iter().filter(|c| c.active) {
+            fluid.push_stir(crate::fluid_core::TirePush {
+                x: c.contact_point.x,
+                z: c.contact_point.z,
+                forward_x: c.forward.x,
+                forward_z: c.forward.z,
+                radius: crate::vehicle::WHEEL_RADIUS,
+                width: crate::vehicle::WHEEL_WIDTH,
+                speed: c.speed.abs(),
+                slip: c.slip,
+            });
+        }
         vehicle.integrate(&contacts, &self.world.soil, dt);
         self.time_s += dt;
     }
@@ -424,7 +438,7 @@ fn depth_near(fluid: &FluidCore, x: f32, z: f32) -> f32 {
 }
 
 /// Copy the sheet's bed and water onto the soil the tires read.
-fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
+pub(crate) fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
     use crate::soil::SurfaceKind;
     let half = soil.size * 0.5;
     for j in 0..soil.res {
