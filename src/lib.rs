@@ -15,6 +15,7 @@ pub mod patch;
 pub mod render_contract;
 pub mod snow;
 pub mod soil;
+pub mod terrain_lod;
 pub mod vehicle;
 pub mod world;
 
