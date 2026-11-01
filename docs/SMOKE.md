@@ -1,18 +1,17 @@
 # Smoke and fire
 
-A world-anchored 3D grid on wgpu compute (`src/smoke.rs`, `src/smoke.wgsl`)
-and a fullscreen ray march over it (`src/smoke_pass.rs`,
-`fs_fog` in `src/beauty_contract.wgsl`, group 5 of the dust march, pass label `dust-volume`). Off unless a scene
+A world-anchored 3D grid on wgpu compute (`src/smoke.rs`, `src/smoke.wgsl`),
+marched in the same half-resolution pass as dust and fog (`fs_fog` in
+`src/beauty_contract.wgsl`, group 5, pass label `dust-volume`; bind group
+from `SmokePass::volume_group` in `src/smoke_pass.rs`). Off unless a scene
 enables it. Needs compute, so there is no smoke on WebGL2 (`low` in the
 browser).
 
 Why not the dust/fog air window (`dust.rs`, PR #127): that window rides with
 the Niva, is 4 m tall and has no pressure solve. A smoke column stands still
 in the world, is taller, and needs pressure and vorticity to roll. The two
-grids do not share data. When the dust/fog march lands on main, the smoke
-texture joins that loop (`air_sigma` + an emission term) and this pass goes
-away; the bind group already carries what that needs (density, emission,
-origin, cell).
+grids do not share data, but one march sums dust, mist and smoke extinction
+per step, so smoke adds no pass of its own.
 
 ## Sources (all MIT, licences checked 2026-11-01)
 
@@ -72,12 +71,11 @@ Grid for the bench smoke scene: 60 × 76 × 60 = 274k cells, 8 cm.
 | Pass | medium (GTX 1660) | How |
 | --- | ---: | --- |
 | `smoke-sim` | ~1.0 ms per step, ~0.5 ms per frame at a 30 Hz step | ~32 dispatches, ~400 B DRAM traffic per cell |
-| `smoke-volume` | ~2.5 ms full res today, ~0.8 ms at half res | 64 steps; per step in smoke: 3 filtered 3D fetches + 6 simplex noises (2 curl octaves) |
+| smoke in `dust-volume` | ~0.8 ms extra at half res | per step inside the smoke box: 3 filtered 3D fetches + 6 simplex noises (2 curl octaves) |
 
-The 12 ms frame (docs/GPU_BUDGET.md, PR #126) is already 11.7 ms full, so
-smoke has to come out of the `dust-volume` row: a scene with smoke draws it
-in the same half-resolution march. Until that merge, `smoke-volume` runs at
-full resolution and is for stills and the bench. Knobs: grid cell,
+The 12 ms frame (docs/GPU_BUDGET.md) is already 11.7 ms full, so smoke comes
+out of the `dust-volume` row: it is drawn in the same half-resolution march.
+Knobs: grid cell,
 `jacobi_iters`, and the `QUALITY_SMOKE_STEPS` / `QUALITY_SMOKE_DETAIL` /
 `SMOKE_SHADOW_STEPS` overrides (WGSL defaults 64 / 2 / 24, within the 64-step
 lint). Detail 1 octave on `medium` and 0 on `low` would cut the march cost
