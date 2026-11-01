@@ -6,6 +6,10 @@
 # preset: drive  = Niva through-drive (puddle z -19..-11, clay slurry ruts
 #                  z -14..-1, dry exit with dust after z 0); stop = chassis z
 #         snow   = snow blanket, ruts, berms, four turn circles; stop unused
+#         river  = silt::ford river with rocks (x -6.5 / 4.0 at z 5), Niva
+#                  starts on the beach at z -5.4; stop = seconds (in the
+#                  channel at 4-16 s, out at ~18 s)
+#         beach  = the same ford with a swell on the beach (z -3.5..1)
 #         missing = no solver scene yet; the SBS says so instead of drawing
 # frame:  car    = x forward, y up, z right of the Niva, metres
 #         world  = absolute world coordinates
@@ -15,12 +19,12 @@
 
 snow-ruts     snow    0     car   -6.5 4.2 -4.5    2.0 0.0 1.2    refs/ue5-96.jpg   Snow: ruts, berms and tracks behind the car
 snow-circles  snow    0     car   -7.0 8.0 -2.0    0.0 0.0 4.5    refs/ue5-97.jpg   Snow: turn circles from above
-ford          drive  -16.0  car   -7.0 2.2 -4.5    1.0 0.3 0.0    refs/ue5-104.jpg  Water: car in a ford, wake and splash
+ford          river    5.0  car   -8.0 2.6 -4.0    1.0 0.3 0.0    refs/ue5-104.jpg  Water: car wading the ford, wake and splash
 mud           drive   -7.0  car   -5.0 4.5 -3.0    1.0 0.0 0.5    refs/ue5-105.jpg  Mud: wet clay ruts and slurry
 mud-overview  drive   -3.0  car   -9.0 6.0 -6.0    2.0 0.0 0.0    refs/ue5-video-mud-10s.jpg  Mud: overview of the rut field
 dust          drive   10.0  car    3.0 3.0 -6.5   -5.0 0.8 0.0    refs/ue5-93.jpg   Dust: cloud behind the car on the dry exit
-river-rocks   missing  0    car    0 0 0           0 0 0          refs/ue5-103.jpg  River around rocks: no river scene in the solver yet (ford & beach thread)
-beach-swash   missing  0    car    0 0 0           0 0 0          refs/ue5-98.jpg   Beach swash and foam on sand: no beach scene yet (ford & beach thread)
-beach-rock    missing  0    car    0 0 0           0 0 0          refs/ue5-99.jpg   Shallows around a rock on a beach: no beach scene yet (ford & beach thread)
+river-rocks   river    9.0  car   -8.0 4.5 -5.0    2.0 0.0 0.0    refs/ue5-103.jpg  River: car in the channel, current around rocks
+beach-swash   beach    1.5  car   -6.0 3.5 -3.0    1.5 0.0 0.0    refs/ue5-98.jpg   Beach: swash and foam on sand
+beach-rock    river    6.0  car   -7.0 2.0 4.0     2.0 0.2 -3.0   refs/ue5-99.jpg   Shallows around a rock
 turbid-water  missing  0    car    0 0 0           0 0 0          refs/ue5-100.jpg  Open muddy water with turbidity: no open-water scene yet
 smoke-column  missing  0    car    0 0 0           0 0 0          refs/ue5-89.jpg   Smoke column in still air: no point-source smoke yet (dust & fog thread)

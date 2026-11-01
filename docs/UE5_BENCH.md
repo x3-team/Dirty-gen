@@ -41,13 +41,13 @@ shot can be lined up with its reference without a rebuild.
 |---|---|---|
 | snow-ruts | ue5-96 | snow blanket, ruts, berms (`snow_ruts_world`) |
 | snow-circles | ue5-97 | same scene, turn arc from above |
-| ford | ue5-104 | through-drive, puddle section |
+| ford | ue5-104 | `silt::ford` river, Niva wading at 5 s |
 | mud | ue5-105 | through-drive, clay slurry ruts |
 | mud-overview | video frame | through-drive, rut field overview |
 | dust | ue5-93 | through-drive, dry exit with dust |
-| river-rocks | ue5-103 | missing: no river with obstacles yet |
-| beach-swash | ue5-98 | missing: no beach yet |
-| beach-rock | ue5-99 | missing: no beach yet |
+| river-rocks | ue5-103 | `silt::ford` river, Niva in the channel (`river` preset) |
+| beach-swash | ue5-98 | `silt::ford` with a swell on the beach (`beach` preset) |
+| beach-rock | ue5-99 | `silt::ford` river, shallows by a rock |
 | turbid-water | ue5-100 | missing: no open turbid water yet |
 | smoke-column | ue5-89 | missing: no point-source smoke yet |
 

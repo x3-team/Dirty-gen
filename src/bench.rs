@@ -158,6 +158,32 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
         }
     }
 
+    // River ford with rocks (`river`) and the same ford with a swell on the
+    // beach (`beach`). `stop` is seconds since the Niva started.
+    for (preset, swell) in [("river", None), ("beach", Some(silt::ford::Swell::default()))] {
+        let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
+        if shots.is_empty() {
+            continue;
+        }
+        shots.sort_by(|a, b| a.stop.total_cmp(&b.stop));
+        renderer.show_hills = false;
+        renderer.daylight = true;
+        renderer.niva_picture = true;
+        renderer.water_column = true;
+        let mut ford = silt::ford::FordDrive::new(swell, 4.0);
+        let dt = 1.0 / 60.0;
+        for scene in shots {
+            while ford.time_s < scene.stop {
+                ford.step(dt);
+            }
+            let cam = pose(scene, &ford.world);
+            let rgba = renderer
+                .draw_with_sheet(&ford.world, cam, None, true, Some(&ford.fluid), None)
+                .expect("readback");
+            save(&dir.join(format!("{}.png", scene.id)), width, height, &rgba, scene, cam);
+        }
+    }
+
     for scene in scenes.iter().filter(|s| s.preset == "missing") {
         println!("bench {} missing: no solver scene yet", scene.id);
     }
@@ -173,7 +199,7 @@ mod tests {
         let scenes = parse_scenes(text);
         assert!(scenes.len() >= 5);
         for s in &scenes {
-            assert!(["drive", "snow", "missing"].contains(&s.preset.as_str()), "{}", s.id);
+            assert!(["drive", "snow", "river", "beach", "missing"].contains(&s.preset.as_str()), "{}", s.id);
         }
     }
 }
