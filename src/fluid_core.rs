@@ -5710,6 +5710,14 @@ impl FluidCore {
         };
         for j in j0..=j1 {
             let row = j * res;
+            // Skip a dry row with one branch-free pass. NaN never counts as wet.
+            let peak = self.water[row + i0..=row + i1]
+                .iter()
+                .zip(&self.slurry[row + i0..=row + i1])
+                .fold(0.0f32, |m, (w, s)| m.max(w + s));
+            if peak < 0.004 {
+                continue;
+            }
             for i in i0..=i1 {
                 let idx = row + i;
                 let h = self.water[idx] + self.slurry[idx];
@@ -6494,17 +6502,20 @@ impl FluidCore {
     /// Horizontal dust-sheet velocity in contract order, vertical channel 0.
     ///
     /// This is not the body wake. The ledger path publishes `Dust::write_air_velocity`
-    /// instead. Index `(x + layer * 128 + z * 128 * 8) * 4`, R +X, G +Y, B +Z, A 0.
-    pub fn write_air_velocity(&self, dst: &mut [f32]) {
+    /// instead. Index `(x + layer * 128 + z * 128 * dst_layers) * 4`, R +X, G +Y,
+    /// B +Z, A 0. The sheet's slabs fill layers `0..AIR_LAYERS`; layers above
+    /// are left as they are.
+    pub fn write_air_velocity(&self, dst: &mut [f32], dst_layers: usize) {
         let n = AIR_RES * AIR_LAYERS * AIR_RES;
-        if dst.len() < n * 4 || self.dust_u.len() < n || self.dust_v.len() < n {
+        let dst_layers = dst_layers.max(AIR_LAYERS);
+        if dst.len() < AIR_RES * dst_layers * AIR_RES * 4 || self.dust_u.len() < n || self.dust_v.len() < n {
             return;
         }
         for iz in 0..AIR_RES {
             for layer in 0..AIR_LAYERS {
                 for ix in 0..AIR_RES {
                     let src = (layer * AIR_RES + iz) * AIR_RES + ix;
-                    let dst_i = (ix + layer * AIR_RES + iz * AIR_RES * AIR_LAYERS) * 4;
+                    let dst_i = (ix + layer * AIR_RES + iz * AIR_RES * dst_layers) * 4;
                     dst[dst_i] = finite0(self.dust_u[src]);
                     dst[dst_i + 1] = 0.0;
                     dst[dst_i + 2] = finite0(self.dust_v[src]);
@@ -7487,6 +7498,10 @@ impl FluidCore {
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
+                    // The closures borrow the sheets mutably, so they are FnMut;
+                    // native code moves them into rayon::join, here they need a
+                    // mutable binding to be called in sequence.
+                    let (mut run_water, mut run_slurry) = (run_water, run_slurry);
                     water_ms = run_water();
                     slurry_ms = run_slurry();
                 }
@@ -9053,15 +9068,17 @@ fn turbid_span(h: &[f32], res: usize) -> Option<(usize, usize, usize, usize)> {
     let mut j0 = res;
     let mut j1 = 0usize;
     for j in 0..res {
-        let row = j * res;
-        for i in 0..res {
-            if h[row + i] > 1.0e-8 {
-                i0 = i0.min(i);
-                i1 = i1.max(i);
-                j0 = j0.min(j);
-                j1 = j1.max(j);
-            }
+        let row = &h[j * res..j * res + res];
+        // One branch-free pass per row; only a live row pays for its ends.
+        if row.iter().fold(0.0f32, |m, &x| m.max(x)) <= 1.0e-8 {
+            continue;
         }
+        let first = row.iter().position(|&x| x > 1.0e-8).unwrap_or(0);
+        let last = row.iter().rposition(|&x| x > 1.0e-8).unwrap_or(0);
+        i0 = i0.min(first);
+        i1 = i1.max(last);
+        j0 = j0.min(j);
+        j1 = j1.max(j);
     }
     if i0 > i1 {
         return None;
@@ -10217,8 +10234,10 @@ fn sample_layer(
     lerp3(a, b, tz)
 }
 
+/// Free-stream world air velocity at `world_x` for this drive: the wind plus
+/// the slipstream the dust stream hold drags along in the lee.
 #[inline(always)]
-fn stream_at(world_x: f32, drive: &AirDrive) -> [f32; 3] {
+pub fn stream_at(world_x: f32, drive: &AirDrive) -> [f32; 3] {
     let forward = drive.forward;
     let right = drive.right;
     let rel_x = drive.wind_x - forward[0] * drive.speed;

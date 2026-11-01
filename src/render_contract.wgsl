@@ -6,7 +6,7 @@
 // Change this contract only by bumping RENDER_CONTRACT_VERSION and
 // recording the change in docs/RENDER_CONTRACT.md.
 
-const RENDER_CONTRACT_VERSION: u32 = 9u;
+const RENDER_CONTRACT_VERSION: u32 = 11u;
 
 struct ContractHeader {
     version: u32,

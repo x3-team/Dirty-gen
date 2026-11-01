@@ -10,14 +10,18 @@
 use bytemuck::Zeroable;
 
 use crate::dust::{DensityTexture, Dust, AIR_DY_M, SETTLED_CELL_M};
-use crate::fluid_core::{FluidCore, AIR_LAYERS, AIR_RES, COARSE_CELL_M, WINDOW_RES};
+use crate::fluid_core::{FluidCore, AIR_LAYERS as SHEET_AIR_SLABS, AIR_RES, COARSE_CELL_M, WINDOW_RES};
+
+/// Published air layers: the dust ledger's 16 × 0.25 m. The fluid-sheet
+/// fallback has 8 slabs of the same height and fills the bottom half.
+const AIR_LAYERS: usize = crate::dust::AIR_LAYERS as usize;
 use crate::particles::Particle;
 use crate::snow_track::{SnowTrack, TRACK_CELL_M, TRACK_RES};
 use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 9;
+pub const RENDER_CONTRACT_VERSION: u32 = 11;
 
 /// Floats per flow texel: vx, vz, speed, turbidity.
 pub const FLOW_CHANNELS: usize = 4;
@@ -578,7 +582,7 @@ pub fn publish_with_snow(
     } else if let Some(fluid) = fluid {
         let (origin, cell) = fluid.air_window();
         for iz in 0..AIR_RES {
-            for layer in 0..AIR_LAYERS {
+            for layer in 0..SHEET_AIR_SLABS {
                 for ix in 0..AIR_RES {
                     let depth = fluid.air_depth(ix, layer, iz);
                     let frac = if AIR_DY_M > 0.0 {
@@ -607,9 +611,9 @@ pub fn publish_with_snow(
             fog_valid = true;
         }
     } else if let Some(fluid) = fluid {
-        fluid.write_air_velocity(&mut out.air_velocity);
+        fluid.write_air_velocity(&mut out.air_velocity, AIR_LAYERS);
         for iz in 0..AIR_RES {
-            for layer in 0..AIR_LAYERS {
+            for layer in 0..SHEET_AIR_SLABS {
                 for ix in 0..AIR_RES {
                     let depth = fluid.fog_depth(ix, layer, iz);
                     let frac = if AIR_DY_M > 0.0 { depth / AIR_DY_M } else { 0.0 };
