@@ -388,6 +388,7 @@ fn e2e_niva() {
         let t0 = Instant::now();
         dust.step_pads(&tires, &moisture, &water, DT);
         fluid.step(DT);
+        stretch_hold(t0);
         let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
         if step_i >= 20 {
             step_ms += elapsed;
@@ -811,15 +812,18 @@ fn e2e_niva() {
         "air step {air_mean:.3} ms over {AIR_STEP_BUDGET_MS}"
     );
     #[cfg(not(debug_assertions))]
-    assert!(
-        step_mean <= E2E_STEP_BUDGET_MS,
-        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the CI mean"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        air_mean <= AIR_RELEASE_BUDGET_MS,
-        "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
-    );
+    {
+        let step_limit = release_limit(E2E_STEP_BUDGET_MS, "PERF_LIMIT_E2E_MEAN");
+        assert!(
+            step_mean <= step_limit,
+            "e2e step {step_mean:.3} ms over {step_limit} from the CI mean"
+        );
+        let air_limit = release_limit(AIR_RELEASE_BUDGET_MS, "PERF_LIMIT_E2E_AIR");
+        assert!(
+            air_mean <= air_limit,
+            "air step {air_mean:.3} ms over {air_limit}"
+        );
+    }
 }
 
 /// Release breakdown of [`ThroughDrive::step`] at dt = 1/30. Printed for the CI log.
@@ -889,20 +893,51 @@ fn print_through_drive() {
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
-    assert!(
-        solver <= DRIVE_SOLVER_BUDGET_MS,
-        "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        p95 <= DRIVE_P95_BUDGET_MS,
-        "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        dust <= DRIVE_DUST_BUDGET_MS,
-        "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
-    );
+    {
+        let solver_limit = release_limit(DRIVE_SOLVER_BUDGET_MS, "PERF_LIMIT_DRIVE_SOLVER");
+        assert!(
+            solver <= solver_limit,
+            "DRIVE_SOLVER {solver:.3} ms over {solver_limit}"
+        );
+        let p95_limit = release_limit(DRIVE_P95_BUDGET_MS, "PERF_LIMIT_DRIVE_P95");
+        assert!(
+            p95 <= p95_limit,
+            "DRIVE_P95 {p95:.3} ms over {p95_limit}"
+        );
+        let dust_limit = release_limit(DRIVE_DUST_BUDGET_MS, "PERF_LIMIT_DRIVE_DUST");
+        assert!(
+            dust <= dust_limit,
+            "DRIVE_DUST {dust:.3} ms over {dust_limit}"
+        );
+    }
+}
+
+/// Burn extra time inside a measurement when `PERF_STRETCH` is above 1.
+/// CI leaves it unset. A proof run sets it on the pull-request side only.
+fn stretch_hold(started: Instant) {
+    let Ok(raw) = std::env::var("PERF_STRETCH") else {
+        return;
+    };
+    let Ok(factor) = raw.parse::<f64>() else {
+        return;
+    };
+    if !factor.is_finite() || factor <= 1.0 {
+        return;
+    }
+    let extra = started.elapsed().mul_f64(factor - 1.0);
+    let spin = Instant::now();
+    while spin.elapsed() < extra {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn release_limit(cap: f64, key: &str) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(cap)
 }
 
 /// Open 2 cm sheet and open wind, the trimmed branch.

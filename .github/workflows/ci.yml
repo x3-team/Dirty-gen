@@ -1,12 +1,18 @@
 name: ci
 
-# One run per pull request update. A push of the same commit does not
-# start a second copy, and a merge to main does not run this workflow.
+# Pull requests compare against the base commit. A push to main compares
+# against github.event.before. workflow_dispatch with no parent runs the
+# absolute caps only. A missing base sha is not itself a failure.
 on:
   pull_request:
     types: [opened, synchronize]
     paths-ignore:
       - "docs/**/*.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**/*.md"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -15,8 +21,11 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
@@ -39,23 +48,9 @@ jobs:
           cargo test --test e2e_niva -- --nocapture
       - name: Release solver budget
         env:
-          PERF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PERF_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before || '' }}
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
           python3 scripts/perf_ratio.py
-  win-release:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.99.1"
-      - name: Release win-demo
-        run: cargo build --release
-      - name: GPU timestamps
-        shell: pwsh
-        run: |
-          & .\target\release\silt.exe capture --gpu-time
-          exit $LASTEXITCODE

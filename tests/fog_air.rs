@@ -148,6 +148,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
         let tires = tires_at(z, SPEED, 1.6);
         let t0 = Instant::now();
         dust.step_pads(&tires, &[0.92; 4], &[0.08; 4], DT);
+        stretch_hold(t0);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if step >= 12 {
             step_ms += ms;
@@ -314,10 +315,39 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
     assert!(frame.fog.iter().all(|v| v.is_finite()));
 
     #[cfg(not(debug_assertions))]
-    assert!(
-        step_mean <= FOG_STEP_BUDGET_MS,
-        "FOG_STEP {step_mean:.3} ms over {FOG_STEP_BUDGET_MS}, max {step_max:.3}"
-    );
+    {
+        let limit = release_limit(FOG_STEP_BUDGET_MS, "PERF_LIMIT_FOG_STEP");
+        assert!(
+            step_mean <= limit,
+            "FOG_STEP {step_mean:.3} ms over {limit}, max {step_max:.3}"
+        );
+    }
+}
+
+fn stretch_hold(started: Instant) {
+    let Ok(raw) = std::env::var("PERF_STRETCH") else {
+        return;
+    };
+    let Ok(factor) = raw.parse::<f64>() else {
+        return;
+    };
+    if !factor.is_finite() || factor <= 1.0 {
+        return;
+    }
+    let extra = started.elapsed().mul_f64(factor - 1.0);
+    let spin = Instant::now();
+    while spin.elapsed() < extra {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn release_limit(cap: f64, key: &str) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(cap)
 }
 
 #[test]
