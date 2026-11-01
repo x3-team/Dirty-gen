@@ -32,6 +32,11 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test puddle_rut -- --nocapture
+      - name: Turbid cloud settles
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test turbid_settle -- --nocapture
       - name: Niva crust and cracks
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"

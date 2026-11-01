@@ -115,6 +115,9 @@ const FOAM_EQ: f32 = 0.85;
 const FOAM_TAU_S: f32 = 0.35;
 /// Silt e-folding time in the water before it settles out of the column.
 const SILT_SETTLE_S: f32 = 4.0;
+/// Fall speed of the wheel-lifted solids (`susp`, contract turbidity), m/s.
+/// Coarse silt: a 10 cm pool clears in about 25 s, a 2 cm film in 5 s.
+const SUSP_FALL_M_S: f32 = 0.004;
 /// Metres of stirred soil one cell will hold.
 const SILT_COLUMN_CAP_M: f32 = 0.028;
 
@@ -4477,6 +4480,9 @@ pub struct FluidCore {
     last_pushes: Vec<TirePush>,
     pub frame: u32,
     pushes: Vec<TirePush>,
+    /// Tires already in the sheet as hydro solids. They lift silt and foam
+    /// the surface; they do not displace water or peel spray a second time.
+    stirs: Vec<TirePush>,
     wind: [f32; 2],
     /// Wheel and belly walls. Empty means the sheet has no body in it.
     solids: Vec<HydroSolid>,
@@ -4598,6 +4604,7 @@ impl FluidCore {
             last_pushes: Vec::new(),
             frame: 0,
             pushes: Vec::new(),
+            stirs: Vec::new(),
             wind: [1.1, 0.35],
             solids: Vec::new(),
             bed_drop: vec![0.0; n],
@@ -5456,6 +5463,15 @@ impl FluidCore {
         self.pushes.push(push);
     }
 
+    /// A tire whose volume the sheet already sees through
+    /// [`FluidCore::set_hydro_solids`]. Next step it lifts silt behind the
+    /// contact and foams the surface it cuts, like [`FluidCore::push_tire`],
+    /// but it does not shove water or throw spray, so the water book is the
+    /// hydro solid's alone.
+    pub fn push_stir(&mut self, push: TirePush) {
+        self.stirs.push(push);
+    }
+
     /// Cubic metres that entered the air. Zero on a wet cell.
     pub fn inject_dust(&mut self, inj: DustInject, dt: f32) -> f32 {
         if !dust_may_lift(inj.moisture, inj.water_m) || dt <= 0.0 || inj.offer_m3_s <= 0.0 {
@@ -5524,9 +5540,14 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
+        let mut stirs = std::mem::take(&mut self.stirs);
+        if !stirs.is_empty() {
+            stirs.extend_from_slice(&pushes);
+        }
+        let wake: &[TirePush] = if stirs.is_empty() { &pushes } else { &stirs };
         // Lift from the column the tire rolls into, before the sheet shoves it.
-        if self.turbidity_enabled && dt > 0.0 && dt.is_finite() && !pushes.is_empty() {
-            self.entrain_wake(&pushes, dt);
+        if self.turbidity_enabled && dt > 0.0 && dt.is_finite() && !wake.is_empty() {
+            self.entrain_wake(wake, dt);
         }
         let wet = self.wet.active();
         if wet {
@@ -5553,7 +5574,9 @@ impl FluidCore {
             self.scour_contacts(dt);
         }
         self.cycle_stream();
-        self.step_tracers(dt, &pushes);
+        self.step_tracers(dt, wake);
+        stirs.clear();
+        self.stirs = stirs;
         self.last_pushes = pushes;
         self.feed_reach();
         self.soak_shore(dt);
@@ -6498,7 +6521,11 @@ impl FluidCore {
             turbidity: if water_m < 1.0e-5 {
                 0.0
             } else {
-                finite0(self.susp[idx] / water_m).clamp(0.0, 1.0)
+                // Wheel-lifted solids (#99) plus silt stirred by tire and
+                // shore shear (#104): one suspended load in the water.
+                ((finite0(self.susp[idx]).max(0.0) + finite0(self.turbid[idx]).max(0.0))
+                    / water_m)
+                    .clamp(0.0, 1.0)
             },
         })
     }
@@ -8227,6 +8254,8 @@ impl FluidCore {
         let mut i1 = 0usize;
         let mut j0 = res;
         let mut j1 = 0usize;
+        // One f64 sum per step: thousands of tiny f32 adds drift the ledger.
+        let mut landed_m3 = 0.0f64;
         for j in 0..res {
             for i in 0..res {
                 let idx = j * res + i;
@@ -8248,6 +8277,16 @@ impl FluidCore {
                     self.susp[idx] = 0.0;
                     continue;
                 }
+                // Grains fall out of the column at their fall speed: the flux
+                // to the bed is w_s * C, C = s / w, so a shallow film clears
+                // first and a deep pool stays cloudy longer.
+                let keep = (-dt * SUSP_FALL_M_S / w).exp();
+                let landed = s * (1.0 - keep);
+                if landed > 0.0 {
+                    landed_m3 += f64::from(landed) * f64::from(area);
+                    s -= landed;
+                    self.susp[idx] = s;
+                }
                 if s > 1.0e-8 {
                     i0 = i0.min(i);
                     i1 = i1.max(i);
@@ -8256,6 +8295,7 @@ impl FluidCore {
                 }
             }
         }
+        self.settled_suspended_m3 += landed_m3 as f32;
         if i0 > i1 {
             return;
         }
@@ -8268,9 +8308,12 @@ impl FluidCore {
         self.susp_next.copy_from_slice(&self.susp);
         self.susp_taken.fill(0.0);
         // The open sheet shoves water onto the shoulders. Solids that followed
-        // that shove left the rut near 0.20. They stay in the track column and
-        // ride the along-track film. A neighbour stops at the donor's fraction,
+        // that shove left the rut near 0.20. On a puddle they stay in the track
+        // column and ride the along-track film. A river or a swell is a real
+        // current in both axes, so there the plume rides u as well as v and
+        // spreads by eddy mixing. A neighbour stops at the donor's fraction,
         // so a thin film cannot publish 1 from a thicker cell.
+        let open = self.surface_driven();
         for j in j0..=j1 {
             for i in i0..=i1 {
                 let idx = j * res + i;
@@ -8285,44 +8328,74 @@ impl FluidCore {
                 }
                 // Clay in the same cell is a second sheet. Blending its
                 // velocity would drag the plume off the water that holds it.
-                let (_, v) = film_uv(water, 0.0, self.uw[idx], self.vw[idx], 0.0, 0.0);
-                if !v.is_finite() || v.abs() < 1.0e-5 {
-                    continue;
-                }
-                let frac = (v.abs() * dt / cell).min(0.45);
-                let give = depth * frac;
-                if give <= 1.0e-12 {
-                    continue;
-                }
-                let recv = if v > 0.0 {
-                    if j + 1 < res {
-                        Some(idx + res)
-                    } else {
-                        None
-                    }
-                } else if j > 0 {
-                    Some(idx - res)
-                } else {
-                    None
-                };
-                let Some(n) = recv else {
-                    self.settled_suspended_m3 += give * area;
-                    self.susp_next[idx] -= give;
-                    continue;
-                };
-                let wr = self.water[n];
-                if !wr.is_finite() || wr < 1.0e-5 {
-                    continue;
-                }
+                let (u, v) = film_uv(water, 0.0, self.uw[idx], self.vw[idx], 0.0, 0.0);
+                let u = if open && u.is_finite() { u } else { 0.0 };
+                let v = if v.is_finite() { v } else { 0.0 };
                 let c = depth / water;
-                let have = self.susp[n] + self.susp_taken[n];
-                let room = (c * wr - have).max(0.0);
-                let accept = give.min(room).min((wr - have).max(0.0));
-                if accept <= 1.0e-12 {
+                let mut fu = u.abs() * dt / cell;
+                let mut fv = v.abs() * dt / cell;
+                let sum = fu + fv;
+                if sum > 0.45 {
+                    fu *= 0.45 / sum;
+                    fv *= 0.45 / sum;
+                }
+                let up_i = if u > 0.0 { (i + 1 < res).then(|| idx + 1) } else { (i > 0).then(|| idx - 1) };
+                let up_j = if v > 0.0 { (j + 1 < res).then(|| idx + res) } else { (j > 0).then(|| idx - res) };
+                for (frac, recv) in [(fu, up_i), (fv, up_j)] {
+                    let give = depth * frac;
+                    if give <= 1.0e-12 {
+                        continue;
+                    }
+                    let Some(n) = recv else {
+                        self.settled_suspended_m3 += give * area;
+                        self.susp_next[idx] -= give;
+                        continue;
+                    };
+                    let wr = self.water[n];
+                    if !wr.is_finite() || wr < 1.0e-5 {
+                        continue;
+                    }
+                    let have = self.susp[n] + self.susp_taken[n];
+                    let room = (c * wr - have).max(0.0);
+                    let accept = give.min(room).min((wr - have).max(0.0));
+                    if accept <= 1.0e-12 {
+                        continue;
+                    }
+                    self.susp_next[idx] -= accept;
+                    self.susp_taken[n] += accept;
+                }
+                if !open {
                     continue;
                 }
-                self.susp_next[idx] -= accept;
-                self.susp_taken[n] += accept;
+                // Eddy mixing, K = 0.01 + 0.2 |U| h m²/s (shear-flow scale).
+                // Down the concentration gradient only, at most 0.1 per side.
+                let speed = (u * u + v * v).sqrt();
+                let k = 0.01 + 0.2 * speed * water;
+                let fd = (k * dt / (cell * cell)).min(0.1);
+                let nbrs = [
+                    (i + 1 < res).then(|| idx + 1),
+                    (i > 0).then(|| idx - 1),
+                    (j + 1 < res).then(|| idx + res),
+                    (j > 0).then(|| idx - res),
+                ];
+                for n in nbrs.into_iter().flatten() {
+                    let wr = self.water[n];
+                    if !wr.is_finite() || wr < 1.0e-5 {
+                        continue;
+                    }
+                    let cn = self.susp[n] / wr;
+                    if !(c > cn) {
+                        continue;
+                    }
+                    let give = fd * (c - cn) * water.min(wr);
+                    let have = self.susp[n] + self.susp_taken[n];
+                    let accept = give.min((wr - have).max(0.0));
+                    if accept <= 1.0e-12 {
+                        continue;
+                    }
+                    self.susp_next[idx] -= accept;
+                    self.susp_taken[n] += accept;
+                }
             }
         }
         for j in j0..=j1 {
