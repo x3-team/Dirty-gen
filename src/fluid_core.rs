@@ -537,6 +537,9 @@ struct Scratch {
     e: Vec<f32>,
     removed: Vec<f32>,
     added: Vec<f32>,
+    /// One row of left-going and right-going open fluxes for `transport_open`.
+    flux_l: Vec<f32>,
+    flux_r: Vec<f32>,
 }
 
 impl Scratch {
@@ -550,6 +553,8 @@ impl Scratch {
             e: Vec::new(),
             removed: Vec::new(),
             added: Vec::new(),
+            flux_l: Vec::new(),
+            flux_r: Vec::new(),
         }
     }
 
@@ -1310,59 +1315,88 @@ fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(
     if !allow_split || solid {
         return vec![(x0, x1, y0, y1)];
     }
-    let n = res * res;
-    MARK.with(|mark| {
-        let mut mark = mark.borrow_mut();
-        if mark.len() < n {
-            mark.resize(n, 0);
+    // Wet bodies by 4-connected runs. Each row's wet runs join the runs
+    // above that share a column. A body's box is the union of its runs and
+    // bodies come out in the raster order of their first cell, the order a
+    // raster flood fill finds them.
+    RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        let RunScratch { runs: all, parent, bbox, first } = &mut *runs;
+        all.clear();
+        parent.clear();
+        bbox.clear();
+        first.clear();
+        fn root(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                let up = parent[parent[x as usize] as usize];
+                parent[x as usize] = up;
+                x = up;
+            }
+            x
         }
-        // Every wet cell lies in the wet bounding box, so the fill and the
-        // reset only visit that box. Order of discovery is unchanged.
+        let mut prev = 0..0usize;
         for j in j0..=j1 {
-            mark[j * res + i0..=j * res + i1].fill(0);
-        }
-        let mut queue = Vec::new();
-        let mut boxes = Vec::new();
-        for j in j0..=j1 {
-            for i in i0..=i1 {
-                let s = j * res + i;
-                if h[s] <= eps || mark[s] != 0 {
+            let row = &h[j * res..j * res + res];
+            let start = all.len();
+            let mut i = i0;
+            while i <= i1 {
+                if !(row[i] > eps) {
+                    i += 1;
                     continue;
                 }
-                let (mut ci0, mut ci1, mut cj0, mut cj1) = (i, i, j, j);
-                mark[s] = 1;
-                queue.clear();
-                queue.push(s);
-                while let Some(cur) = queue.pop() {
-                    let cj = cur / res;
-                    let ci = cur - cj * res;
-                    ci0 = ci0.min(ci);
-                    ci1 = ci1.max(ci);
-                    cj0 = cj0.min(cj);
-                    cj1 = cj1.max(cj);
-                    let neigh = [
-                        if ci > 0 { Some(cur - 1) } else { None },
-                        if ci + 1 < res { Some(cur + 1) } else { None },
-                        if cj > 0 { Some(cur - res) } else { None },
-                        if cj + 1 < res { Some(cur + res) } else { None },
-                    ];
-                    for nidx in neigh.into_iter().flatten() {
-                        if mark[nidx] == 0 && h[nidx] > eps {
-                            mark[nidx] = 1;
-                            queue.push(nidx);
+                let a = i;
+                while i <= i1 && row[i] > eps {
+                    i += 1;
+                }
+                let b = i - 1;
+                let id = all.len() as u32;
+                all.push((a, b));
+                parent.push(id);
+                bbox.push((a, b, j, j));
+                first.push(j * res + a);
+                for k in prev.clone() {
+                    let (pa, pb) = all[k];
+                    if pa <= b && a <= pb {
+                        let ra = root(parent, k as u32);
+                        let rb = root(parent, id);
+                        if ra != rb {
+                            // The older run keeps the root, so its first cell
+                            // (the smaller raster index) stays the body's.
+                            let (keep, gone) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                            parent[gone as usize] = keep;
+                            let g = bbox[gone as usize];
+                            let kb = &mut bbox[keep as usize];
+                            kb.0 = kb.0.min(g.0);
+                            kb.1 = kb.1.max(g.1);
+                            kb.2 = kb.2.min(g.2);
+                            kb.3 = kb.3.max(g.3);
+                            first[keep as usize] = first[keep as usize].min(first[gone as usize]);
                         }
                     }
                 }
-                // Two blur passes of radius 2, plus the gradient, sit inside this halo.
-                const SPLIT_HALO: usize = 6;
-                boxes.push((
+            }
+            prev = start..all.len();
+        }
+        let mut bodies: Vec<(usize, (usize, usize, usize, usize))> = Vec::new();
+        for k in 0..all.len() {
+            if parent[k] == k as u32 {
+                bodies.push((first[k], bbox[k]));
+            }
+        }
+        bodies.sort_unstable_by_key(|b| b.0);
+        // Two blur passes of radius 2, plus the gradient, sit inside this halo.
+        const SPLIT_HALO: usize = 6;
+        let mut boxes: Vec<(usize, usize, usize, usize)> = bodies
+            .iter()
+            .map(|&(_, (ci0, ci1, cj0, cj1))| {
+                (
                     ci0.saturating_sub(SPLIT_HALO),
                     (ci1 + SPLIT_HALO).min(res - 1),
                     cj0.saturating_sub(SPLIT_HALO),
                     (cj1 + SPLIT_HALO).min(res - 1),
-                ));
-            }
-        }
+                )
+            })
+            .collect();
         merge_boxes(&mut boxes);
         // One body keeps the halo of 3, including a puddle with holes. Only
         // separated disks pay for their own boxes.
@@ -1413,8 +1447,16 @@ fn merge_boxes(boxes: &mut Vec<(usize, usize, usize, usize)>) {
     }
 }
 
+#[derive(Default)]
+struct RunScratch {
+    runs: Vec<(usize, usize)>,
+    parent: Vec<u32>,
+    bbox: Vec<(usize, usize, usize, usize)>,
+    first: Vec<usize>,
+}
+
 thread_local! {
-    static MARK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static RUNS: RefCell<RunScratch> = RefCell::new(RunScratch::default());
 }
 
 /// Inclusive 2D prefix. `dst` is `(n + 1)²` and starts at zero, so the
@@ -2745,6 +2787,290 @@ fn transport_open(
         );
         return;
     }
+    match bed {
+        Some(bed) => transport_open_rows::<true>(
+            h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, bed, frac_cap, sc,
+        ),
+        None => transport_open_rows::<false>(
+            h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, &[], frac_cap, sc,
+        ),
+    }
+}
+
+/// One open-flux edge, the same tests as `flux_open` after the speed and
+/// dry-bank checks. Returns 0.0 where the serial loop would skip the edge.
+/// Adding 0.0 to a removed or added sum leaves it unchanged (those sums are
+/// never -0.0), so the sums match the branchy loop bit for bit.
+#[inline(always)]
+fn open_edge_dh<const BED: bool>(
+    hd: f32,
+    hr: f32,
+    remd: f32,
+    gate_r: u8,
+    bed_d: f32,
+    bed_r: f32,
+    speed: f32,
+    dt: f32,
+    cell: f32,
+    frac_cap: f32,
+) -> f32 {
+    let live = !(speed.abs() < 1.0e-5);
+    let bank = BED && hr <= 1.0e-6 && bed_r > bed_d + hd + 1.0e-3;
+    let room = hd - remd;
+    let gate_shut = gate_r == 0 && hr <= 1.0e-6;
+    let frac = (speed.abs() * dt / cell).min(frac_cap);
+    let dh = (hd * frac).min(room);
+    let ok = live & !bank & !(room <= 1.0e-8) & !gate_shut & !(dh <= 1.0e-8);
+    if ok {
+        dh
+    } else {
+        0.0
+    }
+}
+
+/// One row pair of the column pass. Separate slices, so the compiler knows
+/// the removed and added rows of the two cells do not overlap.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn open_row_pair<const BED: bool>(
+    ha: &[f32],
+    hb: &[f32],
+    va: &[f32],
+    vb: &[f32],
+    ga: &[u8],
+    gb: &[u8],
+    ba: &[f32],
+    bb: &[f32],
+    ra: &mut [f32],
+    rb: &mut [f32],
+    aa: &mut [f32],
+    ab: &mut [f32],
+    dt: f32,
+    cell: f32,
+    frac_cap: f32,
+) {
+    let m = ha.len();
+    let (hb, va, vb, ga, gb) = (&hb[..m], &va[..m], &vb[..m], &ga[..m], &gb[..m]);
+    let (ra, rb, aa, ab) = (&mut ra[..m], &mut rb[..m], &mut aa[..m], &mut ab[..m]);
+    // Up-going first: donor b, whose removed sum is still 0.0. Then
+    // down-going: donor a, whose removed sum holds the up-going flux of the
+    // row pair above. Each cell gets its two edges in the serial order.
+    for i in 0..m {
+        let speed = 0.5 * (va[i] + vb[i]);
+        let (bd, bc) = if BED { (bb[i], ba[i]) } else { (0.0, 0.0) };
+        let dh = open_edge_dh::<BED>(hb[i], ha[i], 0.0, ga[i], bd, bc, speed, dt, cell, frac_cap);
+        let up = if speed > 0.0 { 0.0 } else { dh };
+        rb[i] += up;
+        aa[i] += up;
+    }
+    for i in 0..m {
+        let speed = 0.5 * (va[i] + vb[i]);
+        let (bd, bc) = if BED { (ba[i], bb[i]) } else { (0.0, 0.0) };
+        let dh = open_edge_dh::<BED>(ha[i], hb[i], ra[i], gb[i], bd, bc, speed, dt, cell, frac_cap);
+        let down = if speed > 0.0 { dh } else { 0.0 };
+        ra[i] += down;
+        ab[i] += down;
+    }
+}
+
+/// `transport_open` without branches in the edge loop.
+///
+/// Along a row the serial loop is ordered by edge, but an edge only reads the
+/// removed sum of its donor, and before edge k that sum holds at most the
+/// left-going flux of edge k - 1. So the left-going fluxes come first (each
+/// one only reads depths), then the right-going ones, then each cell adds its
+/// two edges in the order the serial loop did. Down a column the rows stay in
+/// order and the cells of one row pair are independent.
+#[allow(clippy::too_many_arguments)]
+fn transport_open_rows<const BED: bool>(
+    h: &mut [f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    bed: &[f32],
+    frac_cap: f32,
+    sc: &mut Scratch,
+) {
+    // The same scalar IEEE operations either way; AVX2 only widens the lanes.
+    // No FMA is enabled, so no multiply and add are fused.
+    #[cfg(target_arch = "x86_64")]
+    if avx2_cached() {
+        unsafe {
+            transport_open_rows_avx2::<BED>(
+                h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, bed, frac_cap, sc,
+            )
+        };
+        return;
+    }
+    transport_open_rows_body::<BED>(
+        h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, bed, frac_cap, sc,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+unsafe fn transport_open_rows_avx2<const BED: bool>(
+    h: &mut [f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    bed: &[f32],
+    frac_cap: f32,
+    sc: &mut Scratch,
+) {
+    transport_open_rows_body::<BED>(
+        h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, bed, frac_cap, sc,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn transport_open_rows_body<const BED: bool>(
+    h: &mut [f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    bed: &[f32],
+    frac_cap: f32,
+    sc: &mut Scratch,
+) {
+    let m = i1 + 1 - i0;
+    if along_x {
+        if sc.flux_l.len() < m {
+            sc.flux_l.resize(m, 0.0);
+            sc.flux_r.resize(m, 0.0);
+        }
+        for j in j0..=j1 {
+            let lo = j * res + i0;
+            let hi = lo + m;
+            let hr = &mut h[lo..hi];
+            let vr = &vel[lo..hi];
+            let gr = &gate[lo..hi];
+            let br: &[f32] = if BED { &bed[lo..hi] } else { &[] };
+            let fl = &mut sc.flux_l[..m];
+            let fr = &mut sc.flux_r[..m];
+            let edges = m - 1;
+            // Left-going: donor k + 1, whose removed sum is still 0.0.
+            for k in 0..edges {
+                let speed = 0.5 * (vr[k] + vr[k + 1]);
+                let (bd, bc) = if BED { (br[k + 1], br[k]) } else { (0.0, 0.0) };
+                let dh = open_edge_dh::<BED>(
+                    hr[k + 1], hr[k], 0.0, gr[k], bd, bc, speed, dt, cell, frac_cap,
+                );
+                fl[k] = if speed > 0.0 { 0.0 } else { dh };
+            }
+            // Right-going: donor k, whose removed sum is 0.0 + the left-going
+            // flux of edge k - 1.
+            for k in 0..edges {
+                let speed = 0.5 * (vr[k] + vr[k + 1]);
+                let prev = if k > 0 { fl[k - 1] } else { 0.0 };
+                let (bd, bc) = if BED { (br[k], br[k + 1]) } else { (0.0, 0.0) };
+                let dh = open_edge_dh::<BED>(
+                    hr[k], hr[k + 1], 0.0 + prev, gr[k + 1], bd, bc, speed, dt, cell, frac_cap,
+                );
+                fr[k] = if speed > 0.0 { dh } else { 0.0 };
+            }
+            fl[edges] = 0.0;
+            fr[edges] = 0.0;
+            let rem = &mut sc.removed[lo..hi];
+            let add = &mut sc.added[lo..hi];
+            // Cell c: removed = 0.0 + left-going of edge c - 1, then + right-going
+            // of edge c. Added = 0.0 + right-going of edge c - 1, then + left-going
+            // of edge c. Cell 0 has no edge on its left in this pass.
+            rem[0] = (0.0 + 0.0) + fr[0];
+            add[0] = (0.0 + 0.0) + fl[0];
+            for c in 1..m {
+                rem[c] = (0.0 + fl[c - 1]) + fr[c];
+                add[c] = (0.0 + fr[c - 1]) + fl[c];
+            }
+            // A select, not a branch, so the row vectorises. Same result per cell.
+            for ((hv, &r), &a) in hr.iter_mut().zip(rem.iter()).zip(add.iter()) {
+                let moved = (*hv - r + a).max(0.0);
+                *hv = if r > 0.0 || a > 0.0 { moved } else { *hv };
+            }
+        }
+        return;
+    }
+    for j in j0..=j1 {
+        let lo = j * res + i0;
+        sc.removed[lo..lo + m].fill(0.0);
+        sc.added[lo..lo + m].fill(0.0);
+    }
+    for j in j0..j1 {
+        let lo = j * res + i0;
+        let (top, low) = h.split_at(lo + res);
+        let ha = &top[lo..lo + m];
+        let hb = &low[..m];
+        let va = &vel[lo..lo + m];
+        let vb = &vel[lo + res..lo + res + m];
+        let ga = &gate[lo..lo + m];
+        let gb = &gate[lo + res..lo + res + m];
+        let (rem_top, rem_low) = sc.removed.split_at_mut(lo + res);
+        let ra = &mut rem_top[lo..lo + m];
+        let rb = &mut rem_low[..m];
+        let (add_top, add_low) = sc.added.split_at_mut(lo + res);
+        let aa = &mut add_top[lo..lo + m];
+        let ab = &mut add_low[..m];
+        let (ba, bb): (&[f32], &[f32]) = if BED {
+            (&bed[lo..lo + m], &bed[lo + res..lo + res + m])
+        } else {
+            (&[], &[])
+        };
+        open_row_pair::<BED>(ha, hb, va, vb, ga, gb, ba, bb, ra, rb, aa, ab, dt, cell, frac_cap);
+    }
+    for j in j0..=j1 {
+        let lo = j * res + i0;
+        let hi = lo + m;
+        for ((hv, &r), &a) in h[lo..hi]
+            .iter_mut()
+            .zip(&sc.removed[lo..hi])
+            .zip(&sc.added[lo..hi])
+        {
+            let moved = (*hv - r + a).max(0.0);
+            *hv = if r > 0.0 || a > 0.0 { moved } else { *hv };
+        }
+    }
+}
+
+#[cfg(test)]
+fn transport_open_ref(
+    h: &mut [f32],
+    vel: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    along_x: bool,
+    bed: Option<&[f32]>,
+    frac_cap: f32,
+    sc: &mut Scratch,
+) {
     for j in j0..=j1 {
         let row = j * res;
         for i in i0..=i1 {
@@ -3001,6 +3327,7 @@ fn flux_open_bufs(
     added[recv] += dh;
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn flux_open(
     h: &[f32],
@@ -5572,6 +5899,7 @@ impl FluidCore {
         self.step_pair(dt, false);
         if wet {
             self.wet_finish();
+            spray.extend(self.wet_splash(dt));
         }
         self.bed_friction(dt);
         self.diffuse_surface(dt);
@@ -10617,6 +10945,243 @@ pub fn bow_height_m(speed: f32, depth: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static REF_MARK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn sheet_work_boxes_ref(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(usize, usize, usize, usize)> {
+        let mut i0 = res;
+        let mut i1 = 0usize;
+        let mut j0 = res;
+        let mut j1 = 0usize;
+        let mut wet = 0usize;
+        for j in 0..res {
+            let row = &h[j * res..j * res + res];
+            // Count without a branch per cell; only a wet row pays for its ends.
+            let c = row.iter().map(|&x| (x > eps) as usize).sum::<usize>();
+            if c == 0 {
+                continue;
+            }
+            wet += c;
+            let first = row.iter().position(|&x| x > eps).unwrap_or(0);
+            let last = row.iter().rposition(|&x| x > eps).unwrap_or(0);
+            i0 = i0.min(first);
+            i1 = i1.max(last);
+            j0 = j0.min(j);
+            j1 = j1.max(j);
+        }
+        if wet == 0 {
+            return Vec::new();
+        }
+        let halo3 = |a0: usize, a1: usize| (a0.saturating_sub(3), (a1 + 3).min(res - 1));
+        let (x0, x1) = halo3(i0, i1);
+        let (y0, y1) = halo3(j0, j1);
+        let solid = wet == (i1 - i0 + 1) * (j1 - j0 + 1);
+        if !allow_split || solid {
+            return vec![(x0, x1, y0, y1)];
+        }
+        let n = res * res;
+        REF_MARK.with(|mark| {
+            let mut mark = mark.borrow_mut();
+            if mark.len() < n {
+                mark.resize(n, 0);
+            }
+            // Every wet cell lies in the wet bounding box, so the fill and the
+            // reset only visit that box. Order of discovery is unchanged.
+            for j in j0..=j1 {
+                mark[j * res + i0..=j * res + i1].fill(0);
+            }
+            let mut queue = Vec::new();
+            let mut boxes = Vec::new();
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let s = j * res + i;
+                    if h[s] <= eps || mark[s] != 0 {
+                        continue;
+                    }
+                    let (mut ci0, mut ci1, mut cj0, mut cj1) = (i, i, j, j);
+                    mark[s] = 1;
+                    queue.clear();
+                    queue.push(s);
+                    while let Some(cur) = queue.pop() {
+                        let cj = cur / res;
+                        let ci = cur - cj * res;
+                        ci0 = ci0.min(ci);
+                        ci1 = ci1.max(ci);
+                        cj0 = cj0.min(cj);
+                        cj1 = cj1.max(cj);
+                        let neigh = [
+                            if ci > 0 { Some(cur - 1) } else { None },
+                            if ci + 1 < res { Some(cur + 1) } else { None },
+                            if cj > 0 { Some(cur - res) } else { None },
+                            if cj + 1 < res { Some(cur + res) } else { None },
+                        ];
+                        for nidx in neigh.into_iter().flatten() {
+                            if mark[nidx] == 0 && h[nidx] > eps {
+                                mark[nidx] = 1;
+                                queue.push(nidx);
+                            }
+                        }
+                    }
+                    // Two blur passes of radius 2, plus the gradient, sit inside this halo.
+                    const SPLIT_HALO: usize = 6;
+                    boxes.push((
+                        ci0.saturating_sub(SPLIT_HALO),
+                        (ci1 + SPLIT_HALO).min(res - 1),
+                        cj0.saturating_sub(SPLIT_HALO),
+                        (cj1 + SPLIT_HALO).min(res - 1),
+                    ));
+                }
+            }
+            merge_boxes(&mut boxes);
+            // One body keeps the halo of 3, including a puddle with holes. Only
+            // separated disks pay for their own boxes.
+            if boxes.len() == 1 || boxes.len() > 8 {
+                vec![(x0, x1, y0, y1)]
+            } else {
+                boxes
+            }
+        })
+    }
+
+
+    /// The run-length wet bodies give the same work boxes, in the same order,
+    /// as the flood fill they replace.
+    #[test]
+    fn run_bodies_match_the_flood_fill() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for case in 0..400 {
+            let res = [16usize, 40, 100, FINE_RES][case % 4];
+            let mut h = vec![0.0f32; res * res];
+            let blobs = 1 + (rnd() * 12.0) as usize;
+            for _ in 0..blobs {
+                let cx = rnd() * res as f32;
+                let cz = rnd() * res as f32;
+                let r = 1.0 + rnd() * res as f32 * 0.2;
+                for j in 0..res {
+                    for i in 0..res {
+                        let dx = i as f32 - cx;
+                        let dz = j as f32 - cz;
+                        if dx * dx + dz * dz < r * r && rnd() > 0.15 {
+                            h[j * res + i] = 0.01 + rnd() * 0.1;
+                        }
+                    }
+                }
+            }
+            if case % 7 == 0 {
+                for x in h.iter_mut() {
+                    if rnd() < 0.3 {
+                        *x = 0.02;
+                    }
+                }
+            }
+            let want = sheet_work_boxes_ref(&h, res, 1.0e-4, true);
+            let got = sheet_work_boxes(&h, res, 1.0e-4, true);
+            assert_eq!(want, got, "case {case}");
+        }
+    }
+
+    /// The branch-free open transport writes the same depths and the same
+    /// removed/added sums as the serial edge loop, bit for bit.
+    #[test]
+    fn transport_open_rows_match_the_serial_edges() {
+        let mut seed = 0x2545_f491_u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for case in 0..96 {
+            let res = [12usize, 37, 64, FINE_RES][case % 4];
+            let n = res * res;
+            let mut h = vec![0.0f32; n];
+            let mut vel = vec![0.0f32; n];
+            let mut gate = vec![1u8; n];
+            let mut bed = vec![0.0f32; n];
+            for idx in 0..n {
+                let r = rnd();
+                h[idx] = if r < 0.25 {
+                    0.0
+                } else if r < 0.3 {
+                    5.0e-7
+                } else if r < 0.33 {
+                    5.0e-9
+                } else {
+                    rnd() * 0.3
+                };
+                let q = rnd();
+                vel[idx] = if q < 0.15 {
+                    0.0
+                } else if q < 0.2 {
+                    (rnd() - 0.5) * 3.0e-5
+                } else {
+                    (rnd() - 0.5) * 6.0
+                };
+                gate[idx] = (rnd() > 0.2) as u8;
+                bed[idx] = (rnd() - 0.5) * 0.05;
+            }
+            let i0 = (rnd() * 3.0) as usize;
+            let j0 = (rnd() * 3.0) as usize;
+            let i1 = res - 1 - (rnd() * 3.0) as usize;
+            let j1 = res - 1 - (rnd() * 3.0) as usize;
+            let cell = 0.02 + rnd() * 0.2;
+            let dt = 0.002 + rnd() * 0.03;
+            for along_x in [true, false] {
+                for with_bed in [false, true] {
+                    let b = if with_bed { Some(&bed[..]) } else { None };
+                    let mut h_ref = h.clone();
+                    let mut h_new = h.clone();
+                    let mut sc_ref = Scratch::new();
+                    sc_ref.fit(n);
+                    let mut sc_new = Scratch::new();
+                    sc_new.fit(n);
+                    transport_open_ref(
+                        &mut h_ref, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x, b, 0.45,
+                        &mut sc_ref,
+                    );
+                    match b {
+                        Some(bed) => transport_open_rows::<true>(
+                            &mut h_new, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x, bed,
+                            0.45, &mut sc_new,
+                        ),
+                        None => transport_open_rows::<false>(
+                            &mut h_new, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x, &[],
+                            0.45, &mut sc_new,
+                        ),
+                    }
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&h_ref), bits(&h_new), "depth case {case} x {along_x} bed {with_bed}");
+                    assert_eq!(bits(&sc_ref.removed), bits(&sc_new.removed), "removed case {case}");
+                    assert_eq!(bits(&sc_ref.added), bits(&sc_new.added), "added case {case}");
+                    // The plain build of the same loops (no AVX2) agrees too.
+                    let mut h_plain = h.clone();
+                    let mut sc_plain = Scratch::new();
+                    sc_plain.fit(n);
+                    match b {
+                        Some(bed) => transport_open_rows_body::<true>(
+                            &mut h_plain, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x,
+                            bed, 0.45, &mut sc_plain,
+                        ),
+                        None => transport_open_rows_body::<false>(
+                            &mut h_plain, &vel, &gate, res, cell, dt, i0, i1, j0, j1, along_x,
+                            &[], 0.45, &mut sc_plain,
+                        ),
+                    }
+                    assert_eq!(bits(&h_ref), bits(&h_plain), "plain depth case {case}");
+                    assert_eq!(bits(&sc_ref.removed), bits(&sc_plain.removed), "plain removed {case}");
+                    assert_eq!(bits(&sc_ref.added), bits(&sc_plain.added), "plain added {case}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn slope_accelerates_downhill() {

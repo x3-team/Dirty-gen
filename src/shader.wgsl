@@ -786,6 +786,7 @@ fn terrain_vertex(in: TerrIn) -> TerrOut {
 
 @fragment
 fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
+    tg_set_pixel_footprint(in.world.xz);
     let xz = in.world.xz;
     var n = terrain_normal(xz);
     if (win_demo_flat_terrain() && win_demo_in_pool(xz) && n.y > 0.62) {
