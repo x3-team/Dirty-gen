@@ -4613,8 +4613,8 @@ impl FluidCore {
             pond_still: vec![0; n],
             pond_eta: vec![0.0; n],
             pond_mark: vec![0.0; n],
-            pond_count_p: vec![0.0; (n + 1) * (n + 1)],
-            pond_eta_p: vec![0.0; (n + 1) * (n + 1)],
+            pond_count_p: vec![0.0; (WINDOW_RES + 1) * (WINDOW_RES + 1)],
+            pond_eta_p: vec![0.0; (WINDOW_RES + 1) * (WINDOW_RES + 1)],
             pond_needs: Vec::new(),
             pond_donors: Vec::new(),
             sheet_scratch: std::array::from_fn(|_| [Scratch::new(), Scratch::new()]),
@@ -5214,20 +5214,29 @@ impl FluidCore {
         if self.seat_etas.len() < 8 {
             return None;
         }
-        self.seat_etas
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let eta = self.seat_etas[self.seat_etas.len() / 2];
+        // The median is the same element a full sort would put there.
+        let mid = self.seat_etas.len() / 2;
+        let (_, &mut eta, _) = self
+            .seat_etas
+            .select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut excess = 0.0_f32;
         let rad = 8i32;
-        let mut floor_src = vec![0.0f32; n * n];
-        for idx in 0..n * n {
-            if self.seat_floor[idx] {
-                floor_src[idx] = 1.0;
+        let cut_wet = (0..n * n).any(|idx| self.seat_is_rut[idx] && self.water[idx] >= 0.012);
+        // Reuse the pond scratch planes: a fresh 160 KB pair per step is a
+        // calloc plus page faults. `pond_ruts` refills both before it reads them.
+        let floor_src = &mut self.pond_mark[..n * n];
+        let floor_p = &mut self.pond_count_p[..(n + 1) * (n + 1)];
+        if cut_wet {
+            for (dst, &on) in floor_src.iter_mut().zip(&self.seat_floor[..n * n]) {
+                *dst = if on { 1.0 } else { 0.0 };
             }
+            floor_p.fill(0.0);
+            prefix_plane(floor_src, n, floor_p);
         }
-        let mut floor_p = vec![0.0f32; (n + 1) * (n + 1)];
-        prefix_plane(&floor_src, n, &mut floor_p);
         for idx in 0..n * n {
+            if !cut_wet {
+                break;
+            }
             if !self.seat_is_rut[idx] || self.water[idx] < 0.012 {
                 continue;
             }
@@ -5239,7 +5248,7 @@ impl FluidCore {
             let i1 = ((i as i32 + rad).min(n as i32 - 1)) as usize;
             // A floor flag is 0 or 1, and the window holds fewer than 2^23 of them,
             // so the prefix count is exact.
-            if plane_window(&floor_p, n, i0, i1, j0, j1) <= 0.0 {
+            if plane_window(&self.pond_count_p, n, i0, i1, j0, j1) <= 0.0 {
                 continue;
             }
             // The column is measured from the pressed ground. The original
@@ -7835,6 +7844,12 @@ impl FluidCore {
                     }
                     let cidx = cj as usize * WINDOW_RES + ci as usize;
                     acc.mark(cidx);
+                    let (fw, fs) = (self.fine_water[fidx], self.fine_slurry[fidx]);
+                    // A dry fine cell adds +0.0 to every sum, which leaves it
+                    // unchanged. Only its count matters for the full-column test.
+                    if fw == 0.0 && fs == 0.0 {
+                        continue;
+                    }
                     acc.w[cidx] += self.fine_water[fidx] * fine_area;
                     acc.s[cidx] += self.fine_slurry[fidx] * fine_area;
                     acc.uw[cidx] += self.fine_uw[fidx] * self.fine_water[fidx] * fine_area;
