@@ -672,7 +672,14 @@ fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, -e.y), 0.0);
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(-e.x, e.y), 0.0);
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, e.y), 0.0);
-    c *= 0.25;
+    // A wider ring, turned 45 degrees: the march's interleaved jitter repeats
+    // over a few half-res texels, and a dense plume printed it as hatching.
+    let r = 3.0 * e;
+    var w = textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(r.x, 0.0), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv - vec2<f32>(r.x, 0.0), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(0.0, r.y), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv - vec2<f32>(0.0, r.y), 0.0);
+    c = c * 0.15 + w * 0.1;
     if (c.a < 0.002) {
         discard;
     }
