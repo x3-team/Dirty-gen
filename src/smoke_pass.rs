@@ -31,12 +31,12 @@ pub struct SmokeLook {
     pub phase_g: f32,
     pub emission: f32,
     pub ambient: f32,
-    /// Sub-grid erosion strength, 0 off.
+    /// Sub-grid curl-noise detail gain, 0 off.
     pub detail: f32,
-    /// Detail noise frequency, 1/m.
+    /// Base noise frequency, cycles per grid cell.
     pub detail_scale: f32,
-    /// Detail noise rise speed, m/s.
-    pub detail_rise: f32,
+    /// Unresolved eddy speed (|curl v| * h) that gets the full gain, m/s.
+    pub detail_ref_m_s: f32,
     /// Light a fire throws on its smoke per unit of fuel fed per second.
     pub fire_light: f32,
 }
@@ -47,10 +47,10 @@ impl Default for SmokeLook {
             albedo: Vec3::new(0.82, 0.82, 0.84),
             phase_g: 0.35,
             emission: 3.0,
-            ambient: 1.6,
-            detail: 1.0,
-            detail_scale: 8.0,
-            detail_rise: 0.9,
+            ambient: 0.6,
+            detail: 0.3,
+            detail_scale: 0.22,
+            detail_ref_m_s: 0.25,
             fire_light: 0.5,
         }
     }
@@ -129,6 +129,11 @@ impl SmokePass {
                     4,
                     wgpu::TextureSampleType::Float { filterable: false },
                     wgpu::TextureViewDimension::D2,
+                ),
+                tex(
+                    5,
+                    wgpu::TextureSampleType::Float { filterable: true },
+                    wgpu::TextureViewDimension::D3,
                 ),
             ],
         });
@@ -214,7 +219,7 @@ impl SmokePass {
         SmokeDraw {
             fire_pos,
             fire_col,
-            detail: [fires as f32, l.detail, l.detail_scale, l.detail_rise],
+            detail: [fires as f32, l.detail, l.detail_scale, l.detail_ref_m_s],
             origin: [c.origin.x, c.origin.y, c.origin.z, c.cell_m],
             size: [size.x, size.y, size.z, c.extinction_m],
             albedo: [l.albedo.x, l.albedo.y, l.albedo.z, l.phase_g],
@@ -268,6 +273,10 @@ impl SmokePass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(shadow),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.sim.flow_view),
                 },
             ],
         });

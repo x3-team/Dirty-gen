@@ -52,6 +52,9 @@ struct Params {
 @group(0) @binding(8) var<storage, read_write> div: array<f32>;
 // r soot, g temperature / 1000 K, b flame (burning fuel), a sun transmittance.
 @group(0) @binding(9) var out_tex: texture_storage_3d<rgba16float, write>;
+// xyz velocity m/s, w unresolved eddy speed |curl v| * h (m/s): drives the
+// sub-grid detail in the march.
+@group(0) @binding(10) var flow_tex: texture_storage_3d<rgba16float, write>;
 
 override SMOKE_SHADOW_STEPS: i32 = 24;
 
@@ -390,4 +393,6 @@ fn k_publish(@builtin(global_invocation_id) gid: vec3<u32>) {
     let trans = exp(-tau * P.sun.w * P.origin.w);
     let burn = s.z * (1.0 - exp(-P.decay.w * P.step.x)) / max(P.step.x, 1e-4);
     textureStore(out_tex, c, vec4<f32>(s.x, s.y / 1000.0, burn, trans));
+    let i = idx(c);
+    textureStore(flow_tex, c, vec4<f32>(vel_out[i].xyz, work[i].w * P.origin.w));
 }

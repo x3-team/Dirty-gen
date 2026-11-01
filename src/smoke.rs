@@ -73,7 +73,7 @@ impl FireSource {
             pos,
             radius: 0.45,
             fuel_s: 0.0,
-            soot_s: 0.9,
+            soot_s: 1.5,
             heat_k_s: 260.0,
             up_m_s: 1.4,
         }
@@ -205,6 +205,10 @@ pub struct GpuSmoke {
     div: wgpu::Buffer,
     texture: wgpu::Texture,
     pub view: wgpu::TextureView,
+    #[allow(dead_code)]
+    flow: wgpu::Texture,
+    /// Velocity and unresolved eddy speed, same grid as `view`.
+    pub flow_view: wgpu::TextureView,
     /// `[velocity phase][pressure phase]`.
     bind: [[wgpu::BindGroup; 2]; 2],
     pipes: Vec<wgpu::ComputePipeline>,
@@ -215,7 +219,7 @@ pub struct GpuSmoke {
 /// True when the device can run the kernels (compute + storage textures).
 pub fn supported(device: &wgpu::Device) -> bool {
     let l = device.limits();
-    l.max_storage_buffers_per_shader_stage >= 8 && l.max_storage_textures_per_shader_stage >= 1
+    l.max_storage_buffers_per_shader_stage >= 8 && l.max_storage_textures_per_shader_stage >= 2
 }
 
 impl GpuSmoke {
@@ -269,6 +273,21 @@ impl GpuSmoke {
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
+        let flow = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("smoke-flow"),
+            size: wgpu::Extent3d {
+                width: config.dims[0],
+                height: config.dims[1],
+                depth_or_array_layers: config.dims[2],
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let flow_view = flow.create_view(&Default::default());
 
         let buf = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
             binding,
@@ -303,6 +322,16 @@ impl GpuSmoke {
                 buf(8, false),
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
@@ -358,6 +387,10 @@ impl GpuSmoke {
                         binding: 9,
                         resource: wgpu::BindingResource::TextureView(&view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::TextureView(&flow_view),
+                    },
                 ],
             })
         };
@@ -394,6 +427,8 @@ impl GpuSmoke {
             div,
             texture,
             view,
+            flow,
+            flow_view,
             bind,
             pipes,
             phase: 0,

@@ -42,7 +42,8 @@ struct SmokeDraw {
     // Fire lights: position xyz, radius; colour rgb (linear, W-ish), _.
     fire_pos: array<vec4<f32>, 4>,
     fire_col: array<vec4<f32>, 4>,
-    // number of fire lights, detail strength, detail scale 1/m, rise speed m/s
+    // number of fire lights, detail gain, base noise frequency (per cell),
+    // reference eddy speed m/s
     detail: vec4<f32>,
 }
 
@@ -54,7 +55,13 @@ struct SmokeDraw {
 @group(1) @binding(3) var scene_depth: texture_depth_2d;
 @group(1) @binding(4) var shadow_tex: texture_2d<f32>;
 
+@group(1) @binding(5) var flow_vol: texture_3d<f32>;
+
 override QUALITY_SMOKE_STEPS: i32 = 64;
+// Multiple-scattering gain on the sun octaves.
+const MS_GAIN: f32 = 5.0;
+// Curl-noise octaves of sub-grid detail. 0 turns it off.
+override QUALITY_SMOKE_DETAIL: i32 = 2;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -98,37 +105,48 @@ fn blackbody(dt_k: f32) -> vec4<f32> {
     return mix(sd.lut[k], sd.lut[k + 1], x - f32(k));
 }
 
-fn hash3(p: vec3<f32>) -> f32 {
-    let q = fract(p * 0.3183099 + vec3<f32>(0.1, 0.2, 0.3)) * 17.0;
-    return fract(q.x * q.y * q.z * (q.x + q.y + q.z));
+// Curl of a vector potential made of three offset simplex noises
+// (Bridson et al. 2007, "Curl-noise for procedural fluid flow"). Divergence
+// free, so the detail swirls instead of bunching.
+fn curl_noise(q: vec3<f32>) -> vec3<f32> {
+    let a = sdnoise3(q);
+    let b = sdnoise3(q + vec3<f32>(31.416, 47.853, 12.679));
+    let c = sdnoise3(q + vec3<f32>(-19.123, 7.391, 53.749));
+    return vec3<f32>(
+        c.gradient.y - b.gradient.z,
+        a.gradient.z - c.gradient.x,
+        b.gradient.x - a.gradient.y,
+    );
 }
 
-// Value noise, 0..1.
-fn vnoise(p: vec3<f32>) -> f32 {
-    let i = floor(p);
-    let f = p - i;
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = mix(mix(hash3(i), hash3(i + vec3<f32>(1.0, 0.0, 0.0)), u.x),
-                mix(hash3(i + vec3<f32>(0.0, 1.0, 0.0)), hash3(i + vec3<f32>(1.0, 1.0, 0.0)), u.x), u.y);
-    let b = mix(mix(hash3(i + vec3<f32>(0.0, 0.0, 1.0)), hash3(i + vec3<f32>(1.0, 0.0, 1.0)), u.x),
-                mix(hash3(i + vec3<f32>(0.0, 1.0, 1.0)), hash3(i + vec3<f32>(1.0, 1.0, 1.0)), u.x), u.y);
-    return mix(a, b, u.z);
-}
-
-// Sub-grid detail. The grid resolves the column and its large rolls; below
-// one cell the edge is eroded by two octaves of noise that rise with the
-// plume (Schneider 2015 cloud erosion). Dense cores keep their density.
-fn detail_sigma(p: vec3<f32>, sigma: f32) -> f32 {
-    let k = sd.detail.y;
-    if (k <= 0.0) {
-        return sigma;
+// Sub-grid detail after Kim et al. 2008 (wavelet turbulence): the grid
+// resolves the column and its big rolls; below one cell, curl noise adds the
+// eddies the grid cannot hold, scaled by the unresolved eddy speed the solver
+// publishes (|curl v| * h) and falling off per octave by the Kolmogorov
+// spectrum, E(k) ~ k^(-5/3), so velocity ~ 2^(-5/6) per octave. Kim advects a
+// finer density grid with that velocity; here it displaces the density lookup
+// in the march instead, so the grid stays the same size.
+fn detail_offset(p: vec3<f32>, flow: vec4<f32>) -> vec3<f32> {
+    let gain = sd.detail.y;
+    if (gain <= 0.0) {
+        return vec3<f32>(0.0);
     }
-    let q = (p - vec3<f32>(0.0, frame.misc.x * sd.detail.w, 0.0)) * sd.detail.z;
-    let n = vnoise(q) * 0.65 + vnoise(q * 2.7 + vec3<f32>(3.1, 1.7, 5.3)) * 0.35;
-    // Thin smoke erodes, thick smoke barely.
-    let edge = exp(-sigma * 0.6);
-    let er = clamp((n - 0.5 * edge * k) / max(1.0 - 0.5 * edge * k, 1e-3), 0.0, 1.0);
-    return sigma * mix(1.0, er * 1.6, edge * k);
+    let h = sd.origin.w;
+    // Eddy speed relative to the reference; quiet air gets no detail.
+    // Quiet air still carries some sub-grid eddies (floor 0.4): the
+    // estimate only sees the resolved shear.
+    let e = clamp(0.4 + flow.w / max(sd.detail.w, 1e-3), 0.0, 1.5);
+    // Noise rides with the flow so the detail climbs with the plume.
+    let drift = flow.xyz * frame.misc.x;
+    var off = vec3<f32>(0.0);
+    var scale = sd.detail.z / h;
+    var amp = h;
+    for (var k: i32 = 0; k < QUALITY_SMOKE_DETAIL; k = k + 1) {
+        off = off + curl_noise((p - drift) * scale + vec3<f32>(f32(k) * 17.0)) * amp;
+        scale = scale * 2.0;
+        amp = amp * 0.5612; // 2^(-5/6)
+    }
+    return off * gain * e;
 }
 
 fn fire_light(p: vec3<f32>) -> vec3<f32> {
@@ -198,9 +216,18 @@ fn fs_smoke(in: VsOut) -> @location(0) vec4<f32> {
         }
         let t = t_near + (f32(k) + jitter) * dt;
         let p = ro + rd * t;
-        let uvw = (p - bmin) / sd.size.xyz;
-        let s = textureSampleLevel(vol, vol_samp, uvw, 0.0);
-        let sigma = detail_sigma(p, max(s.r, 0.0) * sd.size.w);
+        var uvw = (p - bmin) / sd.size.xyz;
+        var s = textureSampleLevel(vol, vol_samp, uvw, 0.0);
+        if (s.r < 1e-4 && s.b < 1e-3) {
+            continue;
+        }
+        let flow = textureSampleLevel(flow_vol, vol_samp, uvw, 0.0);
+        let off = detail_offset(p, flow);
+        if (dot(off, off) > 0.0) {
+            uvw = (p + off - bmin) / sd.size.xyz;
+            s = textureSampleLevel(vol, vol_samp, uvw, 0.0);
+        }
+        let sigma = max(s.r, 0.0) * sd.size.w;
         let flame = max(s.b, 0.0);
         if (sigma < 1e-4 && flame < 1e-3) {
             continue;
@@ -208,12 +235,13 @@ fn fs_smoke(in: VsOut) -> @location(0) vec4<f32> {
         let step_t = exp(-sigma * dt);
         // Energy-conserving: integrate the in-scatter over the step.
         let w = select(dt, (1.0 - step_t) / max(sigma, 1e-5), sigma > 1e-5);
-        // Sun: single scattering plus a softer multiple-scattering octave
-        // (Wrenninge 2015: lower extinction, flatter phase).
         let lit = scene_sun(p);
-        let ms = pow(max(s.a, 0.0), 0.25) * 0.5 * (1.0 / (4.0 * 3.14159265));
+        // Thick smoke is bright: the light that single scattering loses comes
+        // back after many bounces. Two extra octaves (Wrenninge 2015): each at
+        // half the extinction (T^0.5, T^0.25), isotropic, weighted 0.5^k * gain.
+        let ta = max(s.a, 0.0);
+        let ms = (0.5 * sqrt(ta) + 0.25 * sqrt(sqrt(ta))) * MS_GAIN * (1.0 / (4.0 * 3.14159265));
         let sun_l = frame.sun_color.rgb * lit * (s.a * phase + ms);
-        // Height above the floor darkens the sky term a little at the base.
         scat = scat + trans * sigma * w * sd.albedo.rgb * (sun_l + sky + fire_light(p));
         // Flame: the burning gas glows by its temperature.
         let bb = blackbody(s.g * 1000.0);
@@ -228,4 +256,155 @@ fn fs_smoke(in: VsOut) -> @location(0) vec4<f32> {
     let smoke = tonemap(scat / max(alpha, 1e-3)) * alpha;
     let glow = tonemap(emit);
     return vec4<f32>(min(smoke + glow, vec3<f32>(1.0)), alpha);
+}
+
+// psrdnoise3.wgsl
+
+//
+// Authors: Stefan Gustavson (stefan.gustavson@gmail.com)
+// and Ian McEwan (ijm567@gmail.com)
+// Version 2022-02-28, published under the MIT license (see below)
+//
+// Copyright (c) 2021-2022 Stefan Gustavson and Ian McEwan.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+// THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+//
+
+// Only sdnoise3 and its helpers are kept; the struct syntax is updated to
+// current WGSL (comma field separators).
+
+struct NG3 {
+	noise: f32,
+	gradient: vec3<f32>,
+};
+
+fn mod289v4f(i: vec4<f32>) -> vec4<f32> {
+	return i - floor(i / 289.0) * 289.0;
+}
+
+fn permute289v4f(i: vec4<f32>) -> vec4<f32>
+{
+	var im: vec4<f32> = mod289v4f(i);
+	return mod289v4f((im*34.0 + 10.0)*im);
+}
+
+fn sdnoise3(x: vec3<f32>) -> NG3
+{
+	let M = mat3x3<f32>(0.0, 1.0, 1.0, 1.0, 0.0, 1.0,  1.0, 1.0, 0.0);
+	let Mi = mat3x3<f32>(-0.5, 0.5, 0.5, 0.5,-0.5, 0.5, 0.5, 0.5,-0.5);
+
+	var uvw: vec3<f32>;
+	var i0: vec3<f32>;
+	var i1: vec3<f32>;
+	var i2: vec3<f32>;
+	var i3: vec3<f32>;
+	var f0: vec3<f32>;
+	var gt_: vec3<f32>;
+	var lt_: vec3<f32>;
+	var gt: vec3<f32>;
+	var lt: vec3<f32>;
+	var o1: vec3<f32>;
+	var o2: vec3<f32>;
+	var v0: vec3<f32>;
+	var v1: vec3<f32>;
+	var v2: vec3<f32>;
+	var v3: vec3<f32>;
+	var x0: vec3<f32>;
+	var x1: vec3<f32>;
+	var x2: vec3<f32>;
+	var x3: vec3<f32>;
+	
+	uvw = M * x;
+	i0 = floor(uvw);
+	f0 = uvw - i0;
+	gt_ = step(f0.xyx, f0.yzz);
+	lt_ = 1.0 - gt_;
+	gt = vec3<f32>(lt_.z, gt_.xy);
+	lt = vec3<f32>(lt_.xy, gt_.z);
+	o1 = min( gt, lt );
+	o2 = max( gt, lt );
+	i1 = i0 + o1;
+	i2 = i0 + o2;
+	i3 = i0 + vec3<f32>(1.0,1.0,1.0);
+	v0 = Mi * i0;
+	v1 = Mi * i1;
+	v2 = Mi * i2;
+	v3 = Mi * i3;
+	x0 = x - v0;
+	x1 = x - v1;
+	x2 = x - v2;
+	x3 = x - v3;
+
+	var hash: vec4<f32>;
+	var theta: vec4<f32>;
+	var sz: vec4<f32>;
+	var psi: vec4<f32>;
+	var St: vec4<f32>;
+	var Ct: vec4<f32>;
+	var sz_: vec4<f32>;
+
+	hash = permute289v4f( permute289v4f( permute289v4f( 
+		vec4<f32>(i0.z, i1.z, i2.z, i3.z ))
+		+ vec4<f32>(i0.y, i1.y, i2.y, i3.y ))
+		+ vec4<f32>(i0.x, i1.x, i2.x, i3.x ));
+	theta = hash * 3.883222077;
+	sz = hash * -0.006920415 + 0.996539792;
+	psi = hash * 0.108705628;
+	Ct = cos(theta);
+	St = sin(theta);
+	sz_ = sqrt( 1.0 - sz*sz );
+
+	var gx: vec4<f32>;
+	var gy: vec4<f32>;
+	var gz: vec4<f32>;
+
+	gx = Ct * sz_;
+	gy = St * sz_;
+	gz = sz;  
+	
+	var g0: vec3<f32>;
+	var g1: vec3<f32>;
+	var g2: vec3<f32>;
+	var g3: vec3<f32>;
+	var w: vec4<f32>;
+	var w2: vec4<f32>;
+	var w3: vec4<f32>;
+	var gdotx: vec4<f32>;
+	var n: f32;
+	
+	g0 = vec3<f32>(gx.x, gy.x, gz.x);
+	g1 = vec3<f32>(gx.y, gy.y, gz.y);
+	g2 = vec3<f32>(gx.z, gy.z, gz.z);
+	g3 = vec3<f32>(gx.w, gy.w, gz.w);
+	w = 0.5 - vec4<f32>(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3));
+	w = max(w, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+	w2 = w * w;
+	w3 = w2 * w;
+	gdotx = vec4<f32>(dot(g0,x0), dot(g1,x1), dot(g2,x2), dot(g3,x3));
+	n = 39.5 * dot(w3, gdotx);
+
+	var dw: vec4<f32> = -6.0 * w2 * gdotx;
+	var dn0: vec3<f32> = w3.x * g0 + dw.x * x0;
+	var dn1: vec3<f32> = w3.y * g1 + dw.y * x1;
+	var dn2: vec3<f32> = w3.z * g2 + dw.z * x2;
+	var dn3: vec3<f32> = w3.w * g3 + dw.w * x3;
+	var g: vec3<f32> = 39.5 * (dn0 + dn1 + dn2 + dn3);
+	
+	return NG3(n, g);
 }

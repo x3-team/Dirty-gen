@@ -23,6 +23,10 @@ origin, cell).
 | PavelDoGreat/WebGL-Fluid-Simulation | Reference for confinement strength and dissipation |
 | Bevy `volumetric_fog.wgsl` (MIT/Apache, already approved) | March: Henyey-Greenstein phase, Beer-Lambert, energy-conserving step |
 | Planck's law + CIE 1931 fit of Wyman, Sloan, Shirley (JCGT 2013) | Flame colour (`smoke::blackbody`), computed, no code taken |
+| stegu/psrdnoise `psrdnoise3.wgsl` (Gustavson, McEwan, MIT) | `sdnoise3`, simplex noise with analytic gradient, copied with its licence header into `smoke_volume.wgsl` |
+| Bridson et al. 2007, curl noise | Divergence-free detail: curl of three offset `sdnoise3` |
+| Kim et al. 2008, wavelet turbulence | Detail amplitude from the unresolved eddy speed the solver publishes, Kolmogorov 2^(-5/6) per octave |
+| Wrenninge 2015, multiple-scattering octaves | Two extra sun octaves at half extinction so thick smoke is bright |
 
 No Shadertoy code, no BoatAttack.
 
@@ -35,16 +39,19 @@ vorticity confinement, relax to wind, speed cap), divergence, 24 Jacobi
 sweeps (warm start), project, publish. Sides and top are open (wind, no soot,
 p = 0); the ground is a wall.
 
-The publish kernel writes one `rgba16float` 3D texture: soot, ΔT / 1000 K,
+The publish kernel writes two `rgba16float` 3D textures: soot, ΔT / 1000 K,
 burn rate, and the sun transmittance marched per cell (so the ray march needs
-no shadow loop of its own).
+no shadow loop of its own); and velocity plus the unresolved eddy speed
+|curl v|·h that scales the sub-grid detail.
 
 Known limits:
 
 * 24 compact Jacobi sweeps remove about half of the divergence (test
   `smoke_column_rises_in_still_air`); the rest is long-wavelength.
-* At 8 cm cells the column is softer than the UE5 reference; sub-cell detail
-  is a rising noise erosion in the march, not resolved flow.
+* Sub-cell detail is not resolved flow. Kim 2008 advects a finer density grid
+  with the synthesized eddies; here the eddies displace the density lookup in
+  the march (`QUALITY_SMOKE_DETAIL` octaves, default 2), so the grid stays at
+  8 cm. Over time the detail rides with the local velocity.
 
 ## Tests
 
@@ -65,11 +72,13 @@ Grid for the bench smoke scene: 60 × 76 × 60 = 274k cells, 8 cm.
 | Pass | medium (GTX 1660) | How |
 | --- | ---: | --- |
 | `smoke-sim` | ~1.0 ms per step, ~0.5 ms per frame at a 30 Hz step | ~32 dispatches, ~400 B DRAM traffic per cell |
-| `smoke-volume` | ~1.5 ms full res today, ~0.5 ms at half res | 64 steps, one filtered 3D fetch + 2 noise octaves per step |
+| `smoke-volume` | ~2.5 ms full res today, ~0.8 ms at half res | 64 steps; per step in smoke: 3 filtered 3D fetches + 6 simplex noises (2 curl octaves) |
 
 The 12 ms frame (docs/GPU_BUDGET.md, PR #126) is already 11.7 ms full, so
 smoke has to come out of the `dust-volume` row: a scene with smoke draws it
 in the same half-resolution march. Until that merge, `smoke-volume` runs at
 full resolution and is for stills and the bench. Knobs: grid cell,
-`jacobi_iters`, and the `QUALITY_SMOKE_STEPS` / `SMOKE_SHADOW_STEPS`
-overrides (WGSL defaults 64 / 24, both within the 64-step lint).
+`jacobi_iters`, and the `QUALITY_SMOKE_STEPS` / `QUALITY_SMOKE_DETAIL` /
+`SMOKE_SHADOW_STEPS` overrides (WGSL defaults 64 / 2 / 24, within the 64-step
+lint). Detail 1 octave on `medium` and 0 on `low` would cut the march cost
+roughly in half and to a third.
