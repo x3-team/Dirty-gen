@@ -185,7 +185,13 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
 
     // River ford with rocks (`river`) and the same ford with a swell on the
     // beach (`beach`). `stop` is seconds since the Niva started.
-    for (preset, swell) in [("river", None), ("beach", Some(silt::ford::Swell::default()))] {
+    // `river-muddy` is the same ford on a brown river: the inflow carries
+    // silt (RiverReach::inlet_turbidity), the Niva's plume adds to it.
+    for (preset, swell, silt) in [
+        ("river", None, 0.0),
+        ("river-muddy", None, RIVER_MUDDY_TURBIDITY),
+        ("beach", Some(silt::ford::Swell::default()), 0.0),
+    ] {
         let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
         if shots.is_empty() {
             continue;
@@ -196,7 +202,7 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
         renderer.niva_picture = true;
         renderer.water_column = true;
         renderer.open_water = true;
-        let mut ford = silt::ford::FordDrive::new(swell, 4.0);
+        let mut ford = silt::ford::FordDrive::new_turbid(swell, 4.0, silt);
         let dt = 1.0 / 60.0;
         for scene in shots {
             while ford.time_s < scene.stop {
@@ -247,6 +253,9 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
     }
 }
 
+/// Silt the `river-muddy` bench river carries, volume of solids per water.
+const RIVER_MUDDY_TURBIDITY: f32 = 0.08;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,7 +267,7 @@ mod tests {
         assert!(scenes.len() >= 5);
         for s in &scenes {
             assert!(
-                ["drive", "snow", "river", "beach", "wade", "missing"].contains(&s.preset.as_str()),
+                ["drive", "snow", "river", "river-muddy", "beach", "wade", "missing"].contains(&s.preset.as_str()),
                 "{}",
                 s.id
             );
