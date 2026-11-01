@@ -1784,15 +1784,16 @@ mod slurry_shapes {
 /// smaller lumps. Ledger soil is not in this mesh once it has landed: that
 /// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
-    mud_chunks_with_ground(items, None)
+    mud_chunks_with_ground(items, None, true)
 }
 
 /// Same chunks, with picture ribbons laid on the heightfield instead of a flat y.
 pub fn mud_chunks_with_ground(
     items: &[silt::particles::Particle],
     ground: Option<&silt::soil::SoilField>,
+    include_drops: bool,
 ) -> CpuMesh {
-    mud_chunks_split(items, ground, false)
+    mud_chunks_split(items, ground, false, include_drops)
 }
 
 /// Heavier slurry pieces in the spray slots are the rut ribbon on the ground.
@@ -1808,6 +1809,7 @@ pub fn mud_chunks_split(
     items: &[silt::particles::Particle],
     ground: Option<&silt::soil::SoilField>,
     spray_from_contract: bool,
+    include_drops: bool,
 ) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
@@ -1840,7 +1842,7 @@ pub fn mud_chunks_split(
                 continue;
             }
             if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 || p.kind == 9 {
-                if mesh.vertices.len() + 200 < MAX_VERTS {
+                if include_drops && mesh.vertices.len() + 200 < MAX_VERTS {
                     add_mud_drop(&mut mesh, p);
                 }
                 continue;
@@ -2116,4 +2118,152 @@ pub fn spray_from_contract(
         }
     }
     mesh
+}
+
+/// Smooth UV sphere.
+fn add_sphere(mesh: &mut CpuMesh, c: Vec3, r: f32, rot: glam::Quat, panel: f32, stacks: usize, slices: usize) {
+    let p = |i: usize, j: usize| -> Vec3 {
+        let th = i as f32 / stacks as f32 * std::f32::consts::PI;
+        let ph = j as f32 / slices as f32 * std::f32::consts::TAU;
+        rot * Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin())
+    };
+    for i in 0..stacks {
+        for j in 0..slices {
+            let (a, b, cc, d) = (p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1));
+            add_tri_smooth(mesh, c + a * r, a, c + b * r, b, c + cc * r, cc, panel, c);
+            add_tri_smooth(mesh, c + a * r, a, c + cc * r, cc, c + d * r, d, panel, c);
+        }
+    }
+}
+
+/// Smooth capsule-ish limb: a tube with a sphere at each end.
+fn add_limb(mesh: &mut CpuMesh, a: Vec3, b: Vec3, ra: f32, rb: f32, panel: f32) {
+    let axis = b - a;
+    let len = axis.length();
+    if len < 1.0e-4 {
+        return;
+    }
+    let dir = axis / len;
+    let helper = if dir.y.abs() < 0.85 { Vec3::Y } else { Vec3::X };
+    let u = dir.cross(helper).normalize();
+    let v = dir.cross(u).normalize();
+    let segs = 12;
+    let mid = (a + b) * 0.5;
+    for i in 0..segs {
+        let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+        let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+        let n0 = u * t0.cos() + v * t0.sin();
+        let n1 = u * t1.cos() + v * t1.sin();
+        add_tri_smooth(mesh, a + n0 * ra, n0, a + n1 * ra, n1, b + n1 * rb, n1, panel, mid);
+        add_tri_smooth(mesh, a + n0 * ra, n0, b + n1 * rb, n1, b + n0 * rb, n0, panel, mid);
+    }
+    add_sphere(mesh, a, ra, glam::Quat::IDENTITY, panel, 6, 10);
+    add_sphere(mesh, b, rb, glam::Quat::IDENTITY, panel, 6, 10);
+}
+
+/// Box with a rotation.
+fn add_obox(mesh: &mut CpuMesh, c: Vec3, h: Vec3, rot: glam::Quat, panel: f32) {
+    let x = rot * Vec3::X * h.x;
+    let y = rot * Vec3::Y * h.y;
+    let z = rot * Vec3::Z * h.z;
+    let faces = [
+        [c - x + y - z, c - x + y + z, c + x + y + z, c + x + y - z],
+        [c - x - y - z, c + x - y - z, c + x - y + z, c - x - y + z],
+        [c + x - y - z, c + x + y - z, c + x + y + z, c + x - y + z],
+        [c - x - y - z, c - x - y + z, c - x + y + z, c - x + y - z],
+        [c - x - y + z, c + x - y + z, c + x + y + z, c - x + y + z],
+        [c - x - y - z, c - x + y - z, c + x + y - z, c + x - y - z],
+    ];
+    for f in faces {
+        add_quad(mesh, f, panel);
+    }
+}
+
+/// Two-bone leg or arm: the joint bends toward `bend`.
+fn two_bone(root: Vec3, tip: Vec3, l1: f32, l2: f32, bend: Vec3) -> Vec3 {
+    let d = tip - root;
+    let len = d.length().clamp(1.0e-3, l1 + l2 - 1.0e-3);
+    let dir = d.normalize_or_zero();
+    let a = ((l1 * l1 + len * len - l2 * l2) / (2.0 * l1 * len)).clamp(-1.0, 1.0).acos();
+    let side = (bend - dir * bend.dot(dir)).normalize_or_zero();
+    root + (dir * a.cos() + side * a.sin()) * l1
+}
+
+/// A boulder filling a box: a rounded superellipsoid with a lumpy crown.
+/// The solver's body is still the box; this only rounds its picture.
+fn add_rock(mesh: &mut CpuMesh, c: Vec3, h: Vec3, rot: glam::Quat) {
+    let stacks = 12;
+    let slices = 20;
+    let e = 0.55;
+    let sp = |v: f32| v.signum() * v.abs().powf(e);
+    let p = |i: usize, j: usize| -> Vec3 {
+        let th = i as f32 / stacks as f32 * std::f32::consts::PI;
+        let ph = j as f32 / slices as f32 * std::f32::consts::TAU;
+        let d = Vec3::new(sp(th.sin()) * sp(ph.cos()), sp(th.cos()), sp(th.sin()) * sp(ph.sin()));
+        let lump = 1.0 + 0.07 * (3.1 * ph + 1.7 * th).sin() * (2.3 * th).sin() + 0.04 * (7.0 * ph).cos() * th.sin();
+        rot * (d * h * lump)
+    };
+    for i in 0..stacks {
+        for j in 0..slices {
+            let (a, b, cc, d) = (p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1));
+            add_tri(mesh, c + a, c + cc, c + b, 0.0);
+            add_tri(mesh, c + a, c + d, c + cc, 0.0);
+        }
+    }
+}
+
+/// Panels: 17 glossy red (buoys and balls), 0 dark stone (rocks), 47 light
+/// timber (crates), 10 grey suit (the walker, like the reference's mannequin).
+pub fn bodies_mesh(bodies: &silt::bodies::Bodies) -> CpuMesh {
+    use silt::bodies::{BodyShape, HIP_HEIGHT};
+    let mut m = CpuMesh::new();
+    for b in &bodies.items {
+        match b.shape {
+            BodyShape::Ball { r, .. } => add_sphere(&mut m, b.pos, r, b.rot, 17.0, 14, 24),
+            BodyShape::Crate { half } => {
+                if b.mass / b.volume() > 1500.0 {
+                    add_rock(&mut m, b.pos, half, b.rot);
+                } else {
+                    add_obox(&mut m, b.pos, half, b.rot, 47.0);
+                }
+            }
+        }
+    }
+    for w in &bodies.walkers {
+        let suit = 10.0;
+        let fwd2 = w.forward();
+        let fwd = Vec3::new(fwd2.x, 0.0, fwd2.y);
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let pelvis = w.pos;
+        let scale = HIP_HEIGHT / 0.92;
+        let chest = pelvis + Vec3::Y * 0.50 * scale + fwd * 0.03;
+        let neck = chest + Vec3::Y * 0.14;
+        // Legs: hip to the sole, knee forward.
+        for (k, foot) in w.feet.iter().enumerate() {
+            let side = if k == 0 { -1.0 } else { 1.0 };
+            let hip = pelvis + right * (0.10 * side);
+            let ankle = foot.pos + Vec3::Y * 0.08 - fwd * 0.04;
+            let knee = two_bone(hip, ankle, 0.46 * scale, 0.45 * scale, fwd);
+            add_limb(&mut m, hip, knee, 0.075, 0.058, suit);
+            add_limb(&mut m, knee, ankle, 0.055, 0.042, suit);
+            let fyaw = glam::Quat::from_rotation_y(foot.yaw);
+            add_obox(&mut m, foot.pos + Vec3::Y * 0.04 + fyaw * Vec3::Z * 0.03, Vec3::new(0.05, 0.04, 0.13), fyaw, suit);
+        }
+        // Torso and head.
+        add_limb(&mut m, pelvis + Vec3::Y * 0.02, chest, 0.15, 0.17, suit);
+        add_limb(&mut m, chest, neck, 0.08, 0.06, suit);
+        add_sphere(&mut m, neck + Vec3::Y * 0.13, 0.11, glam::Quat::IDENTITY, suit, 10, 16);
+        // Arms swing against the legs.
+        let swing = (w.feet[0].pos - w.feet[1].pos).dot(fwd).clamp(-0.6, 0.6);
+        for k in 0..2 {
+            let side = if k == 0 { -1.0 } else { 1.0 };
+            let shoulder = chest + right * (0.20 * side) + Vec3::Y * 0.02;
+            let reach = -swing * side * 0.45;
+            let hand = shoulder + Vec3::Y * -0.58 + fwd * reach + right * (0.06 * side);
+            let elbow = two_bone(shoulder, hand, 0.30, 0.30, -fwd + Vec3::Y * 0.1);
+            add_limb(&mut m, shoulder, elbow, 0.055, 0.045, suit);
+            add_limb(&mut m, elbow, hand, 0.042, 0.035, suit);
+        }
+    }
+    m
 }

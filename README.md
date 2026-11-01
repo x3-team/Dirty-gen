@@ -1,105 +1,95 @@
 # Silt
 
-Silt — движок грязи и бездорожья. Этот срез — короткий замкнутый грунтовый круг: несколько луж, брустверы, колея, которая остаётся, и полноприводный багги. Камера по умолчанию — фиксированный изометрический вид на весь круг. Колёса продавливают колею, след темнеет, грязь липнет к шинам и панелям, а глубокая жижа на малой скорости сажает машину.
+Silt — движок грязи, воды, снега и пыли для бездорожья. Rust + wgpu, свой солвер, никаких готовых пакетов физики. Цель — физика поверхностей, которая выглядит лучше SnowRunner и UE5-модов с жидкостью: колея с брустверами, вода на песке с пеной, речка вокруг камней, пыль за машиной, и всё из одного честного баланса объёма.
 
-The solver is ours. Soil is a heightfield, not a stock vehicle package and not a 3D SPH sim. Chassis collision only keeps the body from diving through the world; the forces in the mud come from Bekker, Janosi–Hanamoto and a Bingham-like drag.
+Демо-машина — Лада Нива. План продукта и вехи (M0–M5) лежат в документе CPO, ссылка в описании проекта.
 
-## Build and run
+## Что внутри
 
-Rust 1.85 or newer (the repo pins 1.99.1 via `rust-toolchain.toml` when rustup is installed).
+- **Грунт** (`src/soil.rs`). Поле высот 40 м с колеёй, бруствером, влажностью и коркой. Погружение по Беккеру, сцепление по Яноши–Ханамото, вязкое сопротивление жижи как у тела Бингама. Колея — это смещённая сетка, не декаль.
+- **Вода и жижа** (`src/fluid_core.rs`). Двухслойный мелководный лист (вода и жижа) в окне 40 м вокруг Нивы, ячейка 20 см, под шинами вложенный лист 2 см. Берег, бурун, брызги, пена, мутность.
+- **Пыль и туман** (`src/dust.rs`). Воздушная сетка 128 × 8 × 128 над окном: ветер, след машины, оседание пыли на грунт и воду.
+- **Снег** (`src/snow.rs`). Слой с плотностью и уплотнением: колея, бруствер, срез днищем.
+- **Нива** (`src/niva.rs`, `src/vehicle.rs`, `src/adhesion.rs`). Подвеска под нагрузку Беккера, налипание грязи на шины, арки и кузов.
+- **Баланс объёма.** Вода, жижа, грунт, взвесь и пыль ведутся в одной книге (`ledger()`). Ничего не появляется и не исчезает: тесты проверяют разрыв баланса на каждом сценарии.
+
+## Контракт рендера
+
+Физика и картинка общаются только через контракт: набор GPU-карт, которые солвер публикует после шага. Шейдеры читают карты и ничего не рисуют «от руки». Полное описание, форматы и журнал версий: [`docs/RENDER_CONTRACT.md`](docs/RENDER_CONTRACT.md).
+
+| Binding | Карта | Что в ней |
+| --- | --- | --- |
+| 1 | `ground_rut` | грунт, колея, ложе, насыпанное |
+| 2 | `moisture` | влажность пор |
+| 3 | `film` | вода и жижа, м |
+| 4 | `flow` | скорость потока, модуль, мутность (бит 11) |
+| 5 | `dust_settled` | осевшая пыль |
+| 6 | `dust_fog` | пыль в воздухе (3D) |
+| 7 | `crust` | толщина корки и раскрытие трещин |
+| 8 | `wet_edge` | мокрый край |
+| 9 | `foam_crest` | пена и гребни |
+| 10 | `spray` | брызги (буфер частиц) |
+| 11 | `air_velocity` | ветер (3D) |
+| 12 | `fog` | водяной туман (3D, бит 13) |
+| 13 | `soil_mix` | доли глины, песка, гравия, травы (бит 12) |
+| 14 | `snow` | высота, плотность, уплотнение снега (бит 14) |
+
+Версия — константа `RENDER_CONTRACT_VERSION` в `src/render_contract.rs` и `src/render_contract.wgsl`. Каждая карта включается своим битом в `header.valid`. Новый канал, единица или разрешение — это новая версия и строка в журнале.
+
+## Сборка и запуск
+
+Rust из `rust-toolchain.toml` (1.99.1).
 
 ```bash
 cargo run --release
 ```
 
-That opens a window. On a machine with no discrete GPU, lavapipe can drive an offscreen capture. `--software` points Vulkan at lavapipe when that ICD is installed and clears `DISPLAY` so a broken X server is not picked up:
+Окно открывает демо-круг. Управление: W/S газ и тормоз, A/D руль, C камера погони, Q/E/R/F орбита, V сменить машину, Backspace вернуть машину, Esc выход.
+
+Без видеокарты кадры пишет lavapipe (`apt-get install mesa-vulkan-drivers`):
 
 ```bash
-cargo run --release -- capture --software \
-  --width 1280 --height 720 --fps 30 --seconds 12 \
-  --video mud-demo.mp4 \
-  --still-start mud-demo-start.png \
-  --still-puddle mud-demo-puddle.png \
-  --still-ruts mud-demo-ruts.png
+cargo run --release -- capture --software --through-drive
 ```
 
-`--stills-only` jumps the same scripted drive and writes just the three stills. The script is deterministic: idle on the gate, then one lap that crosses a puddle, crests a berm, and leaves the rut in view. Tests use the same inputs. The capture camera is the fixed isometric frame.
+`--through-drive` — приёмочный проезд Нивы: лужа, колея, пыль на выезде. Другие сцены: `--snow-ruts-proof`, `--snow-belly-proof`, `--water-crossing-proof`, `--drying-crust-proof`, `--slurry-proof` и остальные флаги из `src/main.rs`.
+
+Браузер (WebGPU, иначе WebGL2): `trunk serve --release`, страница http://127.0.0.1:8080. Сборка для GitHub Pages — `.github/workflows/pages.yml`.
+
+## Производительность и качество
+
+Цель: 60 FPS при 1920×1080 на GTX 1660 / RTX 3050 / RX 6600 (пресет `medium`). Пресеты `low|medium|high` задаются через `SILT_QUALITY`, `silt --quality low` или `?quality=low` в браузере. В окне F4 переключает пресет, F3 показывает оверлей: FPS, время CPU и GPU по каждому проходу против бюджета.
+
+Бенчмарк на своей видеокарте: `scripts\bench.ps1` (Windows) или `scripts/bench.sh`. Он пишет результаты в `bench-results/summary.txt`. Бюджеты и CI-проверка описаны в [docs/GPU_BUDGET.md](docs/GPU_BUDGET.md).
+
+## Тесты и perf-капы
 
 ```bash
-cargo test
+cargo test --lib
+cargo test --test creek --test puddle_rut --test puddle_shore --test e2e_niva
+cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
 ```
 
-`scripted_drive` checks that the lap cuts a deeper rut, puts mud on the body, throws splash, and slows in the soft water. Stopping in the infield pond and spinning digs the buggy in.
+Release-капы одинаковы на любом раннере и не поднимаются: кадр солвера ≤ 7 мс, сумма подсистем проезда ≤ 7 мс, p95 проезда ≤ 7 мс, пыль ≤ 1 мс, средний шаг e2e ≤ 11.82 мс, воздух ≤ 1.5 мс. Если кап не проходит, ускоряется солвер, а не меняется число. Подробно: [`docs/PERF_BUDGET.md`](docs/PERF_BUDGET.md).
 
-## Controls
+CI запускается один раз на обновление PR (`.github/workflows/ci.yml`), документация в `docs/**/*.md` его не запускает.
 
-| Key | Action |
-| --- | --- |
-| W / Up | Throttle |
-| S / Down | Brake, then reverse once the buggy is slow |
-| A / Left, D / Right | Steer |
-| V | Switch which vehicle the pedals drive. The other one keeps riding the lap |
-| C | Toggle the chase camera. The default is a fixed isometric view of the loop. Chase follows whichever vehicle V selected |
-| Q / E | Orbit the chase camera |
-| R / F | Raise / lower the chase camera |
-| Esc | Quit |
+## SBS-стенд
 
-The isometric camera stays put so the whole loop, the puddles and the rut read at once. The chase camera follows the vehicle selected with V.
+Каждая сцена сравнивается с референсом бок о бок: слева Silt, справа референс, одна камера. Виталий ставит каждой паре оценку от 1 до 5, цель вертикального среза — 4 и выше. Стенд сравнения с UE5: `capture --bench`, `tools/bench_sbs.py`, описание в [`docs/UE5_BENCH.md`](docs/UE5_BENCH.md).
 
-Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
+## Структура
 
-## Браузер
+- `src/soil.rs` — поле высот, колея, влажность, корка
+- `src/fluid_core.rs` — лист воды и жижи, окно Нивы, баланс
+- `src/dust.rs` — пыль и туман на воздушной сетке
+- `src/snow.rs` — снег
+- `src/render_contract.rs`, `src/render_contract.wgsl` — контракт рендера
+- `src/world.rs` — связка подсистем, сцены и приёмочный проезд
+- `src/render.rs`, `src/shader.wgsl`, `src/mesh.rs` — wgpu-рендер
+- `tests/` — сценарии с балансом и perf-капами
+- `docs/` — контракт и perf-бюджет
 
-Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. Пока не нажата педаль, багги и мотоцикл сами едут круг. Первая клавиша газа, тормоза или руля забирает выбранную машину; вторая продолжает круг. V переключает, кого ведёте. Скорость на западной прямой (справа в этом виде) по-прежнему срывает машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.
+## Как идёт работа
 
-Нужен [trunk](https://trunkrs.dev/). Из корня репозитория:
-
-```bash
-trunk serve --release
-```
-
-Страница: http://127.0.0.1:8080 . Сборка без `--release` слишком медленная, чтобы набрать скорость на гребень. Кликните по сцене, иначе клавиши уходят странице.
-
-| Клавиша | Действие |
-| --- | --- |
-| W / ↑ | газ |
-| S / ↓ | тормоз, затем задний ход |
-| A / ←, D / → | руль |
-| V | кого ведёте: багги или кроссовый мотоцикл. Вторая машина продолжает круг |
-| C | камера погони. По умолчанию изометрия. Погоня следует за выбранной машиной |
-| Q / E | орбита камеры погони |
-| R / F | выше / ниже |
-| Esc | выход |
-
-Адрес с `?gl` принудительно включает WebGL2.
-
-## What the soil does
-
-The field is a grid (40 m, 192 cells on a side). Each cell stores height, loose mud, wetness and water depth.
-
-- **Bekker** pressure–sinkage turns wheel load into how far the tire sinks. Wetter, looser ground has a smaller modulus, so the same weight sinks further.
-- **Janosi–Hanamoto** shear is the traction. It saturates with slip. On firm ground a simple tire curve still does most of the work; once the rut is deep, the soil term takes over.
-- **Slip-sinkage** digs a plastic rut. A rolling tire leaves that groove in the heightfield after it has passed — a pair of darker floors with the cut soil piled as a lighter berm on each shoulder. Spinning in a puddle digs deeper. The rut stays. It is the displaced mesh, not a decal.
-- **Bingham-like drag** is why low speed bogs. Fresh mud resists, but a spinning tire can still creep. Viscosity is what kills speed when you hit the water with momentum. If you stop in the deep part and keep the throttle in, the tire digs a hole and the lip of that hole holds the buggy. Reverse while you are still rolling and you can leave.
-- **Tracks** darken the albedo and change roughness along the contact patch. That is stored in the field, not a decal. The groove in the picture is the heightfield mesh the stamp actually lowered, and the berm it piled beside the cut. After the buggy has passed, one groove runs along each side of the path it drove: a darker floor a few centimetres down, and a lighter berm of the soil pushed aside. The tires cut deeper where they slip in the water. That is the depth the camera shows. Carrying speed over the west-straight crest launches the buggy, rotates it in the air, and the landing digs a crater and throws the live splash. The splash is a few large mud clumps with volume, plus smaller droplets. They arc, then sit in the crater as dark glossy mud, not stones. Flat cards are not drawn. The rut floor and the soil around a puddle carry a wet sheen. The water is dark muddy brown in the middle and lighter muddy brown at the shore, with a quiet reflection. The same crest does it for the player. No key.
-- **Shallow water** is a small pipe scheme. The puddle wets the cells under it. A wheel throws that water forward and raises splash particles.
-- **Moisture** moves on its own clock. Wet clay dries toward a crust; rain or standing water turns that crust back into wet clay. Gravel keeps draining. Sand and silt stay their own soils. Grip, sink, and stickiness follow the pore moisture. Drying does not move the cut or the berm.
-- **Adhesion** is an ODE on each tire and on a handful of body panels (nose, sides, belly, fenders, and so on). Pickup grows with slip and speed, mass drips off, and the panel state drives the mud mask: clumps and streaks, not one flat brown multiply.
-
-The buggy is a short-travel 4x4: four wheels, a spring matched to the Bekker load, equal drive torque, steer on the front axle. The picture is a procedural open-wheel frame — cage, seats, arms and coil springs that shorten with the spring travel and hang at droop in the air. It is not a multibody A-arm model.
-
-A motocross bike runs the same loop, just inside the buggy's line. It is the same soil — Bekker, Janosi–Hanamoto, the wheel stamp, and the crest launch — on a lighter chassis with a front fork and a rear shock. Those shorten when the tire loads and hang at droop in the air. The crest flips it and the landing throws the same wet clumps. V hands it the pedals. The isometric camera stays the default.
-
-`.github/workflows/pages.yml` builds that page with `trunk build --release`. https://x3-team.github.io/Dirty-gen/ is the project address once Pages is enabled and the source is GitHub Actions.
-
-## Not in this slice
-
-A race mode, a track editor, menus, multiplayer, and a large world are intentionally absent. The field is one short loop — a few puddles, low berms, and the ground around them — so the soil model can be seen running in real time.
-
-## Layout
-
-- `src/soil.rs` — heightfield, Bekker, Janosi, water, rut stamp
-- `src/vehicle.rs` — buggy, suspension, tire / terramechanics blend, mud ODE
-- `src/particles.rs` — splash, clods, drips
-- `src/world.rs` — coupling and the scripted demo
-- `src/render.rs`, `src/shader.wgsl`, `src/mesh.rs` — wgpu forward renderer
+Ветки физики и рендера разделены: физика публикует поля в контракт, рендер их читает. Изменения только через PR, в `main` вливается после зелёного CI.

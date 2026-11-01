@@ -66,7 +66,18 @@ pub fn load() -> NivaScene {
         scale_mesh(mesh, unit);
     }
     let wheels = fit_to_hardpoints(&mut body, &mut glass, raw_wheels);
-    let (base, nor, mr) = textures(&doc, bin);
+    let (mut base, mut nor, mut mr) = textures(&doc, bin);
+    // Quality cap: 8 layers x 3 maps at 4096 are ~2 GiB with mips. `medium`
+    // keeps 2048 (~0.5 GiB), `low` 1024. Captures stay on `high`.
+    let cap = silt::quality::active().max_texture_side.min(TEX);
+    if cap < TEX {
+        for tex in base.iter_mut().chain(nor.iter_mut()).chain(mr.iter_mut()) {
+            while tex.width > cap && tex.width % 2 == 0 && tex.height % 2 == 0 {
+                *tex = halve(tex);
+            }
+        }
+        eprintln!("niva maps downsampled to {cap} (quality cap)");
+    }
     let (bmin, bmax) = mesh_bounds(&body);
     let ext = bmax - bmin;
     eprintln!(
@@ -88,6 +99,31 @@ pub fn load() -> NivaScene {
         base,
         nor,
         mr,
+    }
+}
+
+/// 2x2 box filter. The normal map is averaged in its encoded form; at one
+/// halving that bias is under a degree.
+fn halve(tex: &RgbaTex) -> RgbaTex {
+    let (w, h) = (tex.width / 2, tex.height / 2);
+    let sw = tex.width as usize;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            for c in 0..4 {
+                let at = |xx: usize, yy: usize| tex.rgba[(yy * sw + xx) * 4 + c] as u32;
+                let sum = at(2 * x, 2 * y)
+                    + at(2 * x + 1, 2 * y)
+                    + at(2 * x, 2 * y + 1)
+                    + at(2 * x + 1, 2 * y + 1);
+                rgba[(y * w as usize + x) * 4 + c] = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+    RgbaTex {
+        width: w,
+        height: h,
+        rgba,
     }
 }
 
