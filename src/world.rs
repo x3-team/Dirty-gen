@@ -4225,7 +4225,8 @@ impl DriveParts {
 pub struct ThroughDrive {
     pub world: World,
     pub fluid: FluidCore,
-    dust: crate::dust::Dust,
+    /// Out only while [`ThroughDrive::step`] runs the air beside the ground.
+    dust: Option<crate::dust::Dust>,
     chassis_z: f32,
     coat: DriveCoat,
     pub report: ThroughReport,
@@ -4282,7 +4283,7 @@ impl ThroughDrive {
         Self {
             world,
             fluid,
-            dust,
+            dust: Some(dust),
             chassis_z: -20.0,
             coat: DriveCoat {
                 removed: 0.0,
@@ -4317,7 +4318,7 @@ impl ThroughDrive {
 
     /// Dust ledger attached to this pass. The render contract reads it.
     pub fn dust(&self) -> &crate::dust::Dust {
-        &self.dust
+        self.dust.as_ref().expect("dust is home between steps")
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -4334,18 +4335,216 @@ impl ThroughDrive {
             .items
             .retain(|p| p.kind != KIND_DUST_MARK);
         other_ms += tick.ms();
+        // The pads read only the chassis position, and nothing below reads the
+        // dust until the picture. The air grid steps beside the ground work.
+        let mut plan: Vec<(f32, f32)> = Vec::with_capacity(4);
         let mut left = dt.max(0.0);
         let sub = 1.0 / 60.0;
         while left > 1.0e-6 {
             let h = left.min(sub);
-            let tick = ProfTick::start();
-            self.advance_dust(h);
-            let wall = tick.ms();
-            let air = self.dust.last_air_ms() as f64;
-            air_ms += air;
-            dust_ms += (wall - air).max(0.0);
+            plan.push((self.chassis_z, h));
+            self.chassis_z += 8.0 * h;
             left -= h;
         }
+        let mut dust = self.dust.take().expect("dust is home between steps");
+        let run_dust = |dust: &mut crate::dust::Dust| -> (f64, f64) {
+            let mut air_ms = 0.0;
+            let mut dust_ms = 0.0;
+            for &(chassis_z, h) in &plan {
+                let tick = ProfTick::start();
+                drive_dust_pads(dust, chassis_z, h);
+                let wall = tick.ms();
+                let air = dust.last_air_ms() as f64;
+                air_ms += air;
+                dust_ms += (wall - air).max(0.0);
+            }
+            (air_ms, dust_ms)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let ((air, dust_part), (soil_part, other_part)) = {
+            let mut dust_out = (0.0, 0.0);
+            let ground = drive_dust_pool().in_place_scope(|s| {
+                s.spawn(|_| dust_out = run_dust(&mut dust));
+                self.step_ground(dt)
+            });
+            (dust_out, ground)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let ((air, dust_part), (soil_part, other_part)) = {
+            let dust_out = run_dust(&mut dust);
+            (dust_out, self.step_ground(dt))
+        };
+        self.dust = Some(dust);
+        air_ms += air;
+        dust_ms += dust_part;
+        soil_ms += soil_part;
+        other_ms += other_part;
+        let tick = ProfTick::start();
+        self.paint_dust_picture();
+        other_ms += tick.ms();
+        let tick = ProfTick::start();
+        self.note_rut();
+        self.seat_tires_in_ruts();
+        soil_ms += tick.ms();
+        let tick = ProfTick::start();
+        let dust_books = self.dust().ledger();
+        self.report.dust_injected_m3 = dust_books.emitted_m3;
+        self.report.dust_air_m3 = dust_books.dust_air_m3;
+        self.report.dust_settled_m3 = dust_books.dust_settled_m3;
+        self.dust_in = dust_books.emitted_m3;
+        self.report.removed_m3 = self.coat.removed;
+        self.report.stuck_m3 = self.coat.stuck;
+        self.report.shed_m3 = self.coat.shed;
+        other_ms += tick.ms();
+        let sheets = self.fluid.sheet_times();
+        dust_ms += sheets.dust_ms;
+        let total_ms = total.ms();
+        self.last_parts = DriveParts {
+            water_ms: sheets.water_ms,
+            slurry_ms: sheets.slurry_ms,
+            soil_ms,
+            air_ms,
+            dust_ms,
+            restrict_ms: sheets.restrict_ms,
+            window_ms: sheets.window_ms,
+            prep_ms: sheets.prep_ms,
+            sheet_rest_ms: sheets.rest_ms,
+            other_ms,
+            total_ms,
+            window_hash: sheets.window_hash,
+        };
+    }
+
+    /// One ribbon in each rut. The head stays at the rear tire while the car
+    /// is in the water and the slurry, and the tail stays where the ribbon
+    /// started, so the strip lies in the track instead of a row of blocks.
+    fn lay_rut_ribbons(&mut self) {
+        let z = self.chassis_z;
+        if !(-18.8..-1.2).contains(&z) {
+            return;
+        }
+        for tire in crate::dust::tires_at(z, 8.0, 1.6) {
+            // Rear hubs only. The front tires share these two ruts.
+            if tire.index < 2 {
+                continue;
+            }
+            self.lay_one_rut_ribbon(tire.contact.x, tire.contact.z);
+        }
+    }
+
+    fn lay_one_rut_ribbon(&mut self, x: f32, head_z: f32) {
+        const LEFT: u32 = 0x71B0_0001;
+        const RIGHT: u32 = 0x71B0_0002;
+        let mark = if x < 0.0 { LEFT } else { RIGHT };
+        let mut ground = self.world.soil.sample(x, head_z).height;
+        if ground < 0.05 {
+            ground = 0.35;
+        }
+        if let Some(p) = self
+            .world
+            .particles
+            .items
+            .iter_mut()
+            .find(|p| p.alive && p.seed == mark)
+        {
+            let tail = p.spin.x;
+            p.pos = Vec3::new(x, ground, head_z);
+            p.vel = Vec3::new(0.0, 0.0, -1.0);
+            p.size = (head_z - tail).max(0.7);
+            p.life = 40.0;
+            p.max_life = 40.0;
+            p.grounded = true;
+            p.deposited = true;
+            p.ledger = false;
+            p.volume = 0.0024;
+            p.kind = crate::particles::KIND_SLURRY_RIBBON;
+            return;
+        }
+        self.world.particles.spawn(
+            Vec3::new(x, ground, head_z),
+            Vec3::new(0.0, 0.0, -1.0),
+            40.0,
+            0.7,
+            crate::particles::KIND_SLURRY_RIBBON,
+        );
+        if let Some(p) = self.world.particles.items.last_mut() {
+            p.seed = mark;
+            p.spin = Vec3::new(head_z, 0.0, 0.0);
+            p.ledger = false;
+            p.volume = 0.0024;
+            p.grounded = true;
+            p.deposited = true;
+            p.size = 0.7;
+        }
+    }
+
+    fn coat_body(&mut self, amount: f32) {
+        let amount = amount.clamp(0.0, 1.0);
+        let mass = amount * PANEL_MUD_CAP;
+        for panel in &mut self.world.vehicle.panels {
+            panel.mass = panel.mass.max(mass);
+            panel.wet = panel.wet.max(amount);
+            panel.drip = panel.drip.max(amount * 0.85);
+            panel.streak = panel.streak.max(amount * 0.6);
+        }
+        for wheel in &mut self.world.vehicle.wheels {
+            wheel.mud = wheel.mud.max(amount * 1.2);
+            wheel.smear = wheel.smear.max(amount * 0.8);
+            wheel.sidewall = wheel.sidewall.max(amount * 0.75);
+            wheel.groove = wheel.groove.max(amount * 0.7);
+        }
+    }
+
+    /// Air-grid dust as a soft cloud, and settled dust as a film on the wet track.
+    /// Marks are not a volume. `advance_dust` already booked the metres.
+    fn paint_dust_picture(&mut self) {
+        let mut tex = crate::dust::DensityTexture::empty();
+        self.dust().publish(&mut tex);
+        let z_car = self.chassis_z;
+        if z_car < 0.6 {
+            return;
+        }
+        let mut splats = tex.splats(0.00008);
+        splats.retain(|(p, _)| p.z < z_car - 0.3 && p.z > z_car - 12.0 && p.y > 0.05 && p.y < 1.9);
+        if splats.is_empty() {
+            return;
+        }
+        let mut mass = 0.0_f32;
+        let mut sx = 0.0_f32;
+        let mut sy = 0.0_f32;
+        for (p, v) in &splats {
+            mass += *v;
+            sx += p.x * *v;
+            sy += p.y * *v;
+        }
+        let cx = if mass > 0.0 { sx / mass } else { 0.8 };
+        let cy = if mass > 0.0 {
+            (sy / mass).clamp(0.35, 1.05)
+        } else {
+            0.55
+        };
+        // One trail behind the car, shifted to +X with the wind. Marks overlap
+        // and shrink, so the tail fades. Two large cards read as two discs.
+        let wind = Vec3::new(1.5, 0.04, -0.9);
+        let n = 18u32;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let pos = Vec3::new(
+                0.55 + cx * 0.45 + t * 2.8,
+                0.38 + cy * 0.22 * (1.0 - t * 0.65),
+                z_car - 2.4 - t * 7.2,
+            );
+            let size = 0.70 * (1.0 - t).powf(0.55) + 0.12;
+            self.world
+                .particles
+                .spawn(pos, wind, 1.0, size, KIND_DUST_MARK);
+        }
+    }
+
+    /// Ground, sheets, and particles for one drive step. Returns soil and other ms.
+    fn step_ground(&mut self, dt: f32) -> (f64, f64) {
+        let mut soil_ms = 0.0;
+        let mut other_ms = 0.0;
         let tick = ProfTick::start();
         let z = self.chassis_z;
         self.world.vehicle.pos.x = 0.0;
@@ -4498,182 +4697,8 @@ impl ThroughDrive {
             true
         });
         self.lay_rut_ribbons();
-        self.paint_dust_picture();
         other_ms += tick.ms();
-        let tick = ProfTick::start();
-        self.note_rut();
-        self.seat_tires_in_ruts();
-        soil_ms += tick.ms();
-        let tick = ProfTick::start();
-        let dust_books = self.dust.ledger();
-        self.report.dust_injected_m3 = dust_books.emitted_m3;
-        self.report.dust_air_m3 = dust_books.dust_air_m3;
-        self.report.dust_settled_m3 = dust_books.dust_settled_m3;
-        self.dust_in = dust_books.emitted_m3;
-        self.report.removed_m3 = self.coat.removed;
-        self.report.stuck_m3 = self.coat.stuck;
-        self.report.shed_m3 = self.coat.shed;
-        other_ms += tick.ms();
-        let sheets = self.fluid.sheet_times();
-        dust_ms += sheets.dust_ms;
-        let total_ms = total.ms();
-        self.last_parts = DriveParts {
-            water_ms: sheets.water_ms,
-            slurry_ms: sheets.slurry_ms,
-            soil_ms,
-            air_ms,
-            dust_ms,
-            restrict_ms: sheets.restrict_ms,
-            window_ms: sheets.window_ms,
-            prep_ms: sheets.prep_ms,
-            sheet_rest_ms: sheets.rest_ms,
-            other_ms,
-            total_ms,
-            window_hash: sheets.window_hash,
-        };
-    }
-
-    /// One ribbon in each rut. The head stays at the rear tire while the car
-    /// is in the water and the slurry, and the tail stays where the ribbon
-    /// started, so the strip lies in the track instead of a row of blocks.
-    fn lay_rut_ribbons(&mut self) {
-        let z = self.chassis_z;
-        if !(-18.8..-1.2).contains(&z) {
-            return;
-        }
-        for tire in crate::dust::tires_at(z, 8.0, 1.6) {
-            // Rear hubs only. The front tires share these two ruts.
-            if tire.index < 2 {
-                continue;
-            }
-            self.lay_one_rut_ribbon(tire.contact.x, tire.contact.z);
-        }
-    }
-
-    fn lay_one_rut_ribbon(&mut self, x: f32, head_z: f32) {
-        const LEFT: u32 = 0x71B0_0001;
-        const RIGHT: u32 = 0x71B0_0002;
-        let mark = if x < 0.0 { LEFT } else { RIGHT };
-        let mut ground = self.world.soil.sample(x, head_z).height;
-        if ground < 0.05 {
-            ground = 0.35;
-        }
-        if let Some(p) = self
-            .world
-            .particles
-            .items
-            .iter_mut()
-            .find(|p| p.alive && p.seed == mark)
-        {
-            let tail = p.spin.x;
-            p.pos = Vec3::new(x, ground, head_z);
-            p.vel = Vec3::new(0.0, 0.0, -1.0);
-            p.size = (head_z - tail).max(0.7);
-            p.life = 40.0;
-            p.max_life = 40.0;
-            p.grounded = true;
-            p.deposited = true;
-            p.ledger = false;
-            p.volume = 0.0024;
-            p.kind = crate::particles::KIND_SLURRY_RIBBON;
-            return;
-        }
-        self.world.particles.spawn(
-            Vec3::new(x, ground, head_z),
-            Vec3::new(0.0, 0.0, -1.0),
-            40.0,
-            0.7,
-            crate::particles::KIND_SLURRY_RIBBON,
-        );
-        if let Some(p) = self.world.particles.items.last_mut() {
-            p.seed = mark;
-            p.spin = Vec3::new(head_z, 0.0, 0.0);
-            p.ledger = false;
-            p.volume = 0.0024;
-            p.grounded = true;
-            p.deposited = true;
-            p.size = 0.7;
-        }
-    }
-
-    fn coat_body(&mut self, amount: f32) {
-        let amount = amount.clamp(0.0, 1.0);
-        let mass = amount * PANEL_MUD_CAP;
-        for panel in &mut self.world.vehicle.panels {
-            panel.mass = panel.mass.max(mass);
-            panel.wet = panel.wet.max(amount);
-            panel.drip = panel.drip.max(amount * 0.85);
-            panel.streak = panel.streak.max(amount * 0.6);
-        }
-        for wheel in &mut self.world.vehicle.wheels {
-            wheel.mud = wheel.mud.max(amount * 1.2);
-            wheel.smear = wheel.smear.max(amount * 0.8);
-            wheel.sidewall = wheel.sidewall.max(amount * 0.75);
-            wheel.groove = wheel.groove.max(amount * 0.7);
-        }
-    }
-
-    /// Air-grid dust as a soft cloud, and settled dust as a film on the wet track.
-    /// Marks are not a volume. `advance_dust` already booked the metres.
-    fn paint_dust_picture(&mut self) {
-        let mut tex = crate::dust::DensityTexture::empty();
-        self.dust.publish(&mut tex);
-        let z_car = self.chassis_z;
-        if z_car < 0.6 {
-            return;
-        }
-        let mut splats = tex.splats(0.00008);
-        splats.retain(|(p, _)| p.z < z_car - 0.3 && p.z > z_car - 12.0 && p.y > 0.05 && p.y < 1.9);
-        if splats.is_empty() {
-            return;
-        }
-        let mut mass = 0.0_f32;
-        let mut sx = 0.0_f32;
-        let mut sy = 0.0_f32;
-        for (p, v) in &splats {
-            mass += *v;
-            sx += p.x * *v;
-            sy += p.y * *v;
-        }
-        let cx = if mass > 0.0 { sx / mass } else { 0.8 };
-        let cy = if mass > 0.0 {
-            (sy / mass).clamp(0.35, 1.05)
-        } else {
-            0.55
-        };
-        // One trail behind the car, shifted to +X with the wind. Marks overlap
-        // and shrink, so the tail fades. Two large cards read as two discs.
-        let wind = Vec3::new(1.5, 0.04, -0.9);
-        let n = 18u32;
-        for i in 0..n {
-            let t = i as f32 / (n - 1) as f32;
-            let pos = Vec3::new(
-                0.55 + cx * 0.45 + t * 2.8,
-                0.38 + cy * 0.22 * (1.0 - t * 0.65),
-                z_car - 2.4 - t * 7.2,
-            );
-            let size = 0.70 * (1.0 - t).powf(0.55) + 0.12;
-            self.world
-                .particles
-                .spawn(pos, wind, 1.0, size, KIND_DUST_MARK);
-        }
-    }
-
-    fn advance_dust(&mut self, dt: f32) {
-        let tires = crate::dust::tires_at(self.chassis_z, 8.0, 1.6);
-        let mut moisture = [0.0f32; 4];
-        let mut water = [0.0f32; 4];
-        for (i, tire) in tires.iter().enumerate() {
-            if tire.contact.z <= 0.0 {
-                moisture[i] = 0.70;
-                water[i] = 0.02;
-            } else {
-                moisture[i] = 0.04;
-                water[i] = 0.0;
-            }
-        }
-        self.dust.step_pads(&tires, &moisture, &water, dt);
-        self.chassis_z += 8.0 * dt;
+        (soil_ms, other_ms)
     }
 
     fn stick_and_dust(&mut self, wheel: usize, center: Vec3, slip: f32, dt: f32, forward: Vec3) {
@@ -4867,7 +4892,7 @@ impl ThroughDrive {
     }
 
     pub fn finish(&mut self) -> ThroughReport {
-        let books = self.dust.ledger();
+        let books = self.dust().ledger();
         self.report.dust_injected_m3 = books.emitted_m3;
         self.report.dust_air_m3 = books.dust_air_m3;
         self.report.dust_settled_m3 = books.dust_settled_m3;
@@ -7050,4 +7075,35 @@ fn wrap_pi(mut a: f32) -> f32 {
         a += pi * 2.0;
     }
     a
+}
+
+/// Pads for one dust substep with the tires at `chassis_z`.
+fn drive_dust_pads(dust: &mut crate::dust::Dust, chassis_z: f32, dt: f32) {
+    let tires = crate::dust::tires_at(chassis_z, 8.0, 1.6);
+    let mut moisture = [0.0f32; 4];
+    let mut water = [0.0f32; 4];
+    for (i, tire) in tires.iter().enumerate() {
+        if tire.contact.z <= 0.0 {
+            moisture[i] = 0.70;
+            water[i] = 0.02;
+        } else {
+            moisture[i] = 0.04;
+            water[i] = 0.0;
+        }
+    }
+    dust.step_pads(&tires, &moisture, &water, dt);
+}
+
+/// Workers for the drive's air grid. They are not the sheet workers, so a
+/// dust layer never lands inside a sheet step that holds a thread scratch.
+#[cfg(not(target_arch = "wasm32"))]
+fn drive_dust_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads().clamp(1, 4))
+            .thread_name(|i| format!("silt-dust-{i}"))
+            .build()
+            .expect("dust pool")
+    })
 }
