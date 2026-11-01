@@ -15,6 +15,7 @@ pub mod lod;
 pub mod particles;
 pub mod patch;
 pub mod quality;
+pub mod route;
 pub mod render_contract;
 pub mod skin;
 pub mod snow;

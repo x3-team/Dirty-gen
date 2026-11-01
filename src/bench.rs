@@ -37,7 +37,7 @@ pub struct BenchScene {
     pub target: Vec3,
 }
 
-pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
+pub(crate) fn parse_scenes(text: &str) -> Vec<BenchScene> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -71,7 +71,7 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
     out
 }
 
-fn pose(scene: &BenchScene, world: &World) -> CameraPose {
+pub(crate) fn pose(scene: &BenchScene, world: &World) -> CameraPose {
     if !scene.car_frame {
         return CameraPose {
             eye: scene.eye,
@@ -91,7 +91,7 @@ fn pose(scene: &BenchScene, world: &World) -> CameraPose {
 }
 
 /// Camera in the first walker's frame: x forward, y up, z right.
-fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
+pub(crate) fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
     let Some(w) = bodies.walkers.first() else {
         return CameraPose {
             eye: scene.eye,
@@ -111,7 +111,7 @@ fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose 
     }
 }
 
-fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
+pub(crate) fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
     write_png(path, width, height, rgba).expect("bench png");
     println!(
         "bench {} {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",

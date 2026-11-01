@@ -25,6 +25,12 @@ Output in `out/bench`:
   scores as JSON (they stay in the browser otherwise)
 - `bench.json`: scene list and which ones rendered
 
+## Niva route
+
+`capture --route out/route` runs the whole route (puddle, mud, dust, crust
+and seams, sand shallows with a walker, ford, snow) with one still per
+segment from `bench/route.txt` and the CPU time per leg. See `docs/ROUTE.md`.
+
 ## CI
 
 `.github/workflows/bench.yml` (`ue5-bench`) runs the same steps on every
