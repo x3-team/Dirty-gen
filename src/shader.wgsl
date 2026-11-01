@@ -434,7 +434,8 @@ fn height_raw(xz: vec2<f32>) -> f32 {
     let h10 = height_at(i0 + vec2<i32>(1, 0));
     let h01 = height_at(i0 + vec2<i32>(0, 1));
     let h11 = height_at(i0 + vec2<i32>(1, 1));
-    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+    // Cubic between samples and the fine track live in terrain_geom.wgsl.
+    return tg_refine(xz, mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y));
 }
 
 fn snow_profile_at(i: i32) -> f32 {
@@ -699,8 +700,7 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
     return height_bilinear(xz);
 }
 
-@vertex
-fn vs_terrain(in: TerrIn) -> TerrOut {
+fn terrain_vertex(in: TerrIn) -> TerrOut {
     let kind = kind_nearest(in.xz);
     // Every layer is sampled. The lip is mud_forest, and only that lip is loud.
     let d0 = textureSampleLevel(ground_pack, ground_samp, in.xz / 3.2, 0, 0.0).b;
@@ -1124,8 +1124,7 @@ fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(gamma, max(alpha, min(spec * 2.0, 1.0) * shore));
 }
 
-@vertex
-fn vs_water(in: TerrIn) -> WaterOut {
+fn water_vertex(in: TerrIn) -> WaterOut {
     if (frame.misc.w > 1.5) {
         return open_water_vertex(in);
     }
@@ -1388,8 +1387,7 @@ struct ShadowOut {
     @location(0) depth: f32,
 }
 
-@vertex
-fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
+fn shadow_terrain_vertex(in: TerrIn) -> ShadowOut {
     let h = apply_seat(in.xz, height_bilinear(in.xz)).x;
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
     let clip = frame.light_vp * vec4<f32>(world, 1.0);
