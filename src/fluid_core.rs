@@ -774,15 +774,9 @@ fn step_sheet_eps_in(
     if dt <= 0.0 || res == 0 || h.len() < res * res {
         return;
     }
-    let mut sum = 0.0f32;
-    let mut any = false;
-    for s in h.iter() {
-        if *s > eps {
-            any = true;
-            sum += *s;
-        }
-    }
-    if !any || sum <= eps {
+    // Branch-free wet sum; it only gates the early return.
+    let sum = wet_sum(h, eps);
+    if sum <= eps {
         return;
     }
     sc.fit(res * res);
@@ -813,15 +807,9 @@ fn step_sheet_eps(
     if dt <= 0.0 || res == 0 || h.len() < res * res {
         return;
     }
-    let mut sum = 0.0f32;
-    let mut any = false;
-    for s in h.iter() {
-        if *s > eps {
-            any = true;
-            sum += *s;
-        }
-    }
-    if !any || sum <= eps {
+    // Branch-free wet sum; it only gates the early return.
+    let sum = wet_sum(h, eps);
+    if sum <= eps {
         return;
     }
     SCRATCH.with(|sc| {
@@ -1248,6 +1236,26 @@ fn advect_one_dust_layer(
     });
 }
 
+/// Sum of the cells above `eps`, in eight lanes so it vectorises.
+fn wet_sum(h: &[f32], eps: f32) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let mut chunks = h.chunks_exact(8);
+    for c in &mut chunks {
+        for k in 0..8 {
+            lanes[k] += if c[k] > eps { c[k] } else { 0.0 };
+        }
+    }
+    let mut sum: f32 = lanes.iter().sum();
+    for &x in chunks.remainder() {
+        sum += if x > eps { x } else { 0.0 };
+    }
+    sum
+}
+
+/// Work boxes are `(i0, i1, j0, j1)` inclusive. A solid wet rectangle stays
+/// one box with the historical halo of 3, so that path is unchanged. Separated
+/// blobs (the tire disks) each carry their own halo and are not stepped across
+/// the dry gap.
 fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(usize, usize, usize, usize)> {
     let mut i0 = res;
     let mut i1 = 0usize;
@@ -1255,16 +1263,19 @@ fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(
     let mut j1 = 0usize;
     let mut wet = 0usize;
     for j in 0..res {
-        let row = j * res;
-        for i in 0..res {
-            if h[row + i] > eps {
-                wet += 1;
-                i0 = i0.min(i);
-                i1 = i1.max(i);
-                j0 = j0.min(j);
-                j1 = j1.max(j);
-            }
+        let row = &h[j * res..j * res + res];
+        // Count without a branch per cell; only a wet row pays for its ends.
+        let c = row.iter().map(|&x| (x > eps) as usize).sum::<usize>();
+        if c == 0 {
+            continue;
         }
+        wet += c;
+        let first = row.iter().position(|&x| x > eps).unwrap_or(0);
+        let last = row.iter().rposition(|&x| x > eps).unwrap_or(0);
+        i0 = i0.min(first);
+        i1 = i1.max(last);
+        j0 = j0.min(j);
+        j1 = j1.max(j);
     }
     if wet == 0 {
         return Vec::new();
@@ -1282,11 +1293,15 @@ fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(
         if mark.len() < n {
             mark.resize(n, 0);
         }
-        mark[..n].fill(0);
+        // Every wet cell lies in the wet bounding box, so the fill and the
+        // reset only visit that box. Order of discovery is unchanged.
+        for j in j0..=j1 {
+            mark[j * res + i0..=j * res + i1].fill(0);
+        }
         let mut queue = Vec::new();
         let mut boxes = Vec::new();
-        for j in 0..res {
-            for i in 0..res {
+        for j in j0..=j1 {
+            for i in i0..=i1 {
                 let s = j * res + i;
                 if h[s] <= eps || mark[s] != 0 {
                     continue;
@@ -2754,12 +2769,16 @@ fn transport_open(
         }
     }
     for j in j0..=j1 {
-        let row = j * res;
-        for i in i0..=i1 {
-            let idx = row + i;
-            if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
-                h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
-            }
+        let lo = j * res + i0;
+        let hi = j * res + i1 + 1;
+        // A select, not a branch, so the row vectorises. Same result per cell.
+        for ((hv, &r), &a) in h[lo..hi]
+            .iter_mut()
+            .zip(&sc.removed[lo..hi])
+            .zip(&sc.added[lo..hi])
+        {
+            let moved = (*hv - r + a).max(0.0);
+            *hv = if r > 0.0 || a > 0.0 { moved } else { *hv };
         }
     }
 }
@@ -8165,8 +8184,13 @@ fn rim_scale(h: &[f32], i: usize, j: usize, rad: i32, feather: f32) -> f32 {
 /// band only the banks' window edges soften, not the inlet and the outlet.
 fn soften_border(u: &mut [f32], v: &mut [f32], res: usize, open: Option<(bool, usize, usize)>) {
     let edge = (res / 12).max(2);
+    // Only the band within `edge` of a window side can soften: `d` is never
+    // below min(di, dj). Interior rows visit just their two end strips.
+    let ends = edge.min(res);
     for j in 0..res {
-        for i in 0..res {
+        let row_band = j.min(res - 1 - j) < edge;
+        let (left, right) = if row_band { (res, res) } else { (ends, res - ends) };
+        for i in (0..left).chain(right.max(left)..res) {
             let di = i.min(res - 1 - i);
             let dj = j.min(res - 1 - j);
             let d = match open {
