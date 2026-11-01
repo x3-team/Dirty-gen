@@ -234,6 +234,7 @@ impl SmokePass {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         shadow: &wgpu::TextureView,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.draw_uniform()));
         let frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -281,7 +282,7 @@ impl SmokePass {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.pipe);
