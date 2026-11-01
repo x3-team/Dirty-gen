@@ -1322,8 +1322,13 @@ fn add_torn_patch(
             let a10 = rows[s][a + 1];
             let a01 = rows[s + 1][a];
             let a11 = rows[s + 1][a + 1];
-            add_quad(mesh, [a00, a10, a11, a01], panel);
-            add_quad(mesh, [a00, a01, a11, a10], panel);
+            // uv: across, along. The shader feathers the torn rim from it.
+            let u0 = a as f32 / (across - 1) as f32;
+            let u1 = (a + 1) as f32 / (across - 1) as f32;
+            let t0 = s as f32 / segs as f32;
+            let t1 = (s + 1) as f32 / segs as f32;
+            add_quad_uv(mesh, [a00, a10, a11, a01], [[u0, t0], [u1, t0], [u1, t1], [u0, t1]], panel);
+            add_quad_uv(mesh, [a00, a01, a11, a10], [[u0, t0], [u0, t1], [u1, t1], [u1, t0]], panel);
         }
     }
 }
@@ -1779,19 +1784,49 @@ mod slurry_shapes {
 /// smaller lumps. Ledger soil is not in this mesh once it has landed: that
 /// volume is the heightfield. Nothing here is a camera-facing quad or a faceted stone.
 pub fn mud_chunks(items: &[silt::particles::Particle]) -> CpuMesh {
-    mud_chunks_with_ground(items, None)
+    mud_chunks_with_ground(items, None, true)
 }
 
 /// Same chunks, with picture ribbons laid on the heightfield instead of a flat y.
 pub fn mud_chunks_with_ground(
     items: &[silt::particles::Particle],
     ground: Option<&silt::soil::SoilField>,
+    include_drops: bool,
+) -> CpuMesh {
+    mud_chunks_split(items, ground, false, include_drops)
+}
+
+/// Heavier slurry pieces in the spray slots are the rut ribbon on the ground.
+pub const RUT_RIBBON_KG: f32 = 1.5;
+
+/// Liquid faster than this is in flight. `spray_from_contract` draws it.
+pub const SPRAY_FLIGHT_SPEED: f32 = 0.5;
+
+/// As `mud_chunks_with_ground`. With `spray_from_contract` set, liquid in
+/// flight is left to the contract spray strips; clods and everything lying
+/// on the ground stay here.
+pub fn mud_chunks_split(
+    items: &[silt::particles::Particle],
+    ground: Option<&silt::soil::SoilField>,
+    spray_from_contract: bool,
+    include_drops: bool,
 ) -> CpuMesh {
     let mut mesh = CpuMesh::new();
     const MAX_VERTS: usize = 14000;
+    let in_flight = |p: &silt::particles::Particle| {
+        spray_from_contract
+            && spray_is_liquid(p.kind as u32)
+            && !(p.kind == silt::particles::KIND_SLURRY_RIBBON && !p.ledger)
+            && p.vel.length() > SPRAY_FLIGHT_SPEED
+    };
     // One continuous ribbon per tire line. Drawn before ledger flecks.
     for p in items {
         if !p.alive || p.life <= 0.0 || p.kind != silt::particles::KIND_SLURRY_RIBBON || p.ledger {
+            continue;
+        }
+        // With the contract, slurry lying in the rut is the published film
+        // (drawn by the water pass); the cut-out strips would double it.
+        if spray_from_contract || in_flight(p) {
             continue;
         }
         if mesh.vertices.len() + 6000 >= MAX_VERTS {
@@ -1803,11 +1838,11 @@ pub fn mud_chunks_with_ground(
     // 7 is a roll sheet, 5 and 6 are the slurry breakaway: ribbons, then drops.
     for kind in [7u8, 5, 6, 9, 3, 1, 4, 0, 2] {
         for p in items {
-            if !p.alive || p.life <= 0.0 || p.kind != kind {
+            if !p.alive || p.life <= 0.0 || p.kind != kind || in_flight(p) {
                 continue;
             }
             if p.kind == silt::particles::KIND_SLURRY_DROP || p.kind == 0 || p.kind == 9 {
-                if mesh.vertices.len() + 200 < MAX_VERTS {
+                if include_drops && mesh.vertices.len() + 200 < MAX_VERTS {
                     add_mud_drop(&mut mesh, p);
                 }
                 continue;
@@ -1875,4 +1910,360 @@ pub fn mud_chunks_with_ground(
         }
     }
     mesh
+}
+
+/// Slurry ribbon from the contract spray buffer. The fraction of the panel
+/// id is the distance along the ribbon, tail 0 to head 1.
+pub const PANEL_SPRAY_RIBBON: f32 = 50.0;
+/// Water drop from the contract spray buffer. Fraction as above.
+pub const PANEL_SPRAY_DROP: f32 = 51.0;
+/// Mud drip or slurry drop from the contract spray buffer.
+pub const PANEL_SPRAY_MUD_DROP: f32 = 52.0;
+/// A round mud drop or a bead torn off a ribbon, drawn as a lit sphere on a
+/// camera-facing quad. The fraction is a per-drop seed for its outline.
+pub const PANEL_SPRAY_BLOB: f32 = 53.0;
+/// A clear water bead, same quad as the blob.
+pub const PANEL_SPRAY_BEAD: f32 = 54.0;
+
+/// One camera-facing quad that the shader turns into a sphere of radius `r`.
+fn push_blob(mesh: &mut CpuMesh, p: Vec3, r: f32, eye: Vec3, panel: f32, seed: f32) {
+    let to_eye = (eye - p).normalize_or_zero();
+    let mut right = Vec3::Y.cross(to_eye);
+    if right.length_squared() < 1.0e-6 {
+        right = Vec3::X;
+    }
+    let right = right.normalize();
+    let up = to_eye.cross(right).normalize_or_zero();
+    let base = mesh.vertices.len() as u32;
+    for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        mesh.vertices.push(MeshVertex {
+            pos: (p + (right * sx + up * sy) * r).to_array(),
+            nrm: to_eye.to_array(),
+            uv: [(sx + 1.0) * 0.5, (sy + 1.0) * 0.5],
+            panel: panel + seed.rem_euclid(1.0) * 0.98,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// Material ids of the contract spray buffer the picture draws as liquid in
+/// flight. Clods (1, 3) stay solid pieces in `mud_chunks_with_ground`.
+pub fn spray_is_liquid(material: u32) -> bool {
+    matches!(material, 0 | 2 | 4 | 5 | 6 | 7 | 9)
+}
+
+/// Spray in flight, read only from the render contract's spray slots.
+///
+/// Slurry pieces (5, 7) become torn ribbons: a strip along the piece's
+/// ballistic path over the last few hundredths of a second, its width set by
+/// the mass and wobbling along the length. Everything else liquid becomes a
+/// short drop streaked along its velocity with a round head. Strips face the
+/// camera about their own axis, so a ribbon never turns edge-on into a line,
+/// and the shader gives them a rounded cross-section. A ribbon may neck and
+/// break in two, and sheds a few beads around its tail.
+pub fn spray_from_contract(
+    spray: &[silt::render_contract::SprayGpu],
+    count: usize,
+    eye: Vec3,
+) -> CpuMesh {
+    let mut mesh = CpuMesh::new();
+    const MAX_VERTS: usize = 24000;
+    let g = Vec3::new(0.0, -9.81, 0.0);
+    for s in spray.iter().take(count) {
+        if s.alive == 0 || !spray_is_liquid(s.material) {
+            continue;
+        }
+        let pos = Vec3::new(s.pos_mass[0], s.pos_mass[1], s.pos_mass[2]);
+        let vel = Vec3::new(s.vel_age[0], s.vel_age[1], s.vel_age[2]);
+        let speed = vel.length();
+        if speed <= SPRAY_FLIGHT_SPEED {
+            continue;
+        }
+        let mass = s.pos_mass[3].max(0.0);
+        // A slurry piece of kilograms is the rut ribbon laid along the tire
+        // line (the chunk mesh draws it on the ground), not a piece in flight.
+        if matches!(s.material, 5 | 7) && mass > RUT_RIBBON_KG {
+            continue;
+        }
+        let age = s.vel_age[3].max(0.0);
+        // A launch point estimate. It drifts slowly with drag, so the tear
+        // pattern stays on the piece from frame to frame instead of flickering.
+        let launch = pos - vel * age + g * (0.5 * age * age);
+        let seed = launch.x * 1.37 + launch.z * 0.91 + launch.y * 2.11;
+        let key = (seed * 6.0).floor() as i32 as u32;
+        let h = |n: u32| chunk_hash(key, n);
+        let ribbon = matches!(s.material, 5 | 7);
+        let (length, width, segs, panel) = if ribbon {
+            // Slurry: 1450 kg/m³. A sheet a few millimetres thick.
+            let vol = mass / 1450.0;
+            let sheet = if s.material == 7 { 0.006 } else { 0.004 };
+            let len = (speed * 0.03 * (0.7 + 0.6 * h(1))).clamp(0.06, 0.32);
+            // A sheet that wide does not stay a sheet in the air: it rolls into
+            // a rope about two thirds as wide, the rest goes into the beads.
+            let w = (vol / (sheet * len)).sqrt().clamp(0.02, 0.12) * (0.6 + 0.8 * h(2)) * 0.65;
+            (len, w, 8usize, PANEL_SPRAY_RIBBON)
+        } else {
+            let density = silt::render_contract::spray_density_kg_m3(s.material as u8).max(1.0);
+            let r = (3.0 * (mass / density) / (4.0 * std::f32::consts::PI))
+                .cbrt()
+                .clamp(0.002, 0.018);
+            let w = r * 2.0 * (0.8 + 0.4 * h(2));
+            // A camera at 30 fps smears a drop over its last frame of travel.
+            let len = (speed / 30.0).clamp(w * 1.6, 0.30);
+            let panel = if matches!(s.material, 2 | 6) {
+                PANEL_SPRAY_MUD_DROP
+            } else {
+                PANEL_SPRAY_DROP
+            };
+            (len, w, 2usize, panel)
+        };
+        if mesh.vertices.len() + (segs + 1) * 2 + 24 >= MAX_VERTS {
+            break;
+        }
+        // Points back along the path, head first.
+        let span = length / speed;
+        let mut pts = Vec::with_capacity(segs + 1);
+        for k in 0..=segs {
+            let t = k as f32 / segs as f32;
+            let back = span * (1.0 - t);
+            pts.push(pos - vel * back + g * (0.5 * back * back));
+        }
+        // Some ribbons have torn in two: one segment is left out.
+        let tear = (ribbon && h(6) > 0.3).then(|| 3 + (h(7) * 3.0) as usize);
+        let base = mesh.vertices.len() as u32;
+        let twist = h(3) * 6.283;
+        for k in 0..=segs {
+            let t = k as f32 / segs as f32;
+            let p = pts[k];
+            let tan = if k < segs {
+                pts[k + 1] - pts[k]
+            } else {
+                pts[k] - pts[k - 1]
+            }
+            .normalize_or_zero();
+            let to_eye = (eye - p).normalize_or_zero();
+            let mut side = tan.cross(to_eye);
+            if side.length_squared() < 1.0e-6 {
+                side = tan.cross(Vec3::Y);
+            }
+            side = side.normalize_or_zero();
+            let face = side.cross(tan).normalize_or_zero();
+            // A slow twist about the path, so a ribbon is a curl and not a card.
+            let (sn, cs) = (twist + t * 2.4).sin_cos();
+            let side_t = if ribbon {
+                (side * (0.75 + 0.25 * cs) + face * (0.35 * sn)).normalize_or_zero()
+            } else {
+                side
+            };
+            let nrm = side_t.cross(tan).normalize_or_zero();
+            // Width wobbles along the strip and pinches toward both ends.
+            let wob = if ribbon {
+                0.65 + 0.35 * (t * 9.0 + h(4) * 6.0).sin() * (0.5 + h(5))
+            } else {
+                1.0
+            };
+            let pinch = (t * (1.0 - t) * 4.0).sqrt().max(if ribbon { 0.18 } else { 0.35 });
+            // Necking toward the tear, so the two halves end in tongues.
+            let neck = match tear {
+                Some(kb) => {
+                    let d = (t - (kb as f32 + 0.5) / segs as f32).abs() * segs as f32;
+                    (d / 1.2).clamp(0.3, 1.0)
+                }
+                None => 1.0,
+            };
+            let hw = width * 0.5 * wob.max(0.25) * pinch * neck;
+            let frac = (t * 0.98).min(0.98);
+            for (side_sign, v) in [(-1.0f32, 0.0f32), (1.0, 1.0)] {
+                mesh.vertices.push(MeshVertex {
+                    pos: (p + side_t * hw * side_sign).to_array(),
+                    nrm: nrm.to_array(),
+                    // u: metres along the piece from its launch estimate, so
+                    // the tears ride with it. v: across, 0..1.
+                    uv: [seed.rem_euclid(97.0) + t * length, v],
+                    panel: panel + frac,
+                });
+            }
+        }
+        for k in 0..segs as u32 {
+            if tear == Some(k as usize) {
+                continue;
+            }
+            let a = base + k * 2;
+            mesh.indices
+                .extend_from_slice(&[a, a + 1, a + 3, a, a + 3, a + 2]);
+        }
+        if ribbon {
+            // Beads shed off the edges and the tail, riding the same arc.
+            let to_eye = (eye - pos).normalize_or_zero();
+            let side = vel.cross(to_eye).normalize_or_zero();
+            let beads = 2 + (h(8) * 5.0) as u32;
+            for b in 0..beads {
+                let along = h(10 + b) * 1.3;
+                let back = span * along;
+                let off = (h(20 + b) - 0.5) * width * 1.6;
+                let lift = (h(30 + b) - 0.5) * width * 0.8;
+                let p = pos - vel * back + g * (0.5 * back * back) + side * off + Vec3::Y * lift;
+                let r = (width * (0.06 + 0.12 * h(40 + b))).clamp(0.003, 0.014);
+                push_blob(&mut mesh, p, r, eye, PANEL_SPRAY_BLOB, h(50 + b));
+            }
+        } else {
+            // The drop itself: a round head on its smear.
+            let head = if panel == PANEL_SPRAY_DROP {
+                PANEL_SPRAY_BEAD
+            } else {
+                PANEL_SPRAY_BLOB
+            };
+            push_blob(&mut mesh, pos, width * 0.55, eye, head, h(9));
+        }
+    }
+    mesh
+}
+
+/// Smooth UV sphere.
+fn add_sphere(mesh: &mut CpuMesh, c: Vec3, r: f32, rot: glam::Quat, panel: f32, stacks: usize, slices: usize) {
+    let p = |i: usize, j: usize| -> Vec3 {
+        let th = i as f32 / stacks as f32 * std::f32::consts::PI;
+        let ph = j as f32 / slices as f32 * std::f32::consts::TAU;
+        rot * Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin())
+    };
+    for i in 0..stacks {
+        for j in 0..slices {
+            let (a, b, cc, d) = (p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1));
+            add_tri_smooth(mesh, c + a * r, a, c + b * r, b, c + cc * r, cc, panel, c);
+            add_tri_smooth(mesh, c + a * r, a, c + cc * r, cc, c + d * r, d, panel, c);
+        }
+    }
+}
+
+/// Smooth capsule-ish limb: a tube with a sphere at each end.
+fn add_limb(mesh: &mut CpuMesh, a: Vec3, b: Vec3, ra: f32, rb: f32, panel: f32) {
+    let axis = b - a;
+    let len = axis.length();
+    if len < 1.0e-4 {
+        return;
+    }
+    let dir = axis / len;
+    let helper = if dir.y.abs() < 0.85 { Vec3::Y } else { Vec3::X };
+    let u = dir.cross(helper).normalize();
+    let v = dir.cross(u).normalize();
+    let segs = 12;
+    let mid = (a + b) * 0.5;
+    for i in 0..segs {
+        let t0 = i as f32 / segs as f32 * std::f32::consts::TAU;
+        let t1 = (i + 1) as f32 / segs as f32 * std::f32::consts::TAU;
+        let n0 = u * t0.cos() + v * t0.sin();
+        let n1 = u * t1.cos() + v * t1.sin();
+        add_tri_smooth(mesh, a + n0 * ra, n0, a + n1 * ra, n1, b + n1 * rb, n1, panel, mid);
+        add_tri_smooth(mesh, a + n0 * ra, n0, b + n1 * rb, n1, b + n0 * rb, n0, panel, mid);
+    }
+    add_sphere(mesh, a, ra, glam::Quat::IDENTITY, panel, 6, 10);
+    add_sphere(mesh, b, rb, glam::Quat::IDENTITY, panel, 6, 10);
+}
+
+/// Box with a rotation.
+fn add_obox(mesh: &mut CpuMesh, c: Vec3, h: Vec3, rot: glam::Quat, panel: f32) {
+    let x = rot * Vec3::X * h.x;
+    let y = rot * Vec3::Y * h.y;
+    let z = rot * Vec3::Z * h.z;
+    let faces = [
+        [c - x + y - z, c - x + y + z, c + x + y + z, c + x + y - z],
+        [c - x - y - z, c + x - y - z, c + x - y + z, c - x - y + z],
+        [c + x - y - z, c + x + y - z, c + x + y + z, c + x - y + z],
+        [c - x - y - z, c - x - y + z, c - x + y + z, c - x + y - z],
+        [c - x - y + z, c + x - y + z, c + x + y + z, c - x + y + z],
+        [c - x - y - z, c - x + y - z, c + x + y - z, c + x - y - z],
+    ];
+    for f in faces {
+        add_quad(mesh, f, panel);
+    }
+}
+
+/// Two-bone leg or arm: the joint bends toward `bend`.
+fn two_bone(root: Vec3, tip: Vec3, l1: f32, l2: f32, bend: Vec3) -> Vec3 {
+    let d = tip - root;
+    let len = d.length().clamp(1.0e-3, l1 + l2 - 1.0e-3);
+    let dir = d.normalize_or_zero();
+    let a = ((l1 * l1 + len * len - l2 * l2) / (2.0 * l1 * len)).clamp(-1.0, 1.0).acos();
+    let side = (bend - dir * bend.dot(dir)).normalize_or_zero();
+    root + (dir * a.cos() + side * a.sin()) * l1
+}
+
+/// A boulder filling a box: a rounded superellipsoid with a lumpy crown.
+/// The solver's body is still the box; this only rounds its picture.
+fn add_rock(mesh: &mut CpuMesh, c: Vec3, h: Vec3, rot: glam::Quat) {
+    let stacks = 12;
+    let slices = 20;
+    let e = 0.55;
+    let sp = |v: f32| v.signum() * v.abs().powf(e);
+    let p = |i: usize, j: usize| -> Vec3 {
+        let th = i as f32 / stacks as f32 * std::f32::consts::PI;
+        let ph = j as f32 / slices as f32 * std::f32::consts::TAU;
+        let d = Vec3::new(sp(th.sin()) * sp(ph.cos()), sp(th.cos()), sp(th.sin()) * sp(ph.sin()));
+        let lump = 1.0 + 0.07 * (3.1 * ph + 1.7 * th).sin() * (2.3 * th).sin() + 0.04 * (7.0 * ph).cos() * th.sin();
+        rot * (d * h * lump)
+    };
+    for i in 0..stacks {
+        for j in 0..slices {
+            let (a, b, cc, d) = (p(i, j), p(i + 1, j), p(i + 1, j + 1), p(i, j + 1));
+            add_tri(mesh, c + a, c + cc, c + b, 0.0);
+            add_tri(mesh, c + a, c + d, c + cc, 0.0);
+        }
+    }
+}
+
+/// Panels: 17 glossy red (buoys and balls), 0 dark stone (rocks), 47 light
+/// timber (crates), 10 grey suit (the walker, like the reference's mannequin).
+pub fn bodies_mesh(bodies: &silt::bodies::Bodies) -> CpuMesh {
+    use silt::bodies::{BodyShape, HIP_HEIGHT};
+    let mut m = CpuMesh::new();
+    for b in &bodies.items {
+        match b.shape {
+            BodyShape::Ball { r, .. } => add_sphere(&mut m, b.pos, r, b.rot, 17.0, 14, 24),
+            BodyShape::Crate { half } => {
+                if b.mass / b.volume() > 1500.0 {
+                    add_rock(&mut m, b.pos, half, b.rot);
+                } else {
+                    add_obox(&mut m, b.pos, half, b.rot, 47.0);
+                }
+            }
+        }
+    }
+    for w in &bodies.walkers {
+        let suit = 10.0;
+        let fwd2 = w.forward();
+        let fwd = Vec3::new(fwd2.x, 0.0, fwd2.y);
+        let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+        let pelvis = w.pos;
+        let scale = HIP_HEIGHT / 0.92;
+        let chest = pelvis + Vec3::Y * 0.50 * scale + fwd * 0.03;
+        let neck = chest + Vec3::Y * 0.14;
+        // Legs: hip to the sole, knee forward.
+        for (k, foot) in w.feet.iter().enumerate() {
+            let side = if k == 0 { -1.0 } else { 1.0 };
+            let hip = pelvis + right * (0.10 * side);
+            let ankle = foot.pos + Vec3::Y * 0.08 - fwd * 0.04;
+            let knee = two_bone(hip, ankle, 0.46 * scale, 0.45 * scale, fwd);
+            add_limb(&mut m, hip, knee, 0.075, 0.058, suit);
+            add_limb(&mut m, knee, ankle, 0.055, 0.042, suit);
+            let fyaw = glam::Quat::from_rotation_y(foot.yaw);
+            add_obox(&mut m, foot.pos + Vec3::Y * 0.04 + fyaw * Vec3::Z * 0.03, Vec3::new(0.05, 0.04, 0.13), fyaw, suit);
+        }
+        // Torso and head.
+        add_limb(&mut m, pelvis + Vec3::Y * 0.02, chest, 0.15, 0.17, suit);
+        add_limb(&mut m, chest, neck, 0.08, 0.06, suit);
+        add_sphere(&mut m, neck + Vec3::Y * 0.13, 0.11, glam::Quat::IDENTITY, suit, 10, 16);
+        // Arms swing against the legs.
+        let swing = (w.feet[0].pos - w.feet[1].pos).dot(fwd).clamp(-0.6, 0.6);
+        for k in 0..2 {
+            let side = if k == 0 { -1.0 } else { 1.0 };
+            let shoulder = chest + right * (0.20 * side) + Vec3::Y * 0.02;
+            let reach = -swing * side * 0.45;
+            let hand = shoulder + Vec3::Y * -0.58 + fwd * reach + right * (0.06 * side);
+            let elbow = two_bone(shoulder, hand, 0.30, 0.30, -fwd + Vec3::Y * 0.1);
+            add_limb(&mut m, shoulder, elbow, 0.055, 0.045, suit);
+            add_limb(&mut m, elbow, hand, 0.042, 0.035, suit);
+        }
+    }
+    m
 }

@@ -25,6 +25,12 @@ Output in `out/bench`:
   scores as JSON (they stay in the browser otherwise)
 - `bench.json`: scene list and which ones rendered
 
+## Niva route
+
+`capture --route out/route` runs the whole route (puddle, mud, dust, crust
+and seams, sand shallows with a walker, ford, snow) with one still per
+segment from `bench/route.txt` and the CPU time per leg. See `docs/ROUTE.md`.
+
 ## CI
 
 `.github/workflows/bench.yml` (`ue5-bench`) runs the same steps on every
@@ -51,7 +57,10 @@ shot can be lined up with its reference without a rebuild.
 | river-rocks | ue5-103 | missing: no river with obstacles yet |
 | beach-swash | ue5-98 | missing: no beach yet |
 | beach-rock | ue5-99 | missing: no beach yet |
-| turbid-water | ue5-100 | missing: no open turbid water yet |
+| wade-swash | ue5-98 | walker in the swash (`silt::wade`) |
+| wade-buoys | ue5-100 | walker, buoys and rock in the shallows |
+| wade-rock | ue5-99 | shallows around a rock, walker close up |
+| turbid-water | ue5-100 | brown river (`river-muddy`: inflow carries silt) with the Niva's plume and foam |
 | smoke-column | ue5-89 | two cold smoke vents in still air (`silt::smoke`, wgpu compute) |
 | fire | none | open flame beside the parked Niva (`silt::smoke`) |
 

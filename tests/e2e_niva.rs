@@ -30,6 +30,9 @@ const DRIVE_SOLVER_BUDGET_MS: f64 = 7.0;
 /// Release dust row. Do not raise.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 const DRIVE_DUST_BUDGET_MS: f64 = 1.0;
+/// Release water row of [`ThroughDrive::step`]. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_WATER_BUDGET_MS: f64 = 2.0;
 /// Release p95 of one `ThroughDrive::step`. Do not raise.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 const DRIVE_P95_BUDGET_MS: f64 = 7.0;
@@ -389,6 +392,7 @@ fn e2e_niva() {
         let t0 = Instant::now();
         dust.step_pads(&tires, &moisture, &water, DT);
         fluid.step(DT);
+        stretch_hold(t0);
         let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
         if step_i >= 20 {
             step_ms += elapsed;
@@ -683,6 +687,7 @@ fn e2e_niva() {
         final_books.gap,
         max_gap
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     assert!(
         (puddle_n - 18.0).abs() < 0.5,
@@ -692,8 +697,11 @@ fn e2e_niva() {
         (puddle_mean - 0.0893).abs() < 0.003,
         "puddle depth {puddle_mean:.4} m"
     );
+    // The 2 cm patch keeps its sub-cell detail between steps (fluid_core/near.rs).
+    // The bow a tire pushed stays ahead of it, so the column it rolls into holds
+    // more water: the hole read 0.0021-0.0025 m while each step started flat.
     assert!(
-        (puddle_hole - 0.0020).abs() < 0.002 && puddle_hole < puddle_mean - 0.04,
+        (puddle_hole - golden(0.0046, 0.0020)).abs() < 0.002 && puddle_hole < puddle_mean - 0.04,
         "tire hole {puddle_hole:.4} m puddle {puddle_mean:.4} m"
     );
     assert!(
@@ -755,8 +763,11 @@ fn e2e_niva() {
         (dry_emitted - 0.009188).abs() < 2.0e-4,
         "dry dust {dry_emitted:.6} m3"
     );
+    // 16-layer air (dust.rs): the wake lifts the dry plume up to 4 m and it
+    // rides the relative wind off the window, so more of it lands on the wet
+    // track behind. The 8-layer sheet read 0.001519 here and 0.002941 on the map.
     assert!(
-        (settled_wet as f64 - 0.001519).abs() < 1.5e-4,
+        (settled_wet as f64 - 0.001739).abs() < 1.5e-4,
         "settled on the wet track {settled_wet:.6} before {settled_wet_before:.6}"
     );
     assert!(
@@ -770,7 +781,7 @@ fn e2e_niva() {
         dust.dust_air_m3()
     );
     assert!(
-        (track_dust_map as f64 - 0.002941).abs() < 5.0e-4,
+        (track_dust_map as f64 - 0.003424).abs() < 5.0e-4,
         "contract dust on the wet track {track_dust_map:.6}"
     );
     assert_eq!(wet_lift, 0.0, "wet lift {wet_lift}");
@@ -785,13 +796,16 @@ fn e2e_niva() {
         "slurry {:.6}",
         final_books.slurry
     );
+    // Soil and dust moved together with the near-field residual: settled dust
+    // that lands on the wetter track is bound into the soil. Their sum moved by
+    // 2e-4 m3 (0.99635 -> 0.99617); soil 0.9730 -> 0.9738, dust 0.02336 -> 0.02241.
     assert!(
-        (final_books.soil - 0.9723).abs() < 1.0e-3,
+        (final_books.soil - golden(0.9738, 0.9723) as f64).abs() < 1.0e-3,
         "soil {:.6}",
         final_books.soil
     );
     assert!(
-        (final_books.dust - 0.02407).abs() < 1.0e-3,
+        (final_books.dust - golden(0.02241, 0.02407) as f64).abs() < 1.0e-3,
         "dust {:.6}",
         final_books.dust
     );
@@ -809,12 +823,12 @@ fn e2e_niva() {
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        step_mean <= E2E_STEP_BUDGET_MS,
+        gate_median() || step_mean <= E2E_STEP_BUDGET_MS,
         "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} on {hardware}"
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        air_mean <= AIR_RELEASE_BUDGET_MS,
+        gate_median() || air_mean <= AIR_RELEASE_BUDGET_MS,
         "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
     );
     #[cfg(not(debug_assertions))]
@@ -870,6 +884,7 @@ fn print_through_drive() {
          DRIVE_SHEET_REST ms={:.3}\n\
          DRIVE_OTHER ms={:.3}\n\
          DRIVE_SOLVER ms={solver:.3}\n\
+         DRIVE_WATER_BUDGET ms={DRIVE_WATER_BUDGET_MS:.3}\n\
          DRIVE_SOLVER_BUDGET ms={DRIVE_SOLVER_BUDGET_MS:.3}\n\
          DRIVE_P95_BUDGET ms={DRIVE_P95_BUDGET_MS:.3}\n\
          DRIVE_DUST_BUDGET ms={DRIVE_DUST_BUDGET_MS:.3}",
@@ -885,22 +900,47 @@ fn print_through_drive() {
         acc.sheet_rest_ms / k,
         acc.other_ms / k,
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let water = acc.water_ms / k;
     let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
-    assert!(
-        solver <= DRIVE_SOLVER_BUDGET_MS,
-        "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        p95 <= DRIVE_P95_BUDGET_MS,
-        "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        dust <= DRIVE_DUST_BUDGET_MS,
-        "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
-    );
+    if !gate_median() {
+        assert!(
+            solver <= DRIVE_SOLVER_BUDGET_MS,
+            "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
+        );
+        assert!(
+            p95 <= DRIVE_P95_BUDGET_MS,
+            "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
+        );
+        assert!(
+            dust <= DRIVE_DUST_BUDGET_MS,
+            "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
+        );
+        assert!(
+            water <= DRIVE_WATER_BUDGET_MS,
+            "DRIVE_WATER {water:.3} ms over {DRIVE_WATER_BUDGET_MS}"
+        );
+    }
+}
+
+/// Burn extra time inside a measurement when `PERF_STRETCH` is above 1.
+/// CI leaves it unset. A proof run sets it on the pull-request side only.
+fn stretch_hold(started: Instant) {
+    let Ok(raw) = std::env::var("PERF_STRETCH") else {
+        return;
+    };
+    let Ok(factor) = raw.parse::<f64>() else {
+        return;
+    };
+    if !factor.is_finite() || factor <= 1.0 {
+        return;
+    }
+    let extra = started.elapsed().mul_f64(factor - 1.0);
+    let spin = Instant::now();
+    while spin.elapsed() < extra {
+        std::hint::spin_loop();
+    }
 }
 
 /// Open 2 cm sheet and open wind, the trimmed branch.
@@ -1061,6 +1101,16 @@ fn assert_plausible_speed(u: &[f32], v: &[f32], lim: f32) {
     }
 }
 
+/// This tree's golden, or the one the pinned base had when
+/// `scripts/perf_ratio.py` runs this harness on the base solver.
+fn golden(now: f32, base: f32) -> f32 {
+    if std::env::var_os("PERF_GATE_BASE").is_some() {
+        base
+    } else {
+        now
+    }
+}
+
 fn percentile_95(samples: &mut [f64]) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -1085,4 +1135,12 @@ fn hardware_line() -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown cpu".to_string());
     format!("{model}, {cores} cores")
+}
+
+/// Set by `scripts/perf_ratio.py` for its paired runs. The script compares
+/// the median of those runs with the same caps, so a single slow run does
+/// not fail the gate. Every other run asserts the caps here.
+#[allow(dead_code)]
+fn gate_median() -> bool {
+    std::env::var_os("PERF_GATE_MEDIAN").is_some()
 }

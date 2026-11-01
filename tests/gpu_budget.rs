@@ -76,9 +76,16 @@ fn wgsl_loop_bounds_under_cap() {
 
 #[test]
 fn shader_validates_and_runs_on_webgl2() {
-    let src =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shader.wgsl"))
-            .unwrap();
+    // The renderer compiles shader.wgsl with terrain_geom.wgsl and the
+    // contract readers appended (render.rs). WebGL2 has no storage buffers or
+    // fifth bind group, so it gets the stand-in readers: validate that module.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = format!(
+        "{}\n{}\n{}",
+        std::fs::read_to_string(dir.join("shader.wgsl")).unwrap(),
+        std::fs::read_to_string(dir.join("terrain_geom.wgsl")).unwrap(),
+        std::fs::read_to_string(dir.join("beauty_nocontract.wgsl")).unwrap()
+    );
     let module = naga::front::wgsl::parse_str(&src).expect("shader.wgsl parses");
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -93,6 +100,7 @@ fn shader_validates_and_runs_on_webgl2() {
         let fi = info.get_entry_point(i);
         let mut textures = 0usize;
         let mut uniforms = 0usize;
+        let mut names: Vec<String> = Vec::new();
         for (h, var) in module.global_variables.iter() {
             if fi[h].is_empty() {
                 continue;
@@ -102,6 +110,7 @@ fn shader_validates_and_runs_on_webgl2() {
                 naga::AddressSpace::Handle => {
                     if let naga::TypeInner::Image { .. } = module.types[var.ty].inner {
                         textures += 1;
+                        names.push(var.name.clone().unwrap_or_default());
                     }
                 }
                 naga::AddressSpace::Storage { .. } => {
@@ -112,8 +121,9 @@ fn shader_validates_and_runs_on_webgl2() {
         }
         assert!(
             textures <= 16,
-            "{}: {textures} textures > WebGL2 16 units",
-            ep.name
+            "{}: {textures} textures > WebGL2 16 units: {}",
+            ep.name,
+            names.join(", ")
         );
         assert!(
             uniforms <= 12,

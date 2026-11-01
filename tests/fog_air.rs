@@ -18,6 +18,9 @@ use silt::render_contract::{
 use silt::soil::SoilField;
 
 const DT: f32 = 1.0 / 60.0;
+
+/// Release fog step. Do not raise this. Every build prints it.
+const FOG_STEP_BUDGET_MS: f64 = 7.0;
 const SPEED: f32 = 8.0;
 const OFFER_M3_S: f32 = 0.0012;
 const DUMP_DIR: &str = "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/fog-air";
@@ -145,6 +148,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
         let tires = tires_at(z, SPEED, 1.6);
         let t0 = Instant::now();
         dust.step_pads(&tires, &[0.92; 4], &[0.08; 4], DT);
+        stretch_hold(t0);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if step >= 12 {
             step_ms += ms;
@@ -251,6 +255,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
          step_mean_ms {step_mean:.3}\n\
          step_max_ms {step_max:.3}\n\
          step_n {timed:.0}\n\
+         FOG_STEP_BUDGET ms={FOG_STEP_BUDGET_MS:.3}\n\
          contract_version {version}\n",
         peak = read.peak,
         z_cm = read.z_cm,
@@ -263,6 +268,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
     write_dump("niva-columns.csv", &columns);
     write_dump("niva-settled.csv", &settled_txt);
     println!("{numbers}");
+    let _ = std::io::stdout().flush();
 
     assert!(taken > 0.004, "taken {taken:.6} m3");
     assert!(water_gap < 1.0e-3, "water gap {water_gap:.6}");
@@ -309,10 +315,29 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
     assert!(frame.fog.iter().all(|v| v.is_finite()));
 
     #[cfg(not(debug_assertions))]
-    assert!(
-        step_mean <= 7.0,
-        "FOG_STEP {step_mean:.3} ms over 7, max {step_max:.3}"
-    );
+    if !gate_median() {
+        assert!(
+            step_mean <= FOG_STEP_BUDGET_MS,
+            "FOG_STEP {step_mean:.3} ms over {FOG_STEP_BUDGET_MS}, max {step_max:.3}"
+        );
+    }
+}
+
+fn stretch_hold(started: Instant) {
+    let Ok(raw) = std::env::var("PERF_STRETCH") else {
+        return;
+    };
+    let Ok(factor) = raw.parse::<f64>() else {
+        return;
+    };
+    if !factor.is_finite() || factor <= 1.0 {
+        return;
+    }
+    let extra = started.elapsed().mul_f64(factor - 1.0);
+    let spin = Instant::now();
+    while spin.elapsed() < extra {
+        std::hint::spin_loop();
+    }
 }
 
 #[test]
@@ -420,4 +445,12 @@ fn fluid_sheet_fog_is_not_dust_and_closes_the_ledger() {
         .chunks(4)
         .all(|texel| texel[1] == 0.0 && texel[3] == 0.0));
     assert!(frame.fog.iter().all(|v| v.is_finite()));
+}
+
+/// Set by `scripts/perf_ratio.py` for its paired runs. The script compares
+/// the median of those runs with the same caps, so a single slow run does
+/// not fail the gate. Every other run asserts the caps here.
+#[allow(dead_code)]
+fn gate_median() -> bool {
+    std::env::var_os("PERF_GATE_MEDIAN").is_some()
 }

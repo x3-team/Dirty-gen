@@ -153,6 +153,13 @@ pub struct Vehicle {
     pub engine_stalled: bool,
     /// Stuck mud: mass, packed tread, arch brake, shader thickness.
     pub adhesion: Adhesion,
+    /// Snow under each tire from the fine snow track, when one is attached.
+    /// It replaces the soil height and mechanics for that tire only.
+    pub snow_ground: [Option<crate::snow_track::SnowGround>; 4],
+    /// Snow under the belly: force and torque about `pos`, world frame,
+    /// from the last belly press. The snow track sets it; zero off snow.
+    pub snow_belly_force: Vec3,
+    pub snow_belly_torque: Vec3,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,6 +216,9 @@ impl Vehicle {
             water_push_n: Vec3::ZERO,
             engine_stalled: false,
             adhesion: Adhesion::default(),
+            snow_ground: [None; 4],
+            snow_belly_force: Vec3::ZERO,
+            snow_belly_torque: Vec3::ZERO,
         }
     }
 
@@ -452,6 +462,10 @@ impl Vehicle {
             let up = ori * Vec3::Y;
             let up_y = up.y.max(0.4);
             let mut sample = soil.sample(wc0.x, wc0.z);
+            let snow = self.snow_ground[i];
+            if let Some(g) = snow {
+                sample.height = g.surface;
+            }
             let local_water = sample.water;
             let z0_bed = sample.height - wc0.y + WHEEL_RADIUS;
             // The free surface, not the bed. A tire sitting in the sheet was
@@ -473,6 +487,8 @@ impl Vehicle {
             let (compression, sinkage, normal) = if z0 <= 0.004 {
                 // Unloaded arm falls to droop, so the tire hangs once the buggy is airborne.
                 ((self.wheels[i].compression - dt * 2.8).max(0.0), 0.0, 0.0)
+            } else if let Some(g) = snow {
+                solve_suspension(z0, up_y, self.wheels[i].slip, g.mech, 0.0)
             } else {
                 let mut mech = terramech_for(sample.kind(), sample.softness, local_water);
                 mech.k_eq *= track_harden_mul(
@@ -526,7 +542,10 @@ impl Vehicle {
             let mut soil_push = 0.0;
 
             if active {
-                let tm = mech_for_sample(&sample);
+                let tm = match snow {
+                    Some(g) => g.mech,
+                    None => mech_for_sample(&sample),
+                };
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
                 let sigma = (normal / area).clamp(0.0, 80_000.0);
@@ -734,7 +753,8 @@ impl Vehicle {
         }
         force.x += self.water_push_n.x;
         force.z += self.water_push_n.z;
-        let mut torque_local = Vec3::ZERO;
+        force += self.snow_belly_force;
+        let mut torque_local = ori.inverse() * self.snow_belly_torque;
         let held = self.jump_hold > 0.0;
         if self.jump_hold > 0.0 {
             self.jump_hold = (self.jump_hold - dt).max(0.0);
@@ -1049,6 +1069,7 @@ impl Default for Contact {
                 crack: 0.0,
                 passes: 0,
                 rest: 0.0,
+                mix: [0.0; 4],
             },
             speed: 0.0,
             fling: 0.0,

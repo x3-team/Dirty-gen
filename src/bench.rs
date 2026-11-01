@@ -32,11 +32,13 @@ pub struct BenchScene {
     pub preset: String,
     pub stop: f32,
     pub car_frame: bool,
+    /// Camera relative to the first walker of a `wade` scene.
+    pub walker_frame: bool,
     pub eye: Vec3,
     pub target: Vec3,
 }
 
-pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
+pub(crate) fn parse_scenes(text: &str) -> Vec<BenchScene> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -51,9 +53,10 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
             f[i].parse()
                 .unwrap_or_else(|_| panic!("bench/scenes.txt line {}: bad number {}", n + 1, f[i]))
         };
-        let car_frame = match f[3] {
-            "car" => true,
-            "world" => false,
+        let (car_frame, walker_frame) = match f[3] {
+            "car" => (true, false),
+            "world" => (false, false),
+            "walker" => (false, true),
             other => panic!("bench/scenes.txt line {}: frame {other}", n + 1),
         };
         out.push(BenchScene {
@@ -61,6 +64,7 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
             preset: f[1].to_string(),
             stop: num(2),
             car_frame,
+            walker_frame,
             eye: Vec3::new(num(4), num(5), num(6)),
             target: Vec3::new(num(7), num(8), num(9)),
         });
@@ -68,7 +72,7 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
     out
 }
 
-fn pose(scene: &BenchScene, world: &World) -> CameraPose {
+pub(crate) fn pose(scene: &BenchScene, world: &World) -> CameraPose {
     if !scene.car_frame {
         return CameraPose {
             eye: scene.eye,
@@ -87,7 +91,28 @@ fn pose(scene: &BenchScene, world: &World) -> CameraPose {
     }
 }
 
-fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
+/// Camera in the first walker's frame: x forward, y up, z right.
+pub(crate) fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
+    let Some(w) = bodies.walkers.first() else {
+        return CameraPose {
+            eye: scene.eye,
+            target: scene.target,
+            ortho_width: None,
+        };
+    };
+    let f = w.forward();
+    let fwd = Vec3::new(f.x, 0.0, f.y);
+    let right = Vec3::new(-fwd.z, 0.0, fwd.x);
+    let base = Vec3::new(w.pos.x, w.pos.y - silt::bodies::HIP_HEIGHT, w.pos.z);
+    let at = |v: Vec3| base + fwd * v.x + Vec3::Y * v.y + right * v.z;
+    CameraPose {
+        eye: at(scene.eye),
+        target: at(scene.target),
+        ortho_width: None,
+    }
+}
+
+pub(crate) fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
     write_png(path, width, height, rgba).expect("bench png");
     println!(
         "bench {} {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
@@ -161,7 +186,13 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
 
     // River ford with rocks (`river`) and the same ford with a swell on the
     // beach (`beach`). `stop` is seconds since the Niva started.
-    for (preset, swell) in [("river", None), ("beach", Some(silt::ford::Swell::default()))] {
+    // `river-muddy` is the same ford on a brown river: the inflow carries
+    // silt (RiverReach::inlet_turbidity), the Niva's plume adds to it.
+    for (preset, swell, silt) in [
+        ("river", None, 0.0),
+        ("river-muddy", None, RIVER_MUDDY_TURBIDITY),
+        ("beach", Some(silt::ford::Swell::default()), 0.0),
+    ] {
         let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
         if shots.is_empty() {
             continue;
@@ -172,7 +203,7 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
         renderer.niva_picture = true;
         renderer.water_column = true;
         renderer.open_water = true;
-        let mut ford = silt::ford::FordDrive::new(swell, 4.0);
+        let mut ford = silt::ford::FordDrive::new_turbid(swell, 4.0, silt);
         let dt = 1.0 / 60.0;
         for scene in shots {
             while ford.time_s < scene.stop {
@@ -184,6 +215,36 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
                 .expect("readback");
             save(&dir.join(format!("{}.png", scene.id)), width, height, &rgba, scene, cam);
         }
+    }
+
+    // A person wading the ford's beach, buoys and a rock in the swash
+    // (`wade`). `stop` is seconds since the walk started.
+    let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == "wade").collect();
+    if !shots.is_empty() {
+        shots.sort_by(|a, b| a.stop.total_cmp(&b.stop));
+        renderer.show_hills = false;
+        renderer.daylight = true;
+        renderer.niva_picture = true;
+        renderer.water_column = true;
+        renderer.open_water = true;
+        let mut wade = silt::wade::WadeScene::new(Some(silt::ford::Swell::default()), 4.0);
+        let dt = 1.0 / 60.0;
+        for scene in shots {
+            while wade.time_s < scene.stop {
+                wade.step(dt);
+            }
+            let cam = if scene.walker_frame {
+                walker_pose(scene, &wade.bodies)
+            } else {
+                pose(scene, &wade.world)
+            };
+            renderer.set_bodies_mesh(Some(&crate::mesh::bodies_mesh(&wade.bodies)));
+            let rgba = renderer
+                .draw_with_sheet(&wade.world, cam, None, true, Some(&wade.fluid), None)
+                .expect("readback");
+            save(&dir.join(format!("{}.png", scene.id)), width, height, &rgba, scene, cam);
+        }
+        renderer.set_bodies_mesh(None);
     }
 
     renderer.open_water = false;
@@ -256,6 +317,9 @@ pub fn smoke_scene(
     }
 }
 
+/// Silt the `river-muddy` bench river carries, volume of solids per water.
+const RIVER_MUDDY_TURBIDITY: f32 = 0.08;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,7 +330,11 @@ mod tests {
         let scenes = parse_scenes(text);
         assert!(scenes.len() >= 5);
         for s in &scenes {
-            assert!(["drive", "snow", "river", "beach", "smoke", "fire", "missing"].contains(&s.preset.as_str()), "{}", s.id);
+            assert!(
+                ["drive", "snow", "river", "river-muddy", "beach", "wade", "smoke", "fire", "missing"].contains(&s.preset.as_str()),
+                "{}",
+                s.id
+            );
         }
     }
 }

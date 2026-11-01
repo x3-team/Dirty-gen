@@ -6,7 +6,7 @@
 // Change this contract only by bumping RENDER_CONTRACT_VERSION and
 // recording the change in docs/RENDER_CONTRACT.md.
 
-const RENDER_CONTRACT_VERSION: u32 = 6u;
+const RENDER_CONTRACT_VERSION: u32 = 11u;
 
 struct ContractHeader {
     version: u32,
@@ -33,6 +33,11 @@ struct ContractHeader {
     flow_source: u32,
     dust_source: u32,
     debug_mode: u32,
+    // Fine window, binding 15: minimum corner, texel size, texels per side.
+    fine_origin_x: f32,
+    fine_origin_z: f32,
+    fine_cell_m: f32,
+    fine_res: u32,
 }
 
 struct SprayParticle {
@@ -57,6 +62,25 @@ struct SprayParticle {
 @group(0) @binding(10) var<storage, read> spray: array<SprayParticle>;
 @group(0) @binding(11) var air_velocity: texture_3d<f32>;
 @group(0) @binding(12) var fog_mist: texture_3d<f32>;
+@group(0) @binding(13) var soil_mix: texture_2d<f32>;
+@group(0) @binding(14) var snow_tex: texture_2d<f32>;
+// R top surface over ground m, G snow depth m, B compaction, A print depth m.
+@group(0) @binding(15) var track_fine: texture_2d<f32>;
+
+const VALID_TRACK_FINE: u32 = 32768u;
+
+fn fine_at(world_xz: vec2<f32>) -> vec4<f32> {
+    if ((header.valid & VALID_TRACK_FINE) == 0u || header.fine_res == 0u) {
+        return vec4<f32>(0.0);
+    }
+    let rel = (world_xz - vec2<f32>(header.fine_origin_x, header.fine_origin_z)) / header.fine_cell_m;
+    let i = vec2<i32>(floor(rel));
+    let n = i32(header.fine_res);
+    if (any(i < vec2<i32>(0)) || any(i >= vec2<i32>(n))) {
+        return vec4<f32>(0.0);
+    }
+    return textureLoad(track_fine, i, 0);
+}
 
 struct DebugOut {
     @builtin(position) clip: vec4<f32>,
@@ -144,6 +168,21 @@ fn field_color(ij: vec2<i32>, world_xz: vec2<f32>) -> vec3<f32> {
     if (mode == 13u) { return ramp(fog_at(world_xz.x, world_xz.y), 0.0, 0.02); }
     if (mode == 14u) { return ramp(air_speed_at(world_xz.x, world_xz.y), 0.0, 12.0); }
     if (mode == 15u) { return ramp(mist_at(world_xz.x, world_xz.y), 0.0, 0.02); }
+    let snow = textureLoad(snow_tex, ij, 0);
+    if (mode == 17u) { return ramp(snow.r, 0.0, 0.70); }
+    if (mode == 18u) { return ramp(snow.g, 0.0, 320.0); }
+    if (mode == 19u) { return ramp(snow.b, 0.0, 1.0); }
+    if (mode == 21u) { return ramp(fine_at(world_xz).r, -0.05, 0.40); }
+    if (mode == 22u) { return ramp(fine_at(world_xz).b, 0.0, 1.0); }
+    if (mode == 23u) { return ramp(fine_at(world_xz).a, 0.0, 0.03); }
+    if (mode == 20u) {
+        let mix = textureLoad(soil_mix, ij, 0);
+        return vec3<f32>(
+            mix.r * 0.55 + mix.g * 0.85,
+            mix.g * 0.45 + mix.a * 0.80,
+            mix.b * 0.70 + mix.a * 0.20,
+        );
+    }
     return ramp(ground.r, -0.4, 0.8);
 }
 
