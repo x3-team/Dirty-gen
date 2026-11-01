@@ -38,8 +38,12 @@ both sides. `shared_edges_close` checks that on every seam, including seams
 between levels. Nodes outside the camera are culled; the shadow list is
 culled to the light's box.
 
-On the proof frames: 4.67 M → 0.37–0.40 M ground triangles in view, and
-4.67 M → 1.26–1.32 M in the shadow pass. The vertex step under the camera
+The shadow pass picks its own list with a coarser ring (96 steps: 1.56 cm
+to 1.5 m, 25 cm past 24 m) and morphs with that same ring.
+
+On the proof frames: 4.67 M → 0.37–0.40 M ground triangles in view (ground
+and water pass each), and 4.67 M → 0.31–0.37 M in the shadow pass. Ground
+across all three passes: 14.0 M → about 1.1 M. The vertex step under the camera
 goes from 2.6 cm to 1.56 cm.
 
 ### Height between solver samples (`src/terrain_geom.wgsl`)
@@ -84,6 +88,10 @@ at least one vertex per texel out to 4 m.
 | `SILT_TERRAIN_CUBIC` | 1 | 0 is bilinear between samples |
 | `SILT_TERRAIN_DEBUG` | 0 | 1 tints by level and draws the triangle grid |
 | `SILT_TERRAIN_LOD_RANGE` | 256 | ring radius in vertex steps (≥ 64) |
+| `SILT_TERRAIN_SHADOW_RANGE` | 96 | shadow pass ring radius (≥ 32) |
+
+Quality presets (#126) should set `range_steps` / `shadow_range_steps` on
+`Renderer::terrain_geom`; that wiring lands after #126.
 
 ## Proof
 

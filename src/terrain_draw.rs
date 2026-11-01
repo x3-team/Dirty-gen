@@ -12,6 +12,8 @@ use silt::terrain_lod::{self, LodNode, LodParams};
 /// Fine track texels the texture holds. The solver's proposed window is
 /// 640 × 640 at 2.5 cm (16 m around the Niva).
 pub const TRACK_FINE_RES: u32 = 640;
+/// Default shadow ring: 1.56 cm to 1.5 m, 25 cm past 24 m.
+pub const SHADOW_RANGE_STEPS: f32 = 96.0;
 /// Most nodes one view can draw. Two views share the buffer.
 const MAX_NODES: usize = 4096;
 
@@ -55,6 +57,9 @@ pub struct TerrainGeometry {
     pub debug: bool,
     /// Ring radius in vertex steps (`SILT_TERRAIN_LOD_RANGE`).
     pub range_steps: f32,
+    /// Ring radius for the shadow pass (`SILT_TERRAIN_SHADOW_RANGE`). The
+    /// shadow map texel is 1.4 cm at best, so its ground can be coarser.
+    pub shadow_range_steps: f32,
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -117,6 +122,11 @@ impl TerrainGeometry {
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| *v >= 64.0)
             .unwrap_or(terrain_lod::RANGE_STEPS);
+        let shadow_range_steps = std::env::var("SILT_TERRAIN_SHADOW_RANGE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v >= 32.0)
+            .unwrap_or(SHADOW_RANGE_STEPS);
         Self {
             patch_v,
             patch_i,
@@ -133,6 +143,7 @@ impl TerrainGeometry {
             cubic: env_flag("SILT_TERRAIN_CUBIC", true),
             debug: env_flag("SILT_TERRAIN_DEBUG", false),
             range_steps,
+            shadow_range_steps,
         }
     }
 
@@ -328,7 +339,7 @@ impl TerrainGeometry {
                 if self.cubic { 1.0 } else { 0.0 },
                 if fine.is_some() { 1.0 } else { 0.0 },
                 0.25,
-                0.0,
+                self.shadow_range_steps,
             ],
             fine: match fine {
                 Some(w) => [w.origin[0], w.origin[1], w.cell, w.res as f32],
@@ -342,7 +353,11 @@ impl TerrainGeometry {
             return;
         }
         let mut main = terrain_lod::select(eye, &params, Some(view_proj));
-        let mut shadow = terrain_lod::select(eye, &params, Some(light_vp));
+        let shadow_params = LodParams {
+            range_steps: self.shadow_range_steps,
+            ..params
+        };
+        let mut shadow = terrain_lod::select(eye, &shadow_params, Some(light_vp));
         main.truncate(MAX_NODES);
         shadow.truncate(MAX_NODES);
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&main));

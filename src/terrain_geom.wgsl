@@ -16,6 +16,7 @@ struct TerrainGeom {
     // x: 1 = monotone cubic between solver samples, 0 = bilinear.
     // y: 1 = the fine track texture holds a solver publish.
     // z: feather at the fine window border, metres.
+    // w: ring radius in steps for the shadow pass (coarser than lod.y).
     recon: vec4<f32>,
     // Fine track window: origin x, origin z (minimum corner), cell (m), res.
     fine: vec4<f32>,
@@ -131,6 +132,10 @@ struct LodIn {
 // xz of the vertex after the morph, and the morph amount (0..1).
 // CPU twin: terrain_lod::vertex_xz. Keep the two identical.
 fn tg_lod_place(g: vec2<f32>, node: vec4<f32>) -> vec3<f32> {
+    return tg_lod_place_range(g, node, tgeom.lod.y);
+}
+
+fn tg_lod_place_range(g: vec2<f32>, node: vec4<f32>, range_steps: f32) -> vec3<f32> {
     let level = node.w;
     let step = tgeom.lod.x * exp2(level);
     let h = node.z / 32.0;
@@ -140,7 +145,7 @@ fn tg_lod_place(g: vec2<f32>, node: vec4<f32>) -> vec3<f32> {
     let gl = floor((node.xy - root) / step + g * (h / step));
     let p = root + gl * step;
     let d = distance(vec3<f32>(p.x, tgeom.lod.z, p.y), frame.cam_pos.xyz);
-    let end = step * tgeom.lod.y;
+    let end = step * range_steps;
     let prev = select(end * 0.5, 0.0, level < 0.5);
     let start = prev + (end - prev) * tgeom.lod.w;
     let k = clamp((d - start) / max(end - start, 1e-4), 0.0, 1.0);
@@ -180,9 +185,12 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
     return shadow_terrain_vertex(in);
 }
 
+// The shadow list is picked with its own, coarser ring (recon.w), so the
+// morph here must use that ring too or the seams open.
 @vertex
 fn vs_shadow_terrain_lod(in: LodIn) -> ShadowOut {
-    return shadow_terrain_vertex(tg_terr_in(in.g, in.node));
+    let xz = tg_lod_place_range(in.g, in.node, tgeom.recon.w).xy;
+    return shadow_terrain_vertex(TerrIn(xz, world_to_ij(xz)));
 }
 
 // ---- LOD debug view -------------------------------------------------------
