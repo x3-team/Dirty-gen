@@ -789,6 +789,14 @@ fn fs_sky(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let sun = normalize(frame.sun_dir.xyz);
         let disc = pow(max(dot(d, sun), 0.0), 900.0) * 4.0;
         var sky = env_radiance(d, 0.0) + frame.sun_color.rgb * disc;
+        if (!sand_field()) {
+            // Below the horizon the HDRI holds its photographed ground, a
+            // brown band wherever a high camera sees past the slab edge.
+            // The backdrop fades to the horizon haze there instead
+            // (reflections still read the full map).
+            let haze = env_radiance(normalize(vec3<f32>(d.x, 0.03, d.z)), 0.3);
+            sky = mix(haze, sky, smoothstep(-0.01, 0.04, d.y));
+        }
         if (sand_field()) {
             // Far dunes on the horizon, a few hundred metres out, softened by
             // the haze. Backdrop only: nothing in the scene touches them.
