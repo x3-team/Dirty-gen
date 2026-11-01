@@ -12,6 +12,7 @@ pub mod lod;
 pub mod particles;
 pub mod patch;
 pub mod render_contract;
+pub mod skin;
 pub mod snow;
 pub mod soil;
 pub mod vehicle;

@@ -630,6 +630,8 @@ pub struct SoilField {
     pub crust: Vec<f32>,
     /// Crack opening, metres. A shader reads this. It does not move the bed.
     pub crack: Vec<f32>,
+    /// Shrinkage-fracture lattice of the skin. It writes [`Self::crack`].
+    pub skin: crate::skin::SkinLattice,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1176,6 +1178,7 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust: vec![0.0; n],
             crack: vec![0.0; n],
+            skin: crate::skin::SkinLattice::default(),
         }
     }
 
@@ -5888,6 +5891,7 @@ impl SoilField {
             }
             self.bake_crust(idx, next, dt, rain);
         }
+        self.fracture_skin();
     }
 
     /// Grow or soak the skin on one cell. The bed and the placed pile stay.
@@ -5915,27 +5919,45 @@ impl SoilField {
         self.open_crack(idx, dt);
     }
 
+    /// A skin under the onset is still plastic: its fissure closes. A plate
+    /// gets its opening from [`Self::fracture_skin`].
     fn open_crack(&mut self, idx: usize, dt: f32) {
         if self.crust[idx] <= CRACK_ONSET_M {
             self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * dt).max(0.0);
+        }
+    }
+
+    /// Shrinkage fracture over the whole field. Each skin wants to shrink by
+    /// the moisture it lost below [`REWET_AT`], the wet ground holds it, and
+    /// edges past their tensile strength break. See [`crate::skin`].
+    fn fracture_skin(&mut self) {
+        if !self.crust.iter().any(|t| *t > CRACK_ONSET_M) && self.skin.fissures == 0 {
             return;
         }
-        let (x, z) = self.cell_xz(idx);
-        let mask = crack_mask(x, z);
-        if mask < 0.12 {
-            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * 0.25 * dt).max(0.0);
-            return;
+        let cells: Vec<crate::skin::SkinCell> = (0..self.crust.len())
+            .map(|idx| crate::skin::SkinCell {
+                thickness: finite_or_zero(self.crust[idx]),
+                strain: crate::skin::free_strain(self.wetness[idx], REWET_AT),
+            })
+            .collect();
+        let mut opening = self.crack.clone();
+        self.skin.step(
+            self.res,
+            self.cell,
+            CRACK_ONSET_M,
+            CRUST_MAX_M,
+            &cells,
+            &mut opening,
+        );
+        for idx in 0..opening.len() {
+            let cap = CRACK_MAX_M.min(self.crust[idx].max(0.0));
+            let o = finite_or_zero(opening[idx]);
+            self.crack[idx] = if self.crust[idx] > CRACK_ONSET_M {
+                o.min(cap)
+            } else {
+                o.min(self.crack[idx])
+            };
         }
-        let skin = ((self.crust[idx] - CRACK_ONSET_M) / (CRUST_MAX_M - CRACK_ONSET_M)).clamp(0.0, 1.0);
-        let plate = if self.passes[idx] > 0 {
-            let age = ((self.rest[idx] - 0.40) / 12.0).clamp(0.0, 1.0);
-            0.55 + 0.45 * age
-        } else {
-            0.40
-        };
-        let target = CRACK_MAX_M * skin * mask * plate;
-        let a = 1.0 - (-0.09 * dt).exp();
-        self.crack[idx] = lerp(self.crack[idx], target, a).clamp(0.0, CRACK_MAX_M);
     }
 
     fn cell_xz(&self, idx: usize) -> (f32, f32) {
@@ -6224,6 +6246,7 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust,
             crack,
+            skin: crate::skin::SkinLattice::default(),
         })
     }
 
@@ -7858,36 +7881,6 @@ pub fn track_harden_mul(crust: f32, crack: f32, passes: u8, rest: f32) -> f32 {
     1.0 + 1.8 * skin * age * (1.0 - 0.35 * open)
 }
 
-/// 1 on a shrinkage fissure, 0 inside the polygon. World metres.
-pub fn crack_mask(x: f32, z: f32) -> f32 {
-    let scale = 0.48_f32;
-    let fx = x / scale;
-    let fz = z / scale;
-    let ix = fx.floor() as i32;
-    let iz = fz.floor() as i32;
-    let mut best = f32::MAX;
-    let mut second = f32::MAX;
-    for dj in -1..=1 {
-        for di in -1..=1 {
-            let gx = (ix + di) as f32;
-            let gz = (iz + dj) as f32;
-            let jx = hash2(gx, gz) - 0.5;
-            let jz = hash2(gx + 4.2, gz + 1.7) - 0.5;
-            let cx = gx + 0.5 + jx * 0.8;
-            let cz = gz + 0.5 + jz * 0.8;
-            let d = (fx - cx).hypot(fz - cz);
-            if d < best {
-                second = best;
-                best = d;
-            } else if d < second {
-                second = d;
-            }
-        }
-    }
-    let gap = (second - best).max(0.0);
-    (1.0 - gap / 0.11).clamp(0.0, 1.0)
-}
-
 /// RGBA8 texel for a shader. R is crust thickness, G is crack opening.
 /// B is unused. A is opaque so a sampler can tell a written cell from empty.
 pub fn crust_shader_texel(thickness: f32, crack: f32) -> [u8; 4] {
@@ -8049,6 +8042,10 @@ fn bog_bowl(x: f32, z: f32, cx: f32, cz: f32, rad: f32, depth: f32) -> f32 {
     let shore = smooth01(1.0, 0.8, d);
     let floor = smooth01(0.8, 0.4, d);
     (shore * 0.35 + floor * 0.65) * depth
+}
+
+fn finite_or_zero(v: f32) -> f32 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 fn hash2(x: f32, y: f32) -> f32 {
