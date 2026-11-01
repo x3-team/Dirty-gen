@@ -44,6 +44,7 @@ struct Frame {
     reflect_view_proj: mat4x4<f32>,
     reflect_flags: vec4<f32>,
     // x: water detail (0 low, 1 medium, 2 high). y: 1 with a fluid sheet.
+    // w: 1 when the scene target is linear HDR (see `present`).
     water_fx: vec4<f32>,
 }
 
@@ -234,14 +235,75 @@ fn mud_of(panel: i32) -> vec4<f32> {
 
 // Filmic curve (Narkowicz ACES fit). The old 1 - exp(-x) flattened every
 // highlight into the same pale tan, so wet gloss never read as gloss.
-fn tonemap(c: vec3<f32>) -> vec3<f32> {
-    let x = max(c, vec3<f32>(0.0)) * frame.env.w * 0.78;
+// Input is already exposed (see `expose`). `fs_tonemap` in render.rs is the
+// same expression.
+fn aces_fit(x_in: vec3<f32>) -> vec3<f32> {
+    let x = max(x_in, vec3<f32>(0.0));
     let m = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
     return pow(clamp(m, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
 }
 
+fn expose(c: vec3<f32>) -> vec3<f32> {
+    return max(c, vec3<f32>(0.0)) * frame.env.w * 0.78;
+}
+
+fn tonemap(c: vec3<f32>) -> vec3<f32> {
+    return aces_fit(expose(c));
+}
+
+// Scene colour target (docs/LOOK_GAP.md, thread 1). With an HDR target
+// (`water_fx.w` = 1, `Rgba16Float`) the scene shaders write exposed linear
+// light and the tone curve runs once, in the blit or the tonemap pass.
+// Without one (an adapter that cannot render and blend half floats, or
+// SILT_HDR=0) they write the display value into the 8-bit target.
+fn scene_hdr() -> bool {
+    return frame.water_fx.w > 0.5;
+}
+
+fn display_curve(c: vec3<f32>) -> vec3<f32> {
+    return tonemap(c);
+}
+
 fn present(c: vec3<f32>) -> vec4<f32> {
+    if (scene_hdr()) {
+        return vec4<f32>(expose(c), 1.0);
+    }
     return vec4<f32>(tonemap(c), 1.0);
+}
+
+// A colour authored as the final display value (particles, debug tints,
+// fog composited in display space) into what the scene target holds:
+// the inverse of `aces_fit`, so the tonemap pass gives the same display
+// value back.
+fn from_display(d: vec3<f32>) -> vec3<f32> {
+    if (!scene_hdr()) {
+        return d;
+    }
+    return aces_inverse(d);
+}
+
+// Inverse of `aces_fit` (display value -> exposed linear light).
+fn aces_inverse(d: vec3<f32>) -> vec3<f32> {
+    let m = min(pow(clamp(d, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2)), vec3<f32>(0.999));
+    let qa = vec3<f32>(2.51) - 2.43 * m;
+    let qb = vec3<f32>(0.03) - 0.59 * m;
+    let qc = -0.14 * m;
+    return (-qb + sqrt(max(qb * qb - 4.0 * qa * qc, vec3<f32>(0.0)))) / (2.0 * qa);
+}
+
+// The old exp curve a few water paths still grade with, as a display value.
+fn legacy_curve(c: vec3<f32>, k: f32) -> vec3<f32> {
+    let mapped = vec3<f32>(1.0) - exp(-max(c, vec3<f32>(0.0)) * k);
+    return pow(mapped, vec3<f32>(1.0 / 2.2));
+}
+
+// A sample of the scene colour copy (SSR, refraction, planar pass) as the
+// display value the water shading was tuned on.
+fn scene_to_display(c: vec3<f32>) -> vec3<f32> {
+    if (scene_hdr()) {
+        return aces_fit(c);
+    }
+    return c;
 }
 
 // Equirect lookup. Matches texel_dir in env.rs.
@@ -1962,7 +2024,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     }
     if (frame.debug.x > 8.5) {
         // 9: published moisture (r), film > 0 (g), the spread wet term (b).
-        return vec4<f32>(bc_moisture(xz, 0.0), select(0.0, 1.0, film_c.r + film_c.g > 0.0005), wet, 1.0);
+        return vec4<f32>(from_display(vec3<f32>(bc_moisture(xz, 0.0), select(0.0, 1.0, film_c.r + film_c.g > 0.0005), wet)), 1.0);
     }
     // Mud on the sand until soil_mix exists: where the contract publishes
     // slurry, or the pore moisture is saturated in a tire cut, the sand is
@@ -2313,7 +2375,7 @@ fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
         i32(clamp(uv.x, 0.0, 1.0) * f32(dims.x - 1u)),
         i32(clamp(uv.y, 0.0, 1.0) * f32(dims.y - 1u)),
     );
-    return textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
+    return scene_to_display(textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb);
 }
 
 // Win-demo pool: sample the mirrored-geometry pass (Niva + sky), not SSR over terrain.
@@ -2351,7 +2413,7 @@ fn pool_scene_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3
         p = p + refl * 0.07;
         let uv = scene_uv_from_world(p);
         if (uv.x > 0.03 && uv.x < 0.97 && uv.y > 0.03 && uv.y < 0.97) {
-            let s = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
+            let s = scene_to_display(textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb);
             let w = 1.0 / (1.0 + f32(i) * 0.22);
             accum += s * w;
             wsum += w;
@@ -2388,7 +2450,7 @@ fn scene_ssr(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
     if (!found) {
         return vec3<f32>(0.0);
     }
-    return textureSampleLevel(scene_color, scene_samp, hit_uv, 0.0).rgb;
+    return scene_to_display(textureSampleLevel(scene_color, scene_samp, hit_uv, 0.0).rgb);
 }
 
 fn reflect_vehicle_scene(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
@@ -2424,7 +2486,7 @@ fn reflect_vehicle_scene(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> v
         if (veh_uv.x < 0.02 || veh_uv.x > 0.98 || veh_uv.y < 0.02 || veh_uv.y > 0.98) {
             continue;
         }
-        let samp = textureSampleLevel(scene_color, scene_samp, veh_uv, 0.0).rgb;
+        let samp = scene_to_display(textureSampleLevel(scene_color, scene_samp, veh_uv, 0.0).rgb);
         let w = pow(aim, select(select(0.28, 0.18, beauty), 0.12, demo_side));
         accum += samp * w;
         wt += w;
@@ -2496,7 +2558,7 @@ fn niva_planar_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec
         if (uv.x < 0.04 || uv.x > 0.96 || uv.y < 0.04 || uv.y > 0.96) {
             continue;
         }
-        let samp = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
+        let samp = scene_to_display(textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb);
         let w = aim * (0.55 + tire_meta.w * 0.45);
         accum += samp * w;
         wt += w;
@@ -2719,11 +2781,11 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 let uvh = clamp(uvm, vec2<f32>(0.0), vec2<f32>(0.9999));
                 let ph = vec2<i32>(uvh * dims);
                 let dmax = vec2<i32>(dims) - vec2<i32>(1);
-                var col = textureLoad(post_color, ph, 0).rgb * 0.4;
-                col += textureLoad(post_color, clamp(ph + vec2<i32>(2, 0), vec2<i32>(0), dmax), 0).rgb * 0.15;
-                col += textureLoad(post_color, clamp(ph - vec2<i32>(2, 0), vec2<i32>(0), dmax), 0).rgb * 0.15;
-                col += textureLoad(post_color, clamp(ph + vec2<i32>(0, 2), vec2<i32>(0), dmax), 0).rgb * 0.15;
-                col += textureLoad(post_color, clamp(ph - vec2<i32>(0, 2), vec2<i32>(0), dmax), 0).rgb * 0.15;
+                var col = scene_to_display(textureLoad(post_color, ph, 0).rgb) * 0.4;
+                col += scene_to_display(textureLoad(post_color, clamp(ph + vec2<i32>(2, 0), vec2<i32>(0), dmax), 0).rgb) * 0.15;
+                col += scene_to_display(textureLoad(post_color, clamp(ph - vec2<i32>(2, 0), vec2<i32>(0), dmax), 0).rgb) * 0.15;
+                col += scene_to_display(textureLoad(post_color, clamp(ph + vec2<i32>(0, 2), vec2<i32>(0), dmax), 0).rgb) * 0.15;
+                col += scene_to_display(textureLoad(post_color, clamp(ph - vec2<i32>(0, 2), vec2<i32>(0), dmax), 0).rgb) * 0.15;
                 let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
                 // Fade to the IBL sky toward the screen edge and with the
                 // gap, so a ray leaving the frame blends out, not cuts off.
@@ -3651,7 +3713,7 @@ fn beauty_water_fragment(in: WaterOut) -> vec4<f32> {
     pl /= 9.0;
     // The planar image wins where it has the body; the screen trace keeps
     // the rest (the bank, the far scene).
-    let pl_rgb = pl.rgb / max(pl.a, 1e-3);
+    let pl_rgb = scene_to_display(pl.rgb / max(pl.a, 1e-3));
     let ssr = vec4<f32>(mix(ssr0.rgb, pl_rgb, pl.a), max(ssr0.a * (1.0 - pl.a), pl.a));
     if (ssr.a > 0.0) {
         // Near the Niva the sheet mirrors the sills, body and tires with its
@@ -3718,7 +3780,7 @@ fn beauty_water_fragment(in: WaterOut) -> vec4<f32> {
     // would pull it under the surface; keep the straight-down texel then.
     let front = textureLoad(post_depth, rpix, 0).x < here_c.z / here_c.w;
     let off_screen = any(ruv < vec2<f32>(0.0)) || any(ruv > vec2<f32>(1.0));
-    let dst = textureLoad(post_color, select(rpix, hpix, front || over_tire > 0.5 || off_screen), 0).rgb;
+    let dst = scene_to_display(textureLoad(post_color, select(rpix, hpix, front || over_tire > 0.5 || off_screen), 0).rgb);
     // Soft intersection with the rubber (bevy_water depth_diff): the sheet
     // thins over the last centimetre of view path in front of the tire, so
     // the waterline is a filtered line, not the pixel steps of two meshes.
@@ -3738,7 +3800,7 @@ fn beauty_water_fragment(in: WaterOut) -> vec4<f32> {
     let tint = mix(vec3<f32>(1.0), clamp(trans / max((trans.r + trans.g + trans.b) / 3.0, 1e-3), vec3<f32>(0.0), vec3<f32>(1.12)),
         smoothstep(0.03, 0.15, depth) * 0.6);
     if (frame.debug.x > 7.5) {
-        return vec4<f32>(textureLoad(post_color, hpix, 0).rgb, 1.0);
+        return vec4<f32>(scene_to_display(textureLoad(post_color, hpix, 0).rgb), 1.0);
     }
     if (frame.debug.x > 6.5) {
         // 7: SSR weight (r), sky occlusion by the body (g), alpha (b).
@@ -4011,8 +4073,7 @@ fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
     let fc = foam_color(bed_col, mk.cloud, nrm, in.world);
     col = mix(col, fc, mk.foam);
     let a_out = mix(max(alpha, min(spec * 2.0, 1.0) * shore), shore, mk.foam);
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    let gamma = from_display(legacy_curve(col, 1.08));
     return vec4<f32>(gamma, a_out);
 }
 
@@ -4107,7 +4168,7 @@ fn shade_seam_pool(
     if (win_demo_flat_terrain()) {
         if (frame.reflect_flags.y > 0.5) {
             let planar = pool_planar_reflect_sample(in.world);
-            return vec4<f32>(pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 0.96);
+            return vec4<f32>(from_display(pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2))), 0.96);
         }
         let reflect_ready = pool_reflect_ready();
         let bow = beauty_bow_wave(xz, t);
@@ -4147,8 +4208,7 @@ fn shade_seam_pool(
         if (reflect_ready && win_demo_in_pool(xz)) {
             alpha = max(alpha, 0.94);
         }
-        let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
-        let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+        let gamma = from_display(legacy_curve(col, 1.05));
         return vec4<f32>(gamma, alpha);
     }
     let view = normalize(frame.cam_pos.xyz - in.world);
@@ -4199,8 +4259,7 @@ fn shade_seam_pool(
     col = mix(mix(bed * vec3<f32>(0.36, 0.30, 0.24), col, 0.65), col, edge_a);
     var alpha = mix(0.76, 0.91, deep) * edge_a;
     alpha = max(alpha, select(0.74, 0.82, ultra) * edge_a);
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    let gamma = from_display(legacy_curve(col, 1.05));
     return vec4<f32>(gamma, alpha);
 }
 
@@ -4229,7 +4288,8 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         return open_water_fragment(in, bed);
     }
     if (sand_field()) {
-        return beauty_water_fragment(in);
+        let bw = beauty_water_fragment(in);
+        return vec4<f32>(from_display(bw.rgb), bw.a);
     }
     let own = mat_bilinear(xz).g * 0.34;
     let dug = max(-stamp_bilinear(xz), 0.0);
@@ -4374,7 +4434,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             }
             let sky_uv = scene_uv_from_world(in.world + normalize(refl_dir) * 0.55);
             if (sky_uv.x > 0.02 && sky_uv.x < 0.98) {
-                let sky_samp = textureSampleLevel(scene_color, scene_samp, sky_uv, 0.0).rgb;
+                let sky_samp = scene_to_display(textureSampleLevel(scene_color, scene_samp, sky_uv, 0.0).rgb);
                 reflect_col = mix(reflect_col, mix(sky_base, sky_samp, 0.78), select(0.32, 0.48, ultra));
             }
             let ibl_lit = reflect_col;
@@ -4419,8 +4479,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         col = mix(col, foam_color(bed, mk.cloud, nrm, in.world), mk.foam);
         alpha = mix(alpha, shore_fade, mk.foam);
     }
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    let gamma = from_display(legacy_curve(col, 1.08));
     return vec4<f32>(gamma, alpha);
 }
 
@@ -4894,7 +4953,8 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     }
     let mesh_fw = length(fwidth(in.world.xz));
     if (in.panel > 49.9 && in.panel < 54.99) {
-        return spray_strip(in);
+        let ss = spray_strip(in);
+        return vec4<f32>(from_display(ss.rgb), ss.a);
     }
     let panel = i32(in.panel + 0.5);
     var paint = panel_paint(in.panel, in.uv, in.world);
@@ -5411,5 +5471,5 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     }
     let fall = smoothstep(0.40, 0.12, d);
     // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
-    return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
+    return vec4<f32>(from_display(in.color.rgb * mix(0.65, 1.0, fall)), in.color.a * fall);
 }

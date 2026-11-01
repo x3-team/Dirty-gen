@@ -4,6 +4,8 @@
 // (Lottes 2009 paper), linear-sampled 9-tap Gaussian.
 
 override POST_BLOOM: u32 = 1u;
+// 1: t0 is the linear HDR scene target. 0: it is the 8-bit display image.
+override POST_HDR: u32 = 0u;
 
 struct V {
     @builtin(position) clip: vec4<f32>,
@@ -36,24 +38,49 @@ fn vs_post(@builtin(vertex_index) vid: u32) -> V {
     return o;
 }
 
-// The scene shaders write gamma(1 - exp(-1.08 c)). Undo it.
+// The display value is gamma(ACES fit(c)) (`aces_fit` in shader.wgsl). Undo it.
 fn decode(s: vec3<f32>) -> vec3<f32> {
-    let m = pow(clamp(s, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
-    return -log(max(vec3<f32>(1.0) - m, vec3<f32>(1.0 / 400.0))) / 1.08;
+    let m = min(pow(clamp(s, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2)), vec3<f32>(0.999));
+    let qa = vec3<f32>(2.51) - 2.43 * m;
+    let qb = vec3<f32>(0.03) - 0.59 * m;
+    let qc = -0.14 * m;
+    return (-qb + sqrt(max(qb * qb - 4.0 * qa * qc, vec3<f32>(0.0)))) / (2.0 * qa);
 }
 
 fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.299, 0.587, 0.114));
 }
 
-fn src(uv: vec2<f32>) -> vec3<f32> {
+// The display-encoded value, what the edge blend and grade were tuned on.
+fn encode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    let m = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return pow(clamp(m, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+}
+
+fn raw(uv: vec2<f32>) -> vec3<f32> {
     return textureSampleLevel(t0, samp, uv, 0.0).rgb;
+}
+
+fn src(uv: vec2<f32>) -> vec3<f32> {
+    if (POST_HDR == 1u) {
+        return encode(raw(uv));
+    }
+    return raw(uv);
+}
+
+// Linear light: exact from the HDR target, decoded from the 8-bit one.
+fn src_linear(uv: vec2<f32>) -> vec3<f32> {
+    if (POST_HDR == 1u) {
+        return max(raw(uv), vec3<f32>(0.0));
+    }
+    return decode(raw(uv));
 }
 
 // ---------------------------------------------------------------- bloom
 
-fn bright(c_ldr: vec3<f32>) -> vec3<f32> {
-    let c = decode(c_ldr) * EXPOSURE;
+fn bright(c_lin: vec3<f32>) -> vec3<f32> {
+    let c = c_lin * EXPOSURE;
     let l = max(c.r, max(c.g, c.b));
     // Soft knee: quadratic ramp from threshold - knee to threshold + knee.
     var soft = clamp(l - BLOOM_THRESHOLD + BLOOM_KNEE, 0.0, 2.0 * BLOOM_KNEE);
@@ -67,19 +94,19 @@ fn fs_bloom_down(in: V) -> @location(0) vec4<f32> {
     // Output is 1/4 resolution; the 13 taps cover about 8x8 source texels.
     let px = 2.0 / vec2<f32>(textureDimensions(t0));
     let uv = in.uv;
-    let a = bright(src(uv + px * vec2<f32>(-2.0, -2.0)));
-    let b = bright(src(uv + px * vec2<f32>(0.0, -2.0)));
-    let c = bright(src(uv + px * vec2<f32>(2.0, -2.0)));
-    let d = bright(src(uv + px * vec2<f32>(-2.0, 0.0)));
-    let e = bright(src(uv));
-    let f = bright(src(uv + px * vec2<f32>(2.0, 0.0)));
-    let g = bright(src(uv + px * vec2<f32>(-2.0, 2.0)));
-    let h = bright(src(uv + px * vec2<f32>(0.0, 2.0)));
-    let i = bright(src(uv + px * vec2<f32>(2.0, 2.0)));
-    let j = bright(src(uv + px * vec2<f32>(-1.0, -1.0)));
-    let k = bright(src(uv + px * vec2<f32>(1.0, -1.0)));
-    let l = bright(src(uv + px * vec2<f32>(-1.0, 1.0)));
-    let m = bright(src(uv + px * vec2<f32>(1.0, 1.0)));
+    let a = bright(src_linear(uv + px * vec2<f32>(-2.0, -2.0)));
+    let b = bright(src_linear(uv + px * vec2<f32>(0.0, -2.0)));
+    let c = bright(src_linear(uv + px * vec2<f32>(2.0, -2.0)));
+    let d = bright(src_linear(uv + px * vec2<f32>(-2.0, 0.0)));
+    let e = bright(src_linear(uv));
+    let f = bright(src_linear(uv + px * vec2<f32>(2.0, 0.0)));
+    let g = bright(src_linear(uv + px * vec2<f32>(-2.0, 2.0)));
+    let h = bright(src_linear(uv + px * vec2<f32>(0.0, 2.0)));
+    let i = bright(src_linear(uv + px * vec2<f32>(2.0, 2.0)));
+    let j = bright(src_linear(uv + px * vec2<f32>(-1.0, -1.0)));
+    let k = bright(src_linear(uv + px * vec2<f32>(1.0, -1.0)));
+    let l = bright(src_linear(uv + px * vec2<f32>(-1.0, 1.0)));
+    let m = bright(src_linear(uv + px * vec2<f32>(1.0, 1.0)));
     var o = e * 0.125;
     o += (a + c + g + i) * 0.03125;
     o += (b + d + f + h) * 0.0625;

@@ -642,8 +642,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 @group(0) @binding(20) var fog_half: texture_2d<f32>;
 @group(0) @binding(21) var fog_half_samp: sampler;
 
-@fragment
-fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+fn fog_up_sample(frag: vec4<f32>) -> vec4<f32> {
     let full = vec2<f32>(textureDimensions(fog_half)) * 2.0;
     // Four bilinear taps half a half-res texel apart: a 4 x 4 tent over the
     // march, which melts the per-pixel jitter of the steps into a smooth
@@ -659,6 +658,20 @@ fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4<f32>(c.rgb / c.a, c.a);
+}
+
+@fragment
+fn fs_fog_up(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    return fog_up_sample(frag);
+}
+
+// The same composite into the linear HDR target, for when the 8-bit
+// picture is not made from it directly (SILT_POST reads the HDR target).
+// Blending in linear light thins the edges of the cloud a little.
+@fragment
+fn fs_fog_up_hdr(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = fog_up_sample(frag);
+    return vec4<f32>(aces_inverse(c.rgb), c.a);
 }
 
 // Solid ground (bed + placed), metres, from binding 1; the caller's height
