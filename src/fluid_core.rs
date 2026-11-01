@@ -7490,6 +7490,10 @@ impl FluidCore {
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
+                    // The closures borrow the sheets mutably, so they are FnMut;
+                    // native code moves them into rayon::join, here they need a
+                    // mutable binding to be called in sequence.
+                    let (mut run_water, mut run_slurry) = (run_water, run_slurry);
                     water_ms = run_water();
                     slurry_ms = run_slurry();
                 }
