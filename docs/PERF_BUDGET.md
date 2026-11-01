@@ -15,6 +15,8 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 
 The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
 
+The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
+
 A pull request that changes the solver prints, in the release CI log, the step count, the mean, p95, the hardware line, and the milliseconds of each subsystem (`DRIVE_*` from `ThroughDrive::step` at dt = 1/30).
 
 ## CI, commit 8a826c5
@@ -68,9 +70,17 @@ The open 2 cm sheet takes one CFL pass and lets flat, slow tiles sleep. It skips
 
 Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger gap 0.000492 m³. Step mean 16.509 ms (budget 33.004), p95 31.104 ms, air 0.235 ms (budget 1.5). Drive p95 8.104 ms. Solver frame 2.505 ms (budget 7). A second timing of the same 96 steps read solver sum 5.695 ms.
 
+## Fog on the shared air grid
+
+Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.
+
+## River ford and beach
+
+`tests/ford_beach.rs` steps the ford in `silt::ford`: an open reach with an inlet and an outlet, full-gravity water with Manning bed friction and eddy viscosity, free-surface diffusion, a paddle swell, and the swash soak. None of these run unless a caller sets them, so `World::demo`, `ThroughDrive`, the e2e step, and the creek take the same path as before and the caps above are unchanged. The release log prints `FORD_RIVER ... step_ms` for one `FluidCore::step` of the ford at dt = 1/30 (coarse sheet only, no tires). Cloud container, 4 cores, which runs about three times slower than the CI runners: 4.2 ms with the rocks, the reach, and the swell.
+
 ## Foam and stirred silt
 
-Base is `main` at 396af7e. Intel(R) Xeon(R) Processor, 4 cores. dt = 1/30. 24 warmup steps, then 96. The before column is the fine-sheet row above. The after column is release `e2e_niva` on this change. Caps are unchanged: solver sum ≤ 7 ms, solver frame ≤ 7 ms, e2e step ≤ 33.004 ms, air ≤ 1.5 ms.
+Base is `main` at 396af7e. Intel(R) Xeon(R) Processor, 4 cores. dt = 1/30. 24 warmup steps, then 96. The before column is the fine-sheet row above. The after column is release `e2e_niva` on this change. Caps are unchanged: solver sum ≤ 7 ms, solver frame ≤ 7 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms.
 
 | Subsystem | Before | After |
 | --- | ---: | ---: |

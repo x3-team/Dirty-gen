@@ -37,6 +37,10 @@ web-sys = { version = "0.3", features = ["console", "Document", "Element", "Html
 web-time = "1"
 wgpu = { version = "23", features = ["webgl"] }
 
+[dev-dependencies]
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+png = "0.17"
+
 [workspace]
 resolver = "2"
 members = ["dust_trail"]
