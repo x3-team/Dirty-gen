@@ -4452,6 +4452,8 @@ pub struct FluidCore {
     /// 1 when this coarse cell's sheet was moved onto the 2 cm patch.
     /// Survives `restrict_fine` so the coarse shove does not hit it twice.
     fine_hold: Vec<u8>,
+    /// 1 on fine cells under a held coarse column. The fine sheet's gate.
+    fine_gate: Vec<u8>,
     dust: Vec<f32>,
     dust_u: Vec<f32>,
     dust_v: Vec<f32>,
@@ -4574,6 +4576,7 @@ impl FluidCore {
             fine_grain: vec![Grain::Other as u8; fine_n],
             fine_on: false,
             fine_hold: vec![0; n],
+            fine_gate: vec![0; FINE_RES * FINE_RES],
             dust: vec![0.0; air_n],
             dust_u: vec![0.0; air_n],
             dust_v: vec![0.0; air_n],
@@ -7406,7 +7409,7 @@ impl FluidCore {
                 let bed = &bed[..n];
                 let nu_w = &nu_w[..n];
                 let nu_s = &mut nu_s[..n];
-                let gate = &gate[..n];
+                let gate = if fine { &self.fine_gate[..n] } else { &gate[..n] };
                 // Water and slurry are separate sheets: their depth and velocity
                 // arrays do not alias, and both only read the bed, gate, and
                 // mask. Each one steps exactly as it did in series, on its own
@@ -7730,6 +7733,11 @@ impl FluidCore {
         self.fine_us.fill(0.0);
         self.fine_vs.fill(0.0);
         self.fine_hold.fill(0);
+        // The 2 cm sheet only moves fluid among the cells it holds. The other
+        // fine cells read as dry ground: open, the held columns would drain
+        // into them every step and leave a hole under the patch in deep water.
+        // The coarse sheet carries the exchange across that rim.
+        self.fine_gate.fill(0);
         let full = ((COARSE_CELL_M / FINE_CELL_M).round() as u32).pow(2);
         let r2 = FINE_TIRE_R_M * FINE_TIRE_R_M;
         let (col, row) = self.fine_coarse_axes();
@@ -7767,9 +7775,18 @@ impl FluidCore {
             let nhit = acc.hits.len();
             for h in 0..nhit {
                 let (fidx, cidx) = acc.hits[h];
+                self.fine_moisture[fidx] = self.moisture[cidx];
+                self.fine_grain[fidx] = self.grain[cidx];
                 if self.fine_hold[cidx] != 1 {
+                    // A closed cell is a wall at the free surface of its coarse
+                    // column, not dry ground at the bed left from an older patch
+                    // position. Ground there would pull the held edge outward.
+                    let surface = self.water[cidx].max(self.slurry[cidx]);
+                    self.fine_bed[fidx] = self.bed[cidx] + surface;
                     continue;
                 }
+                self.fine_bed[fidx] = self.bed[cidx];
+                self.fine_gate[fidx] = 1;
                 self.fine_water[fidx] = self.water[cidx];
                 self.fine_slurry[fidx] = self.slurry[cidx];
                 self.fine_uw[fidx] = self.uw[cidx];
@@ -10618,6 +10635,55 @@ mod tests {
             "dry ground gained moisture {}",
             fluid.sample(6.0, 6.0).moisture
         );
+    }
+
+    /// A still tire in 40 cm of water. The 2 cm patch must not drain the cells
+    /// it holds into its own rim, or a hole follows the patch.
+    #[test]
+    fn fine_patch_leaves_no_hole_in_deep_water() {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        fluid.pour_water(-6.0, 6.0, -6.0, 6.0, 0.40);
+        let before = fluid.ledger().total_m3;
+        let dt = 1.0 / 30.0;
+        for _ in 0..30 {
+            fluid.push_tire(TirePush {
+                x: 0.0,
+                z: 0.0,
+                forward_x: 0.0,
+                forward_z: 1.0,
+                radius: 0.01,
+                width: 0.01,
+                speed: 0.0,
+                slip: 0.0,
+            });
+            fluid.step(dt);
+        }
+        let after = fluid.ledger().total_m3;
+        assert!(
+            (after - before).abs() < 1.0e-3 * before,
+            "volume {before} -> {after}"
+        );
+        // Inside the patch and around its rim the surface stays at the pond
+        // level. Before the wet columns were held, cells under the patch fell
+        // to about 17 cm.
+        let mut lowest = f32::MAX;
+        let mut at = (0.0, 0.0);
+        let mut z = -2.0f32;
+        while z <= 2.0 {
+            let mut x = -2.0f32;
+            while x <= 2.0 {
+                if x.hypot(z) >= 0.5 {
+                    let s = fluid.sample(x, z);
+                    if s.water_m < lowest {
+                        lowest = s.water_m;
+                        at = (x, z);
+                    }
+                }
+                x += 0.1;
+            }
+            z += 0.1;
+        }
+        assert!(lowest > 0.37, "hole {lowest:.4} m at {at:?}");
     }
 
     #[test]
