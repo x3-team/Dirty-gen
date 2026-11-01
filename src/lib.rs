@@ -16,11 +16,14 @@ pub mod particles;
 pub mod patch;
 pub mod quality;
 pub mod render_contract;
+pub mod skin;
 pub mod snow;
 pub mod snow_track;
 pub mod soil;
+pub mod terrain_lod;
 pub mod vehicle;
 pub mod wade;
+pub mod wick;
 pub mod world;
 
 pub use world::{
