@@ -14,6 +14,7 @@ use silt::world::{CameraPose, World};
 use crate::cc0::{buggy_fit, RgbaTex};
 use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime};
 use crate::overlay::Overlay;
+use crate::terrain_draw::TerrainGeometry;
 use crate::mesh::{
     bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_with_ground,
     terrain_mesh,
@@ -116,7 +117,12 @@ pub struct Renderer {
     shadow_depth_view: wgpu::TextureView,
     readback: wgpu::Buffer,
     padded_row: u32,
-    terrain: GpuMesh,
+    terrain: Option<GpuMesh>,
+    pub terrain_geom: TerrainGeometry,
+    pipe_terrain_lod: wgpu::RenderPipeline,
+    pipe_terrain_lod_debug: wgpu::RenderPipeline,
+    pipe_water_lod: wgpu::RenderPipeline,
+    pipe_shadow_terrain_lod: wgpu::RenderPipeline,
     body: GpuMesh,
     glass: GpuMesh,
     wheels: [GpuMesh; 4],
@@ -389,7 +395,10 @@ impl Renderer {
         let shadow_res = quality.shadow_res;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", include_str!("shader.wgsl"), include_str!("terrain_geom.wgsl"))
+                    .into(),
+            ),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -404,6 +413,7 @@ impl Renderer {
                 std::mem::size_of::<FrameData>() as u64,
             )],
         });
+        let tg_layout = TerrainGeometry::layout_entries();
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-tex"),
             entries: &[
@@ -469,6 +479,8 @@ impl Renderer {
                     },
                     count: None,
                 },
+                tg_layout[0],
+                tg_layout[1],
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -488,16 +500,20 @@ impl Renderer {
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("height-only"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                tg_layout[0],
+                tg_layout[1],
+            ],
         });
         let model_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model"),
@@ -716,6 +732,8 @@ impl Renderer {
             niva_nor,
             niva_mr,
         ];
+        let terrain_geom = TerrainGeometry::new(&device, !formats.height_packed);
+        let tg_tex = terrain_geom.bind_entries();
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tex-bg"),
             layout: &tex_bgl,
@@ -768,6 +786,8 @@ impl Renderer {
                         &crust_tex.create_view(&Default::default()),
                     ),
                 },
+                tg_tex[0].clone(),
+                tg_tex[1].clone(),
             ],
         });
         let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -816,15 +836,20 @@ impl Renderer {
                 },
             ],
         });
+        let [tg_fine, tg_uniform] = terrain_geom.bind_entries();
         let height_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("height-bg"),
             layout: &height_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &height_tex.create_view(&Default::default()),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &height_tex.create_view(&Default::default()),
+                    ),
+                },
+                tg_fine.clone(),
+                tg_uniform.clone(),
+            ],
         });
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
@@ -1017,6 +1042,54 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_terrain_lod = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_terrain_lod",
+            Some("fs_terrain"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, true, wgpu::CompareFunction::Less)),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_terrain_lod_debug = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_terrain_lod_debug",
+            Some("fs_terrain_lod_debug"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, true, wgpu::CompareFunction::Less)),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_water_lod = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_water_lod",
+            Some("fs_water"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, false, wgpu::CompareFunction::Less)),
+            true,
+            None,
+        );
+        let pipe_shadow_terrain_lod = pipeline(
+            &device,
+            &shader,
+            &shadow_layout,
+            "vs_shadow_terrain_lod",
+            Some("fs_shadow"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(shadow_depth_state(formats.depth)),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_shadow_mesh = pipeline(
             &device,
             &shader,
@@ -1109,8 +1182,12 @@ impl Renderer {
             });
         }
 
-        let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
-        let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
+        // The old uniform grid is 2.5 M vertices. Only build it when asked for.
+        let terrain = if terrain_geom.lod {
+            None
+        } else {
+            Some(legacy_terrain(&device))
+        };
         let body = upload_cpu(&device, &cc0.body, "body");
         let glass = upload_cpu(&device, &cc0.glass, "glass");
         let wheels = [
@@ -1203,6 +1280,11 @@ impl Renderer {
             readback,
             padded_row,
             terrain,
+            terrain_geom,
+            pipe_terrain_lod,
+            pipe_terrain_lod_debug,
+            pipe_water_lod,
+            pipe_shadow_terrain_lod,
             body,
             glass,
             wheels,
@@ -1413,6 +1495,15 @@ impl Renderer {
         });
     }
 
+    /// The old uniform grid, when the LOD tree is off.
+    fn legacy_terrain(&self) -> Option<&GpuMesh> {
+        if self.terrain_geom.lod {
+            None
+        } else {
+            self.terrain.as_ref()
+        }
+    }
+
     pub fn draw(
         &mut self,
         world: &World,
@@ -1540,6 +1631,11 @@ impl Renderer {
         }
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
+        if !self.terrain_geom.lod && self.terrain.is_none() {
+            self.terrain = Some(legacy_terrain(&self.device));
+        }
+        self.terrain_geom
+            .prepare(&self.queue, &world.soil, cam.eye, &view_proj, &light_vp);
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
@@ -1598,8 +1694,13 @@ impl Renderer {
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.height_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[0]);
-            pass.set_pipeline(&self.pipe_shadow_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_shadow_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_shadow_terrain_lod);
+                self.terrain_geom.draw_all(&mut pass);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if self.show_environment {
@@ -1659,8 +1760,17 @@ impl Renderer {
             }
 
             pass.set_bind_group(1, &self.tex_bg, &[]);
-            pass.set_pipeline(&self.pipe_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(if self.terrain_geom.debug {
+                    &self.pipe_terrain_lod_debug
+                } else {
+                    &self.pipe_terrain_lod
+                });
+                self.terrain_geom.draw_view(&mut pass);
+            }
 
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -1680,8 +1790,13 @@ impl Renderer {
                 draw_indexed(&mut pass, &self.props);
             }
 
-            pass.set_pipeline(&self.pipe_water);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_water);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_water_lod);
+                self.terrain_geom.draw_view(&mut pass);
+            }
 
             // Sheets are thin. Back-face cull hides the side the camera sees.
             pass.set_pipeline(&self.pipe_mesh_double);
@@ -2194,6 +2309,11 @@ fn model(world: Mat4, mud: [[f32; 4]; 12], extra: [f32; 4]) -> ModelData {
 
 fn vec4(v: Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
+}
+
+fn legacy_terrain(device: &wgpu::Device) -> GpuMesh {
+    let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
+    upload_mesh(device, &tverts, &tidx, "terrain")
 }
 
 fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {

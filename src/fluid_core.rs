@@ -6494,17 +6494,20 @@ impl FluidCore {
     /// Horizontal dust-sheet velocity in contract order, vertical channel 0.
     ///
     /// This is not the body wake. The ledger path publishes `Dust::write_air_velocity`
-    /// instead. Index `(x + layer * 128 + z * 128 * 8) * 4`, R +X, G +Y, B +Z, A 0.
-    pub fn write_air_velocity(&self, dst: &mut [f32]) {
+    /// instead. Index `(x + layer * 128 + z * 128 * dst_layers) * 4`, R +X, G +Y,
+    /// B +Z, A 0. The sheet's slabs fill layers `0..AIR_LAYERS`; layers above
+    /// are left as they are.
+    pub fn write_air_velocity(&self, dst: &mut [f32], dst_layers: usize) {
         let n = AIR_RES * AIR_LAYERS * AIR_RES;
-        if dst.len() < n * 4 || self.dust_u.len() < n || self.dust_v.len() < n {
+        let dst_layers = dst_layers.max(AIR_LAYERS);
+        if dst.len() < AIR_RES * dst_layers * AIR_RES * 4 || self.dust_u.len() < n || self.dust_v.len() < n {
             return;
         }
         for iz in 0..AIR_RES {
             for layer in 0..AIR_LAYERS {
                 for ix in 0..AIR_RES {
                     let src = (layer * AIR_RES + iz) * AIR_RES + ix;
-                    let dst_i = (ix + layer * AIR_RES + iz * AIR_RES * AIR_LAYERS) * 4;
+                    let dst_i = (ix + layer * AIR_RES + iz * AIR_RES * dst_layers) * 4;
                     dst[dst_i] = finite0(self.dust_u[src]);
                     dst[dst_i + 1] = 0.0;
                     dst[dst_i + 2] = finite0(self.dust_v[src]);
@@ -10217,8 +10220,10 @@ fn sample_layer(
     lerp3(a, b, tz)
 }
 
+/// Free-stream world air velocity at `world_x` for this drive: the wind plus
+/// the slipstream the dust stream hold drags along in the lee.
 #[inline(always)]
-fn stream_at(world_x: f32, drive: &AirDrive) -> [f32; 3] {
+pub fn stream_at(world_x: f32, drive: &AirDrive) -> [f32; 3] {
     let forward = drive.forward;
     let right = drive.right;
     let rel_x = drive.wind_x - forward[0] * drive.speed;
