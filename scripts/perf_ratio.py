@@ -437,11 +437,14 @@ def run_gate(sha: str) -> int:
         plain = child_env({"PERF_GATE_MEDIAN": "1"})
         run_must_pass(head_bins["e2e_niva"], "fine_open", plain)
         run_must_pass(head_bins["fog_air"], "fluid_sheet_fog_is_not_dust_and_closes_the_ledger", plain)
+        # A borrowed harness carries this tree's goldens. PERF_GATE_BASE lets a
+        # golden this PR re-centres check the base against the value it had.
+        base_env = child_env({"PERF_GATE_MEDIAN": "1", "PERF_GATE_BASE": "1"})
         base_all, base_fatals = collect_side(
             base_bins,
             "base",
             warmup + measured,
-            plain,
+            base_env,
             fog_budget=False,
             water_budget=False,
         )

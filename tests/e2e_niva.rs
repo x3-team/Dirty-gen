@@ -701,7 +701,7 @@ fn e2e_niva() {
     // The bow a tire pushed stays ahead of it, so the column it rolls into holds
     // more water: the hole read 0.0021-0.0025 m while each step started flat.
     assert!(
-        (puddle_hole - 0.0046).abs() < 0.002 && puddle_hole < puddle_mean - 0.04,
+        (puddle_hole - golden(0.0046, 0.0020)).abs() < 0.002 && puddle_hole < puddle_mean - 0.04,
         "tire hole {puddle_hole:.4} m puddle {puddle_mean:.4} m"
     );
     assert!(
@@ -800,12 +800,12 @@ fn e2e_niva() {
     // that lands on the wetter track is bound into the soil. Their sum moved by
     // 2e-4 m3 (0.99635 -> 0.99617); soil 0.9730 -> 0.9738, dust 0.02336 -> 0.02241.
     assert!(
-        (final_books.soil - 0.9738).abs() < 1.0e-3,
+        (final_books.soil - golden(0.9738, 0.9723) as f64).abs() < 1.0e-3,
         "soil {:.6}",
         final_books.soil
     );
     assert!(
-        (final_books.dust - 0.02241).abs() < 1.0e-3,
+        (final_books.dust - golden(0.02241, 0.02407) as f64).abs() < 1.0e-3,
         "dust {:.6}",
         final_books.dust
     );
@@ -1098,6 +1098,16 @@ fn assert_plausible_speed(u: &[f32], v: &[f32], lim: f32) {
             vv.is_finite() && vv.abs() <= cap,
             "v {vv} over {lim}"
         );
+    }
+}
+
+/// This tree's golden, or the one the pinned base had when
+/// `scripts/perf_ratio.py` runs this harness on the base solver.
+fn golden(now: f32, base: f32) -> f32 {
+    if std::env::var_os("PERF_GATE_BASE").is_some() {
+        base
+    } else {
+        now
     }
 }
 
