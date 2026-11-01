@@ -60,7 +60,7 @@ shot can be lined up with its reference without a rebuild.
 | wade-swash | ue5-98 | walker in the swash (`silt::wade`) |
 | wade-buoys | ue5-100 | walker, buoys and rock in the shallows |
 | wade-rock | ue5-99 | shallows around a rock, walker close up |
-| turbid-water | ue5-100 | river ford, silt plume and foam from the contract (turbidity, foam) |
+| turbid-water | ue5-100 | brown river (`river-muddy`: inflow carries silt) with the Niva's plume and foam |
 | smoke-column | ue5-89 | missing: no point-source smoke yet |
 
 A `missing` scene renders a card that names what is missing instead of a
