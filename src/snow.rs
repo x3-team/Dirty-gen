@@ -51,6 +51,9 @@ pub const NIVA_WHEEL_LOAD_N: f32 = 2_850.0;
 pub const FOOT_LOAD_N: f32 = 780.0;
 pub const FOOT_LENGTH: f32 = 0.30;
 pub const FOOT_WIDTH: f32 = 0.11;
+/// A column thinner than this is empty. Compaction is 0, and the contract
+/// publishes no density for it.
+pub const SNOW_EMPTY_M: f32 = 1.0e-4;
 /// Samples of the turn's radial profile. The picture follows this circle.
 pub const ARC_BINS: usize = 32;
 
@@ -247,10 +250,30 @@ impl SnowField {
     }
 
     pub fn compaction(&self, idx: usize) -> f32 {
-        if self.depth[idx] < 1.0e-4 {
+        if self.depth[idx] < SNOW_EMPTY_M {
             return 0.0;
         }
         ((self.density[idx] - RHO_FRESH) / (RHO_PACKED - RHO_FRESH)).clamp(0.0, 1.0)
+    }
+
+    /// The solver has changed this column. The untouched blanket is not active.
+    pub fn is_active(&self, idx: usize) -> bool {
+        let depth = self.depth[idx];
+        let density = self.density[idx];
+        if !depth.is_finite() || !density.is_finite() {
+            return true;
+        }
+        (depth - self.blanket).abs() > 1.0e-6 || (density - RHO_FRESH).abs() > 1.0e-5
+    }
+
+    /// Half-open square of cell `idx`, metres. Same edges as [`Self::idx_at`].
+    pub fn cell_bounds(&self, idx: usize) -> (f32, f32, f32, f32) {
+        let i = idx % self.res;
+        let j = idx / self.res;
+        let half = self.size * 0.5;
+        let x0 = i as f32 * self.cell - half;
+        let z0 = j as f32 * self.cell - half;
+        (x0, x0 + self.cell, z0, z0 + self.cell)
     }
 
     pub fn idx_at(&self, x: f32, z: f32) -> Option<usize> {
