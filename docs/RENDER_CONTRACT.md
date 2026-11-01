@@ -287,7 +287,7 @@ The window does not share the 200 × 200 grid. The header carries it: `fine_orig
 
 Every texel is valid while the bit is set. Untouched ground publishes its undisturbed value: the virgin snow blanket (R = G = blanket depth, B and A 0), or 0 for soil without a print. Readers blend to the 20 cm maps only at the window rim.
 
-Two writers can fill the window: the snow track (`SnowTrack`, `src/snow_track.rs`) and the 2.5 cm soil prints. They combine per texel. A texel with snow on it (G > 0) takes R, G, B, A from the snow: snow lies over a soil print. Otherwise the first soil writer with a non-zero texel gives all four channels. With no writer that has something there, the texel is 0. Non-finite samples are 0.
+Two writers can fill the window: the snow track (`SnowTrack`, `src/snow_track.rs`) and the 2.5 cm soil prints (`Imprint`, `src/imprint.rs`: R is the offset `dz` over the coarse ground, G is 0, B is `clamp(sink / 0.03)`, A is `sink`). They combine per texel. A texel with snow on it (G > 0) takes R, G, B, A from the snow: snow lies over a soil print. Otherwise the first soil writer with a non-zero texel gives all four channels. With no writer that has something there, the texel is 0. Non-finite samples are 0.
 
 Writer: `publish_track_fine(out, center, writers)` after `publish` / `publish_with_snow`, which clear the window, its header fields, and the bit. Writers implement `FineDeform`. The publisher does not step any solver and does not write back into one.
 

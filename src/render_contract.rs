@@ -17,6 +17,7 @@ use crate::fluid_core::{FluidCore, AIR_LAYERS as SHEET_AIR_SLABS, AIR_RES, COARS
 const AIR_LAYERS: usize = crate::dust::AIR_LAYERS as usize;
 use crate::particles::Particle;
 use crate::snow_track::{SnowTrack, TRACK_CELL_M, TRACK_RES};
+const _: () = assert!(crate::imprint::IMPRINT_CELL_M == TRACK_CELL_M);
 use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
 use crate::soil::{SoilField, SurfaceKind};
 
@@ -782,6 +783,22 @@ impl FineDeform for SnowTrack {
         Some([c.surface() - c.bed, c.depth, c.compaction(), c.lug])
     }
 }
+
+/// Soil prints from the bodies (`src/imprint.rs`), on the same 2.5 cm grid.
+/// R is the offset over the coarse ground, G is 0, B is how packed the
+/// print is (3 cm of sink is fully packed), A is the sink.
+impl FineDeform for crate::imprint::Imprint {
+    fn fine_texel(&self, gi: i32, gj: i32) -> Option<[f32; 4]> {
+        let c = self.get(gi, gj);
+        if c.dz == 0.0 && c.sink == 0.0 {
+            return None;
+        }
+        Some([c.dz, 0.0, (c.sink / IMPRINT_PACKED_SINK_M).clamp(0.0, 1.0), c.sink])
+    }
+}
+
+/// Sink at which a soil print reports full compaction in binding 15 B.
+pub const IMPRINT_PACKED_SINK_M: f32 = 0.03;
 
 /// Fill binding 15 around `center` and set its header fields and valid bit.
 /// Call after [`publish`] / [`publish_with_snow`], which clear them.
@@ -1803,5 +1820,38 @@ mod tests {
         assert_eq!(at(&out, 0.0, 0.3), [0.0; 4]);
         publish_track_fine(&mut out, [0.0, 0.3], &[]);
         assert_eq!(out.header.valid & VALID_TRACK_FINE, 0);
+    }
+
+    #[test]
+    fn soil_prints_fill_the_fine_window_and_snow_covers_them() {
+        use crate::imprint::{cell_of, Imprint};
+        let mut prints = Imprint::new();
+        let (gi, gj) = (cell_of(1.0), cell_of(-2.0));
+        *prints.cell_mut(gi, gj) = crate::imprint::ImprintCell { dz: -0.018, sink: 0.024 };
+        *prints.cell_mut(gi + 1, gj) = crate::imprint::ImprintCell { dz: 0.006, sink: 0.0 };
+        let mut out = ContractFrame::new();
+        publish_track_fine(&mut out, [1.0, -2.0], &[&prints]);
+        let h = out.header;
+        assert!(h.valid & VALID_TRACK_FINE != 0);
+        let texel = |out: &ContractFrame, gi: i32, gj: i32| {
+            let h = out.header;
+            let i = (gi - (h.fine_origin_x / h.fine_cell_m).round() as i32) as usize;
+            let j = (gj - (h.fine_origin_z / h.fine_cell_m).round() as i32) as usize;
+            let k = (j * h.fine_res as usize + i) * 4;
+            [out.track_fine[k], out.track_fine[k + 1], out.track_fine[k + 2], out.track_fine[k + 3]]
+        };
+        let print = texel(&out, gi, gj);
+        assert_eq!(print[0], -0.018);
+        assert_eq!(print[1], 0.0);
+        assert!((print[2] - 0.8).abs() < 1.0e-6, "{print:?}");
+        assert_eq!(print[3], 0.024);
+        assert_eq!(texel(&out, gi + 1, gj), [0.006, 0.0, 0.0, 0.0]);
+        assert_eq!(texel(&out, gi + 5, gj + 5), [0.0; 4]);
+        // Under a snow blanket the snow reports the texel.
+        let mut track = SnowTrack::new(0.25, 0.0);
+        track.drift = 0.0;
+        publish_track_fine(&mut out, [1.0, -2.0], &[&track, &prints]);
+        let snow = texel(&out, gi, gj);
+        assert!(snow[1] > 0.2 && snow[3] == 0.0, "{snow:?}");
     }
 }
