@@ -19,6 +19,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+mod wet;
+pub use wet::{WetBody, WetLoad, WetShape, SLURRY_RHO, WATER_RHO};
+
 /// Wall time of one timed region. Absent on wasm so the solver does not read a clock there.
 pub(crate) struct ProfTick {
     #[cfg(not(target_arch = "wasm32"))]
@@ -4202,6 +4205,8 @@ pub struct FluidCore {
     /// boxes of one sheet may too, so each keeps its own buffers instead of
     /// whichever thread-local the worker holds.
     sheet_scratch: [[Scratch; 2]; 4],
+    /// Balls, boxes and legs in the sheet. Empty costs nothing.
+    wet: wet::WetState,
 }
 
 impl FluidCore {
@@ -4275,6 +4280,7 @@ impl FluidCore {
             sheet_times: SheetTimes::default(),
             shift_scratch: Vec::new(),
             sheet_scratch: std::array::from_fn(|_| [Scratch::new(), Scratch::new()]),
+            wet: wet::WetState::default(),
         }
     }
 
@@ -4445,6 +4451,7 @@ impl FluidCore {
     /// are restored. The sum does not change.
     pub fn recenter(&mut self, center: [f32; 2]) {
         self.restrict_fine();
+        self.wet.forget_cells();
         self.center = center;
         let extent = WINDOW_RES as f32 * COARSE_CELL_M;
         let new_origin = snap_origin(center, extent, COARSE_CELL_M);
@@ -4955,7 +4962,14 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
+        let wet = self.wet.active();
+        if wet {
+            self.wet_prepare_coarse();
+        }
         self.refine(&pushes);
+        if wet {
+            self.wet_prepare_fine();
+        }
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
         let mut spray = self.peel_spray(&pushes, true, false);
@@ -4963,6 +4977,9 @@ impl FluidCore {
         self.apply_pushes_outside(&pushes);
         self.drive_waves(dt);
         self.step_pair(dt, false);
+        if wet {
+            self.wet_finish();
+        }
         self.bed_friction(dt);
         self.diffuse_surface(dt);
         spray.extend(self.peel_spray(&pushes, false, true));
@@ -6085,6 +6102,11 @@ impl FluidCore {
             Some(self.solid_mask(fine))
         };
         let n = res * res;
+        let lift: &[(u32, f32)] = if fine {
+            &self.wet.lift_f
+        } else {
+            &self.wet.lift_c
+        };
         PAIR_SCRATCH.with(|slot| {
             let mut scratch = slot.borrow_mut();
             scratch.ensure();
@@ -6118,6 +6140,11 @@ impl FluidCore {
                     )
                 };
                 scratch.bed[..n].copy_from_slice(&bed_s[..n]);
+                // Bodies in the sheet raise the floor this step reads, by
+                // the column they fill. The water itself is not touched.
+                for &(i, o) in lift {
+                    scratch.bed[i as usize] += o;
+                }
                 // The water viscosity row is shared by every sheet on this
                 // thread. An open reach writes its mobility and puts the
                 // water value back after the step.

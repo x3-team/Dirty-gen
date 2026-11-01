@@ -5,9 +5,11 @@
 //! shear and a Bingham-like drag. Rendering lives in the `silt` binary.
 
 pub mod adhesion;
+pub mod bodies;
 pub mod bike;
 pub mod dust;
 pub mod fluid_core;
+pub mod imprint;
 pub mod ford;
 pub mod lod;
 pub mod particles;
@@ -17,6 +19,7 @@ pub mod snow;
 pub mod snow_track;
 pub mod soil;
 pub mod vehicle;
+pub mod wade;
 pub mod world;
 
 pub use world::{

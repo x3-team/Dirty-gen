@@ -31,6 +31,8 @@ pub struct BenchScene {
     pub preset: String,
     pub stop: f32,
     pub car_frame: bool,
+    /// Camera relative to the first walker of a `wade` scene.
+    pub walker_frame: bool,
     pub eye: Vec3,
     pub target: Vec3,
 }
@@ -50,9 +52,10 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
             f[i].parse()
                 .unwrap_or_else(|_| panic!("bench/scenes.txt line {}: bad number {}", n + 1, f[i]))
         };
-        let car_frame = match f[3] {
-            "car" => true,
-            "world" => false,
+        let (car_frame, walker_frame) = match f[3] {
+            "car" => (true, false),
+            "world" => (false, false),
+            "walker" => (false, true),
             other => panic!("bench/scenes.txt line {}: frame {other}", n + 1),
         };
         out.push(BenchScene {
@@ -60,6 +63,7 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
             preset: f[1].to_string(),
             stop: num(2),
             car_frame,
+            walker_frame,
             eye: Vec3::new(num(4), num(5), num(6)),
             target: Vec3::new(num(7), num(8), num(9)),
         });
@@ -79,6 +83,27 @@ fn pose(scene: &BenchScene, world: &World) -> CameraPose {
     let fwd = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
     let right = Vec3::new(-fwd.z, 0.0, fwd.x);
     let at = |v: Vec3| world.vehicle.pos + fwd * v.x + Vec3::Y * v.y + right * v.z;
+    CameraPose {
+        eye: at(scene.eye),
+        target: at(scene.target),
+        ortho_width: None,
+    }
+}
+
+/// Camera in the first walker's frame: x forward, y up, z right.
+fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
+    let Some(w) = bodies.walkers.first() else {
+        return CameraPose {
+            eye: scene.eye,
+            target: scene.target,
+            ortho_width: None,
+        };
+    };
+    let f = w.forward();
+    let fwd = Vec3::new(f.x, 0.0, f.y);
+    let right = Vec3::new(-fwd.z, 0.0, fwd.x);
+    let base = Vec3::new(w.pos.x, w.pos.y - silt::bodies::HIP_HEIGHT, w.pos.z);
+    let at = |v: Vec3| base + fwd * v.x + Vec3::Y * v.y + right * v.z;
     CameraPose {
         eye: at(scene.eye),
         target: at(scene.target),
@@ -185,6 +210,36 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
         }
     }
 
+    // A person wading the ford's beach, buoys and a rock in the swash
+    // (`wade`). `stop` is seconds since the walk started.
+    let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == "wade").collect();
+    if !shots.is_empty() {
+        shots.sort_by(|a, b| a.stop.total_cmp(&b.stop));
+        renderer.show_hills = false;
+        renderer.daylight = true;
+        renderer.niva_picture = true;
+        renderer.water_column = true;
+        renderer.open_water = true;
+        let mut wade = silt::wade::WadeScene::new(Some(silt::ford::Swell::default()), 4.0);
+        let dt = 1.0 / 60.0;
+        for scene in shots {
+            while wade.time_s < scene.stop {
+                wade.step(dt);
+            }
+            let cam = if scene.walker_frame {
+                walker_pose(scene, &wade.bodies)
+            } else {
+                pose(scene, &wade.world)
+            };
+            renderer.set_bodies_mesh(Some(&crate::mesh::bodies_mesh(&wade.bodies)));
+            let rgba = renderer
+                .draw_with_sheet(&wade.world, cam, None, true, Some(&wade.fluid), None)
+                .expect("readback");
+            save(&dir.join(format!("{}.png", scene.id)), width, height, &rgba, scene, cam);
+        }
+        renderer.set_bodies_mesh(None);
+    }
+
     renderer.open_water = false;
 
     for scene in scenes.iter().filter(|s| s.preset == "missing") {
@@ -202,7 +257,11 @@ mod tests {
         let scenes = parse_scenes(text);
         assert!(scenes.len() >= 5);
         for s in &scenes {
-            assert!(["drive", "snow", "river", "beach", "missing"].contains(&s.preset.as_str()), "{}", s.id);
+            assert!(
+                ["drive", "snow", "river", "beach", "wade", "missing"].contains(&s.preset.as_str()),
+                "{}",
+                s.id
+            );
         }
     }
 }
