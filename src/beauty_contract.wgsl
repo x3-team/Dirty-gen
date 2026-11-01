@@ -437,10 +437,10 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Half resolution: each texel stands for a 2x2 block of the frame. The
     // nearest of the four depths keeps the march from running past an edge.
     let px = vec2<i32>(frag.xy) * 2;
-    let dmax = vec2<i32>(textureDimensions(scene_depth)) - vec2<i32>(1);
+    let dmax = vec2<i32>(textureDimensions(post_depth)) - vec2<i32>(1);
     var d = 1.0;
     for (var k: i32 = 0; k < 4; k = k + 1) {
-        d = min(d, textureLoad(scene_depth, min(px + vec2<i32>(k & 1, k >> 1u), dmax), 0));
+        d = min(d, textureLoad(post_depth, min(px + vec2<i32>(k & 1, k >> 1u), dmax), 0));
     }
     let uv = (vec2<f32>(px) + vec2<f32>(1.0)) / max(frame.params.xy, vec2<f32>(1.0));
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, d, 1.0);

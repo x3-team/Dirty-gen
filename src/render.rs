@@ -12,7 +12,9 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS, WHEEL_WID
 use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
-use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime, Q_FRAME_BEGIN, Q_FRAME_END};
+use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime};
+use crate::overlay::Overlay;
+use crate::terrain_draw::TerrainGeometry;
 use crate::mesh::{
     bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_split,
     spray_from_contract, terrain_mesh,
@@ -20,7 +22,27 @@ use crate::mesh::{
     MeshVertex, ParticleVertex, TerrainVertex,
 };
 
+/// Sun shadow map side on the `high` preset. The renderer builds with
+/// [`silt::quality::active`]`().shadow_res`.
+#[allow(dead_code)]
 const SHADOW: u32 = 2048;
+
+thread_local! {
+    /// Draw calls and triangles encoded since the last [`take_draw_stats`].
+    static DRAW_STATS: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+pub(crate) fn count_draw(vertices: u32) {
+    DRAW_STATS.with(|c| {
+        let (d, t) = c.get();
+        c.set((d + 1, t + vertices as u64 / 3));
+    });
+}
+
+/// Draw calls and triangles since the previous call.
+pub fn take_draw_stats() -> (u32, u64) {
+    DRAW_STATS.with(|c| c.replace((0, 0)))
+}
 const MODEL_SLOTS: u64 = 12;
 
 #[repr(C)]
@@ -67,6 +89,11 @@ struct FrameData {
     /// x: 1 when the SSR history holds a valid previous frame. y, z: the
     /// half-resolution SSR target size in pixels.
     ssr_info: [f32; 4],
+    reflect_view_proj: [[f32; 4]; 4],
+    reflect_flags: [f32; 4],
+    /// x: water detail (0 low, 1 medium, 2 high). y: 1 when the water_fx
+    /// texture holds a fluid sheet. z, w: 0.
+    water_fx: [f32; 4],
 }
 
 #[repr(C)]
@@ -95,6 +122,12 @@ pub struct Renderer {
     pub adapter_name: String,
     width: u32,
     height: u32,
+    /// Window size the blit fills. `width × height` is this times the render scale.
+    out_width: u32,
+    out_height: u32,
+    quality: silt::quality::Quality,
+    shadow_res: u32,
+    overlay: Option<Overlay>,
     model_stride: u32,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
@@ -116,13 +149,38 @@ pub struct Renderer {
     model_buf: wgpu::Buffer,
     model_bg: wgpu::BindGroup,
     tex_bg: wgpu::BindGroup,
+    /// Win-demo reflect encode must not bind `reflect_color` while rendering into it.
+    tex_bg_pool_encode: wgpu::BindGroup,
     height_bg: wgpu::BindGroup,
     height_tex: wgpu::Texture,
     imprint_tex: wgpu::Texture,
     mat_tex: wgpu::Texture,
     crust_tex: wgpu::Texture,
+    /// Turbidity, foam and flow from the render contract, resampled on the
+    /// soil grid. Zero without a fluid sheet.
+    water_fx_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    scene_color: wgpu::Texture,
+    scene_color_view: wgpu::TextureView,
+    reflect_color: wgpu::Texture,
+    reflect_color_view: wgpu::TextureView,
+    /// Sample-only copy of the pool reflect pass (never a render target).
+    reflect_sample: wgpu::Texture,
+    reflect_sample_view: wgpu::TextureView,
+    reflect_rt: wgpu::Texture,
+    reflect_rt_view: wgpu::TextureView,
+    scene_depth: wgpu::Texture,
+    scene_depth_view: wgpu::TextureView,
+    reflect_depth: wgpu::Texture,
+    reflect_depth_view: wgpu::TextureView,
+    scene_samp: wgpu::Sampler,
+    nearest_samp: wgpu::Sampler,
+    ground_samp: wgpu::Sampler,
+    ground_diff_view: wgpu::TextureView,
+    ground_nor_view: wgpu::TextureView,
+    ground_pack_view: wgpu::TextureView,
+    tex_bgl: wgpu::BindGroupLayout,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     #[allow(dead_code)]
@@ -132,8 +190,14 @@ pub struct Renderer {
     shadow_depth: wgpu::Texture,
     shadow_depth_view: wgpu::TextureView,
     readback: wgpu::Buffer,
+    reflect_readback: wgpu::Buffer,
     padded_row: u32,
-    terrain: GpuMesh,
+    terrain: Option<GpuMesh>,
+    pub terrain_geom: TerrainGeometry,
+    pipe_terrain_lod: wgpu::RenderPipeline,
+    pipe_terrain_lod_debug: wgpu::RenderPipeline,
+    pipe_water_lod: wgpu::RenderPipeline,
+    pipe_shadow_terrain_lod: wgpu::RenderPipeline,
     body: GpuMesh,
     glass: GpuMesh,
     wheels: [GpuMesh; 4],
@@ -142,6 +206,8 @@ pub struct Renderer {
     env: GpuMesh,
     hills: GpuMesh,
     props: GpuMesh,
+    /// Free bodies (balls, crates, walkers), world space. Rebuilt per frame.
+    bodies: Option<GpuMesh>,
     #[allow(dead_code)]
     resident: Vec<wgpu::Texture>,
     paint_bg: wgpu::BindGroup,
@@ -171,8 +237,12 @@ pub struct Renderer {
     pipe_blit_srgb: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
+    present_format: Option<wgpu::TextureFormat>,
     mat_scratch: Vec<u8>,
     crust_scratch: Vec<u8>,
+    water_fx_scratch: Vec<u8>,
+    /// True while the last upload carried a fluid sheet.
+    water_fx_live: bool,
     imprint_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
     height_bytes: Vec<u8>,
@@ -203,6 +273,22 @@ pub struct Renderer {
     pub niva_picture: bool,
     /// Draw the solved water column, including a bow above the film range.
     pub water_column: bool,
+    /// Win-demo standing puddles: readable depth, sky reflection, tire ripples.
+    pub puddle_beauty: bool,
+    /// Win-demo PNG stills: skip tire seat on the heightfield (avoids spikes/holes).
+    pub win_demo_still: bool,
+    /// Latest pool reflect RT readback (win-demo still capture, same resolution as the frame).
+    pub win_demo_reflect_rgba: Vec<u8>,
+    /// Win-demo still: water shows raw `pool_planar_reflect_sample` (no fresnel/foam).
+    pub win_demo_pool_reflect_debug: bool,
+    /// Slurry drops and dust cards. Off for win-demo stills (water carries splash).
+    pub show_mud_particles: bool,
+    /// Round slurry drops. Off when solver sheets carry the splash read.
+    pub show_mud_drops: bool,
+    /// River or sea shore: the solved column is drawn as the free surface
+    /// (bed + depth) with sky reflection, instead of a film on the bed.
+    /// Implies the `water_column` pack.
+    pub open_water: bool,
     /// Paint the snow layer. Compaction in the darken channel tints the blanket.
     pub snow: bool,
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
@@ -368,6 +454,28 @@ pub fn try_open_adapter(
     Ok((instance, adapter, device, queue))
 }
 
+/// Adapter and device on the instance that made `surface`. Timestamp
+/// queries are requested when the adapter offers them.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_for_surface(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: Some(surface),
+    }))
+    .ok_or_else(|| "no wgpu adapter for the window surface".to_string())?;
+    let info = adapter.get_info();
+    println!(
+        "wgpu adapter: {} {:?} {:?}",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = open_timed_device(&adapter)?;
+    Ok((adapter, device, queue))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn open_timed_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
     if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -403,6 +511,8 @@ impl Renderer {
         formats: GpuFormats,
         cc0: crate::cc0::Cc0Scene,
     ) -> Self {
+        let quality = silt::quality::active();
+        let shadow_res = quality.shadow_res;
         // The picture reads the render contract at group 4 of the terrain and
         // water pipelines. A device without storage buffers or a fifth bind
         // group (WebGL2) gets the stand-in readers and keeps its soil cache.
@@ -413,7 +523,12 @@ impl Renderer {
         } else {
             include_str!("beauty_nocontract.wgsl")
         };
-        let source = format!("{}\n{}", include_str!("shader.wgsl"), readers);
+        let source = format!(
+            "{}\n{}\n{}",
+            include_str!("shader.wgsl"),
+            include_str!("terrain_geom.wgsl"),
+            readers
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -431,6 +546,7 @@ impl Renderer {
                 filter_samp(2, wgpu::ShaderStages::FRAGMENT),
             ],
         });
+        let tg_layout = TerrainGeometry::layout_entries();
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-tex"),
             entries: &[
@@ -496,6 +612,33 @@ impl Renderer {
                     },
                     count: None,
                 },
+                tg_layout[0],
+                tg_layout[1],
+                filter_tex(12, wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                filter_samp(14, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(15, wgpu::ShaderStages::FRAGMENT),
+                // Contract turbidity (R), foam (G) and flow (B, A) on the
+                // soil grid. Water passes read it; the solver never does.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -515,16 +658,20 @@ impl Renderer {
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("height-only"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                tg_layout[0],
+                tg_layout[1],
+            ],
         });
         let model_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model"),
@@ -719,6 +866,20 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let water_fx_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("water-fx"),
+            size: wgpu::Extent3d {
+                width: MAP_RES as u32,
+                height: MAP_RES as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let imprint_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("imprint"),
             size: wgpu::Extent3d {
@@ -736,8 +897,9 @@ impl Renderer {
         let shadow = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow"),
             size: wgpu::Extent3d {
-                width: SHADOW * 2,
-                height: SHADOW,
+                // Two cascades side by side: far left, near (round the Niva) right.
+                width: shadow_res * 2,
+                height: shadow_res,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -751,8 +913,9 @@ impl Renderer {
         let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow-depth"),
             size: wgpu::Extent3d {
-                width: SHADOW * 2,
-                height: SHADOW,
+                // Two cascades side by side: far left, near (round the Niva) right.
+                width: shadow_res * 2,
+                height: shadow_res,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -828,60 +991,8 @@ impl Renderer {
             niva_nor,
             niva_mr,
         ];
-        let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tex-bg"),
-            layout: &tex_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(
-                        &height_tex.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &mat_tex.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&ground_diff_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&ground_nor_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&ground_pack_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::Sampler(&ground_samp),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(
-                        &imprint_tex.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(
-                        &crust_tex.create_view(&Default::default()),
-                    ),
-                },
-            ],
-        });
+        let terrain_geom = TerrainGeometry::new(&device, !formats.height_packed);
+        let tg_tex = terrain_geom.bind_entries();
         let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("paint-bg"),
             layout: &paint_bgl,
@@ -928,19 +1039,91 @@ impl Renderer {
                 },
             ],
         });
+        let [tg_fine, tg_uniform] = terrain_geom.bind_entries();
         let height_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("height-bg"),
             layout: &height_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &height_tex.create_view(&Default::default()),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &height_tex.create_view(&Default::default()),
+                    ),
+                },
+                tg_fine.clone(),
+                tg_uniform.clone(),
+            ],
         });
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
             make_targets(&device, width, height, formats.depth);
+        let reflect_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reflect-readback"),
+            size: padded_row as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let (
+            scene_color,
+            scene_color_view,
+            reflect_color,
+            reflect_color_view,
+            reflect_sample,
+            reflect_sample_view,
+            reflect_rt,
+            reflect_rt_view,
+            scene_depth,
+            scene_depth_view,
+            reflect_depth,
+            reflect_depth_view,
+        ) = make_scene_targets(&device, width, height, formats.depth);
+        let scene_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene-samp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let tex_bg = build_tex_bg(
+            &device,
+            &tex_bgl,
+            &height_tex,
+            &mat_tex,
+            &nearest,
+            &shadow_view,
+            &ground_diff_view,
+            &ground_nor_view,
+            &ground_pack_view,
+            &ground_samp,
+            &imprint_tex,
+            &crust_tex,
+            &scene_color_view,
+            &scene_depth_view,
+            &scene_samp,
+            &reflect_sample_view,
+            &water_fx_tex,
+            &tg_tex,
+        );
+        let tex_bg_pool_encode = build_tex_bg(
+            &device,
+            &tex_bgl,
+            &height_tex,
+            &mat_tex,
+            &nearest,
+            &shadow_view,
+            &ground_diff_view,
+            &ground_nor_view,
+            &ground_pack_view,
+            &ground_samp,
+            &imprint_tex,
+            &crust_tex,
+            &scene_color_view,
+            &scene_depth_view,
+            &scene_samp,
+            &scene_color_view,
+            &water_fx_tex,
+            &tg_tex,
+        );
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
             layout: &blit_bgl,
@@ -1155,7 +1338,7 @@ impl Renderer {
                 wgpu::CompareFunction::Less,
             )),
             true,
-            None,
+            Some(wgpu::Face::Back),
         );
         // Half-resolution SSR trace of the water surface: two targets (the
         // reflection and its view distance) with its own depth so the
@@ -1303,6 +1486,54 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_terrain_lod = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_terrain_lod",
+            Some("fs_terrain"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, true, wgpu::CompareFunction::Less)),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_terrain_lod_debug = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_terrain_lod_debug",
+            Some("fs_terrain_lod_debug"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, true, wgpu::CompareFunction::Less)),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_water_lod = pipeline(
+            &device,
+            &shader,
+            &water_layout,
+            "vs_water_lod",
+            Some("fs_water"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, false, wgpu::CompareFunction::Less)),
+            true,
+            None,
+        );
+        let pipe_shadow_terrain_lod = pipeline(
+            &device,
+            &shader,
+            &shadow_layout,
+            "vs_shadow_terrain_lod",
+            Some("fs_shadow"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(shadow_depth_state(formats.depth)),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_shadow_mesh = pipeline(
             &device,
             &shader,
@@ -1435,8 +1666,12 @@ impl Renderer {
             });
         }
 
-        let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
-        let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
+        // The old uniform grid is 2.5 M vertices. Only build it when asked for.
+        let terrain = if terrain_geom.lod {
+            None
+        } else {
+            Some(legacy_terrain(&device))
+        };
         let body = upload_cpu(&device, &cc0.body, "body");
         let glass = upload_cpu(&device, &cc0.glass, "glass");
         let wheels = [
@@ -1535,13 +1770,34 @@ impl Renderer {
             model_buf,
             model_bg,
             tex_bg,
+            tex_bg_pool_encode,
             height_bg,
             height_tex,
             imprint_tex,
             mat_tex,
             crust_tex,
+            water_fx_tex,
             color,
             color_view,
+            scene_color,
+            scene_color_view,
+            reflect_color,
+            reflect_color_view,
+            reflect_sample,
+            reflect_sample_view,
+            reflect_rt,
+            reflect_rt_view,
+            scene_depth,
+            scene_depth_view,
+            reflect_depth,
+            reflect_depth_view,
+            scene_samp,
+            nearest_samp: nearest,
+            ground_samp,
+            ground_diff_view,
+            ground_nor_view,
+            ground_pack_view,
+            tex_bgl,
             depth,
             depth_view,
             shadow,
@@ -1549,8 +1805,14 @@ impl Renderer {
             shadow_depth,
             shadow_depth_view,
             readback,
+            reflect_readback,
             padded_row,
             terrain,
+            terrain_geom,
+            pipe_terrain_lod,
+            pipe_terrain_lod_debug,
+            pipe_water_lod,
+            pipe_shadow_terrain_lod,
             body,
             glass,
             wheels,
@@ -1585,8 +1847,12 @@ impl Renderer {
             pipe_blit_srgb,
             blit_shader,
             blit_layout,
+            present_format: None,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
             crust_scratch: vec![0; MAP_RES * MAP_RES * 4],
+            // Flow 0 m/s is the byte 128.
+            water_fx_scratch: [0u8, 0, 128, 128].repeat(MAP_RES * MAP_RES),
+            water_fx_live: true,
             imprint_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
@@ -1601,11 +1867,19 @@ impl Renderer {
             tire_water: [-1000.0; 4],
             wind: Vec3::new(1.1, 0.0, -0.65),
             show_props: true,
+            bodies: None,
             show_environment: true,
             show_hills: true,
             show_bike: true,
             niva_picture: false,
             water_column: false,
+            puddle_beauty: false,
+            win_demo_still: false,
+            win_demo_reflect_rgba: Vec::new(),
+            win_demo_pool_reflect_debug: false,
+            show_mud_particles: true,
+            show_mud_drops: true,
+            open_water: false,
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
@@ -1634,7 +1908,49 @@ impl Renderer {
             debug_contract: false,
             debug_mode: 0,
             gpu_time: None,
+            out_width: width,
+            out_height: height,
+            quality,
+            shadow_res,
+            overlay: None,
         }
+    }
+
+    pub fn quality(&self) -> silt::quality::Quality {
+        self.quality
+    }
+
+    /// Switch preset live. Render scale applies now. Shadow resolution is
+    /// fixed when the renderer is built; the window prints that it applies
+    /// on the next start when it differs.
+    pub fn set_quality(&mut self, quality: silt::quality::Quality) -> bool {
+        self.quality = quality;
+        self.terrain_geom.apply_quality(quality.rut_tess);
+        let (w, h) = (self.out_width, self.out_height);
+        self.resize_internal(w, h);
+        quality.shadow_res == self.shadow_res
+    }
+
+    /// Internal target size (after render scale).
+    pub fn internal_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Text drawn over the top-left corner of the presented frame. `None` hides it.
+    pub fn set_overlay_text(&mut self, lines: Option<&[String]>) {
+        let Some(lines) = lines else {
+            if let Some(o) = self.overlay.as_mut() {
+                o.visible = false;
+            }
+            return;
+        };
+        if self.overlay.is_none() {
+            let format = self.present_format.unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+            self.overlay = Some(Overlay::new(&self.device, format));
+        }
+        let o = self.overlay.as_mut().unwrap();
+        o.visible = true;
+        o.write(&self.queue, lines);
     }
 
     /// Arm timestamp queries. The window leaves this off.
@@ -1657,9 +1973,17 @@ impl Renderer {
         }
     }
 
+    /// Newest finished GPU frame without waiting.
+    pub fn poll_gpu_time(&mut self) -> Option<GpuSample> {
+        let clock = self.gpu_time.as_ref()?;
+        clock.poll(&self.device)
+    }
+
     /// Point the window blit at the swapchain format. Offscreen frames stay linear-in-a-Unorm-buffer
     /// (gamma already applied); an sRGB surface must undo that before it encodes again.
     pub fn set_present_format(&mut self, format: wgpu::TextureFormat) {
+        self.present_format = Some(format);
+        self.overlay = None;
         self.pipe_blit = pipeline(
             &self.device,
             &self.blit_shader,
@@ -1686,8 +2010,19 @@ impl Renderer {
         );
     }
 
+    /// Window size. Internal targets follow at the preset's render scale.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 || (width == self.width && height == self.height) {
+        self.resize_internal(width, height);
+    }
+
+    fn resize_internal(&mut self, out_w: u32, out_h: u32) {
+        if out_w == 0 || out_h == 0 {
+            return;
+        }
+        self.out_width = out_w;
+        self.out_height = out_h;
+        let (width, height) = self.quality.scaled(out_w, out_h);
+        if width == self.width && height == self.height {
             return;
         }
         self.width = width;
@@ -1699,6 +2034,12 @@ impl Renderer {
         self.depth = depth;
         self.depth_view = depth_view;
         self.readback = readback;
+        self.reflect_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reflect-readback"),
+            size: padded_row as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         self.padded_row = padded_row;
         let nearest = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -1809,6 +2150,15 @@ impl Renderer {
         self.env_from_file = map.from_file;
     }
 
+    /// The old uniform grid, when the LOD tree is off.
+    fn legacy_terrain(&self) -> Option<&GpuMesh> {
+        if self.terrain_geom.lod {
+            None
+        } else {
+            self.terrain.as_ref()
+        }
+    }
+
     pub fn draw(
         &mut self,
         world: &World,
@@ -1821,6 +2171,13 @@ impl Renderer {
 
     /// Draw the Niva picture. `fluid` and `dust`, when present, are the sheet
     /// the contract publishes. The picture shaders do not read that sheet.
+    /// World-space mesh of the free bodies for the next frames. `None` hides them.
+    pub fn set_bodies_mesh(&mut self, mesh: Option<&CpuMesh>) {
+        self.bodies = mesh
+            .filter(|m| !m.indices.is_empty())
+            .map(|m| upload_cpu(&self.device, m, "bodies"));
+    }
+
     pub fn draw_with_sheet(
         &mut self,
         world: &World,
@@ -1848,6 +2205,7 @@ impl Renderer {
             gpu.upload(&self.queue, &self.contract_cpu);
         }
         self.upload_soil(&world.soil);
+        self.upload_water_fx(fluid.is_some());
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
         self.queue
@@ -1865,6 +2223,11 @@ impl Renderer {
             Mat4::perspective_rh(46f32.to_radians(), aspect, 0.15, 180.0)
         };
         let view_proj = proj * view;
+        let reflect_view_proj = if self.win_demo_still && !self.snow {
+            Some(win_demo_reflect_view_proj(cam, proj))
+        } else {
+            None
+        };
         // The window keeps the low sun. Persist stills ask for daylight.
         let sun = if let Some(s) = self.sun_override {
             s.normalize()
@@ -1901,12 +2264,21 @@ impl Renderer {
         let light_vp_near = Mat4::orthographic_rh(-3.5, 3.5, -3.5, 3.5, 1.0, 24.0)
             * Mat4::look_at_rh(near_target + sun * 12.0, near_target, Vec3::Y);
         let (sun_color, sky_zenith, sky_horizon, amb) = if self.daylight {
-            (
-                [1.70, 1.78, 1.90, 1.0],
-                [0.42, 0.64, 0.98, 1.0],
-                [0.76, 0.84, 0.96, 1.0],
-                [0.18, 0.20, 0.22, 1.0],
-            )
+            if self.win_demo_still {
+                (
+                    [1.70, 1.78, 1.90, 1.0],
+                    [0.10, 0.32, 0.82, 1.0],
+                    [0.78, 0.84, 0.92, 1.0],
+                    [0.18, 0.20, 0.22, 1.0],
+                )
+            } else {
+                (
+                    [1.70, 1.78, 1.90, 1.0],
+                    [0.42, 0.64, 0.98, 1.0],
+                    [0.76, 0.84, 0.96, 1.0],
+                    [0.18, 0.20, 0.22, 1.0],
+                )
+            }
         } else {
             (
                 [1.15, 0.74, 0.42, 1.0],
@@ -1945,9 +2317,13 @@ impl Renderer {
             ],
             misc: [
                 world.time,
-                SHADOW as f32,
+                self.shadow_res as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
-                if self.water_column { 1.0 } else { 0.0 },
+                (if self.water_column || self.open_water { 1.0 } else { 0.0 })
+                    + (if self.puddle_beauty { 2.0 } else { 0.0 })
+                    + (if self.win_demo_still { 4.0 } else { 0.0 })
+                    + (if reflect_view_proj.is_some() { 8.0 } else { 0.0 })
+                    + (if self.open_water { 32.0 } else { 0.0 }),
             ],
             tires: tire_frame(&world.vehicle),
             snow_arc: [0.0; 4],
@@ -1995,9 +2371,24 @@ impl Renderer {
                 self.ssr.height as f32,
                 0.0,
             ],
+            reflect_view_proj: [[0.0; 4]; 4],
+            reflect_flags: [0.0; 4],
+            water_fx: [
+                self.quality.water_detail as f32,
+                if self.water_fx_live { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         };
         self.ssr_prev_vp = view_proj.to_cols_array_2d();
         let mut frame = frame;
+        if let Some(reflect_vp) = reflect_view_proj {
+            frame.reflect_view_proj = reflect_vp.to_cols_array_2d();
+            frame.reflect_flags = [1.0, 0.0, 0.0, 0.0];
+        }
+        if self.win_demo_pool_reflect_debug {
+            frame.reflect_flags[1] = 1.0;
+        }
         if self.snow {
             if let Some(arc) = self.snow_arc {
                 frame.snow_arc = [arc.center.x, arc.center.y, arc.sweep, arc.r_lo];
@@ -2031,6 +2422,11 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.frame_refl_buf, 0, bytemuck::bytes_of(&frame_refl));
         }
+        if !self.terrain_geom.lod && self.terrain.is_none() {
+            self.terrain = Some(legacy_terrain(&self.device));
+        }
+        self.terrain_geom
+            .prepare(&self.queue, &world.soil, cam.eye, &view_proj, &light_vp);
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
@@ -2038,7 +2434,7 @@ impl Renderer {
         // mesh keeps clods and what lies on the ground.
         let spray_valid = self.contract_cpu.header.version == 1
             && self.contract_cpu.header.valid & silt::render_contract::VALID_SPRAY != 0;
-        let chunks = mud_chunks_split(&world.particles.items, Some(&world.soil), spray_valid);
+        let chunks = mud_chunks_split(&world.particles.items, Some(&world.soil), spray_valid, self.show_mud_drops);
         let spray = if spray_valid {
             spray_from_contract(
                 &self.contract_cpu.spray,
@@ -2048,14 +2444,14 @@ impl Renderer {
         } else {
             CpuMesh::new()
         };
-        let spray_count = spray.indices.len() as u32;
+        let spray_count = if self.show_mud_particles { spray.indices.len() as u32 } else { 0 };
         if spray_count > 0 {
             self.queue
                 .write_buffer(&self.spray_v, 0, bytemuck::cast_slice(&spray.vertices));
             self.queue
                 .write_buffer(&self.spray_i, 0, bytemuck::cast_slice(&spray.indices));
         }
-        let chunk_count = chunks.indices.len() as u32;
+        let chunk_count = if self.show_mud_particles { chunks.indices.len() as u32 } else { 0 };
         if chunk_count > 0 {
             self.queue
                 .write_buffer(&self.chunk_v, 0, bytemuck::cast_slice(&chunks.vertices));
@@ -2071,7 +2467,7 @@ impl Renderer {
         } else {
             dust_cloud(&world.particles.items)
         };
-        let dust_count = dust.indices.len() as u32;
+        let dust_count = if self.show_mud_particles { dust.indices.len() as u32 } else { 0 };
         if dust_count > 0 {
             self.queue
                 .write_buffer(&self.dust_v, 0, bytemuck::cast_slice(&dust.vertices));
@@ -2079,15 +2475,9 @@ impl Renderer {
                 .write_buffer(&self.dust_i, 0, bytemuck::cast_slice(&dust.indices));
         }
 
-        // Queries 0 and 1 bracket the frame. Queries 2 and 3 are reserved for a
-        // pool reflect pass, which this tree does not encode. The clock is out
-        // of `self` for the frame: a reflect pass added here calls
-        // `clock.mark_reflect()` after it.
-        let debug_pass =
-            self.debug_contract && self.pipe_debug.is_some() && self.contract.is_some();
-        let end_on_blit = present.is_some();
-        let end_on_debug = debug_pass && !end_on_blit;
-        let end_on_main = !end_on_blit && !debug_pass;
+        // Each pass takes one begin/end timestamp pair, labelled with the pass
+        // label (`silt::quality::pass_budgets` names the same labels). The
+        // clock is out of `self` for the frame.
         let clock = self.gpu_time.take();
 
         let mut encoder = self
@@ -2097,7 +2487,7 @@ impl Renderer {
             });
 
         {
-            let shadow_time = pass_timestamps(clock.as_ref(), Some(Q_FRAME_BEGIN), None);
+            let shadow_time = pass_timestamps(clock.as_ref(), "shadow");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2119,12 +2509,17 @@ impl Renderer {
                 timestamp_writes: shadow_time,
                 occlusion_query_set: None,
             });
-            pass.set_viewport(0.0, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
+            pass.set_viewport(0.0, 0.0, self.shadow_res as f32, self.shadow_res as f32, 0.0, 1.0);
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.height_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[0]);
-            pass.set_pipeline(&self.pipe_shadow_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_shadow_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_shadow_terrain_lod);
+                self.terrain_geom.draw_all(&mut pass);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if self.show_environment {
@@ -2144,9 +2539,14 @@ impl Renderer {
             if chunk_count > 0 {
                 self.draw_chunks(&mut pass, chunk_count);
             }
+            if let Some(b) = &self.bodies {
+                pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+                draw_indexed(&mut pass, b);
+            }
         }
 
         if self.niva_picture {
+            let near_time = pass_timestamps(clock.as_ref(), "shadow-near");
             // Near cascade, right half of the atlas: the ground under the
             // Niva and the Niva itself.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2167,20 +2567,28 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: near_time,
                 occlusion_query_set: None,
             });
-            pass.set_viewport(SHADOW as f32, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
+            let sr = self.shadow_res as f32;
+            pass.set_viewport(sr, 0.0, sr, sr, 0.0, 1.0);
             pass.set_bind_group(0, &self.frame_near_bg, &[]);
             pass.set_bind_group(1, &self.height_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[0]);
-            pass.set_pipeline(&self.pipe_shadow_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_shadow_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_shadow_terrain_lod);
+                self.terrain_geom.draw_all(&mut pass);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             self.draw_vehicle(&mut pass);
         }
 
-        {
+        let refl_level = refl_level.filter(|_| self.quality.planar_reflection);
+        if refl_level.is_some() {
+            let planar_time = pass_timestamps(clock.as_ref(), "planar");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("planar"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2199,10 +2607,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: planar_time,
                 occlusion_query_set: None,
             });
-            if refl_level.is_some() {
+            {
                 pass.set_bind_group(0, &self.frame_refl_bg, &[]);
                 pass.set_bind_group(1, &self.tex_bg, &[]);
                 pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -2211,16 +2619,9 @@ impl Renderer {
                 self.draw_vehicle(&mut pass);
             }
         }
+        let water_ssr = self.puddle_beauty || self.win_demo_still;
         {
-            let main_time = pass_timestamps(
-                clock.as_ref(),
-                None,
-                if end_on_main {
-                    Some(Q_FRAME_END)
-                } else {
-                    None
-                },
-            );
+            let main_time = pass_timestamps(clock.as_ref(), "main");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2245,8 +2646,8 @@ impl Renderer {
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_pipeline(&self.pipe_sky);
             pass.draw(0..3, 0..1);
+            count_draw(3);
 
-            // Floor outside the heightfield, under the terrain so the rim stays the field.
             pass.set_bind_group(1, &self.tex_bg, &[]);
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -2261,8 +2662,17 @@ impl Renderer {
             if let Some(gpu) = &self.contract {
                 pass.set_bind_group(4, &gpu.bind_group, &[]);
             }
-            pass.set_pipeline(&self.pipe_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(if self.terrain_geom.debug {
+                    &self.pipe_terrain_lod_debug
+                } else {
+                    &self.pipe_terrain_lod
+                });
+                self.terrain_geom.draw_view(&mut pass);
+            }
 
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -2281,8 +2691,97 @@ impl Renderer {
             if self.show_props {
                 draw_indexed(&mut pass, &self.props);
             }
+            // Bodies before the water, so the sheet covers what is under it.
+            if let Some(b) = &self.bodies {
+                draw_indexed(&mut pass, b);
+            }
 
         }
+        if water_ssr {
+            let main_frame = frame;
+            if self.win_demo_still {
+                self.encode_win_demo_pool_reflect(
+                    &mut encoder,
+                    reflect_view_proj.expect("win demo reflect vp"),
+                    main_frame,
+                );
+                let extent = wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                };
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.reflect_rt,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.reflect_sample,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.reflect_rt,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.scene_color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+                self.queue.write_buffer(
+                    &self.frame_buf,
+                    0,
+                    bytemuck::bytes_of(&main_frame),
+                );
+                // Still capture: submit reflect RT before water samples pool_reflect_tex.
+                self.queue.submit(Some(encoder.finish()));
+                self.device.poll(wgpu::Maintain::Wait);
+                self.rebuild_tex_bg_pool_reflect();
+                self.queue.write_buffer(
+                    &self.frame_buf,
+                    0,
+                    bytemuck::bytes_of(&main_frame),
+                );
+                encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("frame-pool-water"),
+                    });
+            } else {
+                let extent = wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                };
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.scene_color,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+            }
+        } else {
 
         // The water reflects the opaque frame: copy it, then draw the water
         // with the depth read-only so the same depth can be sampled.
@@ -2306,6 +2805,7 @@ impl Renderer {
             },
         );
         {
+            let ssr_time = pass_timestamps(clock.as_ref(), "water-ssr");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water-ssr"),
                 color_attachments: &[
@@ -2345,11 +2845,13 @@ impl Renderer {
                 pass.set_bind_group(4, &gpu.bind_group, &[]);
             }
             pass.set_pipeline(&self.pipe_water_ssr);
-            if std::env::var("SILT_NO_SSR").is_err() {
-                draw_indexed(&mut pass, &self.terrain);
+            // The SSR trace runs on the uniform grid only.
+            if let (true, Some(legacy)) = (std::env::var("SILT_NO_SSR").is_err(), self.legacy_terrain()) {
+                draw_indexed(&mut pass, legacy);
             }
         }
         {
+            let water_time = pass_timestamps(clock.as_ref(), "water");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2375,8 +2877,13 @@ impl Renderer {
                 pass.set_bind_group(3, &self.paint_bg, &[]);
                 pass.set_bind_group(4, &gpu.bind_group, &[]);
             }
-            pass.set_pipeline(&self.pipe_water);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_water);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_water_lod);
+                self.terrain_geom.draw_view(&mut pass);
+            }
         }
         // This frame's SSR becomes next frame's history.
         let ssr_extent = wgpu::Extent3d {
@@ -2402,6 +2909,7 @@ impl Renderer {
             );
         }
         self.ssr_hist_valid = 1.0;
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("after-water"),
@@ -2426,15 +2934,30 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.tex_bg, &[]);
+            if water_ssr {
+                // Main's puddle demo draws its sheet here.
+                pass.set_bind_group(2, &self.post_bg, &[]);
+                if let Some(gpu) = &self.contract {
+                    pass.set_bind_group(3, &self.paint_bg, &[]);
+                    pass.set_bind_group(4, &gpu.bind_group, &[]);
+                }
+                if let Some(legacy) = self.legacy_terrain() {
+                    pass.set_pipeline(&self.pipe_water);
+                    draw_indexed(&mut pass, legacy);
+                } else {
+                    pass.set_pipeline(&self.pipe_water_lod);
+                    self.terrain_geom.draw_view(&mut pass);
+                }
+            }
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
 
             // Sheets are thin. Back-face cull hides the side the camera sees.
             pass.set_pipeline(&self.pipe_mesh_double);
             pass.set_bind_group(3, &self.paint_bg, &[]);
+            pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if chunk_count > 0 {
                 self.draw_chunks(&mut pass, chunk_count);
             }
-
             pass.set_pipeline(&self.pipe_dust);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             if dust_count > 0 {
@@ -2500,15 +3023,7 @@ impl Renderer {
 
         if self.debug_contract {
             if let (Some(pipe), Some(gpu)) = (&self.pipe_debug, &self.contract) {
-                let debug_time = pass_timestamps(
-                    clock.as_ref(),
-                    None,
-                    if end_on_debug {
-                        Some(Q_FRAME_END)
-                    } else {
-                        None
-                    },
-                );
+                let debug_time = pass_timestamps(clock.as_ref(), "contract-debug");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("contract-debug"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2534,19 +3049,12 @@ impl Renderer {
                     * silt::render_contract::WINDOW_CELLS
                     * 6;
                 pass.draw(0..n, 0..1);
+                count_draw(n);
             }
         }
 
         if let Some((view, srgb)) = present {
-            let blit_time = pass_timestamps(
-                clock.as_ref(),
-                None,
-                if end_on_blit {
-                    Some(Q_FRAME_END)
-                } else {
-                    None
-                },
-            );
+            let blit_time = pass_timestamps(clock.as_ref(), "blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2568,6 +3076,21 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.blit_bg, &[]);
             pass.draw(0..3, 0..1);
+            count_draw(3);
+        }
+
+        if let (Some((view, _)), Some(overlay)) = (present, self.overlay.as_ref()) {
+            if overlay.visible {
+                let overlay_time = pass_timestamps(clock.as_ref(), "overlay");
+                overlay.draw(
+                    &mut encoder,
+                    &self.queue,
+                    view,
+                    self.out_width,
+                    self.out_height,
+                    overlay_time,
+                );
+            }
         }
 
         if readback {
@@ -2595,11 +3118,17 @@ impl Renderer {
         }
 
         if let Some(clock) = clock.as_ref() {
-            clock.note_frame();
             clock.resolve(&mut encoder);
         }
         self.queue.submit(Some(encoder.finish()));
+        if let Some(clock) = clock.as_ref() {
+            clock.after_submit();
+        }
         self.gpu_time = clock;
+
+        if readback && self.win_demo_still && self.win_demo_pool_reflect_debug {
+            self.stash_win_demo_reflect_readback();
+        }
 
         if !readback {
             return None;
@@ -2684,7 +3213,15 @@ impl Renderer {
             // Free water and the mixed body share this channel. The mesh
             // already sits on the slurry, so the tint is that one surface.
             let liquid = soil.water[i] + soil.slurry[i];
-            let liquid_scale = if self.water_column { 0.90 } else { 0.34 };
+            let liquid_scale = if self.puddle_beauty {
+                0.28
+            } else if self.win_demo_still {
+                0.90
+            } else if self.water_column || self.open_water {
+                0.90
+            } else {
+                0.34
+            };
             px[1] = ((liquid / liquid_scale).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
@@ -2757,6 +3294,72 @@ impl Renderer {
         );
     }
 
+    /// Resample the published turbidity, foam and flow onto the soil grid.
+    /// Reads `contract_cpu` only, after `publish`. Nearest texel: the contract
+    /// cell is 0.20 m and the soil cell 0.208 m, so the two grids are close
+    /// to one to one and the shader filters.
+    fn upload_water_fx(&mut self, sheet: bool) {
+        use silt::render_contract::{FLOW_CHANNELS, VALID_FOAM, VALID_TURBIDITY};
+        let header = &self.contract_cpu.header;
+        let live = sheet && header.valid & (VALID_TURBIDITY | VALID_FOAM) != 0;
+        if !live && !self.water_fx_live {
+            return;
+        }
+        self.water_fx_live = live;
+        let res = MAP_RES;
+        let cell = MAP_SIZE / MAP_RES as f32;
+        let half = MAP_SIZE * 0.5;
+        let win = silt::render_contract::WINDOW_CELLS as usize;
+        let wcell = silt::render_contract::WINDOW_CELL_M;
+        let (ox, oz) = (header.origin_x, header.origin_z);
+        let turb_ok = header.valid & VALID_TURBIDITY != 0;
+        let flow = &self.contract_cpu.flow;
+        let foam = &self.contract_cpu.foam_crest;
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        for j in 0..res {
+            let z = (j as f32 + 0.5) * cell - half;
+            let cj = ((z - oz) / wcell).floor() as i32;
+            for i in 0..res {
+                let o = (j * res + i) * 4;
+                let x = (i as f32 + 0.5) * cell - half;
+                let ci = ((x - ox) / wcell).floor() as i32;
+                let px = &mut self.water_fx_scratch[o..o + 4];
+                if !live || ci < 0 || cj < 0 || ci >= win as i32 || cj >= win as i32 {
+                    px.copy_from_slice(&[0, 0, 128, 128]);
+                    continue;
+                }
+                let idx = cj as usize * win + ci as usize;
+                let f = idx * FLOW_CHANNELS;
+                // sqrt keeps the faint tail of a settling cloud above one byte.
+                let t = if turb_ok { flow[f + 3].max(0.0).sqrt() } else { 0.0 };
+                px[0] = q(t);
+                px[1] = q(foam[idx * 2]);
+                // ±2 m/s around the byte 128.
+                px[2] = q(flow[f] * 0.25 + 0.5);
+                px[3] = q(flow[f + 1] * 0.25 + 0.5);
+            }
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.water_fx_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.water_fx_scratch,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(res as u32 * 4),
+                rows_per_image: Some(res as u32),
+            },
+            wgpu::Extent3d {
+                width: res as u32,
+                height: res as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     fn write_models(&self, vehicle: &Vehicle) {
         let chassis = Mat4::from_translation(vehicle.pos) * Mat4::from_quat(vehicle.orientation());
         // The Niva is already fitted onto the hardpoints. The buggy mesh is not.
@@ -2791,6 +3394,121 @@ impl Renderer {
                 bytemuck::bytes_of(slot),
             );
         }
+    }
+
+    fn stash_win_demo_reflect_readback(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("reflect-readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.reflect_sample,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.reflect_readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        let slice = self.reflect_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().expect("map").expect("map buffer");
+        let padded = slice.get_mapped_range();
+        let row = (self.width * 4) as usize;
+        let stride = self.padded_row as usize;
+        let mut out = Vec::with_capacity(row * self.height as usize);
+        for y in 0..self.height as usize {
+            out.extend_from_slice(&padded[y * stride..y * stride + row]);
+        }
+        drop(padded);
+        self.reflect_readback.unmap();
+        self.win_demo_reflect_rgba = out;
+    }
+
+    fn rebuild_tex_bg_pool_reflect(&mut self) {
+        self.tex_bg = build_tex_bg(
+            &self.device,
+            &self.tex_bgl,
+            &self.height_tex,
+            &self.mat_tex,
+            &self.nearest_samp,
+            &self.shadow_view,
+            &self.ground_diff_view,
+            &self.ground_nor_view,
+            &self.ground_pack_view,
+            &self.ground_samp,
+            &self.imprint_tex,
+            &self.crust_tex,
+            &self.scene_color_view,
+            &self.scene_depth_view,
+            &self.scene_samp,
+            &self.reflect_sample_view,
+            &self.water_fx_tex,
+            &self.terrain_geom.bind_entries(),
+        );
+    }
+
+    fn encode_win_demo_pool_reflect(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        reflect_view_proj: Mat4,
+        mut reflect_frame: FrameData,
+    ) {
+        reflect_frame.view_proj = reflect_view_proj.to_cols_array_2d();
+        self.queue
+            .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&reflect_frame));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("win-demo-pool-reflect"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.reflect_rt_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.reflect_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_bind_group(0, &self.frame_bg, &[]);
+        pass.set_pipeline(&self.pipe_sky);
+        pass.draw(0..3, 0..1);
+        pass.set_bind_group(1, &self.tex_bg_pool_encode, &[]);
+        pass.set_pipeline(&self.pipe_mesh);
+        pass.set_bind_group(3, &self.paint_bg, &[]);
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        self.draw_vehicle(&mut pass);
+        pass.set_pipeline(&self.pipe_mesh_blend);
+        pass.set_bind_group(3, &self.paint_bg, &[]);
+        pass.set_bind_group(2, &self.model_bg, &[0]);
+        self.draw_glass(&mut pass);
     }
 
     fn draw_vehicle(&self, pass: &mut wgpu::RenderPass<'_>) {
@@ -2857,6 +3575,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
         pass.set_index_buffer(self.bike_susp_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..susp_indices, 0, 0..1);
+        count_draw(susp_indices);
     }
 
     fn draw_chunks(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -2868,6 +3587,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.chunk_v.slice(..));
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+        count_draw(count);
     }
 
     fn draw_dust(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -2878,6 +3598,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.dust_v.slice(..));
         pass.set_index_buffer(self.dust_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+        count_draw(count);
     }
 }
 
@@ -2908,6 +3629,15 @@ pub fn tire_waterlines(world: &World, fluid: &silt::fluid_core::FluidCore) -> [f
     out
 }
 
+fn win_demo_reflect_view_proj(cam: CameraPose, proj: Mat4) -> Mat4 {
+    let plane = 0.22_f32;
+    let flip = |p: Vec3| Vec3::new(p.x, 2.0 * plane - p.y, p.z);
+    let eye = flip(cam.eye);
+    let target = flip(cam.target);
+    let view = Mat4::look_at_rh(eye, target, Vec3::new(0.0, -1.0, 0.0));
+    proj * view
+}
+
 fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
     use glam::Quat;
     let mut out = [[0.0; 4]; 8];
@@ -2923,8 +3653,11 @@ fn tire_frame(vehicle: &Vehicle) -> [[f32; 4]; 8] {
             fwd = fwd.normalize();
         }
         let live = wheel.sinkage > 0.003 && wheel.normal > 1.0;
+        let spin = wheel.omega.abs();
+        // Odd slot w carries wheel spin (rad/s) when driving; otherwise 1/0 live flag.
+        let active = if spin > 0.35 { spin } else if live { 1.0 } else { 0.0 };
         out[i * 2] = [center.x, center.y, center.z, WHEEL_RADIUS];
-        out[i * 2 + 1] = [fwd.x, fwd.z, wheel.sinkage, if live { 1.0 } else { 0.0 }];
+        out[i * 2 + 1] = [fwd.x, fwd.z, wheel.sinkage, active];
     }
     out
 }
@@ -3011,10 +3744,16 @@ fn vec4(v: Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
 }
 
+fn legacy_terrain(device: &wgpu::Device) -> GpuMesh {
+    let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
+    upload_mesh(device, &tverts, &tidx, "terrain")
+}
+
 fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.count, 0, 0..1);
+    count_draw(mesh.count);
 }
 
 fn filter_array(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -3388,7 +4127,9 @@ fn make_targets(
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
         // The dust volume pass reads scene depth to stop its march.
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&Default::default());
@@ -3401,6 +4142,217 @@ fn make_targets(
         mapped_at_creation: false,
     });
     (color, color_view, depth, depth_view, readback, padded_row)
+}
+
+fn make_scene_targets(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    depth_format: wgpu::TextureFormat,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let scene_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-color"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let scene_color_view = scene_color.create_view(&Default::default());
+    let reflect_color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-color"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let reflect_color_view = reflect_color.create_view(&Default::default());
+    let reflect_sample = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-sample"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let reflect_sample_view = reflect_sample.create_view(&Default::default());
+    let reflect_rt = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-rt"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let reflect_rt_view = reflect_rt.create_view(&Default::default());
+    let scene_depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let scene_depth_view = scene_depth.create_view(&Default::default());
+    let reflect_depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-depth"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: depth_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let reflect_depth_view = reflect_depth.create_view(&Default::default());
+    (
+        scene_color,
+        scene_color_view,
+        reflect_color,
+        reflect_color_view,
+        reflect_sample,
+        reflect_sample_view,
+        reflect_rt,
+        reflect_rt_view,
+        scene_depth,
+        scene_depth_view,
+        reflect_depth,
+        reflect_depth_view,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tex_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    height_tex: &wgpu::Texture,
+    mat_tex: &wgpu::Texture,
+    nearest: &wgpu::Sampler,
+    shadow_view: &wgpu::TextureView,
+    ground_diff_view: &wgpu::TextureView,
+    ground_nor_view: &wgpu::TextureView,
+    ground_pack_view: &wgpu::TextureView,
+    ground_samp: &wgpu::Sampler,
+    imprint_tex: &wgpu::Texture,
+    crust_tex: &wgpu::Texture,
+    scene_color_view: &wgpu::TextureView,
+    scene_depth_view: &wgpu::TextureView,
+    scene_samp: &wgpu::Sampler,
+    pool_reflect_view: &wgpu::TextureView,
+    water_fx_tex: &wgpu::Texture,
+    tg: &[wgpu::BindGroupEntry<'_>; 2],
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tex-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &height_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(
+                    &mat_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(nearest),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(ground_diff_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(ground_nor_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(ground_pack_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(ground_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(
+                    &imprint_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(
+                    &crust_tex.create_view(&Default::default()),
+                ),
+            },
+            tg[0].clone(),
+            tg[1].clone(),
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(scene_color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(scene_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::Sampler(scene_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::TextureView(pool_reflect_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::TextureView(
+                    &water_fx_tex.create_view(&Default::default()),
+                ),
+            },
+        ],
+    })
 }
 
 fn uniform_entry(binding: u32, dynamic: bool, size: u64) -> wgpu::BindGroupLayoutEntry {

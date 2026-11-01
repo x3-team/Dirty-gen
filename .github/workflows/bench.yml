@@ -1,0 +1,70 @@
+name: ue5-bench
+
+# Silt vs UE5 side-by-side stills. Runs on merges to main that touch the
+# picture (Vitalii's call, 2026-11-01) and by hand. Not on pull requests.
+# Renders with lavapipe on the CPU; about 15 minutes with the build.
+# The UE5 screenshots are not in the repo, so CI frames carry the Silt side
+# and a placeholder; run tools/bench_sbs.py locally with --refs for full SBS.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "assets/**"
+      - "bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "tools/bench_sbs.py"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Text printed on each SBS frame, e.g. a PR number"
+        required: false
+        default: ""
+
+concurrency:
+  group: ue5-bench
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: Software Vulkan and Pillow
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers python3-pil fonts-dejavu-core
+      - name: Release build
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo build --release
+      - name: Render bench stills
+        run: |
+          unset DISPLAY
+          ./target/release/silt capture --software --width 1280 --height 720 --bench out/bench
+      - name: Side-by-side frames
+        env:
+          BENCH_LABEL: ${{ inputs.label || github.sha }}
+        run: |
+          python3 tools/bench_sbs.py out/bench
+          {
+            echo "### Silt vs UE5 bench"
+            echo
+            echo "Download the \`ue5-bench\` artifact. Silt stills are in \`ours/\`; for the UE5 side run \`python3 tools/bench_sbs.py <dir> --refs <refs>\` locally."
+            echo
+            echo "| # | scene | Silt |"
+            echo "|---|---|---|"
+            python3 -c "import json;d=json.load(open('out/bench/bench.json'));[print(f\"| {i} | {s['id']} | {'rendered' if s['rendered'] else 'no scene yet'} |\") for i,s in enumerate(d['scenes'],1)]"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ue5-bench
+          path: out/bench
+          retention-days: 30
