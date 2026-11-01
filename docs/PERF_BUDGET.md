@@ -19,7 +19,7 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 
 Release CI runs on pull requests only. A push to main does not start this workflow.
 
-The job builds this pull request and pinned commit `0c04f3e73d3de5500188bfeff4ee075eefb196e6` (main with #112 merged), then runs both in this job. Its tree is #112 head `f3cd933`, which passed the flat caps in run 41302076195 (e2e 6.535 ms, air 0.261 ms, dust 0.644 ms, solver 4.123 ms, water 0.599 ms, solver water 0.628 ms, drive p95 4.986 ms).
+The job builds this pull request and pinned commit `3aa2377d67536b737fcb3c7d98618e9623b7a2c4` (main with #119 merged), then runs both in this job. Its tree is #119 head `40ab33f`, which passed the flat caps on an EPYC 7763 in run 41319551811 (e2e 8.034 ms, air 0.509 ms, dust 0.280 ms, solver 4.711 ms, water 1.390 ms, solver water 1.427 ms, drive p95 5.122 ms).
 
 Base samples are collected first. One warmup round is discarded, then 4 measured rounds. Warmup plus measured is at most 9. The caps stay flat: `E2E_BUDGET ms=11.820`, `E2E_AIR_BUDGET ms=1.500`, `DRIVE_SOLVER_BUDGET ms=7.000`, `DRIVE_P95_BUDGET ms=7.000`, `DRIVE_DUST_BUDGET ms=1.000`, `DRIVE_WATER_BUDGET ms=2.000`, `SOLVER_FRAME` with `budget=7`, `SOLVER_WATER` with `budget=2.000`, and `FOG_STEP_BUDGET ms=7.000`. A base or head median above its cap fails. `k_runner` is the median of head/base. It fails above 1.10. A median of exactly 1.10 passes. `k_runner` does not scale a cap.
 
@@ -85,3 +85,28 @@ Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger g
 ## Fog on the shared air grid
 
 Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, water ≤ 2.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.
+
+## River ford and beach
+
+`tests/ford_beach.rs` steps the ford in `silt::ford`: an open reach with an inlet and an outlet, full-gravity water with Manning bed friction and eddy viscosity, free-surface diffusion, a paddle swell, and the swash soak. None of these run unless a caller sets them, so `World::demo`, `ThroughDrive`, the e2e step, and the creek take the same path as before and the caps above are unchanged. The release log prints `FORD_RIVER ... step_ms` for one `FluidCore::step` of the ford at dt = 1/30 (coarse sheet only, no tires). Cloud container, 4 cores, which runs about three times slower than the CI runners: 4.2 ms with the rocks, the reach, and the swell.
+
+## Foam and stirred silt
+
+Base is `main` at 396af7e. Intel(R) Xeon(R) Processor, 4 cores. dt = 1/30. 24 warmup steps, then 96. The before column is the fine-sheet row above. The after column is release `e2e_niva` on this change. Caps are unchanged: solver sum ≤ 7 ms, solver frame ≤ 7 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms.
+
+| Subsystem | Before | After |
+| --- | ---: | ---: |
+| Water | 0.927 | 0.979 |
+| Slurry | 0.539 | 0.557 |
+| Soil / rut | 0.951 | 1.136 |
+| Air | 0.295 | 0.312 |
+| Dust | 1.899 | 1.141 |
+| restrict_fine | 0.169 | 0.169 |
+| Window 40 m | 0.354 | 0.462 |
+| Sheet prep | 0.209 | 0.211 |
+| Sheet rest | 0.316 | 1.369 |
+| Solver sum | 5.659 | 6.336 |
+| Step mean | 5.916 | 6.631 |
+| Step p95 | — | 8.625 |
+
+Sheet rest is the foam advection, the silt fluxes, and the crest pass. The seat after the sheet step writes the crest foam and is in the soil row. Dust and the window moved between runs; the standing books did not. Release e2e: water 4.607669 m³, slurry 0.883442 m³, soil 0.972286 m³, dust 0.024066 m³, ledger gap 0.000495 m³. Slurry depth 0.0555 m, puddle depth 0.0893 m. Step mean 17.792 ms (budget 33.004), p95 34.107 ms, air 0.276 ms (budget 1.5). Solver frame 3.025 ms (budget 7). The stirred-silt book is not the standing slurry pour. In the puddle scene its gap was 0, on 0.002573 m³ lifted.

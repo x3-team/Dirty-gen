@@ -237,6 +237,7 @@ fn place_tires(vehicle: &mut Vehicle, z: f32) {
 #[test]
 fn e2e_niva() {
     let mut fluid = FluidCore::new([0.0, -16.0]);
+    fluid.set_turbidity_enabled(false);
     fluid.set_wind(1.5, -0.9);
     let poured_water = fluid.pour_water(
         -PUDDLE_X,
@@ -688,9 +689,6 @@ fn e2e_niva() {
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    #[cfg(not(debug_assertions))]
-    print_through_drive();
-
     assert!(
         (puddle_n - 18.0).abs() < 0.5,
         "puddle samples {puddle_n}"
@@ -762,8 +760,11 @@ fn e2e_niva() {
         (dry_emitted - 0.009188).abs() < 2.0e-4,
         "dry dust {dry_emitted:.6} m3"
     );
+    // 16-layer air (dust.rs): the wake lifts the dry plume up to 4 m and it
+    // rides the relative wind off the window, so more of it lands on the wet
+    // track behind. The 8-layer sheet read 0.001519 here and 0.002941 on the map.
     assert!(
-        (settled_wet as f64 - 0.001519).abs() < 1.5e-4,
+        (settled_wet as f64 - 0.001739).abs() < 1.5e-4,
         "settled on the wet track {settled_wet:.6} before {settled_wet_before:.6}"
     );
     assert!(
@@ -777,7 +778,7 @@ fn e2e_niva() {
         dust.dust_air_m3()
     );
     assert!(
-        (track_dust_map as f64 - 0.002941).abs() < 5.0e-4,
+        (track_dust_map as f64 - 0.003424).abs() < 5.0e-4,
         "contract dust on the wet track {track_dust_map:.6}"
     );
     assert_eq!(wet_lift, 0.0, "wet lift {wet_lift}");
@@ -815,16 +816,17 @@ fn e2e_niva() {
         "air step {air_mean:.3} ms over {AIR_STEP_BUDGET_MS}"
     );
     #[cfg(not(debug_assertions))]
-    {
-        assert!(
-            step_mean <= E2E_STEP_BUDGET_MS,
-            "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} from the CI mean"
-        );
-        assert!(
-            air_mean <= AIR_RELEASE_BUDGET_MS,
-            "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
-        );
-    }
+    assert!(
+        step_mean <= E2E_STEP_BUDGET_MS,
+        "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} on {hardware}"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        air_mean <= AIR_RELEASE_BUDGET_MS,
+        "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
+    );
+    #[cfg(not(debug_assertions))]
+    print_through_drive();
 }
 
 /// Release breakdown of [`ThroughDrive::step`] at dt = 1/30. Printed for the CI log.
