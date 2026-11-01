@@ -4839,6 +4839,9 @@ pub struct FluidCore {
     spray_soaked_m3: f32,
     /// Drops peeled this pass that are still in the air.
     drops: Vec<LiveSpray>,
+    /// Scratch for merging fresh spray: per coarse cell, the drop index
+    /// started this step (`u32::MAX` = none). Only touched cells are reset.
+    spray_slot: Vec<u32>,
     /// Tire shoves from the step that just ran. Foam around the tires reads these.
     last_pushes: Vec<TirePush>,
     pub frame: u32,
@@ -4968,6 +4971,7 @@ impl FluidCore {
             spray_stranded_m3: 0.0,
             spray_soaked_m3: 0.0,
             drops: Vec::new(),
+            spray_slot: Vec::new(),
             last_pushes: Vec::new(),
             frame: 0,
             pushes: Vec::new(),
@@ -6637,7 +6641,10 @@ impl FluidCore {
         // of millilitre events; flying and landing them one by one cost the
         // drive step ~0.5 ms. Volume is summed; position, velocity and murk
         // are volume-weighted, so the throw and the ledger are unchanged.
-        let mut cell_of: Vec<(u32, usize)> = Vec::with_capacity(fresh.len().min(1024));
+        if self.spray_slot.len() != WINDOW_RES * WINDOW_RES {
+            self.spray_slot = vec![u32::MAX; WINDOW_RES * WINDOW_RES];
+        }
+        let mut touched: Vec<u32> = Vec::new();
         for event in fresh {
             if event.kind != 0 || !event.volume.is_finite() || event.volume <= 0.0 {
                 continue;
@@ -6650,7 +6657,8 @@ impl FluidCore {
             let hit = if key == u32::MAX {
                 None
             } else {
-                cell_of.iter().find(|(k, _)| *k == key).map(|(_, at)| *at)
+                let at = self.spray_slot[key as usize];
+                (at != u32::MAX).then_some(at as usize)
             };
             match hit {
                 Some(at) => {
@@ -6673,7 +6681,8 @@ impl FluidCore {
                 }
                 None => {
                     if key != u32::MAX {
-                        cell_of.push((key, self.drops.len()));
+                        self.spray_slot[key as usize] = self.drops.len() as u32;
+                        touched.push(key);
                     }
                     self.drops.push(LiveSpray {
                         pos: [event.x, event.y, event.z],
@@ -6685,6 +6694,9 @@ impl FluidCore {
                     });
                 }
             }
+        }
+        for key in touched {
+            self.spray_slot[key as usize] = u32::MAX;
         }
 
         self.land_spray();
@@ -6714,39 +6726,45 @@ impl FluidCore {
         if self.drops.is_empty() {
             return;
         }
+        let mut drops = std::mem::take(&mut self.drops);
         let mut landed: Vec<LiveSpray> = Vec::new();
-        let mut keep: Vec<LiveSpray> = Vec::with_capacity(self.drops.len());
-        let drops = std::mem::take(&mut self.drops);
-        for drop in drops {
+        drops.retain(|drop| {
             let finite = drop.volume.is_finite()
                 && drop.pos.iter().all(|c| c.is_finite())
                 && drop.vel.iter().all(|c| c.is_finite());
             if !finite {
                 // Nothing sane to put back. Keep it booked as spray.
-                continue;
+                return false;
             }
-            let surface = self.coarse_ij(drop.pos[0], drop.pos[2]).map(|(i, j)| {
-                let idx = j * WINDOW_RES + i;
-                // A drop well above any film needs no fine lookup.
-                let coarse_top = self.bed[idx] + self.water[idx] + self.slurry[idx];
-                if drop.pos[1] > coarse_top + 0.5 || !self.fine_on {
-                    return coarse_top;
+            if drop.age >= SPRAY_LIFE_S {
+                landed.push(*drop);
+                return false;
+            }
+            // A rising drop cannot land: no surface lookup.
+            if drop.vel[1] > 0.0 {
+                return true;
+            }
+            let hit = match self.coarse_ij(drop.pos[0], drop.pos[2]) {
+                Some((i, j)) => {
+                    let idx = j * WINDOW_RES + i;
+                    let coarse_top = self.bed[idx] + self.water[idx] + self.slurry[idx];
+                    // A drop well above any film needs no fine lookup.
+                    let top = if drop.pos[1] > coarse_top + 0.5 || !self.fine_on {
+                        coarse_top
+                    } else {
+                        let s = self.sample(drop.pos[0], drop.pos[2]);
+                        self.bed[idx] + s.water_m + s.slurry_m
+                    };
+                    drop.pos[1] <= top
                 }
-                let s = self.sample(drop.pos[0], drop.pos[2]);
-                self.bed[idx] + s.water_m + s.slurry_m
-            });
-            let down = drop.vel[1] <= 0.0;
-            let hit = match surface {
-                Some(top) => down && drop.pos[1] <= top,
                 None => drop.pos[1] <= 0.02,
             };
-            if hit || drop.age >= SPRAY_LIFE_S {
-                landed.push(drop);
-            } else {
-                keep.push(drop);
+            if hit {
+                landed.push(*drop);
             }
-        }
-        self.drops = keep;
+            !hit
+        });
+        self.drops = drops;
         for drop in &landed {
             self.deposit_drop(&drop);
         }
