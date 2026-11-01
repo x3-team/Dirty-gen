@@ -143,7 +143,14 @@ pub fn dynamic_viscosity(grain: Grain, moisture: f32) -> f32 {
 
 /// How hard a free-surface slope accelerates the sheet. A very thin mix,
 /// under about 12 Pa·s, moves more freely. Clay and silt do not.
+///
+/// A negative entry is not a viscosity. It is the mobility itself, for an
+/// open-water reach that runs at full gravity (see
+/// [`FluidCore::set_open_water`]).
 pub fn sheet_mobility_for(nu: f32) -> f32 {
+    if nu < 0.0 {
+        return -nu;
+    }
     let boost = if nu < 12.0 {
         let t = ((12.0 - nu.max(0.0)) / 12.0).clamp(0.0, 1.0);
         t * t * 1.6
@@ -236,6 +243,90 @@ pub struct StreamCycle {
     pub z1: f32,
     pub dir_x: f32,
     pub dir_z: f32,
+}
+
+/// A paddle strip in the coarse water sheet. Inside the strip the water
+/// velocity along `dir` is pulled toward `amplitude * sin(2π t / period)`.
+/// Only velocity is driven, never depth, so the strip cannot mint or delete
+/// water. The waves it sends out, their shoaling, and their run-up on a bank
+/// are whatever the height–velocity step does with that push.
+/// Off unless the caller sets one.
+#[derive(Clone, Copy, Debug)]
+pub struct WaveMaker {
+    pub x0: f32,
+    pub x1: f32,
+    pub z0: f32,
+    pub z1: f32,
+    /// Push direction in the ground plane. Normalised on use.
+    pub dir_x: f32,
+    pub dir_z: f32,
+    /// Peak paddle velocity, metres per second.
+    pub amplitude_m_s: f32,
+    pub period_s: f32,
+    /// Seconds over which the paddle ramps from 0 to full amplitude.
+    pub ramp_s: f32,
+}
+
+/// Open river reach through the window: an inlet at the upstream window
+/// edge and an outlet at the downstream edge, as in a recirculating flume.
+///
+/// The outlet rows hold the free surface at `outlet_eta` and copy the
+/// velocity of the first interior row, so the stream leaves without a wall
+/// to pile against. Water the outlet takes off goes into the reach bank. The
+/// inlet rows are filled from that bank toward `inlet_eta` and push the water
+/// in at `inlet_speed_m_s`, slower on the shallow margins. The bank is part of
+/// the ledger, so the reach neither mints nor deletes water: what arrives at
+/// the inlet is what left at the outlet. Off unless the caller sets one.
+#[derive(Clone, Copy, Debug)]
+pub struct RiverReach {
+    /// True for a river along Z, false for one along X.
+    pub along_z: bool,
+    /// True when the water runs toward +X (or +Z).
+    pub positive: bool,
+    /// Cross-stream band, metres of Z for a river along X (X for one along Z).
+    pub cross0: f32,
+    pub cross1: f32,
+    /// Rows at each window end that belong to the inlet and the outlet.
+    pub rows: usize,
+    /// World Y of the free surface the inlet and the outlet hold.
+    pub inlet_eta: f32,
+    pub outlet_eta: f32,
+    pub inlet_speed_m_s: f32,
+}
+
+/// Water as a river, not a film in a rut.
+///
+/// `mobility` is the share of gravity the free-surface slope applies to the
+/// water sheet (1 is full gravity). `manning_n` is the Manning roughness of
+/// the bed, s/m^(1/3), applied as bed friction on the coarse water sheet.
+/// Sand and gravel river beds sit around 0.025 to 0.04. Uniform flow on a
+/// slope S then runs at `h^(2/3) S^(1/2) / n`, and the thin water on a
+/// boulder's flank or in a swash is slowed far more than the deep thalweg.
+/// Typical depth-averaged eddy viscosity in a shallow gravel river is a few
+/// hundredths of m²/s.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenWater {
+    pub mobility: f32,
+    pub manning_n: f32,
+    /// Depth-averaged horizontal eddy viscosity, m²/s. Shear between wet
+    /// cells, and no slip against dry ground: a boulder or the bank holds the
+    /// water beside it back, which is the wake and the slow margin.
+    pub eddy_m2_s: f32,
+}
+
+/// Pore water that a passing film leaves in the ground.
+///
+/// A coarse cell under at least `wet_film_m` of water or slurry is saturated.
+/// A cell the film has left drains toward the pad moisture with an e-folding
+/// time of `drain_s` scaled by its grain: sand drains at `drain_s`, silt three
+/// times slower, clay eight times slower. This is the wet band a swash leaves
+/// on a beach and the dark sand behind a receding wave. Volume stays in the
+/// water sheet; pore water is a state of the ground, not a second column.
+/// Off unless the caller sets one.
+#[derive(Clone, Copy, Debug)]
+pub struct ShoreSoak {
+    pub wet_film_m: f32,
+    pub drain_s: f32,
 }
 
 /// One tire telling the sheet which way it is shoving.
@@ -384,6 +475,8 @@ pub struct FluidLedger {
     /// Volume the wheels have lifted into suspension. The column, the settled
     /// part, and the parked part sum to this.
     pub entrained_m3: f32,
+    /// Water between the outlet and the inlet of a [`RiverReach`].
+    pub reach_m3: f32,
     pub total_m3: f32,
 }
 
@@ -4330,6 +4423,18 @@ pub struct FluidCore {
     eroded_m3: f32,
     scour_hole_m: f32,
     cycle: Option<StreamCycle>,
+    reach: Option<RiverReach>,
+    /// Cubic metres between the outlet and the inlet of the reach.
+    reach_bank_m3: f32,
+    wave: Option<WaveMaker>,
+    /// Seconds since the wave maker was set.
+    wave_t: f32,
+    soak: Option<ShoreSoak>,
+    /// Free-surface diffusion on the coarse water sheet, m²/s. 0 is off.
+    surface_diffusion: f32,
+    /// Full-gravity water with bed friction for an open reach. `None` keeps
+    /// the viscous mobility of the water grain.
+    open_water: Option<OpenWater>,
     /// Scratch for [`Self::seat_rut_water`]. Sized once so a step does not allocate.
     seat_pressed: Vec<f32>,
     seat_is_rut: Vec<bool>,
@@ -4425,6 +4530,13 @@ impl FluidCore {
             eroded_m3: 0.0,
             scour_hole_m: 0.0,
             cycle: None,
+            reach: None,
+            reach_bank_m3: 0.0,
+            wave: None,
+            wave_t: 0.0,
+            soak: None,
+            surface_diffusion: 0.0,
+            open_water: None,
             seat_pressed: vec![0.0; n],
             seat_is_rut: vec![false; n],
             seat_floor: vec![false; n],
@@ -4549,7 +4661,7 @@ impl FluidCore {
         let nu = vec![dynamic_viscosity(Grain::Water, 1.0); n];
         let gate = vec![1u8; n];
         let bed = self.bed.clone();
-        soften_border(&mut self.uw, &mut self.vw, res);
+        soften_border(&mut self.uw, &mut self.vw, res, None);
         step_sheet_eps(
             &mut self.water,
             &mut self.uw,
@@ -4578,7 +4690,7 @@ impl FluidCore {
         }
         let gate = vec![1u8; n];
         let bed = self.bed.clone();
-        soften_border(&mut self.us, &mut self.vs, res);
+        soften_border(&mut self.us, &mut self.vs, res, None);
         step_sheet_eps(
             &mut self.slurry,
             &mut self.us,
@@ -4651,6 +4763,63 @@ impl FluidCore {
     /// Open-channel lips. `None` leaves the sheet closed at its own banks.
     pub fn set_stream_cycle(&mut self, cycle: Option<StreamCycle>) {
         self.cycle = cycle;
+    }
+
+    /// Open inlet and outlet at the window ends. `None` closes them. Water
+    /// still in the bank stays on the ledger.
+    pub fn set_river_reach(&mut self, reach: Option<RiverReach>) {
+        self.reach = reach;
+    }
+
+    /// Free-surface diffusion between wet coarse cells, m²/s. 0 turns it off.
+    ///
+    /// The collocated height–velocity step leaves a two-cell ripple in the
+    /// free surface of a long open reach. This moves water between wet
+    /// neighbours down the free-surface difference, donor-limited, so the
+    /// column is only moved, never minted. The two-cell mode decays in a few
+    /// steps; a swell a few metres long loses a few percent per second.
+    pub fn set_surface_diffusion(&mut self, m2_s: f32) {
+        self.surface_diffusion = if m2_s.is_finite() { m2_s.max(0.0) } else { 0.0 };
+    }
+
+    /// Open-water mode for the water sheet. `None` restores the default,
+    /// where water shares the viscous mobility curve of the mud sheets (about
+    /// 0.1 of gravity), which is right for a film in a rut and too slow for a
+    /// river: a swell then crawls and never runs up a beach. Slurry keeps its
+    /// own curve either way. See [`OpenWater`].
+    pub fn set_open_water(&mut self, open: Option<OpenWater>) {
+        self.open_water = open
+            .filter(|o| {
+                o.mobility.is_finite() && o.manning_n.is_finite() && o.eddy_m2_s.is_finite()
+            })
+            .map(|o| OpenWater {
+                mobility: o.mobility.clamp(0.0, 1.0),
+                manning_n: o.manning_n.max(0.0),
+                eddy_m2_s: o.eddy_m2_s.max(0.0),
+            });
+    }
+
+    /// Paddle strip in the coarse sheet. `None` turns it off. Restarts the paddle clock.
+    pub fn set_wave_maker(&mut self, wave: Option<WaveMaker>) {
+        self.wave = wave;
+        self.wave_t = 0.0;
+    }
+
+    /// Pore water left behind by the film. `None` leaves moisture to the substrate read.
+    pub fn set_shore_soak(&mut self, soak: Option<ShoreSoak>) {
+        self.soak = soak;
+    }
+
+    /// Grain of the solids per coarse cell. Viscosity and drainage read it.
+    /// Does not move any volume.
+    pub fn map_grain(&mut self, mut f: impl FnMut(f32, f32) -> Grain) {
+        self.restrict_fine();
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = self.coarse_xz(i, j);
+                self.grain[j * WINDOW_RES + i] = f(x, z) as u8;
+            }
+        }
     }
 
     /// Initial bed and water thickness. Returns the water volume now on the sheet.
@@ -5278,13 +5447,18 @@ impl FluidCore {
         let mut spray = self.peel_spray(&pushes, true, false);
         self.restrict_fine();
         self.apply_pushes_outside(&pushes);
+        self.drive_waves(dt);
         self.step_pair(dt, false);
+        self.bed_friction(dt);
+        self.diffuse_surface(dt);
         spray.extend(self.peel_spray(&pushes, false, true));
         self.last_pushes = pushes;
         if !self.solids.is_empty() {
             self.scour_contacts(dt);
         }
         self.cycle_stream();
+        self.feed_reach();
+        self.soak_shore(dt);
         let sus_tick = ProfTick::start();
         if self.turbidity_enabled {
             self.step_suspended(dt);
@@ -5446,6 +5620,7 @@ impl FluidCore {
             + frozen_slurry
             + frozen_dust
             + fog_air
+            + self.reach_bank_m3
             + self.spray_m3
             + suspended
             + self.settled_suspended_m3
@@ -5464,6 +5639,7 @@ impl FluidCore {
             settled_suspended_m3: self.settled_suspended_m3,
             frozen_suspended_m3: frozen_suspended,
             entrained_m3: self.entrained_m3,
+            reach_m3: self.reach_bank_m3,
             total_m3: total,
         }
     }
@@ -5996,6 +6172,361 @@ impl FluidCore {
         }
     }
 
+    /// Pull the water velocity in the paddle strip toward the paddle stroke.
+    /// The pull fades over the outer quarter of the strip on each side so the
+    /// strip edge is not a velocity step.
+    fn drive_waves(&mut self, dt: f32) {
+        let Some(w) = self.wave else {
+            return;
+        };
+        if dt <= 0.0 || w.period_s <= 0.0 {
+            return;
+        }
+        self.wave_t += dt;
+        let len = w.dir_x.hypot(w.dir_z);
+        if len < 1.0e-6 || !len.is_finite() {
+            return;
+        }
+        let (dx, dz) = (w.dir_x / len, w.dir_z / len);
+        let ramp = if w.ramp_s > 0.0 {
+            (self.wave_t / w.ramp_s).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let phase = std::f32::consts::TAU * self.wave_t / w.period_s;
+        let stroke = w.amplitude_m_s * ramp * phase.sin();
+        // Relaxation toward the stroke, a fraction per step that does not
+        // depend on dt for small steps.
+        let pull = 1.0 - (-dt / 0.08).exp();
+        let res = WINDOW_RES;
+        let cell = COARSE_CELL_M;
+        let span_x = (w.x1 - w.x0).max(cell);
+        let span_z = (w.z1 - w.z0).max(cell);
+        let i0 = (((w.x0 - self.origin[0]) / cell).floor() as i32).max(0);
+        let i1 = (((w.x1 - self.origin[0]) / cell).ceil() as i32).min(res as i32);
+        let j0 = (((w.z0 - self.origin[1]) / cell).floor() as i32).max(0);
+        let j1 = (((w.z1 - self.origin[1]) / cell).ceil() as i32).min(res as i32);
+        for j in j0..j1 {
+            for i in i0..i1 {
+                let (x, z) = self.coarse_xz(i as usize, j as usize);
+                if x < w.x0 || x > w.x1 || z < w.z0 || z > w.z1 {
+                    continue;
+                }
+                let idx = j as usize * res + i as usize;
+                if self.water[idx] < 0.02 || !self.water[idx].is_finite() {
+                    continue;
+                }
+                // Taper on the strip's own axes: 0 at the edge, 1 inside the middle half.
+                let tx = ((x - w.x0).min(w.x1 - x) / (0.25 * span_x)).clamp(0.0, 1.0);
+                let tz = ((z - w.z0).min(w.z1 - z) / (0.25 * span_z)).clamp(0.0, 1.0);
+                let k = pull * tx.min(tz);
+                let u = self.uw[idx];
+                let v = self.vw[idx];
+                let along = u * dx + v * dz;
+                let d = (stroke - along) * k;
+                let nu = u + d * dx;
+                let nv = v + d * dz;
+                if nu.is_finite() && nv.is_finite() {
+                    self.uw[idx] = nu;
+                    self.vw[idx] = nv;
+                }
+            }
+        }
+    }
+
+    /// Manning bed friction on the coarse water sheet in open-water mode,
+    /// implicit so a thin swash stops instead of reversing:
+    /// `du/dt = -g n² |u| u / h^(4/3)`.
+    fn bed_friction(&mut self, dt: f32) {
+        let Some(o) = self.open_water else {
+            return;
+        };
+        if dt <= 0.0 {
+            return;
+        }
+        self.eddy_shear(o.eddy_m2_s, dt);
+        if o.manning_n <= 0.0 {
+            return;
+        }
+        let gn2 = GRAVITY * o.manning_n * o.manning_n;
+        for idx in 0..WINDOW_RES * WINDOW_RES {
+            let h = self.water[idx];
+            if !(h > 1.0e-4) {
+                continue;
+            }
+            let (u, v) = (self.uw[idx], self.vw[idx]);
+            let speed = u.hypot(v);
+            if !(speed > 0.0) {
+                continue;
+            }
+            // Thin films are capped at 2 mm so the drag stays finite.
+            let k = gn2 * speed / h.max(0.002).powf(4.0 / 3.0);
+            let keep = 1.0 / (1.0 + dt * k);
+            self.uw[idx] = u * keep;
+            self.vw[idx] = v * keep;
+        }
+    }
+
+    /// Horizontal eddy viscosity on the coarse water velocity, one explicit
+    /// Laplacian from a snapshot. A dry neighbour that stands more than 3 cm
+    /// above the free surface counts as still water (no slip), so a boulder
+    /// or a bank drags the stream beside it. A dry neighbour just above the
+    /// surface is a beach the front is running onto, and is skipped. Moves no
+    /// volume.
+    fn eddy_shear(&mut self, nu_t: f32, dt: f32) {
+        if nu_t <= 0.0 {
+            return;
+        }
+        const WET: f32 = 0.003;
+        const STANDS_OUT: f32 = 0.03;
+        let res = WINDOW_RES;
+        let n = res * res;
+        // Stable for the explicit 5-point Laplacian while k < 0.25.
+        let k = (nu_t * dt / (COARSE_CELL_M * COARSE_CELL_M)).min(0.2);
+        if self.shift_scratch.len() < 2 * n {
+            self.shift_scratch.resize(2 * n, 0.0);
+        }
+        let (du, dv) = self.shift_scratch[..2 * n].split_at_mut(n);
+        for j in 0..res {
+            for i in 0..res {
+                let idx = j * res + i;
+                du[idx] = 0.0;
+                dv[idx] = 0.0;
+                if !(self.water[idx] > WET) {
+                    continue;
+                }
+                let (u0, v0) = (self.uw[idx], self.vw[idx]);
+                let mut lu = 0.0f32;
+                let mut lv = 0.0f32;
+                for (di, dj) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let ni = i as i32 + di;
+                    let nj = j as i32 + dj;
+                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                        // Window edge: no shear across it.
+                        continue;
+                    }
+                    let nidx = nj as usize * res + ni as usize;
+                    let (un, vn) = if self.water[nidx] > WET {
+                        (self.uw[nidx], self.vw[nidx])
+                    } else if self.bed[nidx] > self.bed[idx] + self.water[idx] + STANDS_OUT {
+                        // Ground standing out of the water: no slip.
+                        (0.0, 0.0)
+                    } else {
+                        // A wet front running onto the beach: free slip.
+                        continue;
+                    };
+                    lu += un - u0;
+                    lv += vn - v0;
+                }
+                du[idx] = k * lu;
+                dv[idx] = k * lv;
+            }
+        }
+        for idx in 0..n {
+            if du[idx] != 0.0 || dv[idx] != 0.0 {
+                let nu = self.uw[idx] + du[idx];
+                let nv = self.vw[idx] + dv[idx];
+                if nu.is_finite() && nv.is_finite() {
+                    self.uw[idx] = nu;
+                    self.vw[idx] = nv;
+                }
+            }
+        }
+    }
+
+    /// See [`Self::set_surface_diffusion`]. Fluxes are computed from one
+    /// snapshot of the surface, then applied, so the sweep order does not matter.
+    fn diffuse_surface(&mut self, dt: f32) {
+        if self.surface_diffusion <= 0.0 || dt <= 0.0 {
+            return;
+        }
+        let res = WINDOW_RES;
+        let k = (self.surface_diffusion * dt / (COARSE_CELL_M * COARSE_CELL_M)).min(0.12);
+        const WET: f32 = 0.003;
+        let n = res * res;
+        if self.shift_scratch.len() < n {
+            self.shift_scratch.resize(n, 0.0);
+        }
+        let delta = &mut self.shift_scratch[..n];
+        delta.fill(0.0);
+        for j in 0..res {
+            for i in 0..res {
+                let a = j * res + i;
+                let ha = self.water[a];
+                if !(ha > WET) {
+                    continue;
+                }
+                let ea = self.bed[a] + ha;
+                // East and north faces; each face is visited once.
+                for b in [
+                    if i + 1 < res { Some(a + 1) } else { None },
+                    if j + 1 < res { Some(a + res) } else { None },
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let hb = self.water[b];
+                    if !(hb > WET) {
+                        continue;
+                    }
+                    let eb = self.bed[b] + hb;
+                    let mut f = k * (ea - eb);
+                    // Donor limit: a face never takes more than a quarter of the column.
+                    if f > 0.0 {
+                        f = f.min(0.25 * ha);
+                    } else {
+                        f = f.max(-0.25 * hb);
+                    }
+                    delta[a] -= f;
+                    delta[b] += f;
+                }
+            }
+        }
+        for idx in 0..n {
+            let d = delta[idx];
+            if d != 0.0 && d.is_finite() {
+                self.water[idx] = (self.water[idx] + d).max(0.0);
+            }
+        }
+    }
+
+    /// Outlet to bank, bank to inlet. See [`RiverReach`].
+    fn feed_reach(&mut self) {
+        let Some(r) = self.reach else {
+            return;
+        };
+        let res = WINDOW_RES;
+        let rows = r.rows.clamp(1, res / 4);
+        let cell = COARSE_CELL_M;
+        let area = cell * cell;
+        let cross_origin = if r.along_z {
+            self.origin[0]
+        } else {
+            self.origin[1]
+        };
+        let c0 = (((r.cross0 - cross_origin) / cell).floor() as i32).max(0) as usize;
+        let c1 = (((r.cross1 - cross_origin) / cell).ceil() as i32).clamp(0, res as i32) as usize;
+        if c1 <= c0 {
+            return;
+        }
+        let at = |along: usize, cross: usize| -> usize {
+            if r.along_z {
+                along * res + cross
+            } else {
+                cross * res + along
+            }
+        };
+        // Along-stream rows, upstream first.
+        let row = |k: usize| -> usize {
+            if r.positive {
+                k
+            } else {
+                res - 1 - k
+            }
+        };
+        let (dx, dz) = match (r.along_z, r.positive) {
+            (false, true) => (1.0f32, 0.0f32),
+            (false, false) => (-1.0, 0.0),
+            (true, true) => (0.0, 1.0),
+            (true, false) => (0.0, -1.0),
+        };
+        // Outlet: hold the stage, copy the interior velocity, bank the excess.
+        let first_out = res - rows;
+        for cross in c0..c1 {
+            let src = at(row(first_out - 1), cross);
+            let (su, sv) = (self.uw[src], self.vw[src]);
+            let along = (su * dx + sv * dz).max(0.0);
+            for k in first_out..res {
+                let idx = at(row(k), cross);
+                let target = (r.outlet_eta - self.bed[idx]).max(0.0);
+                let h = self.water[idx];
+                if !h.is_finite() || target <= 0.0 {
+                    continue;
+                }
+                if h > target {
+                    self.reach_bank_m3 += (h - target) * area;
+                    self.water[idx] = target;
+                } else if self.reach_bank_m3 > 0.0 {
+                    let add = (target - h).min(self.reach_bank_m3 / area);
+                    self.water[idx] = h + add;
+                    self.reach_bank_m3 -= add * area;
+                }
+                if su.is_finite() && sv.is_finite() {
+                    let cross_v = if r.along_z { su } else { sv };
+                    if r.along_z {
+                        self.uw[idx] = cross_v;
+                        self.vw[idx] = along * dz;
+                    } else {
+                        self.uw[idx] = along * dx;
+                        self.vw[idx] = cross_v;
+                    }
+                }
+            }
+        }
+        // Inlet: fill from the bank toward the stage and push the water in.
+        let mut deep = 0.0f32;
+        for cross in c0..c1 {
+            let idx = at(row(0), cross);
+            deep = deep.max((r.inlet_eta - self.bed[idx]).max(0.0));
+        }
+        if deep <= 0.0 {
+            return;
+        }
+        for k in 0..rows {
+            for cross in c0..c1 {
+                let idx = at(row(k), cross);
+                let target = (r.inlet_eta - self.bed[idx]).max(0.0);
+                let h = self.water[idx];
+                if !h.is_finite() || target <= 0.0 {
+                    continue;
+                }
+                if h > target {
+                    self.reach_bank_m3 += (h - target) * area;
+                    self.water[idx] = target;
+                } else if self.reach_bank_m3 > 0.0 {
+                    let add = (target - h).min(self.reach_bank_m3 / area);
+                    self.water[idx] = h + add;
+                    self.reach_bank_m3 -= add * area;
+                }
+                let speed = r.inlet_speed_m_s * (self.water[idx] / deep).clamp(0.0, 1.0).sqrt();
+                self.uw[idx] = speed * dx;
+                self.vw[idx] = speed * dz;
+            }
+        }
+    }
+
+    /// Saturate the ground under the film and drain it once the film has gone.
+    fn soak_shore(&mut self, dt: f32) {
+        let Some(soak) = self.soak else {
+            return;
+        };
+        if dt <= 0.0 {
+            return;
+        }
+        let pad = self.moisture_ambient;
+        let base = soak.drain_s.max(1.0e-3);
+        let keep_sand = (-dt / base).exp();
+        let keep_silt = (-dt / (3.0 * base)).exp();
+        let keep_clay = (-dt / (8.0 * base)).exp();
+        for idx in 0..WINDOW_RES * WINDOW_RES {
+            let film = self.water[idx] + self.slurry[idx];
+            let m = self.moisture[idx];
+            if film >= soak.wet_film_m {
+                self.moisture[idx] = 1.0;
+                continue;
+            }
+            if m <= pad || !m.is_finite() {
+                continue;
+            }
+            let keep = match Grain::from_u8(self.grain[idx]) {
+                Grain::Sand => keep_sand,
+                Grain::Silt | Grain::Other | Grain::Water => keep_silt,
+                Grain::Clay => keep_clay,
+            };
+            self.moisture[idx] = pad + (m - pad) * keep;
+        }
+    }
+
     /// Recycle a reach. The downstream lip copies the flowing interior so the
     /// bank does not reflect, and the volume that left is put back on the
     /// upstream lip. No lip, no change.
@@ -6170,6 +6701,27 @@ impl FluidCore {
                     )
                 };
                 scratch.bed[..n].copy_from_slice(&bed_s[..n]);
+                // The water viscosity row is shared by every sheet on this
+                // thread. An open reach writes its mobility and puts the
+                // water value back after the step.
+                if let Some(o) = self.open_water {
+                    scratch.nu_w[..n].fill(-o.mobility.max(1.0e-4));
+                }
+                // An open reach keeps its current through the window ends.
+                let open = if fine {
+                    None
+                } else {
+                    self.reach.map(|r| {
+                        let o = if r.along_z {
+                            self.origin[0]
+                        } else {
+                            self.origin[1]
+                        };
+                        let c0 = ((r.cross0 - o) / cell).floor().max(0.0) as usize;
+                        let c1 = ((r.cross1 - o) / cell).ceil().max(0.0) as usize;
+                        (r.along_z, c0, c1.min(res))
+                    })
+                };
                 prep_ms = prep.ms();
                 let PairScratch {
                     nu_w,
@@ -6195,7 +6747,7 @@ impl FluidCore {
                     let tw = ProfTick::start();
                     // Soft edge of the window: slow the velocity, keep the mass.
                     if !fine {
-                        soften_border(uw, vw, res);
+                        soften_border(uw, vw, res, open);
                     }
                     if let Some(mask) = solid {
                         displace_occupied(water, uw, vw, mask, res);
@@ -6227,7 +6779,7 @@ impl FluidCore {
                         nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
                     }
                     if !fine {
-                        soften_border(us, vs, res);
+                        soften_border(us, vs, res, open);
                     }
                     if let Some(mask) = solid {
                         displace_occupied(slurry, us, vs, mask, res);
@@ -6264,6 +6816,10 @@ impl FluidCore {
                     water_ms = run_water();
                     slurry_ms = run_slurry();
                 }
+            }
+            if self.open_water.is_some() {
+                let n = WINDOW_RES * WINDOW_RES;
+                scratch.nu_w[..n].fill(dynamic_viscosity(Grain::Water, 1.0));
             }
             self.sheet_times.prep_ms += prep_ms;
             self.sheet_times.water_ms += water_ms;
@@ -6683,7 +7239,7 @@ impl FluidCore {
                 let h = &mut self.dust[start..start + n];
                 let u = &mut self.dust_u[start..start + n];
                 let v = &mut self.dust_v[start..start + n];
-                soften_border(u, v, AIR_RES);
+                soften_border(u, v, AIR_RES, None);
                 step_down2(
                     h,
                     u,
@@ -6728,7 +7284,7 @@ impl FluidCore {
                 }
                 let u = &mut self.fog_u[start..start + n];
                 let v = &mut self.fog_v[start..start + n];
-                soften_border(u, v, AIR_RES);
+                soften_border(u, v, AIR_RES, None);
                 step_down2(
                     h,
                     u,
@@ -7605,13 +8161,19 @@ fn rim_scale(h: &[f32], i: usize, j: usize, rad: i32, feather: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn soften_border(u: &mut [f32], v: &mut [f32], res: usize) {
+/// `open` is a reach band `(along_z, cross0, cross1)` in cells. Inside that
+/// band only the banks' window edges soften, not the inlet and the outlet.
+fn soften_border(u: &mut [f32], v: &mut [f32], res: usize, open: Option<(bool, usize, usize)>) {
     let edge = (res / 12).max(2);
     for j in 0..res {
         for i in 0..res {
             let di = i.min(res - 1 - i);
             let dj = j.min(res - 1 - j);
-            let d = di.min(dj);
+            let d = match open {
+                Some((false, c0, c1)) if (c0..c1).contains(&j) => dj,
+                Some((true, c0, c1)) if (c0..c1).contains(&i) => di,
+                _ => di.min(dj),
+            };
             if d >= edge {
                 continue;
             }
