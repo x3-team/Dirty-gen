@@ -37,7 +37,7 @@ pub struct BenchScene {
     pub target: Vec3,
 }
 
-pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
+pub(crate) fn parse_scenes(text: &str) -> Vec<BenchScene> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -71,7 +71,7 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
     out
 }
 
-fn pose(scene: &BenchScene, world: &World) -> CameraPose {
+pub(crate) fn pose(scene: &BenchScene, world: &World) -> CameraPose {
     if !scene.car_frame {
         return CameraPose {
             eye: scene.eye,
@@ -91,7 +91,7 @@ fn pose(scene: &BenchScene, world: &World) -> CameraPose {
 }
 
 /// Camera in the first walker's frame: x forward, y up, z right.
-fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
+pub(crate) fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
     let Some(w) = bodies.walkers.first() else {
         return CameraPose {
             eye: scene.eye,
@@ -111,7 +111,7 @@ fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose 
     }
 }
 
-fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
+pub(crate) fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
     write_png(path, width, height, rgba).expect("bench png");
     println!(
         "bench {} {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
@@ -185,7 +185,13 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
 
     // River ford with rocks (`river`) and the same ford with a swell on the
     // beach (`beach`). `stop` is seconds since the Niva started.
-    for (preset, swell) in [("river", None), ("beach", Some(silt::ford::Swell::default()))] {
+    // `river-muddy` is the same ford on a brown river: the inflow carries
+    // silt (RiverReach::inlet_turbidity), the Niva's plume adds to it.
+    for (preset, swell, silt) in [
+        ("river", None, 0.0),
+        ("river-muddy", None, RIVER_MUDDY_TURBIDITY),
+        ("beach", Some(silt::ford::Swell::default()), 0.0),
+    ] {
         let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
         if shots.is_empty() {
             continue;
@@ -196,7 +202,7 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
         renderer.niva_picture = true;
         renderer.water_column = true;
         renderer.open_water = true;
-        let mut ford = silt::ford::FordDrive::new(swell, 4.0);
+        let mut ford = silt::ford::FordDrive::new_turbid(swell, 4.0, silt);
         let dt = 1.0 / 60.0;
         for scene in shots {
             while ford.time_s < scene.stop {
@@ -247,6 +253,9 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
     }
 }
 
+/// Silt the `river-muddy` bench river carries, volume of solids per water.
+const RIVER_MUDDY_TURBIDITY: f32 = 0.08;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,7 +267,7 @@ mod tests {
         assert!(scenes.len() >= 5);
         for s in &scenes {
             assert!(
-                ["drive", "snow", "river", "beach", "wade", "missing"].contains(&s.preset.as_str()),
+                ["drive", "snow", "river", "river-muddy", "beach", "wade", "missing"].contains(&s.preset.as_str()),
                 "{}",
                 s.id
             );

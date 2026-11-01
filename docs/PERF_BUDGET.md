@@ -8,14 +8,25 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 | ThroughDrive solver sum | ≤ 7 ms | `tests/e2e_niva.rs` `DRIVE_SOLVER`, release. Subsystems of `ThroughDrive::step` at dt = 1/30, except the picture |
 | E2e step mean | ≤ 11.820 ms | `tests/e2e_niva.rs`, `dust.step_pads` then `fluid.step` at dt = 1/30, release |
 | ThroughDrive dust | ≤ 1.0 ms | `DRIVE_DUST` in that release log |
+| ThroughDrive water | ≤ 2.0 ms | `DRIVE_WATER` in that release log |
 | ThroughDrive step p95 | ≤ 7 ms | `DRIVE_P95` in that release log |
+| Solver water | ≤ 2.0 ms | `tests/frame_bench.rs` `SOLVER_WATER`, `Soil::step_water` at 1/60, release |
 | Air step | ≤ 1.5 ms | same e2e air mean, release. Every build still requires `< 4` ms (`AIR_STEP_BUDGET_MS`) |
 
 11.820 ms is 15% over the release CI mean after #100, 10.278 ms on AMD EPYC 9V45, 4 cores (run 41218969837, commit 0cf4957). That is under the mean plus 20% (12.334) and under the previous cap of 33.004 ms, which was the EPYC 7763 mean on run 41202858950. The log prints the mean and p95; it does not print a sample median. The cap is not the 7 ms frame budget.
 
-The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
+## Same-runner gate
+
+Release CI runs on pull requests only. A push to main does not start this workflow.
+
+The job builds this pull request and pinned commit `d0eeb1bb96363321d32b270c3dc565101134bb58` (main with #145 and #147 merged), then runs both in this job. The paired runs set `PERF_GATE_MEDIAN`, so `e2e_niva`, `frame_bench` and `fog_air` skip their own cap asserts there and the script checks the same caps on the median of the measured runs. One slow run on a slow runner does not fail the gate; a slow median does. If the pinned base predates that switch, the base is measured with this tree's copy of those three test files. The single release runs after the gate still assert every cap on every run.
+
+Base samples are collected first. One warmup round is discarded, then 4 measured rounds. Warmup plus measured is at most 9. The caps stay flat: `E2E_BUDGET ms=11.820`, `E2E_AIR_BUDGET ms=1.500`, `DRIVE_SOLVER_BUDGET ms=7.000`, `DRIVE_P95_BUDGET ms=7.000`, `DRIVE_DUST_BUDGET ms=1.000`, `DRIVE_WATER_BUDGET ms=2.000`, `SOLVER_FRAME` with `budget=7`, `SOLVER_WATER` with `budget=2.000`, and `FOG_STEP_BUDGET ms=7.000`. A base or head median above its cap fails. `k_runner` is the median of head/base. It fails above 1.10. A median of exactly 1.10 passes. `k_runner` does not scale a cap.
+
+A base process that exits non-zero fails the job with `base_exit`. That includes exit 101. It is not a measurement. A head process that exits non-zero fails the job. Debug CI still runs the acceptance checks. The release job still requires `fine_open` and `fluid_sheet_fog_is_not_dust_and_closes_the_ledger` to pass.
 
 The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
+
 
 A pull request that changes the solver prints, in the release CI log, the step count, the mean, p95, the hardware line, and the milliseconds of each subsystem (`DRIVE_*` from `ThroughDrive::step` at dt = 1/30).
 
@@ -72,7 +83,7 @@ Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger g
 
 ## Fog on the shared air grid
 
-Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.
+Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, water ≤ 2.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.
 
 ## River ford and beach
 

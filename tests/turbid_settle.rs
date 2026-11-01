@@ -68,3 +68,61 @@ fn wheel_cloud_settles_and_ledgers_close() {
     assert!(fluid.suspended_gap() <= 1.0e-6, "suspended gap {}", fluid.suspended_gap());
     assert!(fluid.silt_book_gap() <= 1.0e-6, "silt gap {}", fluid.silt_book_gap());
 }
+
+/// Mean published turbidity over the river channel, away from the inlet rows.
+fn channel_turbidity(fluid: &FluidCore, soil: &SoilField, t: f32) -> f32 {
+    let mut frame = ContractFrame::new();
+    publish(&mut frame, soil, &[], [0.0, 0.0], t, 16, Some(fluid), None);
+    let ox = frame.header.origin_x;
+    let oz = frame.header.origin_z;
+    let cell = silt::render_contract::WINDOW_CELL_M;
+    let res = silt::render_contract::WINDOW_CELLS as usize;
+    let (mut sum, mut n) = (0.0f64, 0u32);
+    for j in 0..res {
+        let z = oz + (j as f32 + 0.5) * cell;
+        if !(silt::ford::CHANNEL_Z0 + 1.0..silt::ford::CHANNEL_Z1 - 1.0).contains(&z) {
+            continue;
+        }
+        for i in 10..res - 10 {
+            let x = ox + (i as f32 + 0.5) * cell;
+            let _ = x;
+            let idx = j * res + i;
+            if frame.film[idx * 2] < 0.05 {
+                continue;
+            }
+            sum += f64::from(frame.flow[idx * FLOW_CHANNELS + 3]);
+            n += 1;
+        }
+    }
+    assert!(n > 100, "channel cells {n}");
+    (sum / f64::from(n)) as f32
+}
+
+#[test]
+fn river_inlet_turbidity_is_a_parameter_and_closes() {
+    let soil = SoilField::flat(0.0);
+    for c in [0.0f32, 0.08] {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        silt::ford::seed_ford_turbid(&mut fluid, None, c);
+        let mut t = 0.0;
+        for _ in 0..(20.0 / DT) as usize {
+            fluid.step(DT);
+            t += DT;
+        }
+        let mean = channel_turbidity(&fluid, &soil, t);
+        eprintln!("inlet {c}: channel turbidity {mean:.4}, gap {}", fluid.suspended_gap());
+        if c == 0.0 {
+            assert!(mean < 1.0e-4, "clear river published {mean}");
+        } else {
+            // Settling at 4 mm/s takes some out on the way down a 0.5 m channel.
+            assert!(mean > 0.5 * c && mean <= c * 1.01, "brown river published {mean}");
+        }
+        let books = fluid.ledger();
+        assert!(
+            fluid.suspended_gap() <= 1.0e-4 * books.entrained_m3.max(1.0),
+            "suspended gap {} of {}",
+            fluid.suspended_gap(),
+            books.entrained_m3
+        );
+    }
+}

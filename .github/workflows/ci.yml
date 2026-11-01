@@ -15,8 +15,11 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.1"
@@ -69,10 +72,16 @@ jobs:
           export CXX=g++ CC=gcc
           cargo test --test win_demo -- --nocapture
       - name: Release solver budget
+        env:
+          # d0eeb1b is main with #145 (shore headroom) and #147 merged. The
+          # gate checks the caps on the median of its paired runs; the single
+          # runs below still assert every cap. A base exit 101 is an error.
+          PERF_BASE_SHA: d0eeb1bb96363321d32b270c3dc565101134bb58
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
+          python3 scripts/perf_ratio.py
           RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore one_fine_substep_matches_eight -- --nocapture
           cargo test --release --test puddle_shore puddle_shore_follows_relief -- --nocapture
           cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive --test bodies -- --nocapture
