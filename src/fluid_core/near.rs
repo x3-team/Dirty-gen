@@ -80,6 +80,17 @@ impl NearTile {
     }
 }
 
+/// The 2 cm patch as the render contract publishes it (`FluidCore::fine_window`).
+#[derive(Clone, Debug)]
+pub struct FineWindow {
+    /// Minimum corner, world X and Z, metres.
+    pub origin: [f32; 2],
+    pub cell_m: f32,
+    pub res: usize,
+    /// Water and slurry depth, metres, interleaved, row-major, j along +Z.
+    pub film: Vec<f32>,
+}
+
 /// World-anchored residual tiles of the 2 cm water and slurry sheets.
 pub(crate) struct NearField {
     tiles: HashMap<(i32, i32), Box<NearTile>>,
@@ -334,6 +345,61 @@ impl FluidCore {
         if !on {
             self.near.tiles.clear();
         }
+    }
+
+    /// The 2 cm water and slurry the next step starts from, for the render
+    /// contract: each column's depth plus its kept residual, exactly what
+    /// `refine` will lay down. Cells of columns the patch does not hold carry
+    /// their 20 cm depth. Row-major `FINE_RES` × `FINE_RES`, metres, water and
+    /// slurry interleaved. `None` while no tire is on the patch.
+    pub fn fine_window(&self) -> Option<FineWindow> {
+        if self.last_pushes.is_empty() {
+            return None;
+        }
+        let (col, row) = self.fine_coarse_axes();
+        let mut film = vec![0.0f32; FINE_RES * FINE_RES * 2];
+        for j in 0..FINE_RES {
+            let cj = row[j];
+            if cj == u16::MAX {
+                continue;
+            }
+            for i in 0..FINE_RES {
+                let ci = col[i];
+                if ci == u16::MAX {
+                    continue;
+                }
+                let cidx = cj as usize * WINDOW_RES + ci as usize;
+                let o = (j * FINE_RES + i) * 2;
+                film[o] = self.water[cidx].max(0.0);
+                film[o + 1] = self.slurry[cidx].max(0.0);
+            }
+        }
+        if self.near.on {
+            for (_, key, i0, j0) in self.near_columns() {
+                let Some(tile) = self.near.tiles.get(&key) else {
+                    continue;
+                };
+                let o0 = (j0 * FINE_RES + i0) * 2;
+                let (bw, bs) = (film[o0], film[o0 + 1]);
+                let left = tile.left();
+                let aw = left * floor_scale(bw / left.max(1.0e-6), &tile.w);
+                let as_ = left * floor_scale(bs / left.max(1.0e-6), &tile.s);
+                for b in 0..NEAR_SUB {
+                    for a in 0..NEAR_SUB {
+                        let o = ((j0 + b) * FINE_RES + i0 + a) * 2;
+                        let k = b * NEAR_SUB + a;
+                        film[o] = (bw + aw * tile.w[k]).max(0.0);
+                        film[o + 1] = (bs + as_ * tile.s[k]).max(0.0);
+                    }
+                }
+            }
+        }
+        Some(FineWindow {
+            origin: self.fine_origin,
+            cell_m: FINE_CELL_M,
+            res: FINE_RES,
+            film,
+        })
     }
 
     /// 2 cm water depth of the patch, row-major `FINE_RES` × `FINE_RES`, and its

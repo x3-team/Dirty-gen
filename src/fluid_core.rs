@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 mod near;
 mod wet;
-pub use near::NEAR_RESIDUAL_LIFE_S;
+pub use near::{FineWindow, NEAR_RESIDUAL_LIFE_S};
 pub use wet::{WetBody, WetLoad, WetShape, SLURRY_RHO, WATER_RHO};
 
 /// Wall time of one timed region. Absent on wasm so the solver does not read a clock there.

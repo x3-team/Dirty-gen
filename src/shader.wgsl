@@ -27,6 +27,8 @@ struct Frame {
     // x: water detail (0 low, 1 medium, 2 high). y: 1 with a fluid sheet.
     // w: 1 when the scene target is linear HDR (see `present`).
     water_fx: vec4<f32>,
+    // 2 cm water window (contract binding 16): origin x, origin z, cell m, 1 live.
+    water_fine: vec4<f32>,
 }
 
 struct Model {
@@ -69,6 +71,10 @@ struct Model {
 @group(1) @binding(15) var pool_reflect_tex: texture_2d<f32>;
 // Contract turbidity (R, sqrt), foam (G), flow vx (B), vz (A) on the soil grid.
 @group(1) @binding(16) var water_fx_tex: texture_2d<f32>;
+// Contract binding 16 under the tires: water (RG) and slurry (BA), 16-bit
+// each over WATER_FINE_PACK_M. Valid while frame.water_fine.w is 1.
+@group(1) @binding(17) var water_fine_tex: texture_2d<f32>;
+const WATER_FINE_PACK_M: f32 = 0.5;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -844,11 +850,13 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let wet = mat.r;
     let demo_seam_terrain = win_demo_flat_terrain() && distance(xz, beauty_seam_center()) < 3.35;
     let horiz_terrain = n.y > 0.58;
-    let water = select(
+    let water_coarse = select(
         mat.g * 0.34,
         water_column(xz),
         puddle_beauty_on() && (!demo_seam_terrain || horiz_terrain),
     );
+    let fine_t = water_fine(xz);
+    let water = mix(water_coarse, min(fine_t.y, 0.34), fine_t.x);
     let darken = mat.b;
     let pool_beauty = puddle_beauty_on() && !demo_seam_terrain;
     let pool_fill = select(0.0, smoothstep(0.045, 0.11, mat.g), pool_beauty);
@@ -1081,6 +1089,50 @@ struct WaterOut {
     @location(2) depth: f32,
 }
 
+fn water_fine_texel(ij: vec2<i32>) -> vec2<f32> {
+    let n = vec2<i32>(textureDimensions(water_fine_tex));
+    let p = textureLoad(water_fine_tex, clamp(ij, vec2<i32>(0), n - vec2<i32>(1)), 0);
+    let code = vec2<f32>(p.r * 65280.0 + p.g * 255.0, p.b * 65280.0 + p.a * 255.0);
+    return code / 65535.0 * WATER_FINE_PACK_M;
+}
+
+// The 2 cm patch the solver keeps under the tires. x: weight, 1 inside the
+// window, 0 outside, eased over the last 0.2 m (one 20 cm column) so the rim
+// meets the coarse sheet. y: water + slurry, m. z: water, m. Bilinear.
+fn water_fine(xz: vec2<f32>) -> vec3<f32> {
+    if (frame.water_fine.w < 0.5 || frame.water_fine.z <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let cell = frame.water_fine.z;
+    let n = f32(textureDimensions(water_fine_tex).x);
+    let rel = (xz - frame.water_fine.xy) / cell;
+    let edge = min(min(rel.x, rel.y), min(n - rel.x, n - rel.y)) * cell;
+    let w = smoothstep(0.0, 0.2, edge);
+    if (w <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let p = rel - vec2<f32>(0.5);
+    let i0 = vec2<i32>(floor(p));
+    let f = fract(p);
+    let a = water_fine_texel(i0);
+    let b = water_fine_texel(i0 + vec2<i32>(1, 0));
+    let c = water_fine_texel(i0 + vec2<i32>(0, 1));
+    let d = water_fine_texel(i0 + vec2<i32>(1, 1));
+    let ws = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    return vec3<f32>(w, ws.x + ws.y, ws.x);
+}
+
+// Slope of the 2 cm depth, metres per metre, times the window weight.
+fn water_fine_grad(xz: vec2<f32>) -> vec2<f32> {
+    let e = max(frame.water_fine.z, 0.005);
+    let px = water_fine(xz + vec2<f32>(e, 0.0));
+    let nx = water_fine(xz - vec2<f32>(e, 0.0));
+    let pz = water_fine(xz + vec2<f32>(0.0, e));
+    let nz = water_fine(xz - vec2<f32>(0.0, e));
+    let w = min(min(px.x, nx.x), min(pz.x, nz.x));
+    return vec2<f32>(px.y - nx.y, pz.y - nz.y) / (2.0 * e) * w;
+}
+
 fn water_depth(xz: vec2<f32>) -> f32 {
     let raw = mat_bilinear(xz).g;
     if (win_demo_flat_terrain()) {
@@ -1093,7 +1145,11 @@ fn water_depth(xz: vec2<f32>) -> f32 {
     let d2 = mat_bilinear(xz - vec2<f32>(e, 0.0)).g;
     let d3 = mat_bilinear(xz + vec2<f32>(0.0, e)).g;
     let d4 = mat_bilinear(xz - vec2<f32>(0.0, e)).g;
-    return max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
+    let coarse = max(d0, max(d1, max(d2, max(d3, d4)))) * 0.34;
+    // Under the tires the 2 cm depth is the coverage: no dilation, so the
+    // dry tread line and the bow mound are where the solver has them.
+    let fine = water_fine(xz);
+    return mix(coarse, min(fine.y, 0.34), fine.x);
 }
 
 // Solved column for a crossing. misc.w selects the wider pack so a bow
@@ -1105,7 +1161,8 @@ fn water_column(xz: vec2<f32>) -> f32 {
         return raw * 0.28;
     }
     let scale = select(0.34, 0.90, water_column_on());
-    return raw * scale;
+    let fine = water_fine(xz);
+    return mix(raw * scale, min(fine.y, scale), fine.x);
 }
 
 // A dry patch with water on both sides is a hole in the sheet, not a shore.
@@ -1121,7 +1178,8 @@ fn covered_depth(xz: vec2<f32>) -> f32 {
     let pz = water_depth(xz + vec2<f32>(0.0, e));
     let nz = water_depth(xz - vec2<f32>(0.0, e));
     let across = max(min(px, nx), min(pz, nz));
-    return max(here, across);
+    // Inside the 2 cm window a dry strip is the solver's (a tread line), not a hole.
+    return max(here, across * (1.0 - water_fine(xz).x));
 }
 
 // Metres above the bed. The solved column can be most of a metre; drawing
@@ -2113,7 +2171,11 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     if (open_water_on()) {
         return open_water_fragment(in, bed);
     }
-    let own = mat_bilinear(xz).g * 0.34;
+    // Under the tires the 2 cm window is the depth here, per pixel; the
+    // vertex depth is the 20 cm sheet and would smear a dry tread line.
+    let fine = water_fine(xz);
+    let own = mix(mat_bilinear(xz).g * 0.34, min(fine.y, 0.34), fine.x);
+    let depth_px = mix(in.depth, fine.y, fine.x);
     let dug = max(-stamp_bilinear(xz), 0.0);
     // A cut keeps film and slurry on the soil mesh. Dilated water on the lip
     // was drawing flat cards in the pockets beside the floor.
@@ -2130,7 +2192,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         column_here = max(column_here, demo_column);
     }
     let seam_still = win_demo_flat_terrain() && distance(xz, beauty_seam_center()) < 3.25;
-    let free = water_column_on() && in.depth > 0.004;
+    let free = water_column_on() && depth_px > 0.004;
     let tire_pad = water_near_tire_hub(xz, 0.32);
     let seam_flat = beauty_seam_weight(xz);
     let in_seam_pan = (beauty || win_demo_flat_terrain()) && distance(xz, beauty_seam_center()) < 3.25;
@@ -2152,7 +2214,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         if (!keep_water) {
             discard;
         }
-    } else if (!keep_water && (near_cut || own < 0.008 || in.depth < 0.008)) {
+    } else if (!keep_water && (near_cut || own < 0.008 || depth_px < 0.008)) {
         discard;
     }
     let seam_pool = select(
@@ -2180,16 +2242,21 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let dx = (yx - y0) / de;
     let dz = (yz - y0) / de;
     let slope = normalize(vec3<f32>(-(dx * 2.6 + g.x * 2.4), 1.0, -(dz * 2.6 + g.y * 2.4)));
-    let nrm = select(
+    var nrm = select(
         flat,
         select(slope, normalize(puddle_normal(xz, frame.misc.x, column_here)), pool_norm),
         free,
     );
+    // The 2 cm sheet's own relief: wake, bow mound, the walls of the tread line.
+    if (fine.x > 0.0) {
+        let fg = water_fine_grad(xz) * 1.6;
+        nrm = normalize(nrm + vec3<f32>(-fg.x, 0.0, -fg.y));
+    }
     let view = normalize(frame.cam_pos.xyz - in.world);
     let sun = normalize(frame.sun_dir.xyz);
     let ndotv = clamp(dot(nrm, view), 0.0, 1.0);
     let fres = schlick_fresnel(ndotv);
-    let depth_t = smoothstep(0.006, 0.075, in.depth);
+    let depth_t = smoothstep(0.006, 0.075, depth_px);
     // Film shows the bed. Deep slurry is that same bed, darker and opaque.
     let muddy = kind == 4u || kind == 5u || kind == 6u || kind == 8u || kind == 9u;
     var film_col = mix(bed, bed * vec3<f32>(0.5, 0.36, 0.22), 0.7);
@@ -2205,17 +2272,17 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
     let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 28.0);
     let spec_col = mix(bed, vec3<f32>(0.04, 0.016, 0.005), 0.65);
     col += spec_col * spec * shadow_factor(in.world, nrm);
-    let shore = smoothstep(0.002, 0.07, in.depth);
+    let shore = smoothstep(0.002, 0.07, depth_px);
     let reveal = smoothstep(0.016, 0.034, dug);
-    let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, in.depth));
+    let open = mix(0.24, 0.42, smoothstep(0.015, 0.10, depth_px));
     let cover = select(mix(0.34, 0.58, depth_t), mix(0.55, 0.97, depth_t), muddy);
     // A damp speck still opens the groove. A film and a slurry keep the
     // opacity of the bed under them.
-    let skim = 1.0 - smoothstep(0.012, 0.028, in.depth);
+    let skim = 1.0 - smoothstep(0.012, 0.028, depth_px);
     let solved = shore * cover * mix(1.0, mix(1.0, open, skim), reveal);
     // A bowl is a cut, and the groove path opens that cut. The ford sheet is
     // the free surface, so the crest stays a surface instead of a tint.
-    let shore_fade = smoothstep(0.003, 0.07, in.depth);
+    let shore_fade = smoothstep(0.003, 0.07, depth_px);
     var alpha = select(solved, shore_fade, free_water);
     if (free_water) {
         // Turbid water. The bed shows through the troughs. Crests catch the
