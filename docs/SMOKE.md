@@ -2,7 +2,7 @@
 
 A world-anchored 3D grid on wgpu compute (`src/smoke.rs`, `src/smoke.wgsl`)
 and a fullscreen ray march over it (`src/smoke_pass.rs`,
-`src/smoke_volume.wgsl`, pass label `smoke-volume`). Off unless a scene
+`fs_fog` in `src/beauty_contract.wgsl`, group 5 of the dust march, pass label `dust-volume`). Off unless a scene
 enables it. Needs compute, so there is no smoke on WebGL2 (`low` in the
 browser).
 
@@ -23,7 +23,7 @@ origin, cell).
 | PavelDoGreat/WebGL-Fluid-Simulation | Reference for confinement strength and dissipation |
 | Bevy `volumetric_fog.wgsl` (MIT/Apache, already approved) | March: Henyey-Greenstein phase, Beer-Lambert, energy-conserving step |
 | Planck's law + CIE 1931 fit of Wyman, Sloan, Shirley (JCGT 2013) | Flame colour (`smoke::blackbody`), computed, no code taken |
-| stegu/psrdnoise `psrdnoise3.wgsl` (Gustavson, McEwan, MIT) | `sdnoise3`, simplex noise with analytic gradient, copied with its licence header into `smoke_volume.wgsl` |
+| stegu/psrdnoise `psrdnoise3.wgsl` (Gustavson, McEwan, MIT) | `sdnoise3`, simplex noise with analytic gradient, copied with its licence header into `beauty_contract.wgsl` |
 | Bridson et al. 2007, curl noise | Divergence-free detail: curl of three offset `sdnoise3` |
 | Kim et al. 2008, wavelet turbulence | Detail amplitude from the unresolved eddy speed the solver publishes, Kolmogorov 2^(-5/6) per octave |
 | Wrenninge 2015, multiple-scattering octaves | Two extra sun octaves at half extinction so thick smoke is bright |
