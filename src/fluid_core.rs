@@ -643,6 +643,7 @@ fn step_sheet_eps_in(
     eps: f32,
     solid: Option<&[u8]>,
     sc: &mut Scratch,
+    sc2: &mut Scratch,
 ) {
     if dt <= 0.0 || res == 0 || h.len() < res * res {
         return;
@@ -659,7 +660,8 @@ fn step_sheet_eps_in(
         return;
     }
     sc.fit(res * res);
-    step_sheet_scratch(h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, sc);
+    sc2.fit(res * res);
+    step_sheet_scratch(h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, sc, Some(sc2));
 }
 
 fn step_sheet_eps(
@@ -694,7 +696,7 @@ fn step_sheet_eps(
         let mut sc = sc.borrow_mut();
         sc.fit(res * res);
         step_sheet_scratch(
-            h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, &mut sc,
+            h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, &mut sc, None,
         );
     });
 }
@@ -1328,6 +1330,7 @@ fn step_sheet_scratch(
     eps: f32,
     solid: Option<&[u8]>,
     sc: &mut Scratch,
+    sc2: Option<&mut Scratch>,
 ) {
     if ISOLATE_SCRATCH.with(|flag| flag.replace(false)) {
         sc.fit(res * res);
@@ -1387,6 +1390,37 @@ fn step_sheet_scratch(
             .clamp(1.0, 8.0) as u32
     };
     let dts = dt / nsub as f32;
+    // Two blobs far enough apart (the left and right tire tracks) touch
+    // disjoint cells: a substep writes its box and a 1-cell rim and reads a
+    // 2-cell rim. Those two boxes step on two workers, each on its own scratch.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(sc2) = sc2 {
+        if boxes.len() == 2 && boxes_apart(boxes[0], boxes[1], BOX_PAR_GAP) {
+            let (b0, b1) = (boxes[0], boxes[1]);
+            let n = res * res;
+            let hp = ShareMut(h.as_mut_ptr());
+            let up = ShareMut(u.as_mut_ptr());
+            let vp = ShareMut(v.as_mut_ptr());
+            for _ in 0..nsub {
+                let run = |b: (usize, usize, usize, usize), sc: &mut Scratch| {
+                    // SAFETY: the two boxes are `BOX_PAR_GAP` cells apart, so
+                    // the cells one worker writes are never read or written by
+                    // the other. The join below ends before `h`, `u`, `v` are
+                    // used again.
+                    let (h, u, v) = unsafe { (hp.slice(n), up.slice(n), vp.slice(n)) };
+                    substep(
+                        h, u, v, bed, nu, gate, res, cell, dts, drive, eps, b.0, b.1, b.2, b.3,
+                        solid, sc,
+                    );
+                };
+                rayon::join(
+                    || serial_inner(|| run(b0, &mut *sc)),
+                    || serial_inner(|| run(b1, &mut *sc2)),
+                );
+            }
+            return;
+        }
+    }
     for _ in 0..nsub {
         for &(i0, i1, j0, j1) in &boxes {
             substep(
@@ -1394,6 +1428,16 @@ fn step_sheet_scratch(
             );
         }
     }
+}
+
+/// Cells two work boxes must keep between them to step at the same time.
+/// A substep writes up to 1 cell outside its box and reads up to 2.
+const BOX_PAR_GAP: usize = 6;
+
+/// True when the boxes are at least `gap` cells apart along x or along z.
+fn boxes_apart(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize), gap: usize) -> bool {
+    let apart = |a0: usize, a1: usize, b0: usize, b1: usize| a1 + gap < b0 || b1 + gap < a0;
+    apart(a.0, a.1, b.0, b.1) || apart(a.2, a.3, b.2, b.3)
 }
 
 fn substep(
@@ -3072,10 +3116,12 @@ fn transport(
         );
         return;
     }
-    let n = res * res;
-    for idx in 0..n {
-        sc.removed[idx] = 0.0;
-        sc.added[idx] = 0.0;
+    // Every edge below has both cells inside the box, so the books only
+    // need the box, not the whole grid.
+    for j in j0..=j1 {
+        let row = j * res;
+        sc.removed[row + i0..=row + i1].fill(0.0);
+        sc.added[row + i0..=row + i1].fill(0.0);
     }
     if along_x {
         for j in j0..=j1 {
@@ -3118,9 +3164,11 @@ fn transport(
             }
         }
     }
-    for idx in 0..n {
-        if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
-            h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+    for j in j0..=j1 {
+        for idx in j * res + i0..=j * res + i1 {
+            if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
+                h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+            }
         }
     }
 }
@@ -3610,10 +3658,16 @@ fn redirect_into_walls(
     j1: usize,
     sc: &mut Scratch,
 ) {
-    let n = res * res;
-    for idx in 0..n {
-        sc.removed[idx] = 0.0;
-        sc.added[idx] = 0.0;
+    // Removals sit in the box and additions on its 4-neighbours, so the
+    // books cover the box and a 1-cell rim.
+    let ri0 = i0.saturating_sub(1);
+    let ri1 = (i1 + 1).min(res - 1);
+    let rj0 = j0.saturating_sub(1);
+    let rj1 = (j1 + 1).min(res - 1);
+    for j in rj0..=rj1 {
+        let row = j * res;
+        sc.removed[row + ri0..=row + ri1].fill(0.0);
+        sc.added[row + ri0..=row + ri1].fill(0.0);
     }
     for j in j0..=j1 {
         for i in i0..=i1 {
@@ -3699,9 +3753,11 @@ fn redirect_into_walls(
             }
         }
     }
-    for idx in 0..n {
-        if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
-            h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+    for j in rj0..=rj1 {
+        for idx in j * res + ri0..=j * res + ri1 {
+            if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
+                h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+            }
         }
     }
 }
@@ -3944,10 +4000,11 @@ pub struct FluidCore {
     sheet_times: SheetTimes,
     /// Reused by the integer window scroll. Not a second sheet.
     shift_scratch: Vec<f32>,
-    /// One scratch per walled sheet: fine water, fine slurry, coarse water,
-    /// coarse slurry. Water and slurry step on two workers, so each sheet keeps
-    /// its own buffers instead of whichever thread-local the worker holds.
-    sheet_scratch: [Scratch; 4],
+    /// Two scratches per walled sheet: fine water, fine slurry, coarse water,
+    /// coarse slurry. Water and slurry step on two workers, and two far-apart
+    /// boxes of one sheet may too, so each keeps its own buffers instead of
+    /// whichever thread-local the worker holds.
+    sheet_scratch: [[Scratch; 2]; 4],
 }
 
 impl FluidCore {
@@ -4013,7 +4070,7 @@ impl FluidCore {
             seat_etas: Vec::with_capacity(n),
             sheet_times: SheetTimes::default(),
             shift_scratch: Vec::new(),
-            sheet_scratch: [Scratch::new(), Scratch::new(), Scratch::new(), Scratch::new()],
+            sheet_scratch: std::array::from_fn(|_| [Scratch::new(), Scratch::new()]),
         }
     }
 
@@ -4737,6 +4794,12 @@ impl FluidCore {
         self.sample_coarse(x, z)
     }
 
+    /// Cubic metres booked as spray so far. The same value as
+    /// `ledger().spray_m3`, without summing every sheet.
+    pub fn spray_m3(&self) -> f32 {
+        self.spray_m3
+    }
+
     pub fn ledger(&self) -> FluidLedger {
         let mut water = column_sum(&self.water, COARSE_CELL_M);
         let mut slurry = column_sum(&self.slurry, COARSE_CELL_M);
@@ -5447,7 +5510,8 @@ impl FluidCore {
                 // runs inside each worker too.
                 let solid = mask.as_deref();
                 let [fine_w, fine_s, coarse_w, coarse_s] = &mut self.sheet_scratch;
-                let (sc_w, sc_s) = if fine { (fine_w, fine_s) } else { (coarse_w, coarse_s) };
+                let ([sc_w, sc_w2], [sc_s, sc_s2]) =
+                    if fine { (fine_w, fine_s) } else { (coarse_w, coarse_s) };
                 let run_water = || {
                     let tw = ProfTick::start();
                     // Soft edge of the window: slow the velocity, keep the mass.
@@ -5471,6 +5535,7 @@ impl FluidCore {
                         1.0e-6,
                         solid,
                         sc_w,
+                        sc_w2,
                     );
                     tw.ms()
                 };
@@ -5500,6 +5565,7 @@ impl FluidCore {
                         1.0e-6,
                         solid,
                         sc_s,
+                        sc_s2,
                     );
                     ts.ms()
                 };
