@@ -20,6 +20,7 @@ pub mod snow_track;
 pub mod soil;
 pub mod terrain_lod;
 pub mod vehicle;
+pub mod wick;
 pub mod world;
 
 pub use world::{

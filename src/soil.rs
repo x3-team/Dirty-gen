@@ -704,6 +704,8 @@ pub struct SoilField {
     pub crust: Vec<f32>,
     /// Crack opening, metres. A shader reads this. It does not move the bed.
     pub crack: Vec<f32>,
+    /// Row band the capillary step runs next. See [`crate::wick`].
+    wick_band: usize,
     /// Shrinkage-fracture lattice of the skin. It writes [`Self::crack`].
     pub skin: crate::skin::SkinLattice,
     /// Cubic metres of skin written onto the field, including what later left.
@@ -1319,6 +1321,7 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust: vec![0.0; n],
             crack: vec![0.0; n],
+            wick_band: 0,
             skin: crate::skin::SkinLattice::default(),
             skin_grown_m3: 0.0,
             skin_lost_m3: 0.0,
@@ -6099,6 +6102,7 @@ impl SoilField {
     pub fn step_moisture(&mut self, dt: f32, rain: f32) {
         let dt = dt.max(0.0);
         let rain = rain.max(0.0);
+        self.wick_pores(dt);
         let n = self.wetness.len();
         for idx in 0..n {
             let kind = SurfaceKind::from_u8(self.kind[idx]);
@@ -6146,6 +6150,25 @@ impl SoilField {
             self.bake_crust(idx, next, dt, rain);
         }
         self.fracture_skin();
+    }
+
+    /// Capillary pore water across soil joints. See [`crate::wick`]. Water
+    /// past a cell's surface hold is free water: that cell is a pond.
+    fn wick_pores(&mut self, dt: f32) {
+        let kind = &self.kind;
+        crate::wick::wick(
+            &mut self.wetness,
+            &mut self.water,
+            &self.height,
+            |idx| {
+                let k = SurfaceKind::from_u8(kind[idx]);
+                (crate::wick::class_of(k), water_hold(k))
+            },
+            self.res,
+            self.cell,
+            dt,
+            &mut self.wick_band,
+        );
     }
 
     /// Grow or soak the skin on one cell. The bed and the placed pile stay.
@@ -6563,6 +6586,7 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust,
             crack,
+            wick_band: 0,
             skin: crate::skin::SkinLattice::default(),
             skin_grown_m3,
             skin_lost_m3: 0.0,
@@ -9529,6 +9553,57 @@ mod tests {
                 opening <= thickness,
                 "opening {opening} over thickness {thickness}"
             );
+        }
+    }
+
+    /// A puddle on mud beside dry sand: the sand is fed by capillarity about
+    /// a cell out and dries past that, so the joint has a damp band that
+    /// fades, not a hard step.
+    #[test]
+    fn a_mud_sand_joint_grows_a_damp_band_in_the_sand() {
+        let mut soil = SoilField::flat(0.2);
+        let res = soil.res;
+        let seam = res / 2;
+        for idx in 0..res * res {
+            let i = idx % res;
+            soil.water[idx] = 0.0;
+            if i < seam {
+                soil.kind[idx] = SurfaceKind::WetMud as u8;
+                soil.wetness[idx] = 0.92;
+                soil.water[idx] = 0.03;
+            } else {
+                soil.kind[idx] = SurfaceKind::Sand as u8;
+                soil.wetness[idx] = 0.06;
+            }
+        }
+        let row = res / 2;
+        for _ in 0..5 {
+            for _ in 0..16 {
+                // The mud is a puddle bed: its pond is kept topped up.
+                for j in 0..res {
+                    for i in 0..seam {
+                        soil.water[j * res + i] = soil.water[j * res + i].max(0.03);
+                    }
+                }
+                soil.advance_weather(0.25, 0.0);
+            }
+        }
+        let w = |i: usize| soil.wetness[row * res + i];
+        let profile: Vec<String> = (seam - 4..seam + 8).map(|i| format!("{:.2}", w(i))).collect();
+        eprintln!("joint wetness mud|sand {}", profile.join(" "));
+        let far = w(res - 10);
+        assert!(w(seam) > far + 0.10, "no damp band, {} vs far {far}", w(seam));
+        assert!(w(seam + 1) > far + 0.01, "the band stops at the joint, {}", w(seam + 1));
+        assert!(
+            w(seam) >= w(seam + 1) && w(seam + 1) >= w(seam + 2),
+            "the band does not fade into the sand"
+        );
+        assert!(w(seam + 5) < far + 0.02, "the whole sand got wet, {}", w(seam + 5));
+        assert!(w(seam - 1) > 0.9, "the puddle bed dried, {}", w(seam - 1));
+        for i in 0..res {
+            if i < seam {
+                assert_eq!(soil.kind[row * res + i], SurfaceKind::WetMud as u8);
+            }
         }
     }
 
