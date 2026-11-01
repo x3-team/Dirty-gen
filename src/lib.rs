@@ -8,6 +8,8 @@ pub mod adhesion;
 pub mod bike;
 pub mod dust;
 pub mod fluid_core;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_sheet;
 pub mod lod;
 pub mod particles;
 pub mod patch;
