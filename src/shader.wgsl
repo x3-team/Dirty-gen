@@ -945,7 +945,9 @@ fn layer_of(kind: u32) -> i32 {
     if (kind == 2u) { return 4; }
     if (kind == 9u) { return 2; }
     if (kind == 4u) { return 5; }
-    if (kind == 10u) { return 6; }
+    // Bank sand takes the beauty sand layer on the beauty field only; on
+    // main's scenes it stays main's layer (the bench bank drew as a tan plate).
+    if (kind == 10u && sand_field()) { return 6; }
     if (kind == 0u || kind == 3u || kind == 7u || kind == 11u) { return 1; }
     return 0;
 }
