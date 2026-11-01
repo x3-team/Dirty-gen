@@ -43,7 +43,9 @@ pub const PANEL_SEAT: usize = 11;
 const I_YAW: f32 = 720.0 * TUNE;
 const I_PITCH: f32 = 480.0 * TUNE;
 const I_ROLL: f32 = 260.0 * TUNE;
-const WHEEL_INERTIA: f32 = 2.6;
+// Wheel plus the drivetrain reflected through the gears. Wheel torques scale
+// with TUNE, so this does too and the spin-up time stays the same.
+const WHEEL_INERTIA: f32 = 2.6 * TUNE;
 const MAX_STEER: f32 = 0.50;
 const ENGINE_TORQUE: f32 = 500.0 * TUNE;
 const MAX_OMEGA: f32 = 34.0;
@@ -178,6 +180,10 @@ pub struct Contact {
     pub chassis_long: f32,
     pub chassis_lat: f32,
     pub wheel_torque: f32,
+    /// Share of `wheel_torque` that is the soil shear reacting on the tread.
+    pub shear_nm: f32,
+    /// Spin rate at which the tread rolls without slip, rad/s.
+    pub roll_omega: f32,
     pub slip: f32,
     pub forward: Vec3,
     pub right: Vec3,
@@ -536,7 +542,10 @@ impl Vehicle {
             let active = sinkage > 0.003 && normal > 1.0;
             let mut chassis_long = 0.0;
             let mut chassis_lat = 0.0;
-            let mut wheel_torque = engine_torque(throttle, omega);
+            let mut wheel_torque = engine_torque(
+                throttle * spin_governor(self.wheels[i].slip, self.wheels[i].sinkage),
+                omega,
+            );
             wheel_torque += brake_torque(brake, omega, v_long);
             let mut stuck = false;
             let mut fling = 0.0;
@@ -545,6 +554,7 @@ impl Vehicle {
             let mut pull = 0.0;
             let mut patch_length = 0.0;
             let mut soil_push = 0.0;
+            let mut shear_nm = 0.0;
 
             if active {
                 let tm = match snow {
@@ -672,7 +682,8 @@ impl Vehicle {
                 }
 
                 // Shear reacts on the wheel even if Bingham holds the chassis still.
-                wheel_torque -= blended_long * WHEEL_RADIUS;
+                shear_nm = -blended_long * WHEEL_RADIUS;
+                wheel_torque += shear_nm;
 
                 // Deep slurry. Viscosity is the mix under the tire. Translation
                 // and spin are resisted separately, including when only one is moving.
@@ -725,6 +736,8 @@ impl Vehicle {
                 chassis_long,
                 chassis_lat,
                 wheel_torque,
+                shear_nm,
+                roll_omega: v_long / WHEEL_RADIUS,
                 slip,
                 forward: fwd,
                 right,
@@ -782,9 +795,19 @@ impl Vehicle {
                 torque_local += ori.inverse() * r.cross(f_world);
             }
             let inertia = self.wheel_inertia(c.index);
-            let alpha = c.wheel_torque / inertia;
+            // Engine, brake and slurry first. The soil shear can then only pull
+            // the tread back to rolling; it cannot carry it past in one step,
+            // or a heavy tire flips between spin and lock every frame.
+            let omega0 = self.wheels[c.index].omega + (c.wheel_torque - c.shear_nm) / inertia * dt;
+            let rel = omega0 - c.roll_omega;
+            let shear_step = c.shear_nm / inertia * dt;
+            let omega_next = if shear_step * rel < 0.0 && shear_step.abs() > rel.abs() {
+                c.roll_omega
+            } else {
+                omega0 + shear_step
+            };
             let brake = self.adhesion.arch_brake_nm(c.index);
-            let mut omega = (self.wheels[c.index].omega + alpha * dt).clamp(-MAX_OMEGA, MAX_OMEGA);
+            let mut omega = omega_next.clamp(-MAX_OMEGA, MAX_OMEGA);
             if brake > 0.0 && omega.abs() > 1.0e-3 {
                 let kick = brake / inertia * dt;
                 if kick >= omega.abs() {
@@ -1053,6 +1076,8 @@ impl Default for Contact {
             chassis_long: 0.0,
             chassis_lat: 0.0,
             wheel_torque: 0.0,
+            shear_nm: 0.0,
+            roll_omega: 0.0,
             slip: 0.0,
             forward: Vec3::Z,
             right: Vec3::X,
@@ -1152,6 +1177,23 @@ impl Vehicle {
         WHEEL_INERTIA + mud * WHEEL_RADIUS * WHEEL_RADIUS * 0.55
     }
 }
+
+/// Pedal share the driver keeps on a wheel that slipped by `slip` last step.
+/// A tread spun far past its peak only digs, so the foot lifts until the lugs
+/// bite again, the way a careful driver works a binary key. Below 0.3 slip the
+/// pedal is untouched.
+/// On firm ground (sinkage under 3 cm) a spin is a launch, not digging, so
+/// the foot stays down.
+pub fn spin_governor(slip: f32, sinkage: f32) -> f32 {
+    let x = slip.abs();
+    let t = ((x - SPIN_GOV_START) / (SPIN_GOV_FULL - SPIN_GOV_START)).clamp(0.0, 1.0);
+    let dug = smoothstep(0.03, 0.09, sinkage);
+    lerp(1.0, SPIN_GOV_FLOOR, t * t * (3.0 - 2.0 * t) * dug)
+}
+
+const SPIN_GOV_START: f32 = 0.30;
+const SPIN_GOV_FULL: f32 = 0.65;
+const SPIN_GOV_FLOOR: f32 = 0.12;
 
 fn engine_torque(throttle: f32, omega: f32) -> f32 {
     if throttle >= 0.0 {
