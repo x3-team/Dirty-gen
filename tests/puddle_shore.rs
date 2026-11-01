@@ -540,9 +540,16 @@ fn rel_vol(a: f32, b: f32) -> f32 {
 ///
 /// The tolerances are the equality. A cap of eight with a different film,
 /// or a formal pass while the volumes diverge, fails this test.
+///
+/// Both runs lay the 2 cm patch down flat each step (`set_near_field(false)`).
+/// This test checks how one step splits its substeps. With the near field on,
+/// sub-cell detail is carried from step to step, so any difference between the
+/// two splits is carried too and the two runs drift apart over the drive. That
+/// drift is not a pacing error; `tests/near_field.rs` covers the near field.
 #[test]
 fn one_fine_substep_matches_eight() {
     let mut prod = ThroughDrive::new();
+    prod.fluid.set_near_field(false);
     let production_cap = prod.fluid.fine_sub_cap();
     let production_pace = prod.fluid.fine_pace();
     assert!(
@@ -550,6 +557,7 @@ fn one_fine_substep_matches_eight() {
         "fine cap {production_cap} left eight"
     );
     let mut full = ThroughDrive::new();
+    full.fluid.set_near_field(false);
     full.fluid.set_fine_pace(2);
 
     let (rest_prod, film_rest) = shore_snap(&prod, None);

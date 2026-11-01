@@ -1,19 +1,20 @@
 //! Post-processing prototype (docs/LOOK_GAP.md, item 1).
 //!
-//! The scene shaders still tone-map in place and write an 8-bit
-//! `exp`-curve image (`present()` in shader.wgsl). This pass undoes that
-//! curve to get an approximate linear HDR value back (up to about 5.8),
-//! then runs a small film-style stack on it:
+//! Input is the scene target. With the HDR target (`Rgba16Float`, the
+//! default where the adapter supports it) that is linear light and bloom
+//! sees the full highlight range. On the 8-bit fallback the scene shaders
+//! tone-map in place (`present()` in shader.wgsl) and this pass undoes that
+//! curve to get an approximate linear value back (up to about 5.8). Then a
+//! small film-style stack runs on it:
 //!
 //! 1. bloom: soft-threshold downsample to 1/4 resolution, separable blur
 //! 2. FXAA-style edge blend (luma edges only, no temporal history)
 //! 3. exposure + bloom + ACES fitted tone curve
 //! 4. grade: saturation, split toning, vignette, light sharpen
 //!
-//! The 8-bit round trip limits the highlight range. The real fix is an
-//! `Rgba16Float` scene target with the tone curve only here (LOOK_GAP
-//! thread 1). This module is the drop-in proof that the stack alone moves
-//! the picture, at a cost of one full-screen and three quarter-screen passes.
+//! The edge blend and the final grade still work on the display-encoded
+//! value (their thresholds were tuned on it); only bloom reads linear light.
+//! Cost: one full-screen and three quarter-screen passes.
 //!
 //! Opt-in with `SILT_POST=1` while it is a prototype. Off by default, so the
 //! golden frames and committed stills do not change.
@@ -88,6 +89,7 @@ impl Post {
         width: u32,
         height: u32,
         src: &wgpu::TextureView,
+        hdr_input: bool,
     ) -> Self {
         // Bloom is the only part with a real cost. The low preset keeps the
         // tone curve, grade and edge blend, which are one full-screen pass.
@@ -125,7 +127,11 @@ impl Post {
             push_constant_ranges: &[],
         });
         let constants: std::collections::HashMap<String, f64> =
-            [("POST_BLOOM".to_string(), if bloom { 1.0 } else { 0.0 })].into();
+            [
+                ("POST_BLOOM".to_string(), if bloom { 1.0 } else { 0.0 }),
+                ("POST_HDR".to_string(), if hdr_input { 1.0 } else { 0.0 }),
+            ]
+            .into();
         let pipe = |entry: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
