@@ -3286,7 +3286,12 @@ fn capture_snow_track(renderer: &mut Renderer, parsed: &CaptureArgs) {
     let mid = (lo + hi) * 0.5;
     renderer.snow_bed = 0.0;
     renderer.snow_arc = None;
-    renderer.track = Some(track.window(mid));
+    // The 2.5 cm window (contract binding 15 layout) is built here. The
+    // terrain reader for it lands with the LOD ground (#120); until then the
+    // frame shows the same field sampled on the 20 cm grid.
+    let win = track.window(mid);
+    let deep = win.texels.iter().map(|t| t[0]).fold(f32::MAX, f32::min);
+    println!("snow-track window {}x{} origin=({:.3},{:.3}) min surface {:.3} m", win.res, win.res, win.origin.x, win.origin.y, deep);
 
     let v3 = |key: &str| -> Option<Vec3> {
         let v: Vec<f32> = std::env::var(key).ok()?.split(',').filter_map(|t| t.trim().parse().ok()).collect();
