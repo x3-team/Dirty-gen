@@ -34,9 +34,10 @@ fn pool(level: f32) -> FluidCore {
     f
 }
 
+/// Water in the sheet plus water thrown into the air as drops.
 fn water_m3(f: &FluidCore) -> f64 {
     let l = f.ledger();
-    l.water_m3 as f64
+    l.water_m3 as f64 + f.spray_m3() as f64
 }
 
 fn eta_at(f: &FluidCore, x: f32, z: f32) -> f32 {
@@ -353,6 +354,110 @@ fn boot_prints_in_fresh_snow_keep_the_mass() {
     assert!(w.steps >= 6);
     assert!(deep > 0.04 && deep < 0.2, "boot print depth in fresh snow");
     assert!(((m1 - m0) / m0.max(1.0)).abs() < 1.0e-6, "snow mass moved");
+}
+
+/// Highest foam on the coarse cells within `r` of a point.
+fn foam_near(f: &FluidCore, x: f32, z: f32, r: f32) -> f32 {
+    let mut m = 0.0f32;
+    let n = (r / 0.1).ceil() as i32;
+    for j in -n..=n {
+        for i in -n..=n {
+            let (px, pz) = (x + i as f32 * 0.1, z + j as f32 * 0.1);
+            if (px - x).hypot(pz - z) <= r {
+                m = m.max(f.foam_turbid_at(px, pz).0);
+            }
+        }
+    }
+    m
+}
+
+#[test]
+fn legs_and_impacts_foam_and_splash_but_a_resting_buoy_does_not() {
+    let level = 0.4;
+    // Wading: foam along the path behind the legs, a few litres of drops.
+    let mut fluid = pool(level);
+    for _ in 0..30 {
+        fluid.step(DT);
+    }
+    let v0 = water_m3(&fluid);
+    let mut imprint = Imprint::new();
+    let mut bodies = Bodies::new();
+    {
+        let ground = PrintGround {
+            imprint: &mut imprint,
+            base: bed_base(&fluid),
+        };
+        let mut w = Walker::new(Vec2::new(-4.0, 0.0), std::f32::consts::FRAC_PI_2, 1.4, &ground);
+        w.path = vec![Vec2::new(4.5, 0.0)];
+        bodies.walkers.push(w);
+    }
+    let mut at_legs = 0.0f32;
+    let mut n = 0.0f32;
+    run(&mut bodies, &mut fluid, &mut imprint, 4.0, |b, f, t| {
+        if t > 1.0 {
+            for (foot, _) in b.walkers[0].legs() {
+                at_legs += foam_near(f, foot.x, foot.z, 0.3);
+                n += 1.0;
+            }
+        }
+    });
+    let w = &bodies.walkers[0];
+    let behind = Vec2::new(w.pos.x, w.pos.z) - w.forward() * 0.8;
+    let trail = foam_near(&fluid, behind.x, behind.y, 0.4);
+    let far = foam_near(&fluid, 0.0, 3.5, 0.4);
+    let wade_spray = fluid.spray_m3();
+    println!(
+        "wade foam: at legs {:.3} trail {:.3} away {:.3} spray {:.2} l water+spray {:.5} -> {:.5}",
+        at_legs / n,
+        trail,
+        far,
+        wade_spray * 1000.0,
+        v0,
+        water_m3(&fluid)
+    );
+    assert!(at_legs / n > 0.15, "no foam at the wading legs");
+    assert!(trail > 0.05, "no foam trail behind the walker");
+    assert!(far < 0.01, "foam away from any body");
+    assert!(wade_spray > 2.0e-4 && wade_spray < 0.01, "wading drops {wade_spray} m3");
+    assert!(((water_m3(&fluid) - v0) / v0).abs() < 1.0e-4, "water book moved");
+
+    // A ball dropped in: a crown of drops and a foam ring at the impact.
+    let mut fluid = pool(level);
+    for _ in 0..30 {
+        fluid.step(DT);
+    }
+    let mut bodies = Bodies::new();
+    bodies.items.push(Body::ball(Vec3::new(0.0, level + 0.6, 0.0), 0.22, 70.0, false));
+    let mut imprint = Imprint::new();
+    let mut ring = 0.0f32;
+    let mut drops_up = 0usize;
+    run(&mut bodies, &mut fluid, &mut imprint, 1.0, |_, f, _| {
+        ring = ring.max(foam_near(f, 0.0, 0.0, 0.5));
+        drops_up = drops_up.max(f.spray_drops().iter().filter(|d| d.vel[1] > 0.5).count());
+    });
+    let crown = fluid.spray_m3();
+    println!("impact: foam {:.3} crown {:.2} l rising drops {}", ring, crown * 1000.0, drops_up);
+    assert!(ring > 0.15, "no foam ring at the impact");
+    assert!(crown > 2.0e-4 && crown < 0.01, "impact drops {crown} m3");
+    assert!(drops_up >= 4, "crown drops should rise");
+
+    // A buoy at rest: no foam, no drops once it has settled.
+    let mut fluid = pool(0.6);
+    for _ in 0..30 {
+        fluid.step(DT);
+    }
+    let mut bodies = Bodies::new();
+    bodies.items.push(Body::ball(Vec3::new(0.3, 0.6 + 0.10, -0.2), 0.18, 6.0, true));
+    let mut imprint = Imprint::new();
+    run(&mut bodies, &mut fluid, &mut imprint, 4.0, |_, _, _| {});
+    let s0 = fluid.spray_m3();
+    let mut calm = 0.0f32;
+    run(&mut bodies, &mut fluid, &mut imprint, 3.0, |_, f, _| {
+        calm = calm.max(foam_near(f, 0.3, -0.2, 0.5));
+    });
+    println!("buoy at rest: foam {:.4} drops {:.2e} m3", calm, fluid.spray_m3() - s0);
+    assert!(calm < 0.02, "resting buoy foams");
+    assert!(fluid.spray_m3() - s0 < 1.0e-7, "resting buoy splashes");
 }
 
 #[test]

@@ -5545,6 +5545,7 @@ impl FluidCore {
         self.step_pair(dt, false);
         if wet {
             self.wet_finish();
+            spray.extend(self.wet_splash(dt));
         }
         self.bed_friction(dt);
         self.diffuse_surface(dt);
