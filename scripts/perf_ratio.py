@@ -13,8 +13,8 @@ Fail when any of these is true:
 
 k_runner is only the paired head/base comparison. It does not scale a cap.
 
-The pinned base is f97aed4 (run 41231677339), which passed these caps.
-dfc05d4 is that same tree and is not the pin. Pairs are at most 9.
+The pinned base is 0c04f3e (main with #112 merged). Its tree is f3cd933,
+which passed these caps in run 41302076195. Pairs are at most 9.
 """
 
 from __future__ import annotations
@@ -34,10 +34,10 @@ LIMIT = 1.10
 DEFAULT_WARMUP = 1
 DEFAULT_MEASURED = 4
 MAX_PAIRS = 9
-# Release CI run 41231677339 passed the flat caps on this commit.
+# Release CI run 41302076195 passed the flat caps on this tree (#112 head f3cd933).
 # e2e 10.347, air 0.191, dust 0.748, solver 3.741, water 0.565,
 # solver water 0.450, frame 2.517, fog step 0.766.
-PINNED_BASE_SHA = "f97aed4a6b628b626ba0371e08e582a5db413b4b"
+PINNED_BASE_SHA = "0c04f3e73d3de5500188bfeff4ee075eefb196e6"
 CAPS = {
     "E2E_MEAN": 11.820,
     "E2E_AIR": 1.5,

@@ -19,7 +19,7 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 
 Release CI runs on pull requests only. A push to main does not start this workflow.
 
-The job builds this pull request and pinned commit `f97aed4a6b628b626ba0371e08e582a5db413b4b`, then runs both in this job. That commit passed the flat caps in run 41231677339 (e2e 10.347 ms, air 0.191 ms, dust 0.748 ms, solver 3.741 ms, water 0.565 ms, solver water 0.450 ms). `dfc05d4` is the merge of that same tree and is not the pin.
+The job builds this pull request and pinned commit `0c04f3e73d3de5500188bfeff4ee075eefb196e6` (main with #112 merged), then runs both in this job. Its tree is #112 head `f3cd933`, which passed the flat caps in run 41302076195 (e2e 6.535 ms, air 0.261 ms, dust 0.644 ms, solver 4.123 ms, water 0.599 ms, solver water 0.628 ms, drive p95 4.986 ms).
 
 Base samples are collected first. One warmup round is discarded, then 4 measured rounds. Warmup plus measured is at most 9. The caps stay flat: `E2E_BUDGET ms=11.820`, `E2E_AIR_BUDGET ms=1.500`, `DRIVE_SOLVER_BUDGET ms=7.000`, `DRIVE_P95_BUDGET ms=7.000`, `DRIVE_DUST_BUDGET ms=1.000`, `DRIVE_WATER_BUDGET ms=2.000`, `SOLVER_FRAME` with `budget=7`, `SOLVER_WATER` with `budget=2.000`, and `FOG_STEP_BUDGET ms=7.000`. A base or head median above its cap fails. `k_runner` is the median of head/base. It fails above 1.10. A median of exactly 1.10 passes. `k_runner` does not scale a cap.
 

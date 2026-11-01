@@ -42,9 +42,10 @@ jobs:
           cargo test --test e2e_niva -- --nocapture
       - name: Release solver budget
         env:
-          # f97aed4 passed the flat caps in run 41231677339. dfc05d4 is that
-          # same tree and is not the pin: an exit 101 from the base is an error.
-          PERF_BASE_SHA: f97aed4a6b628b626ba0371e08e582a5db413b4b
+          # 0c04f3e is main with #112 merged. Its tree is #112 head f3cd933,
+          # which passed the flat caps in run 41302076195. An exit 101 from
+          # the base is an error.
+          PERF_BASE_SHA: 0c04f3e73d3de5500188bfeff4ee075eefb196e6
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
