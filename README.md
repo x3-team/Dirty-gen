@@ -48,6 +48,12 @@ The isometric camera stays put so the whole loop, the puddles and the rut read a
 
 Opening the window or the page plays that lap with both vehicles. The first drive key (W, S, A, D, or the arrows) takes the selected one. The other keeps the lap, so the track still has two machines. The capture is the same lap, with nobody at the wheel.
 
+## Производительность и качество
+
+Цель: 60 FPS при 1920×1080 на GTX 1660 / RTX 3050 / RX 6600 (пресет `medium`). Пресеты `low|medium|high` задаются через `SILT_QUALITY`, `silt --quality low` или `?quality=low` в браузере. В окне F4 переключает пресет, F3 показывает оверлей: FPS, время CPU и GPU по каждому проходу против бюджета.
+
+Бенчмарк на своей видеокарте: `scripts\bench.ps1` (Windows) или `scripts/bench.sh`. Он пишет результаты в `bench-results/summary.txt`. Бюджеты и CI-проверка описаны в [docs/GPU_BUDGET.md](docs/GPU_BUDGET.md).
+
 ## Браузер
 
 Та же симуляция открывается в браузере: WebGPU, а если его нет на машине — WebGL2. Решатель тот же. Камера по умолчанию — изометрия. Пока не нажата педаль, багги и мотоцикл сами едут круг. Первая клавиша газа, тормоза или руля забирает выбранную машину; вторая продолжает круг. V переключает, кого ведёте. Скорость на западной прямой (справа в этом виде) по-прежнему срывает машину с гребня: кувырок, кратер и комья грязи, которые летят дугой и садятся на поле высот. Сборка для GitHub Pages лежит в `.github/workflows/pages.yml`. Адрес https://x3-team.github.io/Dirty-gen/ открывается после того, как в настройках репозитория включён Pages и источник — GitHub Actions.

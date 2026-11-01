@@ -2,4 +2,5 @@
 /dist
 **/*.rs.bk
 *.log
+/bench-results
 bench/refs/

@@ -43,3 +43,31 @@ jobs:
           export CXX=g++ CC=gcc
           unset DISPLAY
           cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive -- --nocapture
+
+  # Static GPU budget (docs/GPU_BUDGET.md). No GPU on the runner: WGSL loop
+  # bounds and WebGL2 translation run in a test; draw calls, triangles and
+  # texture/buffer memory per quality preset are counted on lavapipe.
+  # Triangles are reported but allowed until the CDLOD terrain (#120) lands.
+  gpu-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Shader budget and WebGL2
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --release --test gpu_budget -- --nocapture
+          cargo test --release --lib quality::
+      - name: Draw calls and memory per preset
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          unset DISPLAY
+          cargo build --release
+          GPU_BUDGET_ALLOW=triangles ./target/release/silt budget --software 2>&1 | grep -E "GPU_BUDGET|exceeded|panicked"
+          exit ${PIPESTATUS[0]}
