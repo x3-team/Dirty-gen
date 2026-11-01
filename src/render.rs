@@ -43,6 +43,10 @@ struct FrameData {
     snow_arc: [f32; 4],
     snow_arc2: [f32; 4],
     snow_profile: [[f32; 4]; 8],
+    /// Fine track window: origin x, origin z, cell, res. res 0 is off.
+    track_win: [f32; 4],
+    /// x: bed height under the window.
+    track_win2: [f32; 4],
 }
 
 #[repr(C)]
@@ -77,6 +81,8 @@ pub struct Renderer {
     imprint_tex: wgpu::Texture,
     mat_tex: wgpu::Texture,
     crust_tex: wgpu::Texture,
+    /// Fine track window, `TRACK_RES`² rgba32float. Contract binding 15 layout.
+    track_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth: wgpu::Texture,
@@ -149,6 +155,8 @@ pub struct Renderer {
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
     pub snow_arc: Option<silt::snow::SnowArc>,
     pub snow_bed: f32,
+    /// Fine snow track window. Drawn instead of the 20 cm height inside it.
+    pub track: Option<silt::snow_track::TrackWindow>,
     niva_body: GpuMesh,
     niva_glass: GpuMesh,
     niva_wheels: [GpuMesh; 4],
@@ -413,6 +421,16 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -432,16 +450,28 @@ impl Renderer {
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("height-only"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let model_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model"),
@@ -534,6 +564,20 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let track_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("track-fine"),
+            size: wgpu::Extent3d {
+                width: silt::snow_track::TRACK_RES as u32,
+                height: silt::snow_track::TRACK_RES as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -712,6 +756,12 @@ impl Renderer {
                         &crust_tex.create_view(&Default::default()),
                     ),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(
+                        &track_tex.create_view(&Default::default()),
+                    ),
+                },
             ],
         });
         let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -763,12 +813,20 @@ impl Renderer {
         let height_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("height-bg"),
             layout: &height_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &height_tex.create_view(&Default::default()),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &height_tex.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(
+                        &track_tex.create_view(&Default::default()),
+                    ),
+                },
+            ],
         });
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
@@ -1196,6 +1254,8 @@ impl Renderer {
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
+            track: None,
+            track_tex,
             niva_body,
             niva_glass,
             niva_wheels,
@@ -1403,8 +1463,33 @@ impl Renderer {
             snow_arc: [0.0; 4],
             snow_arc2: [1.0, 0.0, 0.0, 0.0],
             snow_profile: [[0.0; 4]; 8],
+            track_win: [0.0; 4],
+            track_win2: [0.0; 4],
         };
         let mut frame = frame;
+        if let (true, Some(win)) = (self.snow, self.track.as_ref()) {
+            frame.track_win = [win.origin.x, win.origin.y, win.cell, win.res as f32];
+            frame.track_win2 = [self.snow_bed, 0.0, 0.0, 0.0];
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.track_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&win.texels),
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(win.res as u32 * 16),
+                    rows_per_image: Some(win.res as u32),
+                },
+                wgpu::Extent3d {
+                    width: win.res as u32,
+                    height: win.res as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         if self.snow {
             if let Some(arc) = self.snow_arc {
                 frame.snow_arc = [arc.center.x, arc.center.y, arc.sweep, arc.r_lo];

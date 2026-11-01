@@ -22,6 +22,10 @@ struct Frame {
     snow_arc: vec4<f32>,
     snow_arc2: vec4<f32>,
     snow_profile: array<vec4<f32>, 8>,
+    // Fine track window: origin.x, origin.z, cell, res. res 0 is off.
+    track_win: vec4<f32>,
+    // x: bed height under the window.
+    track_win2: vec4<f32>,
 }
 
 struct Model {
@@ -58,6 +62,9 @@ struct Model {
 @group(1) @binding(8) var imprint_tex: texture_2d<f32>;
 // R: crust thickness / 0.04 m. G: crack opening / 0.02 m. Not a color.
 @group(1) @binding(9) var crust_tex: texture_2d<f32>;
+// Fine snow track, contract binding 15 layout: R surface over the bed,
+// G snow depth, B compaction, A lug print. 2.5 cm texels.
+@group(1) @binding(10) var track_tex: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -482,7 +489,60 @@ fn snow_arc_height(xz: vec2<f32>) -> f32 {
     return mix(raw, prof, fade);
 }
 
+// 1 inside the fine window, easing to 0 over its last 60 cm.
+fn track_weight(xz: vec2<f32>) -> f32 {
+    if (frame.track_win.w < 1.0 || frame.sun_dir.w < 0.5) {
+        return 0.0;
+    }
+    let ext = frame.track_win.z * frame.track_win.w;
+    let rel = xz - frame.track_win.xy;
+    let edge = min(min(rel.x, rel.y), min(ext - rel.x, ext - rel.y));
+    return smoothstep(0.0, 0.6, edge);
+}
+
+fn track_load(ij: vec2<i32>) -> vec4<f32> {
+    let n = i32(frame.track_win.w);
+    return textureLoad(track_tex, clamp(ij, vec2<i32>(0), vec2<i32>(n - 1)), 0);
+}
+
+fn track_bilinear(xz: vec2<f32>) -> vec4<f32> {
+    let u = (xz - frame.track_win.xy) / frame.track_win.z - vec2<f32>(0.5);
+    let b = floor(u);
+    let f = u - b;
+    let i = vec2<i32>(b);
+    let a00 = track_load(i);
+    let a10 = track_load(i + vec2<i32>(1, 0));
+    let a01 = track_load(i + vec2<i32>(0, 1));
+    let a11 = track_load(i + vec2<i32>(1, 1));
+    return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+}
+
+fn track_height(xz: vec2<f32>) -> f32 {
+    return frame.track_win2.x + track_bilinear(xz).x;
+}
+
+fn track_normal(xz: vec2<f32>) -> vec3<f32> {
+    let e = frame.track_win.z;
+    let hl = track_height(xz - vec2<f32>(e, 0.0));
+    let hr = track_height(xz + vec2<f32>(e, 0.0));
+    let hd = track_height(xz - vec2<f32>(0.0, e));
+    let hu = track_height(xz + vec2<f32>(0.0, e));
+    return normalize(vec3<f32>(hl - hr, 2.0 * e, hd - hu));
+}
+
 fn height_bilinear(xz: vec2<f32>) -> f32 {
+    let tw = track_weight(xz);
+    if (tw >= 1.0) {
+        return track_height(xz);
+    }
+    let coarse = height_bilinear_coarse(xz);
+    if (tw > 0.0) {
+        return mix(coarse, track_height(xz), tw);
+    }
+    return coarse;
+}
+
+fn height_bilinear_coarse(xz: vec2<f32>) -> f32 {
     if (frame.sun_dir.w > 0.5 && frame.snow_arc2.y > 1.5) {
         return snow_arc_height(xz);
     }
@@ -559,6 +619,13 @@ fn apply_seat(xz: vec2<f32>, base_h: f32) -> vec3<f32> {
 // Same samples as height_bilinear, but the step sits in a short wall.
 // A linear blend across a 20 cm cell shades a 10 cm rut as a tint.
 fn height_sharp(xz: vec2<f32>) -> f32 {
+    if (track_weight(xz) > 0.0) {
+        return height_bilinear(xz);
+    }
+    return height_sharp_coarse(xz);
+}
+
+fn height_sharp_coarse(xz: vec2<f32>) -> f32 {
     let ij = world_to_ij(xz);
     let base = floor(ij);
     let f = fract(ij);
@@ -610,6 +677,18 @@ fn track_near(xz: vec2<f32>) -> bool {
 }
 
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
+    let tw = track_weight(xz);
+    if (tw >= 1.0) {
+        return track_normal(xz);
+    }
+    let coarse = terrain_normal_coarse(xz);
+    if (tw > 0.0) {
+        return normalize(mix(coarse, track_normal(xz), tw));
+    }
+    return coarse;
+}
+
+fn terrain_normal_coarse(xz: vec2<f32>) -> vec3<f32> {
     let torn = lip_near(xz) && !track_near(xz);
     // Short step. A wider sample flattens a tyre-width cut into the lane slope.
     let e = max(frame.params.z * select(0.28, 0.16, torn), 0.04);
@@ -741,6 +820,11 @@ fn vs_terrain(in: TerrIn) -> TerrOut {
     // The heightfield ends. Ease the map relief down so the rim is not a lip.
     let rim = smoothstep(15.5, 19.2, max(abs(in.xz.x), abs(in.xz.y)));
     h = mix(h, base, rim);
+    // Inside the fine snow window the track is the surface, lugs and all.
+    let tw = track_weight(in.xz);
+    if (tw > 0.0) {
+        h = mix(h, track_height(in.xz), tw);
+    }
     // World Y at this column's XZ. Adding the rut along the normal would
     // walk the groove up a slope as the wheel moves.
     let world = vec3<f32>(in.xz.x, h, in.xz.y);
@@ -773,10 +857,15 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     if (frame.sun_dir.w > 0.5) {
         let fresh = vec3<f32>(0.79, 0.83, 0.87);
         let packed = vec3<f32>(0.47, 0.53, 0.60);
-        var albedo = mix(fresh, packed, darken);
+        let tw = track_weight(xz);
+        var comp = darken;
+        if (tw > 0.0) {
+            comp = mix(darken, track_bilinear(xz).z, tw);
+        }
+        var albedo = mix(fresh, packed, comp);
         let grain = noise(xz * 6.5);
         albedo *= mix(0.93, 1.05, grain);
-        let rough_out = mix(0.96, 0.86, darken);
+        let rough_out = mix(0.96, 0.86, comp);
         let lit = shade(in.world, n, albedo, rough_out, vec3<f32>(0.0));
         return present(lit);
     }
