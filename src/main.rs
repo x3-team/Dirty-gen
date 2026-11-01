@@ -9,8 +9,11 @@ mod gpu_time;
 mod mesh;
 mod niva;
 mod overlay;
+mod post;
 #[cfg(not(target_arch = "wasm32"))]
 mod bench;
+#[cfg(not(target_arch = "wasm32"))]
+mod route_bench;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_bench;
 mod render;
@@ -1957,6 +1960,8 @@ fn capture(args: &[String]) {
     let mut bench_out: Option<PathBuf> = None;
     let mut bench_scenes = PathBuf::from("bench/scenes.txt");
     let mut terrain_proof: Option<PathBuf> = None;
+    let mut route_out: Option<PathBuf> = None;
+    let mut route_scenes = PathBuf::from("bench/route.txt");
     let mut kept: Vec<String> = Vec::with_capacity(args.len());
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1964,6 +1969,10 @@ fn capture(args: &[String]) {
             "--bench" => bench_out = Some(PathBuf::from(it.next().expect("--bench <dir>"))),
             "--bench-scenes" => {
                 bench_scenes = PathBuf::from(it.next().expect("--bench-scenes <file>"))
+            }
+            "--route" => route_out = Some(PathBuf::from(it.next().expect("--route <dir>"))),
+            "--route-scenes" => {
+                route_scenes = PathBuf::from(it.next().expect("--route-scenes <file>"))
             }
             "--terrain-proof" => {
                 terrain_proof = Some(PathBuf::from(it.next().expect("--terrain-proof <dir>")))
@@ -2017,6 +2026,10 @@ fn capture(args: &[String]) {
     }
     if let Some(dir) = terrain_proof {
         capture_terrain(&mut renderer, &parsed, &dir);
+        return;
+    }
+    if let Some(out) = route_out {
+        route_bench::run(&mut renderer, parsed.width, parsed.height, &out, &route_scenes);
         return;
     }
     if let Some(out) = bench_out {
@@ -4600,18 +4613,42 @@ fn capture_snow_track(renderer: &mut Renderer, parsed: &CaptureArgs) {
     renderer.water_column = false;
     renderer.snow = true;
 
-    let blanket = 0.25;
+    // SILT_SNOW_DEEP=1: 75 cm of fresh snow with two old packed ruts, driven
+    // straight. The tires run in the ruts and the underside planes the hump.
+    let deep = std::env::var("SILT_SNOW_DEEP").map(|v| v == "1").unwrap_or(false);
+    let blanket = if deep { 0.75 } else { 0.25 };
     let mut track = SnowTrack::new(blanket, 0.0);
-    track.rho_blanket = 160.0;
+    track.rho_blanket = if deep { 130.0 } else { 160.0 };
+    if deep {
+        use silt::snow_track::cell_of;
+        for gj in cell_of(-8.0)..cell_of(8.0) {
+            for x in [-0.74f32, 0.74] {
+                for gi in cell_of(x - 0.17)..=cell_of(x + 0.17) {
+                    let c = track.cell_mut(gi, gj);
+                    let m = c.depth * c.rho;
+                    c.depth = 0.30;
+                    c.rho = m / 0.30;
+                }
+            }
+        }
+    }
     let mut world = World::flat(0.1);
     world.soil = SoilField::flat(0.1);
     world.particles = Particles::new();
     world.vehicle.clear_loose_mud();
     world.vehicle.vel = Vec3::ZERO;
     world.vehicle.yaw = 0.0;
-    world.vehicle.pos = Vec3::new(0.0, blanket + 0.38 + 0.45, -6.0);
+    let ride = if deep { 0.30 } else { blanket };
+    world.vehicle.pos = Vec3::new(0.0, ride + 0.38 + 0.45, -6.0);
     let soil = world.soil.clone();
-    let script = circle_script();
+    let script = if deep {
+        vec![
+            silt::snow_track::DriveSegment { seconds: 4.0, speed: 2.0, steer: 0.0 },
+            silt::snow_track::DriveSegment { seconds: 1.5, speed: 0.0, steer: 0.0 },
+        ]
+    } else {
+        circle_script()
+    };
     let mut lo = Vec2::splat(f32::MAX);
     let mut hi = Vec2::splat(f32::MIN);
     let mut total = silt::snow_track::DriveLog::default();

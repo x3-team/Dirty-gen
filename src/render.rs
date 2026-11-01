@@ -161,6 +161,9 @@ pub struct Renderer {
     water_fx_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    /// Post-processing prototype (`SILT_POST=1`, docs/LOOK_GAP.md). When on,
+    /// the blit and the capture readback read its output instead of `color`.
+    post: Option<crate::post::Post>,
     scene_color: wgpu::Texture,
     scene_color_view: wgpu::TextureView,
     reflect_color: wgpu::Texture,
@@ -1057,6 +1060,8 @@ impl Renderer {
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
             make_targets(&device, width, height, formats.depth);
+        let post = crate::post::enabled()
+            .then(|| crate::post::Post::new(&device, &quality, width, height, &color_view));
         let reflect_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reflect-readback"),
             size: padded_row as u64 * height as u64,
@@ -1130,7 +1135,9 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&color_view),
+                    resource: wgpu::BindingResource::TextureView(
+                        post.as_ref().map_or(&color_view, |p| p.output_view()),
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1781,6 +1788,7 @@ impl Renderer {
             water_fx_tex,
             color,
             color_view,
+            post,
             scene_color,
             scene_color_view,
             reflect_color,
@@ -2033,6 +2041,9 @@ impl Renderer {
             make_targets(&self.device, width, height, self.depth_format);
         self.color = color;
         self.color_view = color_view;
+        if let Some(post) = self.post.as_mut() {
+            post.resize(&self.device, width, height, &self.color_view);
+        }
         self.depth = depth;
         self.depth_view = depth_view;
         self.readback = readback;
@@ -2088,7 +2099,9 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.color_view),
+                    resource: wgpu::BindingResource::TextureView(
+                        self.post.as_ref().map_or(&self.color_view, |p| p.output_view()),
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -3055,6 +3068,10 @@ impl Renderer {
             }
         }
 
+        if let Some(post) = self.post.as_ref() {
+            post.encode(&mut encoder, clock.as_ref());
+        }
+
         if let Some((view, srgb)) = present {
             let blit_time = pass_timestamps(clock.as_ref(), "blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3098,7 +3115,7 @@ impl Renderer {
         if readback {
             encoder.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture {
-                    texture: &self.color,
+                    texture: self.post.as_ref().map_or(&self.color, |p| p.output()),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
