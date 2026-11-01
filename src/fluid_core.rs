@@ -425,10 +425,26 @@ impl Scratch {
 }
 
 thread_local! {
+    /// Set while a water or slurry sheet runs beside the other one. The two
+    /// sheets already fill the workers, so the row splits inside stay serial.
+    static INNER_SERIAL: Cell<bool> = const { Cell::new(false) };
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::new());
     /// Dust layers run together. Each one starts from a zero scratch so the
     /// pressure halo does not depend on which layer ran last.
     static ISOLATE_SCRATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Row and column splits are allowed on this thread.
+fn inner_par() -> bool {
+    !INNER_SERIAL.with(|flag| flag.get())
+}
+
+/// Runs `f` with the inner row splits off, then puts the flag back.
+fn serial_inner<R>(f: impl FnOnce() -> R) -> R {
+    let prev = INNER_SERIAL.with(|flag| flag.replace(true));
+    let out = f();
+    INNER_SERIAL.with(|flag| flag.set(prev));
+    out
 }
 
 fn park_sheet_scratch() -> Scratch {
@@ -1505,6 +1521,10 @@ fn substep(
             }
         }
     }
+    // Neighbouring cells nearly always share one viscosity (the water sheet
+    // has a single value), so the damping exponent is reused until it changes.
+    let mut memo_nu = f32::NAN;
+    let mut memo_decay = 1.0f32;
     for j in j0..=j1 {
         for i in i0..=i1 {
             let idx = j * res + i;
@@ -1518,7 +1538,12 @@ fn substep(
                 u[idx] += 0.012 * dt * qx;
                 v[idx] += 0.012 * dt * qz;
             }
-            let decay = (-sheet_damp(nu[idx]) * dt).exp();
+            let nu_here = nu[idx];
+            if nu_here.to_bits() != memo_nu.to_bits() {
+                memo_nu = nu_here;
+                memo_decay = (-sheet_damp(nu_here) * dt).exp();
+            }
+            let decay = memo_decay;
             let lim = match drive {
                 SheetDrive::Wind { x, z, .. } => x.hypot(z).max(1.6),
                 SheetDrive::Gravity { .. } => 1.6,
@@ -1578,7 +1603,7 @@ fn force_gravity_solid(
     j1: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && inner_par() {
         force_gravity_solid_par(
             h, u, v, nu, p, mask, res, cell, dt, vorticity, eps, i0, i1, j0, j1,
         );
@@ -1706,7 +1731,7 @@ fn force_gravity_open(
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && inner_par() {
         force_gravity_par(h, u, v, nu, p, res, cell, dt, vorticity, eps, i0, i1, j0, j1);
         return;
     }
@@ -2133,7 +2158,7 @@ fn force_wind_open(
     j1: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && inner_par() {
         // Dust is stepped on the halved air grid. Same Jacobi confinement as
         // the row workers, without a scope per blur and per layer.
         if res <= SERIAL_SHEET_MAX {
@@ -2325,7 +2350,7 @@ fn transport_open(
     #[cfg(not(target_arch = "wasm32"))]
     // The 2 cm sheet and the halved dust plane stay on this thread. Each row
     // or column still writes the same edges. The coarse window stays split.
-    if i1 - i0 >= 31 && j1 - j0 >= 47 && res != FINE_RES && res > SERIAL_SHEET_MAX {
+    if i1 - i0 >= 31 && j1 - j0 >= 47 && res != FINE_RES && res > SERIAL_SHEET_MAX && inner_par() {
         transport_open_par(h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, sc);
         return;
     }
@@ -2680,7 +2705,7 @@ fn blur_box(
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 && res != FINE_RES && res > SERIAL_SHEET_MAX {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && res != FINE_RES && res > SERIAL_SHEET_MAX && inner_par() {
         par_blur_axis(src, tmp, res, i0, i1, j0, j1, k, true);
         par_blur_axis(tmp, dst, res, i0, i1, j0, j1, k, false);
         return;
@@ -3034,7 +3059,7 @@ fn transport(
     sc: &mut Scratch,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if i1 - i0 >= 31 && j1 - j0 >= 47 {
+    if i1 - i0 >= 31 && j1 - j0 >= 47 && inner_par() {
         let speed = if along_x { u } else { v };
         transport_par(
             h, speed, gate, res, cell, dt, i0, i1, j0, j1, along_x, solid, bed, sc,
@@ -5461,7 +5486,8 @@ impl FluidCore {
                 };
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    (water_ms, slurry_ms) = rayon::join(run_water, run_slurry);
+                    (water_ms, slurry_ms) =
+                        rayon::join(|| serial_inner(run_water), || serial_inner(run_slurry));
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
