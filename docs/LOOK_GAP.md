@@ -100,6 +100,26 @@ flat white, the water still has no detail or glints (there are no HDR
 highlights to bloom), the mud is still a texture without relief. That is
 layers 1–3, not layer 5.
 
+## Free assets and tools (Vitalii, 2026-11-01)
+
+Every thread starts from existing free material, not from scratch, and
+records each source with its licence (and commit, for code) in
+`THIRD_PARTY.md`:
+
+* **Textures (CC0):** Poly Haven and ambientCG scanned PBR sets (albedo,
+  normal, roughness, height): snow, mud, sand, gravel, clay, cracked ground,
+  wet puddle. Height maps are what the seam height blend and parallax need.
+* **Sky:** Poly Haven HDRIs (CC0) for IBL and backdrop, matched to each
+  scene's sun.
+* **Shader code (MIT/Apache):** Bevy 0.16 `bevy_pbr` / `bevy_core_pipeline`
+  (atmosphere, GTAO, TAA, SSR, tonemapping, volumetric fog), bevy_water,
+  wgpu examples, bevy_hanabi, AMD FidelityFX CAS / FSR 1, SMAA.
+* **Generative (Kling):** used for target-look concept frames per scene
+  and for detail textures only where no CC0 scan exists. Such a texture
+  gets a normal/height map derived from it and is marked as generated in
+  `THIRD_PARTY.md`.
+* Still excluded: Shadertoy (CC BY-NC-SA) and Unity BoatAttack code.
+
 ## Plan: work threads, in order
 
 The GPU frame budget stays 12 ms on the reference card (`docs/GPU_BUDGET.md`).
