@@ -994,26 +994,6 @@ let fog = map3(
             wgpu::TextureFormat::Rgba32Float,
             4,
         )?;
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("render-contract-bg"),
-            layout: &layout,
-            entries: &[
-                bind_buf(BIND_HEADER, header.as_entire_binding()),
-                bind_tex(BIND_GROUND, &ground.view),
-                bind_tex(BIND_MOISTURE, &moisture.view),
-                bind_tex(BIND_FILM, &film.view),
-                bind_tex(BIND_FLOW, &flow.view),
-                bind_tex(BIND_DUST_SETTLED, &dust_settled.view),
-                bind_tex(BIND_DUST_FOG, &dust_fog.view),
-                bind_tex(BIND_CRUST, &crust.view),
-                bind_tex(BIND_WET_EDGE, &wet_edge.view),
-                bind_tex(BIND_FOAM, &foam.view),
-                bind_buf(BIND_SPRAY, spray.as_entire_binding()),
-                bind_tex(BIND_AIR, &air_velocity.view),
-                bind_tex(BIND_FOG, &fog.view),
-                bind_tex(BIND_MIX, &soil_mix.view),
-            ],
-        });
         let snow = map2(
             device,
             "contract-snow",
@@ -1038,6 +1018,7 @@ let fog = map3(
                 bind_buf(BIND_SPRAY, spray.as_entire_binding()),
                 bind_tex(BIND_AIR, &air_velocity.view),
                 bind_tex(BIND_FOG, &fog.view),
+                bind_tex(BIND_MIX, &soil_mix.view),
                 bind_tex(BIND_SNOW, &snow.view),
             ],
         });
