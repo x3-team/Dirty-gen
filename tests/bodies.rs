@@ -570,6 +570,44 @@ fn dump_maps() {
         }
     }
     img.save(format!("{dir}/wade-surface.png")).unwrap();
+    // Foam field (#104) around the walker and the buoys, 8 m square: water
+    // blue, foam white, dry tan, bodies red.
+    let nf = 320usize;
+    let sf = 8.0f32;
+    let mut imgf = image::RgbImage::new(nf as u32, nf as u32);
+    for j in 0..nf {
+        for i in 0..nf {
+            let x = c.x - sf * 0.5 + (i as f32 + 0.5) * sf / nf as f32;
+            let z = c.y - sf * 0.5 + (j as f32 + 0.5) * sf / nf as f32;
+            let (e, b, _, _) = scene.fluid.surface_at(x, z);
+            let px = if e - b < 0.004 {
+                image::Rgb([196u8, 170, 120])
+            } else {
+                let f = scene.fluid.foam_turbid_at(x, z).0.clamp(0.0, 1.0);
+                let lerp = |a: f32, b: f32| (a + (b - a) * f) as u8;
+                image::Rgb([lerp(40.0, 250.0), lerp(80.0, 250.0), lerp(130.0, 250.0)])
+            };
+            imgf.put_pixel(i as u32, (nf - 1 - j) as u32, px);
+        }
+    }
+    let mut mark = |x: f32, z: f32| {
+        let i = ((x - (c.x - sf * 0.5)) / sf * nf as f32) as i32;
+        let j = ((z - (c.y - sf * 0.5)) / sf * nf as f32) as i32;
+        for d in -2..=2 {
+            for (a, b) in [(i + d, j), (i, j + d)] {
+                if a >= 0 && b >= 0 && (a as usize) < nf && (b as usize) < nf {
+                    imgf.put_pixel(a as u32, (nf - 1 - b as usize) as u32, image::Rgb([220, 30, 30]));
+                }
+            }
+        }
+    };
+    for (foot, _) in w.legs() {
+        mark(foot.x, foot.z);
+    }
+    for b in &scene.bodies.items {
+        mark(b.pos.x, b.pos.z);
+    }
+    imgf.save(format!("{dir}/wade-foam.png")).unwrap();
     // Prints along the walk: offset ±2 cm, grey.
     let n2 = 480usize;
     let side2 = 12.0f32;
