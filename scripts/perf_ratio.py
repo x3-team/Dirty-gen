@@ -399,16 +399,20 @@ def prove_stretch() -> str:
 GATE_HARNESS = ("tests/e2e_niva.rs", "tests/frame_bench.rs", "tests/fog_air.rs")
 
 
-def borrow_gate_harness(base_dir: Path) -> None:
+def borrow_gate_harness(base_dir: Path) -> bool:
     """A base pinned before PERF_GATE_MEDIAN existed still asserts the caps on
     every run. Its solver is what is measured; the timing harness comes from
-    this tree, so both sides skip the in-test asserts the same way."""
+    this tree, so both sides skip the in-test asserts the same way. Returns
+    whether any file was borrowed."""
+    borrowed = False
     for rel in GATE_HARNESS:
         theirs = base_dir / rel
         if theirs.exists() and "PERF_GATE_MEDIAN" in theirs.read_text():
             continue
         shutil.copyfile(ROOT / rel, theirs)
         print(f"PERF_BASE_HARNESS file={rel} from=head", flush=True)
+        borrowed = True
+    return borrowed
 
 
 def fail_gate(reason: str, detail: str) -> int:
@@ -428,7 +432,7 @@ def run_gate(sha: str) -> int:
     base_dir = Path(tempfile.gettempdir()) / "silt-perf-base"
     try:
         prepare_tree(sha, base_dir)
-        borrow_gate_harness(base_dir)
+        borrowed = borrow_gate_harness(base_dir)
         shared = ROOT / "target"
         head_bins = cargo_bins(ROOT, shared, Path(tempfile.gettempdir()) / "silt-perf-head")
         # The base builds into its own target dir. Sharing ROOT/target let the
@@ -445,7 +449,12 @@ def run_gate(sha: str) -> int:
         run_must_pass(head_bins["fog_air"], "fluid_sheet_fog_is_not_dust_and_closes_the_ledger", plain)
         # A borrowed harness carries this tree's goldens. PERF_GATE_BASE lets a
         # golden this PR re-centres check the base against the value it had.
-        base_env = child_env({"PERF_GATE_MEDIAN": "1", "PERF_GATE_BASE": "1"})
+        # A base with its own harness keeps its own goldens, so it runs them as
+        # they stand ("now" is the base's own value there).
+        base_extra = {"PERF_GATE_MEDIAN": "1"}
+        if borrowed:
+            base_extra["PERF_GATE_BASE"] = "1"
+        base_env = child_env(base_extra)
         base_all, base_fatals = collect_side(
             base_bins,
             "base",
