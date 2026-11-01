@@ -22,6 +22,8 @@ struct Frame {
     snow_arc: vec4<f32>,
     snow_arc2: vec4<f32>,
     snow_profile: array<vec4<f32>, 8>,
+    // x: water detail (0 low, 1 medium, 2 high). y: 1 with a fluid sheet.
+    water_fx: vec4<f32>,
 }
 
 struct Model {
@@ -58,6 +60,8 @@ struct Model {
 @group(1) @binding(8) var imprint_tex: texture_2d<f32>;
 // R: crust thickness / 0.04 m. G: crack opening / 0.02 m. Not a color.
 @group(1) @binding(9) var crust_tex: texture_2d<f32>;
+// Contract turbidity (R, sqrt), foam (G), flow vx (B), vz (A) on the soil grid.
+@group(1) @binding(12) var water_fx_tex: texture_2d<f32>;
 
 @group(2) @binding(0) var<uniform> model: Model;
 
@@ -1079,6 +1083,143 @@ fn open_water_vertex(in: TerrIn) -> WaterOut {
     return o;
 }
 
+// ---- Turbid water and foam -------------------------------------------------
+// Everything here reads the contract (binding 4 A turbidity, binding 4 RG
+// flow, binding 9 foam) through water_fx_tex. Where the silt is, where the
+// foam is and where both drift is the solver's. The noise below is only the
+// texture inside a solved cloud, carried by the solved flow (flow-map
+// technique as in three.js Water2.js, MIT): it never adds silt or foam where
+// the maps are 0.
+
+fn water_fx_at(ij: vec2<i32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(water_fx_tex));
+    let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(water_fx_tex, c, 0);
+}
+
+// x turbidity 0..1, y foam 0..1, zw flow m/s.
+fn water_fx(xz: vec2<f32>) -> vec4<f32> {
+    if (frame.water_fx.y < 0.5) {
+        return vec4<f32>(0.0);
+    }
+    let ij = world_to_ij(xz);
+    let i0 = vec2<i32>(floor(ij));
+    let f = fract(ij);
+    let a = water_fx_at(i0);
+    let b = water_fx_at(i0 + vec2<i32>(1, 0));
+    let c = water_fx_at(i0 + vec2<i32>(0, 1));
+    let d = water_fx_at(i0 + vec2<i32>(1, 1));
+    let m = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    let t = m.r * m.r;
+    return vec4<f32>(t, m.g, (m.b - 0.5) * 4.0, (m.a - 0.5) * 4.0);
+}
+
+fn fbm2(p: vec2<f32>) -> f32 {
+    return noise(p) * 0.62 + noise(p * 2.13 + vec2<f32>(5.2, 1.3)) * 0.38;
+}
+
+// Two half-period phases of the same noise, each dragged by the flow and
+// faded at its reset, so the pattern drifts downstream without a seam.
+fn flow_noise(xz: vec2<f32>, flow: vec2<f32>, scale: f32, period: f32, octaves: i32) -> f32 {
+    let t = frame.misc.x / period;
+    let p0 = fract(t);
+    let p1 = fract(t + 0.5);
+    let w = abs(p0 - 0.5) * 2.0;
+    let drift = flow * period;
+    let q0 = (xz - drift * p0) * scale;
+    let q1 = (xz - drift * p1) * scale + vec2<f32>(17.3, 9.1);
+    var n0 = noise(q0);
+    var n1 = noise(q1);
+    if (octaves > 1) {
+        n0 = fbm2(q0);
+        n1 = fbm2(q1);
+    }
+    return mix(n0, n1, w);
+}
+
+struct Murk {
+    // Silt concentration the eye sees, 0 clear to 1 opaque.
+    cloud: f32,
+    foam: f32,
+    // Extinction, 1/m.
+    sigma: f32,
+    // Light on the billows: thick cores lit, the sun-far flank in shade.
+    shade: f32,
+}
+
+fn murk_at(xz: vec2<f32>) -> Murk {
+    let fx = water_fx(xz);
+    var m: Murk;
+    let detail = i32(frame.water_fx.x + 0.5);
+    let flow = fx.zw;
+    var t = fx.x;
+    if (detail >= 1 && t > 0.0005) {
+        // Billows inside the plume: thick cores, thin edges, all inside
+        // the solved column. Mean factor ~1, so the cloud keeps its mass.
+        // Two scales: metre-sized billows and the curl inside them.
+        let big = flow_noise(xz, flow, 0.75, 3.1, detail);
+        let small = flow_noise(xz + vec2<f32>(3.7, 1.9), flow, 2.4, 1.9, 1);
+        let n = clamp(big * 0.7 + small * 0.3, 0.0, 1.0);
+        t = t * (0.2 + 1.6 * n * n);
+        m.shade = 0.8 + 0.4 * n;
+        if (detail >= 2) {
+            // One tap toward the sun: a billow whose sun side is thinner
+            // than its core shades its own far flank.
+            let sun = normalize(frame.sun_dir.xyz);
+            let lean = sun.xz / max(length(sun.xz), 1e-3) * 0.35;
+            let big_s = flow_noise(xz + lean, flow, 0.75, 3.1, detail);
+            m.shade = clamp(0.85 + 1.4 * (big - big_s) + 0.3 * n, 0.55, 1.35);
+        }
+    } else {
+        m.shade = 1.0;
+    }
+    m.cloud = 1.0 - exp(-t * 16.0);
+    m.sigma = mix(3.2, 70.0, m.cloud);
+    var foam = fx.y;
+    if (foam > 0.002) {
+        if (detail >= 1) {
+            // Foam is a lace of bubble rafts that closes up as the fraction
+            // rises, streaked along the current.
+            let sp = length(flow);
+            let dir = select(vec2<f32>(1.0, 0.0), flow / max(sp, 1e-4), sp > 0.05);
+            let across = vec2<f32>(-dir.y, dir.x);
+            let stretch = 1.0 + min(sp, 2.0) * 0.9;
+            let fp = vec2<f32>(dot(xz, dir) / stretch, dot(xz, across));
+            let fflow = vec2<f32>(sp / stretch, 0.0);
+            let cells = flow_noise(fp, fflow, 6.5, 1.7, detail);
+            let cover = clamp(foam * 1.15, 0.0, 1.0);
+            var lace = smoothstep(1.0 - cover - 0.07, 1.0 - cover + 0.07, cells);
+            if (detail >= 2) {
+                let bub = flow_noise(fp * 2.7, fflow * 2.7, 9.0, 1.3, 1);
+                lace = lace * (0.6 + 0.4 * smoothstep(0.3, 0.75, bub));
+            }
+            foam = lace * smoothstep(0.0, 0.1, fx.y) * 0.9;
+        } else {
+            foam = smoothstep(0.02, 0.7, foam) * 0.7;
+        }
+    }
+    m.foam = clamp(foam, 0.0, 1.0);
+    return m;
+}
+
+// Lit colour of silt-laden water: the bed's own soil, washed lighter by
+// fine particles and lit by sun and sky from above.
+fn silt_color(bed_col: vec3<f32>) -> vec3<f32> {
+    let sun = normalize(frame.sun_dir.xyz);
+    let lit = clamp(sun.y, 0.0, 1.0);
+    let soil = mix(bed_col, vec3<f32>(0.40, 0.25, 0.11), 0.65);
+    return soil * (frame.amb.rgb * 0.8 + frame.sky_zenith.rgb * 0.18 + frame.sun_color.rgb * lit * 0.42);
+}
+
+fn foam_color(bed_col: vec3<f32>, cloud: f32, nrm: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
+    let sun = normalize(frame.sun_dir.xyz);
+    let ndl = clamp(dot(nrm, sun), 0.0, 1.0) * 0.7 + 0.3;
+    // Foam on muddy water is cream, not white.
+    let alb = mix(vec3<f32>(0.74, 0.73, 0.69), vec3<f32>(0.62, 0.53, 0.41), cloud * 0.7);
+    let sh = shadow_factor(world, nrm);
+    return alb * (frame.amb.rgb * 0.8 + frame.sky_zenith.rgb * 0.3 + frame.sun_color.rgb * ndl * sh * 0.95);
+}
+
 fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
     let xz = in.world.xz;
     // Depth of water over the ground under this fragment.
@@ -1108,10 +1249,12 @@ fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
     let refl = sky_color(reflect(-view, nrm));
     // River water: clear in the shallows, olive-brown with depth. The ground
     // under it is the terrain pass; alpha is how much of it the column hides.
+    let mk = murk_at(xz);
     let path = d / max(ndotv, 0.25);
-    let t = exp(-path * 3.2);
+    let t = exp(-path * mk.sigma);
     let lit = clamp(dot(vec3<f32>(0.0, 1.0, 0.0), sun), 0.0, 1.0);
-    let scatter = vec3<f32>(0.075, 0.095, 0.07) * (0.35 + 1.4 * lit) + bed_col * 0.08;
+    let clear = vec3<f32>(0.075, 0.095, 0.07) * (0.35 + 1.4 * lit) + bed_col * 0.08;
+    let scatter = mix(clear, silt_color(bed_col) * mk.shade, mk.cloud);
     let spec = pow(clamp(dot(nrm, normalize(sun + view)), 0.0, 1.0), 220.0)
         * shadow_factor(in.world, nrm);
     let shore = smoothstep(0.0, 0.025, d);
@@ -1119,9 +1262,13 @@ fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
     let alpha = clamp(hide * shore, 0.0, 1.0);
     var col = (scatter * (1.0 - t) * (1.0 - fres) + refl * fres) / max(hide, 1.0e-3);
     col += frame.sun_color.rgb * spec * 2.5 / max(alpha, 0.05);
+    // Foam floats on the surface: it hides the column and kills the glint.
+    let fc = foam_color(bed_col, mk.cloud, nrm, in.world);
+    col = mix(col, fc, mk.foam);
+    let a_out = mix(max(alpha, min(spec * 2.0, 1.0) * shore), shore, mk.foam);
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
-    return vec4<f32>(gamma, max(alpha, min(spec * 2.0, 1.0) * shore));
+    return vec4<f32>(gamma, a_out);
 }
 
 fn water_vertex(in: TerrIn) -> WaterOut {
@@ -1255,6 +1402,15 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), 3.0);
         col += vec3<f32>(0.62, 0.46, 0.24) * sheen * 1.5;
         alpha = shore_fade * mix(0.46, 0.72, deep);
+    }
+    // Contract silt and foam on the film and the puddle sheet.
+    let mk = murk_at(xz);
+    if (mk.cloud > 0.0 || mk.foam > 0.0) {
+        let lit_silt = silt_color(bed) * mk.shade * (0.55 + 0.45 * shadow_factor(in.world, nrm));
+        col = mix(col, mix(lit_silt, col, fres * 0.6), mk.cloud * 0.85);
+        alpha = mix(alpha, max(alpha, shore_fade * 0.92), mk.cloud);
+        col = mix(col, foam_color(bed, mk.cloud, nrm, in.world), mk.foam);
+        alpha = mix(alpha, shore_fade, mk.foam);
     }
     let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
     let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));

@@ -30,5 +30,5 @@ dust          drive   10.0  car    3.0 3.0 -6.5   -5.0 0.8 0.0    ue5-93.jpg   D
 river-rocks   river    9.0  car   -8.0 4.5 -5.0    2.0 0.0 0.0    ue5-103.jpg  River: car in the channel, current around rocks
 beach-swash   beach    1.5  car   -6.0 3.5 -3.0    1.5 0.0 0.0    ue5-98.jpg   Beach: swash and foam on sand
 beach-rock    river    6.0  car   -7.0 2.0 4.0     2.0 0.2 -3.0   ue5-99.jpg   Shallows around a rock
-turbid-water  missing  0    car    0 0 0           0 0 0          ue5-100.jpg  Open muddy water with turbidity: no open-water scene yet
+turbid-water  river   12.0  car   -9.0 4.0 -3.0    3.0 0.0 1.0    ue5-100.jpg  Turbid water: silt plume behind the wheels drifting downstream, foam at rocks and shore
 smoke-column  missing  0    car    0 0 0           0 0 0          ue5-89.jpg   Smoke column in still air: no point-source smoke yet (dust & fog thread)

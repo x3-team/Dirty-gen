@@ -27,7 +27,7 @@ The labels are the render pass labels. The overlay and `silt bench` print the sa
 | `planar` | — | — | 0.9 | Vehicle mirror over standing water (beauty #60) |
 | `main` | 5.6 | 4.5 | 3.8 | Opaque: sky, terrain with rut geometry, vehicle, props |
 | `water-ssr` | — | 0.8 | 0.9 | SSR on water (beauty #60) |
-| `water` | 1.4 | 1.2 | 1.0 | Water / slurry surface, foam |
+| `water` | 1.4 | 1.2 | 1.0 | Water / slurry surface, turbidity and foam (`water_detail` 0 / 1 / 2: map tint only / one flow-advected silt and foam layer / second octave, billow self-shadow, bubbles) |
 | `after-water` | 1.0 | 0.8 | 0.7 | Chunks, spray, dust sprites, glass |
 | `dust-volume` | 2.0 | 2.0 | 2.2 | Volumetric dust/fog ray march (at reduced resolution) |
 | `dust-volume-up` | 0.3 | 0.4 | 0.4 | Upsampling the volume to full screen |

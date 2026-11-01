@@ -107,6 +107,10 @@ pub struct Quality {
     pub max_particles: u32,
     /// Largest side of a material texture (vehicle maps are 4096 at source).
     pub max_texture_side: u32,
+    /// Turbid water and foam detail. 0: the contract turbidity and foam as a
+    /// tint, no noise. 1: one flow-advected silt and foam layer. 2: a second
+    /// octave and foam bubbles. The maps are the same on every preset.
+    pub water_detail: u32,
 }
 
 impl Quality {
@@ -125,6 +129,7 @@ impl Quality {
                 rut_tess: 1,
                 max_particles: 2000,
                 max_texture_side: 1024,
+                water_detail: 2,
             },
             Preset::Medium => Quality {
                 preset,
@@ -139,6 +144,7 @@ impl Quality {
                 rut_tess: 2,
                 max_particles: 6000,
                 max_texture_side: 2048,
+                water_detail: 2,
             },
             Preset::High => Quality {
                 preset,
@@ -153,6 +159,7 @@ impl Quality {
                 rut_tess: 4,
                 max_particles: 12000,
                 max_texture_side: 4096,
+                water_detail: 2,
             },
         }
     }
