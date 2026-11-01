@@ -32,7 +32,7 @@ thread_local! {
     static DRAW_STATS: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-fn count_draw(vertices: u32) {
+pub(crate) fn count_draw(vertices: u32) {
     DRAW_STATS.with(|c| {
         let (d, t) = c.get();
         c.set((d + 1, t + vertices as u64 / 3));
@@ -1492,6 +1492,7 @@ impl Renderer {
     /// on the next start when it differs.
     pub fn set_quality(&mut self, quality: silt::quality::Quality) -> bool {
         self.quality = quality;
+        self.terrain_geom.apply_quality(quality.rut_tess);
         let (w, h) = (self.out_width, self.out_height);
         self.resize_internal(w, h);
         quality.shadow_res == self.shadow_res
