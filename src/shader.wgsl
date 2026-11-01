@@ -1282,12 +1282,28 @@ fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
     return textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
 }
 
-// Win-demo pool: one planar UV sample from the geometry-mirror RT.
+// Win-demo pool: sample the mirrored-geometry pass (Niva + sky), not SSR over terrain.
 fn pool_planar_reflect_sample(world: vec3<f32>) -> vec3<f32> {
     if (!pool_reflect_ready()) {
         return vec3<f32>(0.0);
     }
-    return pool_reflect_tex_sample(pool_reflect_uv(world.x, world.z));
+    var center = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        center += frame.tires[i * 2u].xyz;
+    }
+    center = center * 0.25 + vec3<f32>(0.0, 0.68, 0.0);
+    let uv_plane = pool_reflect_uv(world.x, world.z);
+    let uv_body = pool_reflect_uv(center.x, center.z);
+    let s_plane = pool_reflect_tex_sample(uv_plane);
+    let s_body = pool_reflect_tex_sample(uv_body);
+    let under = smoothstep(0.95, 0.18, distance(world.xz, center.xz));
+    if (under > 0.45 && length(s_body) > 0.03) {
+        return s_body;
+    }
+    if (length(s_plane) > 0.03) {
+        return s_plane;
+    }
+    return s_body;
 }
 
 // wgpu water.wgsl-style screen reflection: march in reflection direction and

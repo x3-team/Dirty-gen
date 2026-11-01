@@ -73,6 +73,8 @@ pub struct Renderer {
     model_buf: wgpu::Buffer,
     model_bg: wgpu::BindGroup,
     tex_bg: wgpu::BindGroup,
+    /// Win-demo reflect encode must not bind `reflect_color` while rendering into it.
+    tex_bg_pool_encode: wgpu::BindGroup,
     height_bg: wgpu::BindGroup,
     height_tex: wgpu::Texture,
     imprint_tex: wgpu::Texture,
@@ -84,6 +86,9 @@ pub struct Renderer {
     scene_color_view: wgpu::TextureView,
     reflect_color: wgpu::Texture,
     reflect_color_view: wgpu::TextureView,
+    /// Sample-only copy of the pool reflect pass (never a render target).
+    reflect_sample: wgpu::Texture,
+    reflect_sample_view: wgpu::TextureView,
     reflect_rt: wgpu::Texture,
     reflect_rt_view: wgpu::TextureView,
     scene_depth: wgpu::Texture,
@@ -91,6 +96,11 @@ pub struct Renderer {
     reflect_depth: wgpu::Texture,
     reflect_depth_view: wgpu::TextureView,
     scene_samp: wgpu::Sampler,
+    nearest_samp: wgpu::Sampler,
+    ground_samp: wgpu::Sampler,
+    ground_diff_view: wgpu::TextureView,
+    ground_nor_view: wgpu::TextureView,
+    ground_pack_view: wgpu::TextureView,
     tex_bgl: wgpu::BindGroupLayout,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
@@ -696,6 +706,8 @@ impl Renderer {
             scene_color_view,
             reflect_color,
             reflect_color_view,
+            reflect_sample,
+            reflect_sample_view,
             reflect_rt,
             reflect_rt_view,
             scene_depth,
@@ -726,7 +738,25 @@ impl Renderer {
             &scene_color_view,
             &scene_depth_view,
             &scene_samp,
-            &reflect_color_view,
+            &reflect_sample_view,
+        );
+        let tex_bg_pool_encode = build_tex_bg(
+            &device,
+            &tex_bgl,
+            &height_tex,
+            &mat_tex,
+            &nearest,
+            &shadow_view,
+            &ground_diff_view,
+            &ground_nor_view,
+            &ground_pack_view,
+            &ground_samp,
+            &imprint_tex,
+            &crust_tex,
+            &scene_color_view,
+            &scene_depth_view,
+            &scene_samp,
+            &scene_color_view,
         );
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
@@ -1086,6 +1116,7 @@ impl Renderer {
             model_buf,
             model_bg,
             tex_bg,
+            tex_bg_pool_encode,
             height_bg,
             height_tex,
             imprint_tex,
@@ -1097,6 +1128,8 @@ impl Renderer {
             scene_color_view,
             reflect_color,
             reflect_color_view,
+            reflect_sample,
+            reflect_sample_view,
             reflect_rt,
             reflect_rt_view,
             scene_depth,
@@ -1104,6 +1137,11 @@ impl Renderer {
             reflect_depth,
             reflect_depth_view,
             scene_samp,
+            nearest_samp: nearest,
+            ground_samp,
+            ground_diff_view,
+            ground_nor_view,
+            ground_pack_view,
             tex_bgl,
             depth,
             depth_view,
@@ -1572,7 +1610,7 @@ impl Renderer {
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::ImageCopyTexture {
-                        texture: &self.reflect_color,
+                        texture: &self.reflect_sample,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -1599,6 +1637,20 @@ impl Renderer {
                     0,
                     bytemuck::bytes_of(&main_frame),
                 );
+                // Still capture: submit reflect RT before water samples pool_reflect_tex.
+                self.queue.submit(Some(encoder.finish()));
+                self.device.poll(wgpu::Maintain::Wait);
+                self.rebuild_tex_bg_pool_reflect();
+                self.queue.write_buffer(
+                    &self.frame_buf,
+                    0,
+                    bytemuck::bytes_of(&main_frame),
+                );
+                encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("frame-pool-water"),
+                    });
             } else {
                 let extent = wgpu::Extent3d {
                     width: self.width,
@@ -1942,6 +1994,27 @@ impl Renderer {
         }
     }
 
+    fn rebuild_tex_bg_pool_reflect(&mut self) {
+        self.tex_bg = build_tex_bg(
+            &self.device,
+            &self.tex_bgl,
+            &self.height_tex,
+            &self.mat_tex,
+            &self.nearest_samp,
+            &self.shadow_view,
+            &self.ground_diff_view,
+            &self.ground_nor_view,
+            &self.ground_pack_view,
+            &self.ground_samp,
+            &self.imprint_tex,
+            &self.crust_tex,
+            &self.scene_color_view,
+            &self.scene_depth_view,
+            &self.scene_samp,
+            &self.reflect_sample_view,
+        );
+    }
+
     fn encode_win_demo_pool_reflect(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1975,7 +2048,7 @@ impl Renderer {
         pass.set_bind_group(0, &self.frame_bg, &[]);
         pass.set_pipeline(&self.pipe_sky);
         pass.draw(0..3, 0..1);
-        pass.set_bind_group(1, &self.tex_bg, &[]);
+        pass.set_bind_group(1, &self.tex_bg_pool_encode, &[]);
         pass.set_pipeline(&self.pipe_mesh);
         pass.set_bind_group(3, &self.paint_bg, &[]);
         pass.set_bind_group(2, &self.model_bg, &[0]);
@@ -2078,8 +2151,7 @@ fn win_demo_reflect_view_proj(cam: CameraPose, proj: Mat4) -> Mat4 {
     let plane = 0.22_f32;
     let flip = |p: Vec3| Vec3::new(p.x, 2.0 * plane - p.y, p.z);
     let eye = flip(cam.eye);
-    let door_aim = Vec3::new(cam.target.x - 0.08, cam.target.y + 0.62, cam.target.z + 0.12);
-    let target = flip(door_aim);
+    let target = flip(cam.target);
     let view = Mat4::look_at_rh(eye, target, Vec3::new(0.0, -1.0, 0.0));
     proj * view
 }
@@ -2597,6 +2669,8 @@ fn make_scene_targets(
     wgpu::TextureView,
     wgpu::Texture,
     wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
 ) {
     let size = wgpu::Extent3d {
         width,
@@ -2627,6 +2701,19 @@ fn make_scene_targets(
         view_formats: &[],
     });
     let reflect_color_view = reflect_color.create_view(&Default::default());
+    let reflect_sample = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflect-sample"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let reflect_sample_view = reflect_sample.create_view(&Default::default());
     let reflect_rt = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("reflect-rt"),
         size,
@@ -2665,6 +2752,8 @@ fn make_scene_targets(
         scene_color_view,
         reflect_color,
         reflect_color_view,
+        reflect_sample,
+        reflect_sample_view,
         reflect_rt,
         reflect_rt_view,
         scene_depth,
