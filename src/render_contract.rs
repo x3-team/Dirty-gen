@@ -867,7 +867,7 @@ impl ContractGpu {
             let _ = device.poll(wgpu::Maintain::Wait);
             let err = pollster::block_on(device.pop_error_scope());
             if let Some(err) = err {
-                eprintln!("render contract textures unavailable: {err}");
+                eprintln!("render contract textures unavailable: {err:?}");
                 return None;
             }
         }
