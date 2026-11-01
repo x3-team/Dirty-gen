@@ -222,9 +222,11 @@ fn assert_puddle_shore(frame: &ContractFrame, label: &str, z: f32, x0: f32) {
 
     // Last cell that still holds the floor column. The bank is the fall from
     // there to a dry cell, and the bed rises over that same run.
+    // The column means the floor bed too: a cell already up the bank that
+    // happens to hold 88% of a wake-lowered floor is not the floor.
     let deep = ray
         .iter()
-        .rposition(|s| s.water > floor.water * 0.88);
+        .rposition(|s| s.water > floor.water * 0.88 && s.bed < floor.bed + 0.01);
     let Some(deep) = deep else {
         panic!("{label}: no deep water on the east shore");
     };
