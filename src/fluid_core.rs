@@ -5710,6 +5710,14 @@ impl FluidCore {
         };
         for j in j0..=j1 {
             let row = j * res;
+            // Skip a dry row with one branch-free pass. NaN never counts as wet.
+            let peak = self.water[row + i0..=row + i1]
+                .iter()
+                .zip(&self.slurry[row + i0..=row + i1])
+                .fold(0.0f32, |m, (w, s)| m.max(w + s));
+            if peak < 0.004 {
+                continue;
+            }
             for i in i0..=i1 {
                 let idx = row + i;
                 let h = self.water[idx] + self.slurry[idx];
@@ -7490,6 +7498,10 @@ impl FluidCore {
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
+                    // The closures borrow the sheets mutably, so they are FnMut;
+                    // native code moves them into rayon::join, here they need a
+                    // mutable binding to be called in sequence.
+                    let (mut run_water, mut run_slurry) = (run_water, run_slurry);
                     water_ms = run_water();
                     slurry_ms = run_slurry();
                 }
@@ -9056,15 +9068,17 @@ fn turbid_span(h: &[f32], res: usize) -> Option<(usize, usize, usize, usize)> {
     let mut j0 = res;
     let mut j1 = 0usize;
     for j in 0..res {
-        let row = j * res;
-        for i in 0..res {
-            if h[row + i] > 1.0e-8 {
-                i0 = i0.min(i);
-                i1 = i1.max(i);
-                j0 = j0.min(j);
-                j1 = j1.max(j);
-            }
+        let row = &h[j * res..j * res + res];
+        // One branch-free pass per row; only a live row pays for its ends.
+        if row.iter().fold(0.0f32, |m, &x| m.max(x)) <= 1.0e-8 {
+            continue;
         }
+        let first = row.iter().position(|&x| x > 1.0e-8).unwrap_or(0);
+        let last = row.iter().rposition(|&x| x > 1.0e-8).unwrap_or(0);
+        i0 = i0.min(first);
+        i1 = i1.max(last);
+        j0 = j0.min(j);
+        j1 = j1.max(j);
     }
     if i0 > i1 {
         return None;
