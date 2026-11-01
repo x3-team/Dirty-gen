@@ -58,6 +58,8 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore -- --test-threads=1 --nocapture
-          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach -- --nocapture
-          cargo test --release --test scripted_drive --test turbidity --test crust_cracks -- --nocapture
+          RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore one_fine_substep_matches_eight -- --nocapture
+          cargo test --release --test puddle_shore puddle_shore_follows_relief -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive -- --nocapture
+          cargo test --release --test scripted_drive --test turbidity -- --nocapture
+          cargo test --release --test crust_cracks -- --nocapture

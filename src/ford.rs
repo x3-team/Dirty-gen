@@ -339,3 +339,152 @@ pub fn seed_ford(fluid: &mut FluidCore, swell: Option<Swell>) -> f32 {
     }));
     vol
 }
+
+/// Ford pace the driver holds, metres per second: a walking pace to a slow jog.
+pub const FORD_PACE_M_S: f32 = 1.5;
+
+/// The Niva crossing the ford, for tests and for the renderer.
+///
+/// `world.soil` mirrors the sheet's bed and water every step so the tires read
+/// the river bed, and `world.vehicle` is the Niva. The wheels and the belly
+/// are walls in `fluid` (`Vehicle::hydro_solids`), and the hydro load goes back
+/// into the car as a push and hull buoyancy, as in the creek. The car starts
+/// on the beach, 2.5 m above the still waterline, nose north (+Z).
+pub struct FordDrive {
+    pub world: crate::world::World,
+    pub fluid: FluidCore,
+    /// Speed the driver aims for, metres per second.
+    pub pace_m_s: f32,
+    pub time_s: f32,
+}
+
+impl FordDrive {
+    /// Ford with the river settled for `settle_s` seconds, swell optional.
+    pub fn new(swell: Option<Swell>, settle_s: f32) -> Self {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        seed_ford(&mut fluid, swell);
+        let dt = 1.0 / 60.0;
+        for _ in 0..(settle_s.max(0.0) / dt) as u32 {
+            fluid.step(dt);
+        }
+        let mut world = crate::world::World::flat(0.0);
+        world.soil = crate::soil::SoilField::flat(0.0);
+        world.particles.clear();
+        world.vehicle.clear_loose_mud();
+        world.bike.pos = glam::Vec3::new(80.0, 0.0, 80.0);
+        sync_soil(&fluid, &mut world.soil, true);
+        let start_z = still_waterline_z() - 2.5;
+        let bed = fluid.sample(0.0, start_z).bed_m;
+        plant(&mut world.vehicle, &world.soil, 0.0, start_z, bed, dt);
+        Self {
+            world,
+            fluid,
+            pace_m_s: FORD_PACE_M_S,
+            time_s: 0.0,
+        }
+    }
+
+    /// One step: walls into the sheet, sheet step, load back into the car,
+    /// soil mirrored from the sheet, car integrated at ford pace.
+    pub fn step(&mut self, dt: f32) {
+        let fluid = &mut self.fluid;
+        let vehicle = &mut self.world.vehicle;
+        let solids = vehicle.hydro_solids(|x, z| depth_near(fluid, x, z));
+        fluid.set_hydro_solids(&solids);
+        fluid.step(dt);
+        let load = fluid.hydro_load();
+        vehicle.water_push_n = glam::Vec3::new(load.force_x, 0.0, load.force_z);
+        vehicle.water_lift_n = load.hull_buoyancy_n;
+        vehicle.water_drag_n = 0.0;
+        sync_soil(fluid, &mut self.world.soil, false);
+        vehicle.update_steer(0.0, dt);
+        let throttle = ((self.pace_m_s - vehicle.speed()) * 1.2 + 0.25).clamp(0.0, 1.0);
+        let contacts = vehicle.compute_contacts(&self.world.soil, throttle, 0.0, dt);
+        vehicle.integrate(&contacts, &self.world.soil, dt);
+        self.time_s += dt;
+    }
+}
+
+fn depth_near(fluid: &FluidCore, x: f32, z: f32) -> f32 {
+    let mut acc = 0.0f32;
+    let mut n = 0.0f32;
+    for k in 0..8 {
+        let a = k as f32 * std::f32::consts::TAU / 8.0;
+        let h = fluid.sample(x + a.cos() * 0.48, z + a.sin() * 0.48).water_m;
+        if h > 0.02 {
+            acc += h;
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        acc / n
+    } else {
+        fluid.sample(x, z).water_m
+    }
+}
+
+/// Copy the sheet's bed and water onto the soil the tires read.
+fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
+    use crate::soil::SurfaceKind;
+    let half = soil.size * 0.5;
+    for j in 0..soil.res {
+        for i in 0..soil.res {
+            let x = (i as f32 + 0.5) * soil.cell - half;
+            let z = (j as f32 + 0.5) * soil.cell - half;
+            let s = fluid.sample(x, z);
+            let idx = j * soil.res + i;
+            if initial {
+                soil.initial_height[idx] = s.bed_m;
+                soil.kind[idx] = if z < CHANNEL_Z0 + 0.6 {
+                    SurfaceKind::Sand as u8
+                } else {
+                    SurfaceKind::Gravel as u8
+                };
+                soil.loose[idx] = 0.004;
+                soil.wetness[idx] = 0.2;
+            }
+            soil.bed[idx] = s.bed_m;
+            soil.water[idx] = s.water_m;
+            soil.slurry[idx] = s.slurry_m;
+            soil.placed[idx] = 0.0;
+            soil.height[idx] = s.bed_m + s.slurry_m;
+            if s.water_m > 0.02 {
+                soil.wetness[idx] = 0.35;
+            }
+        }
+    }
+}
+
+fn plant(
+    vehicle: &mut crate::vehicle::Vehicle,
+    soil: &crate::soil::SoilField,
+    x: f32,
+    z: f32,
+    bed: f32,
+    dt: f32,
+) {
+    vehicle.pos = glam::Vec3::new(x, bed + 0.58, z);
+    vehicle.yaw = 0.0;
+    vehicle.pitch = 0.0;
+    vehicle.roll = 0.0;
+    vehicle.vel = glam::Vec3::ZERO;
+    vehicle.yaw_rate = 0.0;
+    vehicle.pitch_rate = 0.0;
+    vehicle.roll_rate = 0.0;
+    for w in &mut vehicle.wheels {
+        w.compression = 0.08;
+        w.omega = 0.0;
+        w.steer = 0.0;
+    }
+    for _ in 0..24 {
+        let c = vehicle.compute_contacts(soil, 0.0, 1.0, dt);
+        for ct in &c {
+            vehicle.wheels[ct.index].compression = ct.compression;
+        }
+        if c.iter().filter(|ct| ct.active).count() >= 3 {
+            break;
+        }
+        vehicle.pos.y -= 0.015;
+    }
+    vehicle.vel = glam::Vec3::ZERO;
+}
