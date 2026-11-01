@@ -17,6 +17,8 @@ mod route_bench;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_bench;
 mod render;
+#[cfg(not(target_arch = "wasm32"))]
+mod smoke_pass;
 mod terrain_draw;
 
 #[cfg(not(target_arch = "wasm32"))]

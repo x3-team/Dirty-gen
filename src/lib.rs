@@ -17,6 +17,7 @@ pub mod patch;
 pub mod quality;
 pub mod route;
 pub mod render_contract;
+pub mod smoke;
 pub mod skin;
 pub mod snow;
 pub mod snow_track;

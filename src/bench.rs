@@ -10,8 +10,9 @@
 //!
 //! * `preset` is `drive` (the Niva through-drive: puddle, slurry ruts, dry
 //!   exit with dust), `snow` (snow blanket with ruts and turn circles) or
-//!   `missing` (no solver scene yet; nothing is rendered and the SBS shows
-//!   the title as the reason).
+//!   `smoke` / `fire` (`silt::smoke` grid beside the parked Niva, `stop` in
+//!   seconds; needs compute, skipped on WebGL2), or `missing` (no solver
+//!   scene yet; nothing is rendered and the SBS shows the title as the reason).
 //! * `stop` is the chassis z where the drive still is taken. Unused for snow.
 //! * `frame` is `car` (x forward, y up, z right of the Niva) or `world`.
 //!
@@ -248,8 +249,71 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
 
     renderer.open_water = false;
 
+    // Point-source smoke (`smoke`: two cold vents like the UE5 column) and an
+    // open fire (`fire`) beside the parked Niva. `stop` is seconds of smoke.
+    for preset in ["smoke", "fire"] {
+        let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
+        if shots.is_empty() {
+            continue;
+        }
+        shots.sort_by(|a, b| a.stop.total_cmp(&b.stop));
+        renderer.show_hills = false;
+        renderer.daylight = false;
+        renderer.niva_picture = true;
+        renderer.water_column = false;
+        let world = World::flat(0.12);
+        let (config, sources) = smoke_scene(preset, &world);
+        if !renderer.enable_smoke(config) {
+            println!("bench {preset}: no compute on this adapter, skipped");
+            continue;
+        }
+        if let Some(pass) = renderer.smoke_mut() {
+            pass.sim.sources = sources;
+        }
+        let dt = 1.0 / 30.0;
+        let mut t = 0.0f32;
+        for scene in shots {
+            while t < scene.stop {
+                renderer.step_smoke(dt);
+                t += dt;
+            }
+            if let Some(st) = renderer.smoke_stats() {
+                println!("bench {} smoke {st:?}", scene.id);
+            }
+            let cam = pose(scene, &world);
+            let rgba = renderer.draw(&world, cam, None, true).expect("readback");
+            save(&dir.join(format!("{}.png", scene.id)), width, height, &rgba, scene, cam);
+        }
+        renderer.disable_smoke();
+    }
+
     for scene in scenes.iter().filter(|s| s.preset == "missing") {
         println!("bench {} missing: no solver scene yet", scene.id);
+    }
+}
+
+/// Grid and sources for the `smoke` and `fire` presets, 3.6 m left of the
+/// Niva parked at the origin.
+pub fn smoke_scene(
+    preset: &str,
+    world: &World,
+) -> (silt::smoke::SmokeConfig, Vec<silt::smoke::FireSource>) {
+    use silt::smoke::{FireSource, SmokeConfig};
+    let centre = Vec3::new(-3.6, 0.0, 0.0);
+    let ground = world.soil.sample(centre.x, centre.z).height;
+    let c = Vec3::new(centre.x, ground, centre.z);
+    if preset == "fire" {
+        let cfg = SmokeConfig::around(c, 3.6, 5.4, 0.075);
+        (cfg, vec![FireSource::campfire(c + Vec3::new(0.0, 0.12, 0.0))])
+    } else {
+        let cfg = SmokeConfig::around(c, 4.8, 6.0, 0.08);
+        (
+            cfg,
+            vec![
+                FireSource::smoke_vent(c + Vec3::new(1.1, 0.15, 0.2)),
+                FireSource::smoke_vent(c + Vec3::new(-1.0, 0.15, -0.3)),
+            ],
+        )
     }
 }
 
@@ -267,7 +331,7 @@ mod tests {
         assert!(scenes.len() >= 5);
         for s in &scenes {
             assert!(
-                ["drive", "snow", "river", "river-muddy", "beach", "wade", "missing"].contains(&s.preset.as_str()),
+                ["drive", "snow", "river", "river-muddy", "beach", "wade", "smoke", "fire", "missing"].contains(&s.preset.as_str()),
                 "{}",
                 s.id
             );

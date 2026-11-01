@@ -324,6 +324,10 @@ pub struct Renderer {
     /// The dust and fog march runs at half resolution into this target and
     /// is upsampled over the frame (`pipe_fog_up`): a quarter of the pixels.
     fog_half_view: wgpu::TextureView,
+    /// Group 5 of the dust march: smoke and fire (`SmokePass::volume_group`),
+    /// or an empty volume when no smoke runs.
+    smoke_bgl: wgpu::BindGroupLayout,
+    smoke_empty_bg: wgpu::BindGroup,
     fog_up_bgl: wgpu::BindGroupLayout,
     fog_up_bg: wgpu::BindGroup,
     pipe_fog_up: Option<wgpu::RenderPipeline>,
@@ -336,6 +340,9 @@ pub struct Renderer {
     pub debug_mode: u32,
     /// Set by [`Renderer::enable_gpu_time`]. Absent for the window and for captures.
     gpu_time: Option<GpuTime>,
+    /// Smoke and fire grid and its march. `None` unless a scene enables it.
+    #[cfg(not(target_arch = "wasm32"))]
+    smoke: Option<crate::smoke_pass::SmokePass>,
 }
 
 pub struct GpuFormats {
@@ -1626,11 +1633,20 @@ impl Renderer {
             false,
             None,
         );
-        // Dust volume. Only with the contract: it marches the dust_fog grid.
+        let (smoke_bgl, smoke_empty_bg) = smoke_volume_slot(&device);
+        // Dust volume. Only with the contract: it marches the dust_fog grid,
+        // the mist, and the smoke grid when one runs (group 5).
         let pipe_fog = contract.as_ref().map(|contract_gpu| {
             let fog_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("fog-layout"),
-                bind_group_layouts: &[&frame_bgl, &tex_bgl, &post_bgl, &paint_bgl, &contract_gpu.layout],
+                bind_group_layouts: &[
+                    &frame_bgl,
+                    &tex_bgl,
+                    &post_bgl,
+                    &paint_bgl,
+                    &contract_gpu.layout,
+                    &smoke_bgl,
+                ],
                 push_constant_ranges: &[],
             });
             pipeline(
@@ -1992,6 +2008,8 @@ impl Renderer {
             pipe_fog_up,
             pipe_fog_up_hdr,
             fog_half_view,
+            smoke_bgl,
+            smoke_empty_bg,
             fog_up_bgl,
             fog_up_bg,
             post_bgl,
@@ -2013,6 +2031,8 @@ impl Renderer {
             quality,
             shadow_res,
             overlay: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            smoke: None,
         }
     }
 
@@ -2051,6 +2071,59 @@ impl Renderer {
         let o = self.overlay.as_mut().unwrap();
         o.visible = true;
         o.write(&self.queue, lines);
+    }
+
+    /// Sun direction of the current lighting preset (towards the sun).
+    pub fn sun_dir(&self) -> Vec3 {
+        if let Some(s) = self.sun_override {
+            s.normalize()
+        } else if self.daylight {
+            // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
+            Vec3::new(0.593, 0.755, 0.281).normalize()
+        } else {
+            Vec3::new(0.88, 0.32, 0.24).normalize()
+        }
+    }
+
+    /// Start a smoke and fire grid. False when the device has no compute.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_smoke(&mut self, config: silt::smoke::SmokeConfig) -> bool {
+        if !silt::smoke::supported(&self.device) {
+            return false;
+        }
+        let mut pass = crate::smoke_pass::SmokePass::new(&self.device, config);
+        pass.sim.sun = self.sun_dir();
+        pass.sim.reset(&self.queue);
+        self.smoke = Some(pass);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn disable_smoke(&mut self) {
+        self.smoke = None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn smoke_mut(&mut self) -> Option<&mut crate::smoke_pass::SmokePass> {
+        self.smoke.as_mut()
+    }
+
+    /// Advance the smoke grid by `dt`. Sources and wind are set on `smoke_mut().sim`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn step_smoke(&mut self, dt: f32) {
+        let sun = self.sun_dir();
+        if let Some(pass) = self.smoke.as_mut() {
+            pass.sim.sun = sun;
+            pass.sim.step(&self.device, &self.queue, dt);
+        }
+    }
+
+    /// Smoke readback for logs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn smoke_stats(&self) -> Option<silt::smoke::SmokeStats> {
+        self.smoke
+            .as_ref()
+            .map(|p| p.sim.stats(&self.device, &self.queue))
     }
 
     /// Arm timestamp queries. The window leaves this off.
@@ -2342,14 +2415,7 @@ impl Renderer {
             None
         };
         // The window keeps the low sun. Persist stills ask for daylight.
-        let sun = if let Some(s) = self.sun_override {
-            s.normalize()
-        } else if self.daylight {
-            // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
-            Vec3::new(0.593, 0.755, 0.281).normalize()
-        } else {
-            Vec3::new(0.88, 0.32, 0.24).normalize()
-        };
+        let sun = self.sun_dir();
         let light_target = if self.daylight {
             Vec3::new(0.4, 0.0, 0.0)
         } else {
@@ -3089,7 +3155,14 @@ impl Renderer {
             self.draw_glass(&mut pass);
         }
 
-        let air_pass = fog_volume || self.fog > 0.0;
+        #[cfg(not(target_arch = "wasm32"))]
+        let smoke_bg = self
+            .smoke
+            .as_ref()
+            .map(|smoke| smoke.volume_group(&self.device, &self.queue, &self.smoke_bgl));
+        #[cfg(target_arch = "wasm32")]
+        let smoke_bg: Option<wgpu::BindGroup> = None;
+        let air_pass = fog_volume || self.fog > 0.0 || smoke_bg.is_some();
         let mut fog_over_ldr = false;
         if let (true, Some(pipe), Some(up), Some(gpu)) =
             (air_pass, &self.pipe_fog, &self.pipe_fog_up, &self.contract)
@@ -3106,7 +3179,7 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: pass_timestamps(clock.as_ref(), "dust-volume"),
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(pipe);
@@ -3115,6 +3188,7 @@ impl Renderer {
                 pass.set_bind_group(2, &self.post_bg, &[]);
                 pass.set_bind_group(3, &self.paint_bg, &[]);
                 pass.set_bind_group(4, &gpu.bind_group, &[]);
+                pass.set_bind_group(5, smoke_bg.as_ref().unwrap_or(&self.smoke_empty_bg), &[]);
                 pass.draw(0..3, 0..1);
             }
             // Display-space composite over the 8-bit picture after the
@@ -5308,3 +5382,80 @@ fn make_ssr(device: &wgpu::Device, width: u32, height: u32) -> SsrTargets {
     let (_depth, depth_view) = tex("ssr-depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT);
     SsrTargets { width: w, height: h, a, a_view, b, b_view, hist_a, hist_a_view, hist_b, hist_b_view, depth_view }
 }
+
+/// Layout of group 5 of the dust march (the smoke grid of `silt::smoke`) and
+/// an empty volume for frames without smoke: zero draw constants, so the
+/// march reads no smoke, and 1 x 1 x 1 zero textures.
+fn smoke_volume_slot(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let tex3 = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("smoke-volume"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(SMOKE_DRAW_BYTES),
+                },
+                count: None,
+            },
+            tex3(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            tex3(3),
+        ],
+    });
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("smoke-draw-empty"),
+        size: SMOKE_DRAW_BYTES,
+        usage: wgpu::BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+    let empty = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("smoke-empty"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default());
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("smoke-empty"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("smoke-volume-empty"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&empty) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&samp) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&empty) },
+        ],
+    });
+    (layout, bg)
+}
+
+/// Bytes of `SmokeDraw` in `beauty_contract.wgsl`: 37 vec4.
+const SMOKE_DRAW_BYTES: u64 = 37 * 16;

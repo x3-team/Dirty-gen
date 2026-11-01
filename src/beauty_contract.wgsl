@@ -296,6 +296,16 @@ fn air_sigma_soft(p: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
     return 0.5 * (air_sigma(p + h, bmin, bmax) + air_sigma(p - h, bmin, bmax));
 }
 
+// `air_sigma` blurred over a disc of radius r, for light paths only: two
+// taps on a diagonal turned by the pixel's jitter. Light that reaches a point
+// has crossed a cone, not a line, so the shadow should not print the solver's
+// cells; the half-res tent then averages the turns of neighbouring pixels.
+fn air_sigma_cone(p: vec3<f32>, r: f32, turn: f32, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+    let a = turn * 6.2831853;
+    let h = vec3<f32>(cos(a), 0.6 * sin(a * 1.7), sin(a)) * r;
+    return 0.5 * (air_sigma(p + h, bmin, bmax) + air_sigma(p - h, bmin, bmax));
+}
+
 // ---------------------------------------------------------------------------
 // Air velocity. Contract v2 publishes `air_velocity` from the solver; v1 does
 // not, so `bc_air_published` returns w = 0 and the picture builds the air from
@@ -420,6 +430,124 @@ fn hg_phase(cos_t: f32, g: f32) -> f32 {
     return (1.0 - g2) / (12.566371 * d * sqrt(d));
 }
 
+// ---------------------------------------------------------------------------
+// Smoke and fire (`silt::smoke`, GPU grid, world-anchored): group 5 of the
+// dust march, so soot, dust and mist share one march and one budget. With no
+// smoke the slot holds zero constants and 1 x 1 x 1 zero textures.
+// Look after the smoke thread's march (Bevy volumetric_fog.wgsl, MIT/Apache):
+// HG single scattering with the sun transmittance the solver marched per
+// cell (.a), two Wrenninge octaves, black-body flame emission.
+struct SmokeDraw {
+    // grid min corner xyz (world), cell m
+    origin: vec4<f32>,
+    // grid size m xyz, extinction per metre at soot 1 (0: no smoke)
+    size: vec4<f32>,
+    // soot albedo rgb, phase g
+    albedo: vec4<f32>,
+    // emission gain, ambient gain, kelvin per LUT step, LUT steps
+    light: vec4<f32>,
+    // Black body: linear rgb (max 1), relative power; entry k at k * light.z K over ambient.
+    lut: array<vec4<f32>, 24>,
+    // Fire lights: position xyz, radius; colour rgb.
+    fire_pos: array<vec4<f32>, 4>,
+    fire_col: array<vec4<f32>, 4>,
+    // fire light count, detail gain, noise frequency per cell, reference eddy speed m/s
+    detail: vec4<f32>,
+}
+
+@group(5) @binding(0) var<uniform> sd: SmokeDraw;
+// r soot, g temperature over ambient / 1000 K, b burn rate 1/s, a sun transmittance.
+@group(5) @binding(1) var smoke_vol: texture_3d<f32>;
+@group(5) @binding(2) var smoke_samp: sampler;
+// xyz velocity m/s, w unresolved eddy speed |curl v| * h.
+@group(5) @binding(3) var smoke_flow: texture_3d<f32>;
+
+// Curl-noise octaves of sub-grid smoke detail. 0 turns it off.
+override QUALITY_SMOKE_DETAIL: i32 = 2;
+// Multiple-scattering gain on the smoke's sun octaves.
+const SMOKE_MS_GAIN: f32 = 5.0;
+
+fn smoke_blackbody(dt_k: f32) -> vec4<f32> {
+    let n = i32(sd.light.w);
+    let x = clamp(dt_k / sd.light.z, 0.0, f32(n - 1));
+    let k = min(i32(x), n - 2);
+    return mix(sd.lut[k], sd.lut[k + 1], x - f32(k));
+}
+
+// Curl of three offset simplex noises (Bridson et al. 2007): divergence
+// free, so the detail swirls instead of bunching.
+fn smoke_curl(q: vec3<f32>) -> vec3<f32> {
+    let a = sdnoise3(q);
+    let b = sdnoise3(q + vec3<f32>(31.416, 47.853, 12.679));
+    let c = sdnoise3(q + vec3<f32>(-19.123, 7.391, 53.749));
+    return vec3<f32>(
+        c.gradient.y - b.gradient.z,
+        a.gradient.z - c.gradient.x,
+        b.gradient.x - a.gradient.y,
+    );
+}
+
+// Sub-grid detail after Kim et al. 2008: curl noise below one cell, scaled by
+// the unresolved eddy speed and falling 2^(-5/6) per octave (Kolmogorov). It
+// displaces the density lookup instead of advecting a finer grid.
+fn smoke_detail_offset(p: vec3<f32>, flow: vec4<f32>) -> vec3<f32> {
+    let gain = sd.detail.y;
+    if (gain <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let h = sd.origin.w;
+    let e = clamp(0.4 + flow.w / max(sd.detail.w, 1e-3), 0.0, 1.5);
+    let drift = flow.xyz * frame.misc.x;
+    var off = vec3<f32>(0.0);
+    var scale = sd.detail.z / h;
+    var amp = h;
+    for (var k: i32 = 0; k < QUALITY_SMOKE_DETAIL; k = k + 1) {
+        off = off + smoke_curl((p - drift) * scale + vec3<f32>(f32(k) * 17.0)) * amp;
+        scale = scale * 2.0;
+        amp = amp * 0.5612;
+    }
+    return off * gain * e;
+}
+
+fn smoke_fire_light(p: vec3<f32>) -> vec3<f32> {
+    var l = vec3<f32>(0.0);
+    let n = i32(sd.detail.x);
+    for (var k: i32 = 0; k < 4; k = k + 1) {
+        if (k >= n) {
+            break;
+        }
+        let d = p - sd.fire_pos[k].xyz;
+        let r2 = dot(d, d) + sd.fire_pos[k].w * sd.fire_pos[k].w;
+        l = l + sd.fire_col[k].rgb / r2;
+    }
+    return l * (1.0 / (4.0 * 3.14159265));
+}
+
+// Smoke sample at p: (soot, temperature/1000 K, burn rate, sun transmittance),
+// with the sub-grid detail displacing the lookup. Zero outside the grid.
+fn smoke_at(p: vec3<f32>) -> vec4<f32> {
+    let bmin = sd.origin.xyz;
+    let uvw = (p - bmin) / sd.size.xyz;
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) {
+        return vec4<f32>(0.0);
+    }
+    var s = textureSampleLevel(smoke_vol, smoke_samp, uvw, 0.0);
+    if (s.r < 1e-4 && s.b < 1e-3) {
+        return vec4<f32>(0.0);
+    }
+    // Detail displaces the soot (and its sun transmittance) only. The flame
+    // (temperature, burn rate) keeps the undisplaced sample, and the detail
+    // fades inside it: per-pixel noise on an emitter printed as confetti that
+    // the half-res upsample cannot average.
+    let flow = textureSampleLevel(smoke_flow, smoke_samp, uvw, 0.0);
+    let off = smoke_detail_offset(p, flow) * (1.0 - saturate(s.b));
+    if (dot(off, off) > 0.0) {
+        let d = textureSampleLevel(smoke_vol, smoke_samp, (p + off - bmin) / sd.size.xyz, 0.0);
+        s = vec4<f32>(d.r, s.g, s.b, d.a);
+    }
+    return max(s, vec4<f32>(0.0));
+}
+
 @vertex
 fn vs_fog(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
     let x = f32(i32(vid & 1u) * 4 - 1);
@@ -430,8 +558,9 @@ fn vs_fog(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let has_dust = bc_has(BC_VALID_DUST_FOG);
+    let has_smoke = sd.size.w > 0.0 && sd.size.x > 0.0;
     let fog_k = frame.air[0].w;
-    if (!has_dust && fog_k <= 0.0) {
+    if (!has_dust && fog_k <= 0.0 && !has_smoke) {
         discard;
     }
     // Half resolution: each texel stands for a 2x2 block of the frame. The
@@ -484,6 +613,17 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             t_far = max(t_far, f0);
         }
     }
+    // The smoke grid, world-anchored, may stand outside the air box.
+    if (has_smoke) {
+        let ta = (sd.origin.xyz - ro) * inv;
+        let tb = (sd.origin.xyz + sd.size.xyz - ro) * inv;
+        let n0 = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), max(min(ta.z, tb.z), 0.0));
+        let f0 = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), min(max(ta.z, tb.z), dist));
+        if (f0 > n0) {
+            t_near = min(t_near, n0);
+            t_far = max(t_far, f0);
+        }
+    }
     if (t_far <= t_near) {
         discard;
     }
@@ -507,6 +647,8 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let ground = frame.air[1].y - 0.5;
     var trans = 1.0;
     var light = vec3<f32>(0.0);
+    // Flame light, added over the cloud rather than through its alpha.
+    var emit = vec3<f32>(0.0);
     // Steps bunch up near the camera (t grows with the square of the step
     // index), and shorten inside a dense plume so one step never jumps from
     // clear air to opaque.
@@ -523,7 +665,10 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         let u = sqrt(max(t - t_near, 0.0) / range);
         dt = max(range * (2.0 * u + 1.0 / fsteps) / fsteps, 0.05);
-        let p = ro + rd * t;
+        // Each sample sits at the pixel's jitter inside its own step. With
+        // the jitter only on the first step, near-level rays of a row took
+        // their samples at the same depths and the plume printed as lines.
+        let p = ro + rd * max(t + dt * (jitter - 0.5), t_near);
         var dm = vec2<f32>(0.0);
         if (has_dust) {
             dm = air_sigma_soft(p, bmin, bmax);
@@ -531,84 +676,119 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let dust = dm.x;
         let mist = dm.y;
         let fog = ground_fog(p) + mist;
-        if (dust + fog < 1e-3) {
+        // Smoke from the GPU grid at the same point: soot extinction, and the
+        // burning gas that glows.
+        var sm = vec4<f32>(0.0);
+        if (has_smoke) {
+            sm = smoke_at(p);
+        }
+        let s_smoke = sm.r * sd.size.w;
+        let flame = sm.b;
+        let has_air = dust + fog >= 1e-3;
+        if (!has_air && s_smoke < 1e-4 && flame < 1e-3) {
             continue;
         }
-        // The solver gives the big shape; the curl noise carried by the air
-        // adds the swirls. Detail erodes the thin rim of a plume harder than
-        // its core, so edges go wispy and the body stays a body.
-        // The air solve runs on 0.25 x 0.5 x 0.25 m blocks copied onto the
-        // fine grid, so its velocity steps at every block face; carried by
-        // that, the noise tore into rectangles. Two taps one block apart on a
-        // diagonal turn each step into a ramp.
-        let o = vec3<f32>(bc_header.air_cell_x * 2.0, bc_header.air_cell_y * 2.0, -bc_header.air_cell_z * 2.0) * 0.5;
-        let v = 0.5 * (air_velocity(p + o) + air_velocity(p - o));
-        let detail = air_detail(p, v, t_now, 0.32);
-        let core = 1.0 - exp(-dust * 0.6);
-        let s_dust = dust * mix(detail, 0.6 + 0.4 * detail, core);
-        let s_fog = fog * mix(1.0, detail, 0.7);
-        let sigma = s_dust + s_fog;
-        dt = min(dt, max(0.9 / max(sigma, 1e-4), 0.08));
-        let wd = s_dust / max(sigma, 1e-6);
-        // Self-shadow toward the sun through the published grid: taps 0.4,
-        // 0.9, 1.9 m long (doubling), so a 3 m column darkens its far side.
-        // The point's own detail scales the first tap.
-        var od = 0.0;
-        if (has_dust) {
-            var s0 = 0.0;
-            var len = 0.4;
-            for (var j: i32 = 0; j < QUALITY_FOG_SHADOW_STEPS; j = j + 1) {
-                let q = p + sun * (s0 + 0.5 * len);
-                let a = air_sigma(q, bmin, bmax);
-                od += (a.x + a.y) * len * select(1.0, detail, j == 0);
-                s0 += len;
-                len *= 2.2;
+        // Dust and mist: in-scattered radiance times albedo, per unit sigma.
+        var sig_air = 0.0;
+        var l_air = vec3<f32>(0.0);
+        if (has_air) {
+            // The solver gives the big shape; the curl noise carried by the air
+            // adds the swirls. Detail erodes the thin rim of a plume harder than
+            // its core, so edges go wispy and the body stays a body.
+            // The air solve runs on 0.25 x 0.5 x 0.25 m blocks copied onto the
+            // fine grid, so its velocity steps at every block face; carried by
+            // that, the noise tore into rectangles. Two taps one block apart on a
+            // diagonal turn each step into a ramp.
+            let o = vec3<f32>(bc_header.air_cell_x * 2.0, bc_header.air_cell_y * 2.0, -bc_header.air_cell_z * 2.0) * 0.5;
+            let v = 0.5 * (air_velocity(p + o) + air_velocity(p - o));
+            let detail = air_detail(p, v, t_now, 0.32);
+            let core = 1.0 - exp(-dust * 0.6);
+            let s_dust = dust * mix(detail, 0.6 + 0.4 * detail, core);
+            let s_fog = fog * mix(1.0, detail, 0.7);
+            let sigma = s_dust + s_fog;
+            let wd = s_dust / max(sigma, 1e-6);
+            // Self-shadow toward the sun through the published grid: taps 0.4,
+            // 0.9, 1.9 m long (doubling), so a 3 m column darkens its far side.
+            // The point's own detail scales the first tap.
+            // Turns for the light cones: smooth in the world, so they neither
+            // print as a pixel pattern nor line up along screen rows.
+            let turn = textureSampleLevel(air_noise, air_samp, p * 0.12 + vec3<f32>(0.21, 0.47, 0.13), 0.0).xyz * 3.0;
+            var od = 0.0;
+            if (has_dust) {
+                var s0 = 0.0;
+                var len = 0.4;
+                for (var j: i32 = 0; j < QUALITY_FOG_SHADOW_STEPS; j = j + 1) {
+                    // Jittered along the tap so layer faces do not line up into
+                    // stripes, and widened with distance like the cone of light.
+                    let q = p + sun * (s0 + (0.25 + 0.5 * fract(turn.y + f32(j) * 0.618)) * len);
+                    let a = air_sigma_cone(q, 0.15 + 0.35 * (s0 + 0.5 * len), turn.x + f32(j) * 0.37, bmin, bmax);
+                    od += (a.x + a.y) * len * select(1.0, detail, j == 0);
+                    s0 += len;
+                    len *= 2.2;
+                }
             }
-        }
-        od += ground_fog(p) * fog_h / max(sun.y, 0.08);
-        // Multiple scattering, after Wrenninge et al.: each octave sees a
-        // thinner medium and a rounder phase, so the lit core glows instead
-        // of going flat grey behind its first metre.
-        var ms = 0.0;
-        var a_o = 1.0;
-        var b_o = 1.0;
-        var c_o = 1.0;
-        for (var o: i32 = 0; o < 3; o = o + 1) {
-            let ph = mix(mix(hg_phase(mu, 0.8 * c_o), hg_phase(mu, 0.2 * c_o), 0.45), hg_phase(mu, 0.55 * c_o), wd);
-            ms += a_o * ph * exp(-od * b_o);
-            a_o *= 0.5;
-            b_o *= 0.4;
-            c_o *= 0.5;
-        }
-        ms *= 12.566371;
-        // Powder: the sunward rim of a dense puff is darker than its inside,
-        // where light has scattered in from all sides.
-        let powder = 0.6 + 0.4 * (1.0 - exp(-sigma * 0.8));
-        // Sky through the plume above the point: dark undersides, bright tops.
-        var od_up = 0.0;
-        if (has_dust) {
-            let a1 = air_sigma(p + vec3<f32>(0.0, 0.5, 0.0), bmin, bmax);
-            let a2 = air_sigma(p + vec3<f32>(0.0, 1.5, 0.0), bmin, bmax);
-            od_up = (a1.x + a1.y) * 0.8 + (a2.x + a2.y) * 1.2;
-        }
-        let sky_vis = exp(-od_up * 0.5);
-        // Lifted off the ground so the shadow map's texels do not print as acne.
-        // Two taps a step apart along the ray: the map's texels no longer
-        // print as bricks through a thin plume.
-        let lit = 0.5 * (shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0))
-            + shadow_factor(p - rd * (0.5 * dt) + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0)));
-        var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
-        if (lamp_on > 0.0) {
-            for (var i: i32 = 0; i < 2; i = i + 1) {
-                let b = lamp_beam(i, p);
-                let c = dot(b.xyz, -rd);
-                let lp = mix(hg_phase(c, 0.8), hg_phase(c, 0.6), wd) * 12.566371;
-                l_in += LAMP_COLOR * LAMP_POWER * lamp_on * b.w * lp;
+            od += ground_fog(p) * fog_h / max(sun.y, 0.08);
+            // Multiple scattering, after Wrenninge et al.: each octave sees a
+            // thinner medium and a rounder phase, so the lit core glows instead
+            // of going flat grey behind its first metre.
+            var ms = 0.0;
+            var a_o = 1.0;
+            var b_o = 1.0;
+            var c_o = 1.0;
+            for (var o: i32 = 0; o < 3; o = o + 1) {
+                let ph = mix(mix(hg_phase(mu, 0.8 * c_o), hg_phase(mu, 0.2 * c_o), 0.45), hg_phase(mu, 0.55 * c_o), wd);
+                ms += a_o * ph * exp(-od * b_o);
+                a_o *= 0.5;
+                b_o *= 0.5;
+                c_o *= 0.5;
             }
+            ms *= 12.566371;
+            // Powder: the sunward rim of a dense puff is darker than its inside,
+            // where light has scattered in from all sides.
+            let powder = 0.45 + 0.55 * (1.0 - exp(-sigma * 0.8));
+            // Sky through the plume above the point: dark undersides, bright tops.
+            var od_up = 0.0;
+            if (has_dust) {
+                let a1 = air_sigma_cone(p + vec3<f32>(0.0, 0.5, 0.0), 0.35, turn.z, bmin, bmax);
+                let a2 = air_sigma_cone(p + vec3<f32>(0.0, 1.5, 0.0), 0.8, turn.z + 0.25, bmin, bmax);
+                od_up = (a1.x + a1.y) * 0.8 + (a2.x + a2.y) * 1.2;
+            }
+            let sky_vis = exp(-od_up * 0.9);
+            // Lifted off the ground so the shadow map's texels do not print as acne.
+            // Two taps a step apart along the ray: the map's texels no longer
+            // print as bricks through a thin plume.
+            let lit = 0.5 * (shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0))
+                + shadow_factor(p - rd * (0.5 * dt) + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0)));
+            var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky * mix(0.75, 1.0, 1.0 - wd) * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
+            if (lamp_on > 0.0) {
+                for (var i: i32 = 0; i < 2; i = i + 1) {
+                    let b = lamp_beam(i, p);
+                    let c = dot(b.xyz, -rd);
+                    let lp = mix(hg_phase(c, 0.8), hg_phase(c, 0.6), wd) * 12.566371;
+                    l_in += LAMP_COLOR * LAMP_POWER * lamp_on * b.w * lp;
+                }
+            }
+            sig_air = sigma;
+            l_air = mix(FOG_ALBEDO, DUST_ALBEDO, wd) * l_in;
         }
-        let albedo = mix(FOG_ALBEDO, DUST_ALBEDO, wd);
-        let step_t = exp(-sigma * dt);
-        light += trans * albedo * l_in * (1.0 - step_t);
+        // Soot: the solver's sun transmittance (.a) through the grid replaces
+        // shadow taps; the scene shadow map still cuts the Niva's shadow in.
+        var l_smoke = vec3<f32>(0.0);
+        if (s_smoke >= 1e-4) {
+            let ta = sm.a;
+            let ms_s = (0.5 * sqrt(ta) + 0.25 * sqrt(sqrt(ta))) * SMOKE_MS_GAIN * (1.0 / 12.566371);
+            let lit_s = shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+            let sun_s = frame.sun_color.rgb * lit_s * (ta * hg_phase(mu, sd.albedo.w) + ms_s);
+            l_smoke = sd.albedo.rgb * (sun_s + sky * sd.light.y + smoke_fire_light(p));
+        }
+        let sigma_all = sig_air + s_smoke;
+        dt = min(dt, max(0.9 / max(sigma_all, 1e-4), 0.08));
+        let step_t = exp(-sigma_all * dt);
+        light += trans * (sig_air * l_air + s_smoke * l_smoke) / max(sigma_all, 1e-6) * (1.0 - step_t);
+        if (flame >= 1e-3) {
+            let bb = smoke_blackbody(sm.g * 1000.0);
+            emit += trans * bb.rgb * bb.w * flame * sd.light.x * dt;
+        }
         trans *= step_t;
         if (trans < 0.01) {
             break;
@@ -631,10 +811,13 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         trans *= step_t;
     }
     let alpha = 1.0 - trans;
-    if (alpha < 0.002) {
+    let glow = tonemap(emit);
+    if (alpha < 0.002 && max(glow.r, max(glow.g, glow.b)) < 0.002) {
         discard;
     }
-    return vec4<f32>(tonemap(light / alpha) * alpha, alpha);
+    // Premultiplied; the flame adds on top (the upsample lifts alpha to the
+    // glow so the blend keeps it additive).
+    return vec4<f32>(min(tonemap(light / max(alpha, 1e-4)) * alpha + glow, vec3<f32>(1.0)), alpha);
 }
 
 // Upsample of the half-resolution march over the frame. Premultiplied in,
@@ -653,11 +836,22 @@ fn fog_up_sample(frag: vec4<f32>) -> vec4<f32> {
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, -e.y), 0.0);
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(-e.x, e.y), 0.0);
     c += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(e.x, e.y), 0.0);
-    c *= 0.25;
-    if (c.a < 0.002) {
+    // A wider ring, turned 45 degrees: the march's interleaved jitter repeats
+    // over a few half-res texels, and a dense plume printed it as hatching.
+    let r = 3.0 * e;
+    var w = textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(r.x, 0.0), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv - vec2<f32>(r.x, 0.0), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv + vec2<f32>(0.0, r.y), 0.0);
+    w += textureSampleLevel(fog_half, fog_half_samp, uv - vec2<f32>(0.0, r.y), 0.0);
+    c = c * 0.15 + w * 0.1;
+    // Flame glow is premultiplied colour above alpha. Raising alpha to the
+    // brightest channel keeps the straight colour within 1, so the alpha
+    // blend adds it instead of clipping it.
+    let a = max(c.a, max(c.r, max(c.g, c.b)));
+    if (a < 0.002) {
         discard;
     }
-    return vec4<f32>(c.rgb / c.a, c.a);
+    return vec4<f32>(c.rgb / a, a);
 }
 
 @fragment
@@ -833,4 +1027,155 @@ fn bc_drop_rings(xz: vec2<f32>, surf: f32, k_max: f32) -> vec2<f32> {
         g += dv / r * (amp * k * sin(k * r));
     }
     return g;
+}
+
+// psrdnoise3.wgsl
+
+//
+// Authors: Stefan Gustavson (stefan.gustavson@gmail.com)
+// and Ian McEwan (ijm567@gmail.com)
+// Version 2022-02-28, published under the MIT license (see below)
+//
+// Copyright (c) 2021-2022 Stefan Gustavson and Ian McEwan.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+// THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+//
+
+// Only sdnoise3 and its helpers are kept; the struct syntax is updated to
+// current WGSL (comma field separators).
+
+struct NG3 {
+	noise: f32,
+	gradient: vec3<f32>,
+};
+
+fn mod289v4f(i: vec4<f32>) -> vec4<f32> {
+	return i - floor(i / 289.0) * 289.0;
+}
+
+fn permute289v4f(i: vec4<f32>) -> vec4<f32>
+{
+	var im: vec4<f32> = mod289v4f(i);
+	return mod289v4f((im*34.0 + 10.0)*im);
+}
+
+fn sdnoise3(x: vec3<f32>) -> NG3
+{
+	let M = mat3x3<f32>(0.0, 1.0, 1.0, 1.0, 0.0, 1.0,  1.0, 1.0, 0.0);
+	let Mi = mat3x3<f32>(-0.5, 0.5, 0.5, 0.5,-0.5, 0.5, 0.5, 0.5,-0.5);
+
+	var uvw: vec3<f32>;
+	var i0: vec3<f32>;
+	var i1: vec3<f32>;
+	var i2: vec3<f32>;
+	var i3: vec3<f32>;
+	var f0: vec3<f32>;
+	var gt_: vec3<f32>;
+	var lt_: vec3<f32>;
+	var gt: vec3<f32>;
+	var lt: vec3<f32>;
+	var o1: vec3<f32>;
+	var o2: vec3<f32>;
+	var v0: vec3<f32>;
+	var v1: vec3<f32>;
+	var v2: vec3<f32>;
+	var v3: vec3<f32>;
+	var x0: vec3<f32>;
+	var x1: vec3<f32>;
+	var x2: vec3<f32>;
+	var x3: vec3<f32>;
+	
+	uvw = M * x;
+	i0 = floor(uvw);
+	f0 = uvw - i0;
+	gt_ = step(f0.xyx, f0.yzz);
+	lt_ = 1.0 - gt_;
+	gt = vec3<f32>(lt_.z, gt_.xy);
+	lt = vec3<f32>(lt_.xy, gt_.z);
+	o1 = min( gt, lt );
+	o2 = max( gt, lt );
+	i1 = i0 + o1;
+	i2 = i0 + o2;
+	i3 = i0 + vec3<f32>(1.0,1.0,1.0);
+	v0 = Mi * i0;
+	v1 = Mi * i1;
+	v2 = Mi * i2;
+	v3 = Mi * i3;
+	x0 = x - v0;
+	x1 = x - v1;
+	x2 = x - v2;
+	x3 = x - v3;
+
+	var hash: vec4<f32>;
+	var theta: vec4<f32>;
+	var sz: vec4<f32>;
+	var psi: vec4<f32>;
+	var St: vec4<f32>;
+	var Ct: vec4<f32>;
+	var sz_: vec4<f32>;
+
+	hash = permute289v4f( permute289v4f( permute289v4f( 
+		vec4<f32>(i0.z, i1.z, i2.z, i3.z ))
+		+ vec4<f32>(i0.y, i1.y, i2.y, i3.y ))
+		+ vec4<f32>(i0.x, i1.x, i2.x, i3.x ));
+	theta = hash * 3.883222077;
+	sz = hash * -0.006920415 + 0.996539792;
+	psi = hash * 0.108705628;
+	Ct = cos(theta);
+	St = sin(theta);
+	sz_ = sqrt( 1.0 - sz*sz );
+
+	var gx: vec4<f32>;
+	var gy: vec4<f32>;
+	var gz: vec4<f32>;
+
+	gx = Ct * sz_;
+	gy = St * sz_;
+	gz = sz;  
+	
+	var g0: vec3<f32>;
+	var g1: vec3<f32>;
+	var g2: vec3<f32>;
+	var g3: vec3<f32>;
+	var w: vec4<f32>;
+	var w2: vec4<f32>;
+	var w3: vec4<f32>;
+	var gdotx: vec4<f32>;
+	var n: f32;
+	
+	g0 = vec3<f32>(gx.x, gy.x, gz.x);
+	g1 = vec3<f32>(gx.y, gy.y, gz.y);
+	g2 = vec3<f32>(gx.z, gy.z, gz.z);
+	g3 = vec3<f32>(gx.w, gy.w, gz.w);
+	w = 0.5 - vec4<f32>(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3));
+	w = max(w, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+	w2 = w * w;
+	w3 = w2 * w;
+	gdotx = vec4<f32>(dot(g0,x0), dot(g1,x1), dot(g2,x2), dot(g3,x3));
+	n = 39.5 * dot(w3, gdotx);
+
+	var dw: vec4<f32> = -6.0 * w2 * gdotx;
+	var dn0: vec3<f32> = w3.x * g0 + dw.x * x0;
+	var dn1: vec3<f32> = w3.y * g1 + dw.y * x1;
+	var dn2: vec3<f32> = w3.z * g2 + dw.z * x2;
+	var dn3: vec3<f32> = w3.w * g3 + dw.w * x3;
+	var g: vec3<f32> = 39.5 * (dn0 + dn1 + dn2 + dn3);
+	
+	return NG3(n, g);
 }
