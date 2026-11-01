@@ -397,7 +397,7 @@ fn ford_contract_carries_flow_film_and_wet_sand() {
     let j = ((5.0 - h.origin_z) / h.cell_m).floor() as usize;
     let i = ((-1.0 - h.origin_x) / h.cell_m).floor() as usize;
     let idx = j * WINDOW_RES + i;
-    assert!(frame.flow[idx * 2] > 0.2, "flow {}", frame.flow[idx * 2]);
+    assert!(frame.flow[idx * silt::render_contract::FLOW_CHANNELS] > 0.2, "flow {}", frame.flow[idx * silt::render_contract::FLOW_CHANNELS]);
     let _ = CHANNEL_Z1;
 }
 
@@ -452,8 +452,8 @@ fn ford_dump_maps() {
                 let m = frame.moisture[idx];
                 let sand = [0.82 - 0.40 * m, 0.72 - 0.38 * m, 0.55 - 0.32 * m];
                 let h = frame.film[idx * 2];
-                let u = frame.flow[idx * 2];
-                let v = frame.flow[idx * 2 + 1];
+                let u = frame.flow[idx * silt::render_contract::FLOW_CHANNELS];
+                let v = frame.flow[idx * silt::render_contract::FLOW_CHANNELS + 1];
                 let sp = (u * u + v * v).sqrt().min(1.5);
                 let foam = frame.foam_crest[idx * 2];
                 let a = if h > 0.003 {
