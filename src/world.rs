@@ -5942,7 +5942,9 @@ mod tests {
             let bottom = center.y - WHEEL_RADIUS;
             let seat = h - w.sinkage;
             assert!(w.normal > 200.0, "wheel {i} is not supporting the body");
-            assert!(w.sinkage > 0.02 && w.sinkage < 0.09, "wheel {i} sink {}", w.sinkage);
+            // 1210 kg Niva: Bekker sink grows as W^(2/(2n+1)), about 1.5x the
+            // old 640 kg model's 2–9 cm.
+            assert!(w.sinkage > 0.03 && w.sinkage < 0.14, "wheel {i} sink {}", w.sinkage);
             assert!(
                 (bottom - seat).abs() < 0.002,
                 "wheel {i} hub is not on soil-sink, bottom {bottom:.4} soil-sink {seat:.4} sink {:.4}",

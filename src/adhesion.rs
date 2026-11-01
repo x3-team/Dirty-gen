@@ -1011,9 +1011,12 @@ mod tests {
             "sprung weight drifted {}",
             light.vel.y
         );
+        // Free fall of the unsprung mud share over the step, at least half
+        // of it after the body damping: extra·g/(M+extra)·dt.
+        let fall = extra * 9.81 / (MASS + extra) * 0.18;
         assert!(
-            heavy.vel.y < -0.15,
-            "extra mud did not add weight {}",
+            heavy.vel.y < -0.5 * fall,
+            "extra mud did not add weight {} (free fall {fall})",
             heavy.vel.y
         );
     }
