@@ -2,13 +2,15 @@
 //!
 //! `silt` drives the buggy. `silt capture` steps the same solver and writes frames.
 
-#[cfg(not(target_arch = "wasm32"))]
-mod bench;
 mod cc0;
 mod gpu_time;
 mod mesh;
 mod niva;
 mod overlay;
+#[cfg(not(target_arch = "wasm32"))]
+mod bench;
+#[cfg(not(target_arch = "wasm32"))]
+mod frame_bench;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -46,12 +48,12 @@ fn main() {
         let first = args.next();
         if first.as_deref() == Some("bench") {
             let rest: Vec<String> = args.collect();
-            bench::run_bench(bench::parse_bench(&rest));
+            frame_bench::run_bench(frame_bench::parse_bench(&rest));
             return;
         }
         if first.as_deref() == Some("budget") {
             let rest: Vec<String> = args.collect();
-            bench::run_budget(&rest);
+            frame_bench::run_budget(&rest);
             return;
         }
         if first.as_deref() == Some("--quality") {
@@ -992,6 +994,21 @@ fn gpu_time_report() {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn capture(args: &[String]) {
+    // The UE5 bench owns its two flags; the rest goes through parse_capture.
+    let mut bench_out: Option<PathBuf> = None;
+    let mut bench_scenes = PathBuf::from("bench/scenes.txt");
+    let mut kept: Vec<String> = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--bench" => bench_out = Some(PathBuf::from(it.next().expect("--bench <dir>"))),
+            "--bench-scenes" => {
+                bench_scenes = PathBuf::from(it.next().expect("--bench-scenes <file>"))
+            }
+            _ => kept.push(arg.clone()),
+        }
+    }
+    let args = &kept[..];
     let parsed = parse_capture(args);
     if parsed.software {
         prepare_software_vulkan();
@@ -1015,6 +1032,10 @@ fn capture(args: &[String]) {
         formats,
         scene,
     );
+    if let Some(out) = bench_out {
+        bench::run(&mut renderer, parsed.width, parsed.height, &out, &bench_scenes);
+        return;
+    }
     if args.iter().any(|s| s == "--through-drive") {
         renderer.show_bike = false;
         renderer.show_props = false;
@@ -3276,20 +3297,14 @@ fn stitch_side_by_side(left: &[u8], right: &[u8], half_w: u32, height: u32) -> V
 }
 
 
+/// Snow blanket with the four turn circles and the Niva parked on the
+/// straight ruts. Shared by the snow-ruts proof and the UE5 bench.
 #[cfg(not(target_arch = "wasm32"))]
-fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
+fn snow_ruts_world() -> (World, silt::snow::SnowScene) {
     use silt::particles::Particles;
     use silt::snow::niva_snow_scene;
     use silt::soil::SoilField;
     use silt::vehicle::WHEEL_RADIUS;
-
-    renderer.daylight = true;
-    renderer.show_props = false;
-    renderer.show_environment = false;
-    renderer.show_bike = false;
-    renderer.niva_picture = true;
-    renderer.water_column = false;
-    renderer.snow = true;
 
     let scene = niva_snow_scene();
     let mut world = World::flat(0.1);
@@ -3329,6 +3344,20 @@ fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
     surface /= 4.0;
     let bottom = world.vehicle.wheel_center_local(0).y - WHEEL_RADIUS;
     world.vehicle.pos.y = surface - bottom;
+    (world, scene)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = false;
+    renderer.snow = true;
+
+    let (world, scene) = snow_ruts_world();
 
     let r = &scene.report;
     println!(
