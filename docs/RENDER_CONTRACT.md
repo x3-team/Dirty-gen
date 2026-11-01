@@ -1,6 +1,6 @@
 # Render contract
 
-Version **5**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Bits 11 and 12 are not this channel.
+Version **6**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Turbidity is the A channel of binding 4, `VALID_TURBIDITY` bit 11 (`1 << 11`).
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -27,7 +27,7 @@ Valid after the solver step that produced the frame, and until the next step. Th
 
 Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 96 bytes. Spray slot: `SprayGpu`, 48 bytes.
 
-`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog). It is not a solver map. Changing which mode is on screen does not bump the version.
+`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 turbidity). It is not a solver map. Changing which mode is on screen does not bump the version.
 
 | Binding | Name | Format | Channels | Units |
 |---|---|---|---|---|
@@ -35,7 +35,7 @@ Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `Cont
 | 1 | `ground_rut` | `rgba32float` | R ground, G rut, B bed, A placed | m |
 | 2 | `moisture` | `r32float` | R pore moisture | 0..1 |
 | 3 | `film` | `rg32float` | R water, G slurry | m |
-| 4 | `flow` | `rg32float` | R velocity +X, G velocity +Z | m/s |
+| 4 | `flow` | `rgba32float` | R vx +X, G vz +Z, B speed, A turbidity | m/s, m/s, m/s, 0..1 |
 | 5 | `dust_settled` | `r32float` | R settled dust depth | m |
 | 6 | `dust_fog` | `r32float` 3D | R airborne volume fraction | m³/m³ |
 | 7 | `crust` | `rg32float` | R crust thickness, G crack opening | m |
@@ -77,13 +77,17 @@ Valid: `VALID_FILM` is set on every publish.
 
 ### Flow — binding 4
 
-Horizontal velocity of the film, metres per second, world +X and +Z. Thickness-weighted: `(water * water_velocity + slurry * slurry_velocity) / (water + slurry)`. A cell with less than 0.01 mm of film is 0.
+Four channels. R and G are the flow vector, metres per second, world +X and +Z. B is the flow speed, `hypot(vx, vz)`, metres per second. A is turbidity, the suspended-solids concentration in the water column, 0 to 1.
 
-Writer: the fluid sheet. `header.flow_source` is 1 when that sheet was attached and 0 when it was not. Without the sheet the texels are 0 and `VALID_FLOW` is clear. Those zeros are not a measured still surface.
+The vector is thickness-weighted: `(water * water_velocity + slurry * slurry_velocity) / (water + slurry)`. A cell with less than 0.01 mm of film publishes vx, vz, and speed as 0. Turbidity uses the water column only: water under 0.01 mm publishes 0, including a dry cell and any sample that is not finite. The same rule covers every map and the spray buffer: no NaN, no Inf.
 
-A dry cell, film under 0.01 mm, publishes `(0, 0)`. It does not publish NaN, even when the stored velocity is not finite. A sample that is not finite is written as 0. The same rule covers every map and the spray buffer: no NaN, no Inf.
+Turbidity is `suspended_depth / water_depth`, clamped to 0..1. The wheel lifts solids into the water in the sector behind the contact. That column then advects with this flow vector, at most one coarse cell per step. Where the water is thinner than the solids, or the cell has gone dry, the extra depth leaves the column and stays in the volume ledger as settled suspended mass. Parked cells take their depth with them when the window moves.
 
-Valid: `VALID_FLOW` only when `flow_source` is 1, after `FluidCore::step`.
+`header.flow_source` is 1 when the fluid sheet was attached and 0 when it was not. Without the sheet the texels are 0 and `VALID_FLOW` and `VALID_TURBIDITY` are clear. Those zeros are not a measured still surface.
+
+Writer: the fluid sheet, after `FluidCore::step`. The suspended account is `suspended_m3 + settled_suspended_m3 + frozen_suspended_m3`. That sum is `entrained_m3`. The gap is the absolute difference. It is part of `total_m3`. Water and slurry volumes are not the source and are not reduced.
+
+Valid: `VALID_FLOW` and `VALID_TURBIDITY` only when `flow_source` is 1, after `FluidCore::step`.
 
 ### Settled dust — binding 5
 
@@ -236,6 +240,7 @@ Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A no
 | 8 | `VALID_FOAM` | foam and crest |
 | 9 | `VALID_SPRAY` | spray |
 | 10 | `VALID_AIR` | air velocity |
+| 11 | `VALID_TURBIDITY` | turbidity, only with the fluid sheet |
 | 13 | `VALID_FOG` | fog |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
@@ -292,3 +297,11 @@ Dry cells of flow and foam do not bump this version either. Binding 4 on a dry c
 `fog`, binding 12, `r32float` 3D, 128 × 8 × 128. R is the water volume fraction, m³/m³. Same origin and cell as `dust_fog` and `air_velocity`. `VALID_FOG` is bit 13 (`1 << 13`), set when `dust_source` is 1 or 2. Bits 11 and 12 are not this channel.
 
 `dust_fog` and `air_velocity` are unchanged. Fog does not replace either channel and it does not add a velocity. With the dust ledger, `inject_fog` writes the scalar and the existing wind step plus `advect_density_by_air` move it. Without the ledger, `FluidCore::inject_fog` takes the water and the same wind step moves the slab. The header stays 96 bytes. Debug mode 15 shows this channel. Debug mode 13 remains airborne dust.
+
+### 6
+
+Turbidity, from #99 (written as version 3 on its branch; fog had already taken 5 on `main`, so the merge is 6).
+
+Binding 4, `flow`, is `rgba32float`. R and G stay the flow vector, metres per second, +X and +Z. B is the flow speed, `hypot(vx, vz)`. A is turbidity, suspended-solids concentration in the water, 0..1.
+
+The wheel lifts solids behind the contact. The column advects with the flow vector. Dry water publishes 0, not NaN. Suspended mass is in the volume ledger: the live column, the part that settled out of a dry or over-full cell, and the part parked off the window. Those three sum to the volume the wheels lifted. `VALID_TURBIDITY` is bit 11, set with the fluid sheet. The header stays 96 bytes. Debug mode 5 reads the stored speed. Debug mode 16 reads turbidity.

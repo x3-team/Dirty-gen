@@ -6,7 +6,7 @@
 // Change this contract only by bumping RENDER_CONTRACT_VERSION and
 // recording the change in docs/RENDER_CONTRACT.md.
 
-const RENDER_CONTRACT_VERSION: u32 = 5u;
+const RENDER_CONTRACT_VERSION: u32 = 6u;
 
 struct ContractHeader {
     version: u32,
@@ -133,7 +133,8 @@ fn field_color(ij: vec2<i32>, world_xz: vec2<f32>) -> vec3<f32> {
     if (mode == 2u) { return ramp(textureLoad(moisture_tex, ij, 0).r, 0.0, 1.0); }
     if (mode == 3u) { return ramp(film.r, 0.0, 0.12); }
     if (mode == 4u) { return ramp(film.g, 0.0, 0.12); }
-    if (mode == 5u) { return ramp(length(flow.rg), 0.0, 1.5); }
+    if (mode == 5u) { return ramp(flow.b, 0.0, 1.5); }
+    if (mode == 16u) { return ramp(flow.a, 0.0, 1.0); }
     if (mode == 6u) { return ramp(textureLoad(dust_settled_tex, ij, 0).r, 0.0, 0.01); }
     if (mode == 7u) { return ramp(crust.r, 0.0, 0.04); }
     if (mode == 8u) { return ramp(crust.g, 0.0, 0.02); }

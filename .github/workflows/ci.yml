@@ -42,7 +42,12 @@ jobs:
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
-          cargo test --test e2e_niva -- --nocapture
+          cargo test --test e2e_niva -- --nocapture --test-threads=1
+      - name: Scripted drive
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test scripted_drive -- --nocapture
       - name: Release solver budget
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -51,6 +56,7 @@ jobs:
           RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore one_fine_substep_matches_eight -- --nocapture
           cargo test --release --test puddle_shore puddle_shore_follows_relief -- --nocapture
           cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive -- --nocapture
+          cargo test --release --test scripted_drive --test turbidity -- --nocapture
 
   # Static GPU budget (docs/GPU_BUDGET.md). No GPU on the runner: WGSL loop
   # bounds and WebGL2 translation run in a test; draw calls, triangles and
