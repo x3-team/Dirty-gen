@@ -73,7 +73,7 @@ struct Model {
 
 // Post group: scene depth and a copy of the opaque frame (water and dust
 // volume pipelines only; meshes bind the model uniform at group 2).
-@group(2) @binding(1) var post_depth: texture_depth_2d;
+@group(2) @binding(1) var post_depth: texture_2d<f32>;
 @group(2) @binding(2) var post_color: texture_2d<f32>;
 // Tileable curl (rgb) and billow (a) noise for the dust and fog detail.
 @group(2) @binding(3) var air_noise: texture_3d<f32>;
@@ -2683,7 +2683,7 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
             break;
         }
         let pix = vec2<i32>(uv * dims);
-        let d = textureLoad(post_depth, pix, 0);
+        let d = textureLoad(post_depth, pix, 0).x;
         if (d < 0.9999 && ndc.z > d) {
             // Behind the surface: compare distances so a thin object does
             // not swallow everything behind it.
@@ -2707,7 +2707,7 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                     let cb = frame.view_proj * vec4<f32>(world + dir * tm, 1.0);
                     let nb = cb.xyz / cb.w;
                     let ub = clamp(vec2<f32>(nb.x * 0.5 + 0.5, 0.5 - nb.y * 0.5), vec2<f32>(0.0), vec2<f32>(0.9999));
-                    let db = textureLoad(post_depth, vec2<i32>(ub * dims), 0);
+                    let db = textureLoad(post_depth, vec2<i32>(ub * dims), 0).x;
                     if (db < 0.9999 && nb.z > db) {
                         hi = tm;
                     } else {
@@ -2730,7 +2730,7 @@ fn water_ssr(world: vec3<f32>, dir: vec3<f32>) -> vec4<f32> {
                 // The waterline cut-off, soft and from the refined hit: a
                 // binary test on the coarse texel cut the mirror into stairs.
                 let hz = (frame.view_proj * vec4<f32>(world + dir * hi, 1.0)).z / cm.w;
-                let hw = frame.inv_view_proj * vec4<f32>(uvh.x * 2.0 - 1.0, 1.0 - uvh.y * 2.0, max(textureLoad(post_depth, ph, 0), hz), 1.0);
+                let hw = frame.inv_view_proj * vec4<f32>(uvh.x * 2.0 - 1.0, 1.0 - uvh.y * 2.0, max(textureLoad(post_depth, ph, 0).x, hz), 1.0);
                 let sub_k = smoothstep(-0.005, 0.04, hw.y / hw.w - world.y);
                 let w = sub_k * smoothstep(0.0, 0.15, edge) * (1.0 - smoothstep(6.0, 14.0, t))
                     * (1.0 - smoothstep(0.15 + t * 0.04, 0.35 + t * 0.08, gap));
@@ -3354,7 +3354,7 @@ fn beauty_water_fragment(in: WaterOut) -> vec4<f32> {
     let pc = frame.view_proj * vec4<f32>(in.world, 1.0);
     let puv = clamp(vec2<f32>(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5), vec2<f32>(0.0), vec2<f32>(0.9999));
     let pdims = vec2<f32>(textureDimensions(post_depth));
-    let d_behind = textureLoad(post_depth, vec2<i32>(puv * pdims), 0);
+    let d_behind = textureLoad(post_depth, vec2<i32>(puv * pdims), 0).x;
     let bw = frame.inv_view_proj * vec4<f32>(pc.x / pc.w, pc.y / pc.w, d_behind, 1.0);
     let behind = bw.xyz / bw.w;
     let view_path = max(length(behind - frame.cam_pos.xyz) - length(in.world - frame.cam_pos.xyz), 0.0);
@@ -3716,7 +3716,7 @@ fn beauty_water_fragment(in: WaterOut) -> vec4<f32> {
     let hpix = vec2<i32>(clamp(huv, vec2<f32>(0.0), vec2<f32>(0.9999)) * dims_s);
     // A sample that lands on something standing above the water (a tire)
     // would pull it under the surface; keep the straight-down texel then.
-    let front = textureLoad(post_depth, rpix, 0) < here_c.z / here_c.w;
+    let front = textureLoad(post_depth, rpix, 0).x < here_c.z / here_c.w;
     let off_screen = any(ruv < vec2<f32>(0.0)) || any(ruv > vec2<f32>(1.0));
     let dst = textureLoad(post_color, select(rpix, hpix, front || over_tire > 0.5 || off_screen), 0).rgb;
     // Soft intersection with the rubber (bevy_water depth_diff): the sheet
@@ -4718,7 +4718,13 @@ fn niva_body_mud(local: vec3<f32>, world: vec3<f32>, n: vec3<f32>) -> Coat {
     let m = niva_panel_mud(local, n);
     let mass = clamp(m.x, 0.0, 1.3);
     let wet = clamp(m.w, 0.0, 1.0);
-    let ground = terrain_height(world.xz);
+    // Ground under the body from the four tire contacts: sampling the
+    // height map here pushed fs_mesh past WebGL2's 16 texture units.
+    var ground = 0.0;
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let c = frame.tires[i * 2];
+        ground += (c.y - c.w) * 0.25;
+    }
     let above = world.y - ground;
     // Spray reaches the sills first and the roof last.
     let reach = mix(0.7, 1.2, smoothstep(0.05, 0.9, mass));
@@ -5105,16 +5111,23 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     // Mesh passes do not bind the contract group; the picture cache carries
     // the same solved water for them.
     if (sand_field()) {
-        var wd = water_depth(in.world.xz);
-        var wl = height_bilinear(in.world.xz) + wd;
-        // At a tire the cache's dilated depth runs shallow; the contract has
-        // the tread 5+ cm under. Take the tire's own contact as the floor.
+        // WebGL2 caps fs_mesh at 16 textures, so the soak reads the
+        // per-tire waterline the frame already carries (solved from the
+        // contract on the CPU) instead of sampling the height/water maps.
+        var wl = 0.0;
+        var n_wet = 0.0;
         for (var i: i32 = 0; i < 4; i = i + 1) {
             let c = frame.tires[i * 2];
-            if (length(in.world.xz - c.xz) < c.w * 1.1 && wd > 0.003) {
-                wl = max(wl, c.y - c.w + 0.05);
-                wd = max(wd, 0.05);
+            let tw_i = frame.tire_water[i];
+            if (tw_i > -100.0 && tw_i > c.y - c.w + 0.003) {
+                wl += tw_i;
+                n_wet += 1.0;
             }
+        }
+        var wd = 0.0;
+        if (n_wet > 0.5 && length(in.world.xz - frame.air[1].xz) < 2.5) {
+            wl = wl / n_wet;
+            wd = 0.05;
         }
         let tw = tire_waterline(in.world);
         if (tw.y > 0.5) {
