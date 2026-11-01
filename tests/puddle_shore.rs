@@ -276,6 +276,7 @@ fn puddle_shore_follows_relief() {
     let held = (books.water_m3
         + books.slurry_m3
         + books.spray_m3
+        + books.spray_soaked_m3
         + books.frozen_water_m3
         + books.frozen_slurry_m3) as f64;
     let gap = (held - drive.sheet_opened_m3()).abs();
@@ -441,6 +442,7 @@ fn ledger_gap(drive: &ThroughDrive) -> (f32, f32, f32, f64) {
     let held = (books.water_m3
         + books.slurry_m3
         + books.spray_m3
+        + books.spray_soaked_m3
         + books.frozen_water_m3
         + books.frozen_slurry_m3) as f64;
     (
@@ -708,7 +710,7 @@ fn one_fine_substep_matches_eight() {
         run_prod.tongues, run_full.tongues
     );
     assert!(
-        (run_prod.gap - run_full.gap).abs() <= 1.5e-3,
+        (run_prod.gap - run_full.gap).abs() <= 1.0e-3,
         "ledger gap {:.6} vs {:.6}",
         run_prod.gap,
         run_full.gap

@@ -4315,7 +4315,7 @@ impl ThroughDrive {
         pull_substrate(&mut fluid, &world.soil);
         let _poured_slurry = fluid.lay_slurry_on_water(0.018, Grain::Clay);
         let opened = fluid.ledger();
-        let sheet_opened_m3 = (opened.water_m3 + opened.slurry_m3 + opened.spray_m3) as f64;
+        let sheet_opened_m3 = (opened.water_m3 + opened.slurry_m3 + opened.spray_m3 + opened.spray_soaked_m3) as f64;
         let mut shore_before = vec![0.0f32; WINDOW_RES * WINDOW_RES];
         let mut shore_before_water = vec![0.0f32; WINDOW_RES * WINDOW_RES];
         for j in 0..WINDOW_RES {

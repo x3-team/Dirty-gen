@@ -403,6 +403,13 @@ pub struct LiveSpray {
 const SPRAY_LIFE_S: f32 = 1.1;
 /// Horizontal air drag on a spray drop, 1/s.
 const SPRAY_AIR_DRAG: f32 = 0.10;
+/// Share of a cell's water a fast tire throws per step, and the most in metres.
+const SPRAY_PEEL_SHARE: f32 = 0.04;
+const SPRAY_PEEL_MAX_M: f32 = 0.004;
+/// A drop landing where the film is thinner than this soaks into the ground.
+const SPRAY_SOAK_FILM_M: f32 = 0.001;
+/// Water depth that saturates the pores of one cell's top layer, metres.
+const SPRAY_SOAK_PORE_M: f32 = 0.02;
 /// Share of a landing drop's horizontal momentum the column keeps.
 const SPRAY_MOMENTUM_SHARE: f32 = 0.3;
 /// A landing never pushes a column faster than this, m/s, unless it already was.
@@ -499,6 +506,8 @@ pub struct FluidLedger {
     pub frozen_slurry_m3: f32,
     pub frozen_dust_m3: f32,
     pub spray_m3: f32,
+    /// Spray that landed on dry ground and soaked into it.
+    pub spray_soaked_m3: f32,
     /// Airborne fog plus fog parked off the air window, cubic metres.
     /// Settled fog is already back in `water_m3`.
     pub fog_air_m3: f32,
@@ -4826,6 +4835,8 @@ pub struct FluidCore {
     spray_thrown_m3: f32,
     /// Spray that came down outside the window. Still booked as spray.
     spray_stranded_m3: f32,
+    /// Spray that landed on dry ground and soaked in.
+    spray_soaked_m3: f32,
     /// Drops peeled this pass that are still in the air.
     drops: Vec<LiveSpray>,
     /// Tire shoves from the step that just ran. Foam around the tires reads these.
@@ -4955,6 +4966,7 @@ impl FluidCore {
             spray_m3: 0.0,
             spray_thrown_m3: 0.0,
             spray_stranded_m3: 0.0,
+            spray_soaked_m3: 0.0,
             drops: Vec::new(),
             last_pushes: Vec::new(),
             frame: 0,
@@ -6621,19 +6633,60 @@ impl FluidCore {
             drop.pos[2] += drop.vel[2] * dt;
             drop.age += dt;
         }
+        // One parcel per 20 cm cell per step. The 2 cm peel makes thousands
+        // of millilitre events; flying and landing them one by one cost the
+        // drive step ~0.5 ms. Volume is summed; position, velocity and murk
+        // are volume-weighted, so the throw and the ledger are unchanged.
+        let mut cell_of: Vec<(u32, usize)> = Vec::with_capacity(fresh.len().min(1024));
         for event in fresh {
             if event.kind != 0 || !event.volume.is_finite() || event.volume <= 0.0 {
                 continue;
             }
-            self.drops.push(LiveSpray {
-                pos: [event.x, event.y, event.z],
-                vel: [event.vx, event.vy, event.vz],
-                volume: event.volume,
-                kind: event.kind,
-                age: 0.0,
-                murk: event.murk,
-            });
+            let key = match self.coarse_ij(event.x, event.z) {
+                Some((i, j)) => (j * WINDOW_RES + i) as u32,
+                None => u32::MAX,
+            };
+            let w = event.volume;
+            let hit = if key == u32::MAX {
+                None
+            } else {
+                cell_of.iter().find(|(k, _)| *k == key).map(|(_, at)| *at)
+            };
+            match hit {
+                Some(at) => {
+                    let d = &mut self.drops[at];
+                    let t = d.volume + w;
+                    let a = d.volume / t;
+                    let b = w / t;
+                    d.pos = [
+                        d.pos[0] * a + event.x * b,
+                        d.pos[1] * a + event.y * b,
+                        d.pos[2] * a + event.z * b,
+                    ];
+                    d.vel = [
+                        d.vel[0] * a + event.vx * b,
+                        d.vel[1] * a + event.vy * b,
+                        d.vel[2] * a + event.vz * b,
+                    ];
+                    d.murk = d.murk * a + event.murk * b;
+                    d.volume = t;
+                }
+                None => {
+                    if key != u32::MAX {
+                        cell_of.push((key, self.drops.len()));
+                    }
+                    self.drops.push(LiveSpray {
+                        pos: [event.x, event.y, event.z],
+                        vel: [event.vx, event.vy, event.vz],
+                        volume: w,
+                        kind: event.kind,
+                        age: 0.0,
+                        murk: event.murk,
+                    });
+                }
+            }
         }
+
         self.land_spray();
         const SPRAY_KEEP: usize = 8192;
         if self.drops.len() > SPRAY_KEEP {
@@ -6673,8 +6726,14 @@ impl FluidCore {
                 continue;
             }
             let surface = self.coarse_ij(drop.pos[0], drop.pos[2]).map(|(i, j)| {
+                let idx = j * WINDOW_RES + i;
+                // A drop well above any film needs no fine lookup.
+                let coarse_top = self.bed[idx] + self.water[idx] + self.slurry[idx];
+                if drop.pos[1] > coarse_top + 0.5 || !self.fine_on {
+                    return coarse_top;
+                }
                 let s = self.sample(drop.pos[0], drop.pos[2]);
-                self.bed[j * WINDOW_RES + i] + s.water_m + s.slurry_m
+                self.bed[idx] + s.water_m + s.slurry_m
             });
             let down = drop.vel[1] <= 0.0;
             let hit = match surface {
@@ -6711,6 +6770,22 @@ impl FluidCore {
         } else {
             None
         };
+        // A drop on dry ground (no film in the 20 cm cell) soaks in: it
+        // wets the pore water there and is booked in `spray_soaked_m3`.
+        // Drops never start a new film on a dry shoulder; that spread a
+        // haze of millimetre films the sheet then had to drain (+0.5 ms a
+        // drive step on CI).
+        if fine_at.is_none()
+            && self.water[cidx] + self.slurry[cidx] < SPRAY_SOAK_FILM_M
+        {
+            let dh = drop.volume / (COARSE_CELL_M * COARSE_CELL_M);
+            let m = self.moisture[cidx];
+            if m.is_finite() {
+                self.moisture[cidx] = (m + dh / SPRAY_SOAK_PORE_M).min(1.0);
+            }
+            self.spray_soaked_m3 += drop.volume;
+            return;
+        }
         let (water, uw, vw, area, idx) = match fine_at {
             Some(f) => (
                 &mut self.fine_water,
@@ -6829,6 +6904,7 @@ impl FluidCore {
             + fog_air
             + self.reach_bank_m3
             + self.spray_m3
+            + self.spray_soaked_m3
             + suspended
             + self.settled_suspended_m3
             + frozen_suspended;
@@ -6841,6 +6917,7 @@ impl FluidCore {
             frozen_slurry_m3: frozen_slurry,
             frozen_dust_m3: frozen_dust,
             spray_m3: self.spray_m3,
+            spray_soaked_m3: self.spray_soaked_m3,
             fog_air_m3: fog_air,
             suspended_m3: suspended,
             settled_suspended_m3: self.settled_suspended_m3,
@@ -8256,7 +8333,7 @@ impl FluidCore {
                     if water[idx] < 0.01 {
                         continue;
                     }
-                    let take = (water[idx] * 0.04).min(0.004);
+                    let take = (water[idx] * SPRAY_PEEL_SHARE).min(SPRAY_PEEL_MAX_M);
                     if take * area < 1.0e-6 {
                         continue;
                     }

@@ -37,7 +37,7 @@ fn pool(level: f32) -> FluidCore {
 /// Water in the sheet plus water thrown into the air as drops.
 fn water_m3(f: &FluidCore) -> f64 {
     let l = f.ledger();
-    l.water_m3 as f64 + f.spray_m3() as f64
+    l.water_m3 as f64 + f.spray_m3() as f64 + l.spray_soaked_m3 as f64
 }
 
 fn eta_at(f: &FluidCore, x: f32, z: f32) -> f32 {
