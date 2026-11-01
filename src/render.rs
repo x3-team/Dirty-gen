@@ -156,6 +156,8 @@ pub struct Renderer {
     env: GpuMesh,
     hills: GpuMesh,
     props: GpuMesh,
+    /// Free bodies (balls, crates, walkers), world space. Rebuilt per frame.
+    bodies: Option<GpuMesh>,
     #[allow(dead_code)]
     resident: Vec<wgpu::Texture>,
     paint_bg: wgpu::BindGroup,
@@ -1407,6 +1409,7 @@ impl Renderer {
             depth_format: formats.depth,
             daylight: false,
             show_props: true,
+            bodies: None,
             show_environment: true,
             show_hills: true,
             show_bike: true,
@@ -1608,6 +1611,13 @@ impl Renderer {
 
     /// Draw the Niva picture. `fluid` and `dust`, when present, are the sheet
     /// the contract publishes. The picture shaders do not read that sheet.
+    /// World-space mesh of the free bodies for the next frames. `None` hides them.
+    pub fn set_bodies_mesh(&mut self, mesh: Option<&CpuMesh>) {
+        self.bodies = mesh
+            .filter(|m| !m.indices.is_empty())
+            .map(|m| upload_cpu(&self.device, m, "bodies"));
+    }
+
     pub fn draw_with_sheet(
         &mut self,
         world: &World,
@@ -1845,6 +1855,10 @@ impl Renderer {
             if chunk_count > 0 {
                 self.draw_chunks(&mut pass, chunk_count);
             }
+            if let Some(b) = &self.bodies {
+                pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
+                draw_indexed(&mut pass, b);
+            }
         }
 
         let water_ssr = self.puddle_beauty || self.win_demo_still;
@@ -1913,6 +1927,10 @@ impl Renderer {
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if self.show_props {
                 draw_indexed(&mut pass, &self.props);
+            }
+            // Bodies before the water, so the sheet covers what is under it.
+            if let Some(b) = &self.bodies {
+                draw_indexed(&mut pass, b);
             }
 
             if !water_ssr {
