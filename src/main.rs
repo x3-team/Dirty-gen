@@ -927,182 +927,6 @@ fn win_demo_low_pose(world: &World) -> CameraPose {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn win_demo_pool_disc_mask(rgba: &[u8], width: u32, height: u32) -> Vec<bool> {
-    let w = width as f32;
-    let h = height as f32;
-    let mut mask = vec![false; (width * height) as usize];
-    let mut sum_x = 0.0_f64;
-    let mut sum_y = 0.0_f64;
-    let mut count = 0_u32;
-    for y in 0..height {
-        if (y as f32) < h * 0.50 || (y as f32) > h * 0.72 {
-            continue;
-        }
-        for x in 0..width {
-            let i = ((y * width + x) * 4) as usize;
-            let r = rgba[i] as f32;
-            let g = rgba[i + 1] as f32;
-            let b = rgba[i + 2] as f32;
-            let lum = (r + g + b) / 3.0;
-            if lum < 178.0 {
-                continue;
-            }
-            if (r - g).abs() > 18.0 || (g - b).abs() > 18.0 {
-                continue;
-            }
-            mask[i / 4] = true;
-            sum_x += x as f64;
-            sum_y += y as f64;
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return mask;
-    }
-    let cx = (sum_x / count as f64) as f32;
-    let cy = (sum_y / count as f64) as f32;
-    let mut rx = 0.0_f32;
-    let mut ry = 0.0_f32;
-    for y in 0..height {
-        for x in 0..width {
-            if !mask[(y * width + x) as usize] {
-                continue;
-            }
-            rx = rx.max((x as f32 - cx).abs());
-            ry = ry.max((y as f32 - cy).abs());
-        }
-    }
-    rx = rx.max(w * 0.14);
-    ry = ry.max(h * 0.07);
-    for y in 0..height {
-        for x in 0..width {
-            let dx = (x as f32 + 0.5 - cx) / rx;
-            let dy = (y as f32 + 0.5 - cy) / ry;
-            mask[(y * width + x) as usize] = dx * dx + dy * dy <= 1.0;
-        }
-    }
-    mask
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn reflect_subject_bounds(reflect: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
-    let mut x0 = width;
-    let mut y0 = height;
-    let mut x1 = 0_u32;
-    let mut y1 = 0_u32;
-    let mut hits = 0_u32;
-    for y in 0..height {
-        for x in 0..width {
-            let i = ((y * width + x) * 4) as usize;
-            let r = reflect[i] as f32;
-            let g = reflect[i + 1] as f32;
-            let b = reflect[i + 2] as f32;
-            let lum = (r + g + b) / 3.0;
-            if lum < 28.0 {
-                continue;
-            }
-            let sky_dist = (r - 196.0).abs() + (g - 200.0).abs() + (b - 206.0).abs();
-            if sky_dist < 22.0 && lum > 150.0 {
-                continue;
-            }
-            hits += 1;
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
-        }
-    }
-    if hits < 800 {
-        return None;
-    }
-    Some((x0, y0, x1 + 1, y1 + 1))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn write_puddle_reflect_debug(
-    reflect: &[u8],
-    width: u32,
-    height: u32,
-    disc: &[bool],
-) -> Vec<u8> {
-    let mut out = vec![0_u8; reflect.len()];
-    for y in 0..height {
-        for x in 0..width {
-            let p = (y * width + x) as usize;
-            if !disc[p] {
-                continue;
-            }
-            let i = p * 4;
-            out[i..i + 4].copy_from_slice(&reflect[i..i + 4]);
-        }
-    }
-    out
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn composite_win_demo_pool_reflect(rgba: &mut [u8], reflect: &[u8], width: u32, height: u32) {
-    if reflect.len() != rgba.len() {
-        return;
-    }
-    let disc = win_demo_pool_disc_mask(rgba, width, height);
-    let Some((sx0, sy0, sx1, sy1)) = reflect_subject_bounds(reflect, width, height) else {
-        return;
-    };
-    let sw = (sx1 - sx0).max(1) as f32;
-    let sh = (sy1 - sy0).max(1) as f32;
-    let mut dx0 = width;
-    let mut dy0 = height;
-    let mut dx1 = 0_u32;
-    let mut dy1 = 0_u32;
-    for y in 0..height {
-        for x in 0..width {
-            if !disc[(y * width + x) as usize] {
-                continue;
-            }
-            dx0 = dx0.min(x);
-            dy0 = dy0.min(y);
-            dx1 = dx1.max(x);
-            dy1 = dy1.max(y);
-        }
-    }
-    if dx1 <= dx0 || dy1 <= dy0 {
-        return;
-    }
-    let dw = (dx1 - dx0 + 1) as f32;
-    let dh = (dy1 - dy0 + 1) as f32;
-    for y in dy0..=dy1 {
-        for x in dx0..=dx1 {
-            if !disc[(y * width + x) as usize] {
-                continue;
-            }
-            let u = (x - dx0) as f32 / dw;
-            let v = (y - dy0) as f32 / dh;
-            let sx = sx0 as f32 + u * sw;
-            let sy = sy0 as f32 + v * sh;
-            let sx_i = sx.clamp(0.0, width as f32 - 1.0) as u32;
-            let sy_i = sy.clamp(0.0, height as f32 - 1.0) as u32;
-            let si = ((sy_i * width + sx_i) * 4) as usize;
-            let di = ((y * width + x) * 4) as usize;
-            rgba[di] = reflect[si];
-            rgba[di + 1] = reflect[si + 1];
-            rgba[di + 2] = reflect[si + 2];
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn apply_win_demo_pool_reflect(
-    rgba: &mut [u8],
-    renderer: &Renderer,
-    width: u32,
-    height: u32,
-) {
-    if !renderer.win_demo_reflect_rgba.is_empty() {
-        composite_win_demo_pool_reflect(rgba, &renderer.win_demo_reflect_rgba, width, height);
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, media: &Path) {
     use silt::world::Input;
 
@@ -1153,24 +977,32 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.puddle_beauty = true;
     renderer.water_column = true;
     let _ = renderer.draw(&wheel, pose, None, true);
-    let mut rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
-    let reflect = renderer.win_demo_reflect_rgba.clone();
-    if !reflect.is_empty() {
-        write_png(&media.join("reflect_rt.png"), width, height, &reflect)
-            .expect("reflect rt png");
-        println!("win demo {}", media.join("reflect_rt.png").display());
-        let disc = win_demo_pool_disc_mask(&rgba, width, height);
-        let debug = write_puddle_reflect_debug(&reflect, width, height, &disc);
+    let _ = renderer.draw(&wheel, pose, None, true);
+    renderer.win_demo_pool_reflect_debug = false;
+    let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
+    renderer.win_demo_pool_reflect_debug = true;
+    let debug_rgba = renderer
+        .draw(&wheel, pose, None, true)
+        .expect("wheel reflect debug");
+    renderer.win_demo_pool_reflect_debug = false;
+    if !renderer.win_demo_reflect_rgba.is_empty() {
         write_png(
-            &media.join("puddle-reflect-debug.png"),
+            &media.join("reflect_rt.png"),
             width,
             height,
-            &debug,
+            &renderer.win_demo_reflect_rgba,
         )
-        .expect("reflect debug png");
-        println!("win demo {}", media.join("puddle-reflect-debug.png").display());
+        .expect("reflect rt png");
+        println!("win demo {}", media.join("reflect_rt.png").display());
     }
-    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
+    write_png(
+        &media.join("puddle-reflect-debug.png"),
+        width,
+        height,
+        &debug_rgba,
+    )
+    .expect("reflect debug png");
+    println!("win demo {}", media.join("puddle-reflect-debug.png").display());
     write_png(
         &media.join("puddle-wheel.png"),
         width,
@@ -1188,10 +1020,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     parked.time = 1.2;
     let pose = win_demo_low_pose(&parked);
     let _ = renderer.draw(&parked, pose, None, true);
-    let mut rgba = renderer
+    let rgba = renderer
         .draw(&parked, pose, None, true)
         .expect("puddle before");
-    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
     write_png(
         &media.join("puddle-low-before.png"),
         width,
@@ -1209,8 +1040,7 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     driven.time = 13.8;
     let pose = win_demo_low_pose(&driven);
     let _ = renderer.draw(&driven, pose, None, true);
-    let mut rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
-    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
+    let rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
     for name in ["puddle-low-after.png", "puddle-patches.png"] {
         let path = media.join(name);
         write_png(&path, width, height, &rgba).expect("win demo png");
@@ -1254,10 +1084,9 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.show_mud_drops = false;
     let pose = win_demo_low_pose(&drive);
     let _ = renderer.draw(&drive, pose, None, true);
-    let mut rgba = renderer
+    let rgba = renderer
         .draw(&drive, pose, None, true)
         .expect("drive through pool");
-    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
     for name in ["puddle-drive-after.png", "puddle-drive.png"] {
         let path = media.join(name);
         write_png(&path, width, height, &rgba).expect("win demo png");

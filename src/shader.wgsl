@@ -1267,12 +1267,24 @@ fn pool_reflect_mirror_world(world: vec4<f32>) -> vec4<f32> {
 
 fn pool_reflect_uv(x: f32, z: f32) -> vec2<f32> {
     let level = win_demo_pool_level();
-    let clip = frame.view_proj * vec4<f32>(x, level, z, 1.0);
+    var p = vec3<f32>(x, level, z);
+    var vp = frame.view_proj;
+    if ((render_flags() & 8u) != 0u) {
+        vp = frame.reflect_view_proj;
+        p.y = 2.0 * level - p.y;
+    }
+    let clip = vp * vec4<f32>(p, 1.0);
     if (clip.w <= 0.02) {
         return vec2<f32>(-1.0, -1.0);
     }
     var uv = clip.xy / clip.w;
-    return vec2<f32>(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
+    var u = uv.x * 0.5 + 0.5;
+    var v = 0.5 - uv.y * 0.5;
+    // Reflected-camera RT is viewed from below; flip V so plane samples hit Niva texels.
+    if ((render_flags() & 8u) != 0u) {
+        v = 1.0 - v;
+    }
+    return vec2<f32>(u, v);
 }
 
 fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
@@ -1709,6 +1721,31 @@ fn shade_seam_pool(
     let t = frame.misc.x;
     var nrm = normalize(puddle_normal(xz, t, column_here));
     if (win_demo_flat_terrain()) {
+        let planar = pool_planar_reflect_sample(in.world);
+        let reflect_ready = pool_reflect_ready();
+        let planar_l = length(planar);
+        let sky_l = length(vec3<f32>(0.77, 0.79, 0.81));
+        let planar_subject = planar_l > 0.03 && planar_l < sky_l * 0.92;
+        if (reflect_ready && planar_subject) {
+            let c = beauty_seam_center();
+            let dx = (xz.x - c.x) / 1.32;
+            let dz = (xz.y - c.y) / 1.02;
+            let r = sqrt(dx * dx + dz * dz);
+            let edge_a = smoothstep(1.26, 0.68, r);
+            let core_a = smoothstep(1.05, 0.42, r);
+            let alpha = max(edge_a * 0.92, core_a * 0.97);
+            var col = pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+            if (frame.reflect_flags.y < 0.5) {
+                let sun = normalize(frame.sun_dir.xyz);
+                let ndl = clamp(dot(normalize(vec3<f32>(0.0, 1.0, 0.0)), sun), 0.0, 1.0);
+                let body = vec3<f32>(0.05, 0.34, 0.52) * (0.12 + 0.88 * ndl);
+                col = mix(col, body, 0.05);
+            }
+            return vec4<f32>(pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), alpha);
+        }
+        if (frame.reflect_flags.y > 0.5) {
+            return vec4<f32>(pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 0.96);
+        }
         let bow = beauty_bow_wave(xz, t);
         let driven = smoothstep(4.0, 5.5, t);
         let ripple_mix = clamp(0.12 + max(bow, 0.0) * 3.2 * (0.35 + driven * 0.65), 0.12, 0.58);
@@ -1721,14 +1758,17 @@ fn shade_seam_pool(
         let ndl = clamp(dot(nrm, sun), 0.0, 1.0);
         let water_tint = vec3<f32>(0.05, 0.34, 0.52);
         let body = water_tint * (0.12 + 0.88 * ndl);
-        var reflect_col = pool_planar_reflect_sample(in.world);
+        var reflect_col = planar;
         let refl_dir = reflect(-view, nrm);
-        if (length(reflect_col) < 0.02) {
+        if (length(reflect_col) < 0.02 && !reflect_ready) {
             reflect_col = sky_reflect(refl_dir);
         }
         let fres_w = clamp(fres * 0.28 + 0.94, 0.0, 1.0);
         var col = reflect_col * (0.08 + 0.92 * fres_w) + body * (1.0 - fres_w) * 0.12;
-        let bow_foam = max(beauty_bow_wave(xz, t), 0.0) * smoothstep(4.0, 5.5, t) * 2.4;
+        var bow_foam = max(beauty_bow_wave(xz, t), 0.0) * smoothstep(4.0, 5.5, t) * 2.4;
+        if (reflect_ready) {
+            bow_foam = 0.0;
+        }
         col = mix(col, vec3<f32>(0.90, 0.94, 0.98), clamp(bow_foam, 0.0, 1.0) * 0.55);
         let halfv = normalize(sun + view);
         let sheen = pow(clamp(dot(nrm, halfv), 0.0, 1.0), 128.0);

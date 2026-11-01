@@ -111,6 +111,7 @@ pub struct Renderer {
     shadow_depth: wgpu::Texture,
     shadow_depth_view: wgpu::TextureView,
     readback: wgpu::Buffer,
+    reflect_readback: wgpu::Buffer,
     padded_row: u32,
     terrain: GpuMesh,
     body: GpuMesh,
@@ -173,6 +174,8 @@ pub struct Renderer {
     pub win_demo_still: bool,
     /// Latest pool reflect RT readback (win-demo still capture, same resolution as the frame).
     pub win_demo_reflect_rgba: Vec<u8>,
+    /// Win-demo still: water shows raw `pool_planar_reflect_sample` (no fresnel/foam).
+    pub win_demo_pool_reflect_debug: bool,
     /// Slurry drops and dust cards. Off for win-demo stills (water carries splash).
     pub show_mud_particles: bool,
     /// Round slurry drops. Off when solver sheets carry the splash read.
@@ -703,6 +706,12 @@ impl Renderer {
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
             make_targets(&device, width, height, formats.depth);
+        let reflect_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reflect-readback"),
+            size: padded_row as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         let (
             scene_color,
             scene_color_view,
@@ -1152,6 +1161,7 @@ impl Renderer {
             shadow_depth,
             shadow_depth_view,
             readback,
+            reflect_readback,
             padded_row,
             terrain,
             body,
@@ -1203,6 +1213,7 @@ impl Renderer {
             puddle_beauty: false,
             win_demo_still: false,
             win_demo_reflect_rgba: Vec::new(),
+            win_demo_pool_reflect_debug: false,
             show_mud_particles: true,
             show_mud_drops: true,
             snow: false,
@@ -1261,6 +1272,12 @@ impl Renderer {
         self.depth = depth;
         self.depth_view = depth_view;
         self.readback = readback;
+        self.reflect_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reflect-readback"),
+            size: padded_row as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
         self.padded_row = padded_row;
         let nearest = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -1418,6 +1435,9 @@ impl Renderer {
         if let Some(reflect_vp) = reflect_view_proj {
             frame.reflect_view_proj = reflect_vp.to_cols_array_2d();
             frame.reflect_flags = [1.0, 0.0, 0.0, 0.0];
+        }
+        if self.win_demo_pool_reflect_debug {
+            frame.reflect_flags[1] = 1.0;
         }
         if self.snow {
             if let Some(arc) = self.snow_arc {
@@ -1644,7 +1664,6 @@ impl Renderer {
                 self.queue.submit(Some(encoder.finish()));
                 self.device.poll(wgpu::Maintain::Wait);
                 self.rebuild_tex_bg_pool_reflect();
-                self.stash_win_demo_reflect_readback();
                 self.queue.write_buffer(
                     &self.frame_buf,
                     0,
@@ -1797,6 +1816,10 @@ impl Renderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
+
+        if readback && self.win_demo_still && self.win_demo_pool_reflect_debug {
+            self.stash_win_demo_reflect_readback();
+        }
 
         if !readback {
             return None;
@@ -2012,7 +2035,7 @@ impl Renderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::ImageCopyBuffer {
-                buffer: &self.readback,
+                buffer: &self.reflect_readback,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_row),
@@ -2027,7 +2050,7 @@ impl Renderer {
         );
         self.queue.submit(Some(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
-        let slice = self.readback.slice(..);
+        let slice = self.reflect_readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -2042,7 +2065,7 @@ impl Renderer {
             out.extend_from_slice(&padded[y * stride..y * stride + row]);
         }
         drop(padded);
-        self.readback.unmap();
+        self.reflect_readback.unmap();
         self.win_demo_reflect_rgba = out;
     }
 
@@ -2073,7 +2096,7 @@ impl Renderer {
         reflect_view_proj: Mat4,
         mut reflect_frame: FrameData,
     ) {
-        reflect_frame.misc[3] += 16.0;
+        reflect_frame.view_proj = reflect_view_proj.to_cols_array_2d();
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&reflect_frame));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
