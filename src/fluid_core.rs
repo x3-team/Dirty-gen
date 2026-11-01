@@ -594,6 +594,130 @@ thread_local! {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static GPU_SHEET: RefCell<Option<Option<crate::gpu_sheet::GpuSheet>>> = const { RefCell::new(None) };
+}
+
+/// `SILT_SHEET_GPU=1` routes the water and slurry sheets through wgpu compute.
+pub fn sheet_gpu_enabled() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SILT_SHEET_GPU").map(|v| v == "1").unwrap_or(false))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// Run `f` with this thread's GPU sheet, creating it on first use.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn with_gpu_sheet<R>(f: impl FnOnce(&mut crate::gpu_sheet::GpuSheet) -> R) -> Option<R> {
+    GPU_SHEET.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let soft = std::env::var("SILT_SHEET_GPU_SOFTWARE").map(|v| v == "1").unwrap_or(false);
+            *slot = Some(crate::gpu_sheet::GpuSheet::new(soft));
+        }
+        slot.as_mut().unwrap().as_mut().map(f)
+    })
+}
+
+fn sheet_dispatch(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    vorticity: f32,
+    mask: Option<&[u8]>,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if sheet_gpu_enabled()
+        && step_sheet_gpu(h, u, v, bed, nu, gate, res, cell, dt, vorticity, 1.0e-6, mask)
+    {
+        return;
+    }
+    let drive = SheetDrive::Gravity { vorticity };
+    match mask {
+        Some(m) => step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, 1.0e-6, Some(m)),
+        None => step_sheet(h, u, v, bed, nu, gate, res, cell, dt, drive),
+    }
+}
+
+/// GPU twin of the gravity sheet step. Same early exit and substep count as
+/// the CPU, except the speed for the CFL count is read over the whole grid,
+/// and the 2 cm open sheet does not sleep flat tiles. False when no adapter.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn step_sheet_gpu(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    vorticity: f32,
+    eps: f32,
+    solid: Option<&[u8]>,
+) -> bool {
+    if dt <= 0.0 || res == 0 || h.len() < res * res {
+        return true;
+    }
+    let n = res * res;
+    let mut sum = 0.0f32;
+    let mut any = false;
+    for s in h[..n].iter() {
+        if *s > eps {
+            any = true;
+            sum += *s;
+        }
+    }
+    if !any || sum <= eps {
+        return true;
+    }
+    let fine_open = solid.is_none() && cell <= FINE_CELL_M + 1.0e-6;
+    let nsub = if fine_open {
+        1
+    } else {
+        let mut max_s = 0.15f32;
+        for idx in 0..n {
+            max_s = max_s.max(u[idx].hypot(v[idx]));
+        }
+        ((dt * max_s) / (0.42 * cell.max(1.0e-3))).ceil().clamp(1.0, 8.0) as u32
+    };
+    let project = solid.is_some() || cell > FINE_CELL_M + 1.0e-6;
+    with_gpu_sheet(|gpu| {
+        let mut job = crate::gpu_sheet::SheetJob {
+            h,
+            u,
+            v,
+            bed,
+            nu,
+            gate,
+            solid,
+            res,
+            cell,
+            dt,
+            vorticity,
+            eps,
+            nsub,
+            project,
+        };
+        gpu.step(&mut job);
+    })
+    .is_some()
+}
+
 /// Step one height–velocity sheet. `bed` is the solid under the film, metres.
 /// `gate` is 1 where a dry neighbour may receive fluid. Mass only moves in the
 /// upwind flux, so the filter cannot mint or delete a column.
@@ -610,6 +734,37 @@ pub fn step_sheet(
     drive: SheetDrive,
 ) {
     step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, 1.0e-6, None);
+}
+
+/// The walled gravity step `FluidCore` runs when a wheel or the body is in the
+/// sheet. Public so the GPU spike can compare against it.
+pub fn step_sheet_walled(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    solid: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    vorticity: f32,
+) {
+    step_sheet_eps(
+        h,
+        u,
+        v,
+        bed,
+        nu,
+        gate,
+        res,
+        cell,
+        dt,
+        SheetDrive::Gravity { vorticity },
+        1.0e-6,
+        Some(solid),
+    );
 }
 
 fn step_sheet_eps(
@@ -5319,69 +5474,13 @@ impl FluidCore {
                 let nu_w = &scratch.nu_w[..n];
                 let nu_s = &scratch.nu_s[..n];
                 let gate = &scratch.gate[..n];
-                if let Some(mask) = &mask {
-                    let tw = ProfTick::start();
-                    step_sheet_eps(
-                        water,
-                        uw,
-                        vw,
-                        bed,
-                        nu_w,
-                        gate,
-                        res,
-                        cell,
-                        dt,
-                        SheetDrive::Gravity { vorticity: 0.08 },
-                        1.0e-6,
-                        Some(mask),
-                    );
-                    water_ms = tw.ms();
-                    let ts = ProfTick::start();
-                    step_sheet_eps(
-                        slurry,
-                        us,
-                        vs,
-                        bed,
-                        nu_s,
-                        gate,
-                        res,
-                        cell,
-                        dt,
-                        SheetDrive::Gravity { vorticity: 0.05 },
-                        1.0e-6,
-                        Some(mask),
-                    );
-                    slurry_ms = ts.ms();
-                } else {
-                    let tw = ProfTick::start();
-                    step_sheet(
-                        water,
-                        uw,
-                        vw,
-                        bed,
-                        nu_w,
-                        gate,
-                        res,
-                        cell,
-                        dt,
-                        SheetDrive::Gravity { vorticity: 0.08 },
-                    );
-                    water_ms = tw.ms();
-                    let ts = ProfTick::start();
-                    step_sheet(
-                        slurry,
-                        us,
-                        vs,
-                        bed,
-                        nu_s,
-                        gate,
-                        res,
-                        cell,
-                        dt,
-                        SheetDrive::Gravity { vorticity: 0.05 },
-                    );
-                    slurry_ms = ts.ms();
-                }
+                let mask_ref = mask.as_deref();
+                let tw = ProfTick::start();
+                sheet_dispatch(water, uw, vw, bed, nu_w, gate, res, cell, dt, 0.08, mask_ref);
+                water_ms = tw.ms();
+                let ts = ProfTick::start();
+                sheet_dispatch(slurry, us, vs, bed, nu_s, gate, res, cell, dt, 0.05, mask_ref);
+                slurry_ms = ts.ms();
             }
             self.sheet_times.prep_ms += prep_ms;
             self.sheet_times.water_ms += water_ms;
