@@ -1,6 +1,6 @@
 # Render contract
 
-Version **11**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Turbidity is the A channel of binding 4, `VALID_TURBIDITY` bit 11 (`1 << 11`). Material shares are binding 13, `VALID_MIX` bit 12 (`1 << 12`). Snow is binding 14, `VALID_SNOW` bit 14 (`1 << 14`). The fine deformation window is binding 15, `VALID_TRACK_FINE` bit 15 (`1 << 15`).
+Version **12**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Turbidity is the A channel of binding 4, `VALID_TURBIDITY` bit 11 (`1 << 11`). Material shares are binding 13, `VALID_MIX` bit 12 (`1 << 12`). Snow is binding 14, `VALID_SNOW` bit 14 (`1 << 14`). The fine deformation window is binding 15, `VALID_TRACK_FINE` bit 15 (`1 << 15`). The 2 cm water window under the tires is binding 16, `VALID_WATER_FINE` bit 16 (`1 << 16`).
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -25,9 +25,9 @@ Valid after the solver step that produced the frame, and until the next step. Th
 
 ## Bind group
 
-Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 112 bytes. Spray slot: `SprayGpu`, 48 bytes.
+Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 128 bytes. Spray slot: `SprayGpu`, 48 bytes.
 
-`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 turbidity, 17 snow height, 18 snow density, 19 snow compaction, 20 material mix, 21 fine surface over ground, 22 fine compaction, 23 fine print depth). It is not a solver map. Changing which mode is on screen does not bump the version.
+`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 turbidity, 17 snow height, 18 snow density, 19 snow compaction, 20 material mix, 21 fine surface over ground, 22 fine compaction, 23 fine print depth, 24 water with the 2 cm window, 25 slurry with the 2 cm window). It is not a solver map. Changing which mode is on screen does not bump the version.
 
 | Binding | Name | Format | Channels | Units |
 |---|---|---|---|---|
@@ -47,6 +47,7 @@ Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `Cont
 | 13 | `soil_mix` | `rgba32float` | R mud, G sand, B gravel, A grass | 0..1 |
 | 14 | `snow` | `rgba32float` | R height, G density, B compaction, A 0 | m, kg/m³, 0..1, — |
 | 15 | `track_fine` | `rgba32float`, 640 × 640 | R surface over ground, G snow depth, B compaction, A print depth | m, m, 0..1, m |
+| 16 | `water_fine` | `rg32float`, 160 × 160 | R water, G slurry | m |
 
 Ground maps, including `snow`, are 200 × 200. `dust_fog`, `air_velocity`, and `fog` share one air grid. Spray is a buffer, not a grid.
 
@@ -293,6 +294,31 @@ Writer: `publish_track_fine(out, center, writers)` after `publish` / `publish_wi
 
 Valid: `VALID_TRACK_FINE` is bit 15, set only by `publish_track_fine` with at least one writer. The GPU copy (6.5 MB) is uploaded only on frames with the bit set. Debug modes 21, 22, and 23 show R, B, and A.
 
+### Fine water — binding 16
+
+The 2 cm water and slurry under the tires (`docs/HYBRID_SIM.md`, H1). Binding 3 stays the 20 cm sheet; this window adds the detail that the near field (`src/fluid_core/near.rs`) keeps between steps: wakes, bow mounds, and the dry tread line.
+
+| | |
+|---|---|
+| Texels | 160 × 160 |
+| Texel | 0.02 m (`WATER_FINE_CELL_M`) |
+| Extent | 3.2 m × 3.2 m, the fine patch of the last step |
+| Origin | the patch's minimum corner, on the coarse 20 cm grid |
+| Texel (i, j) | centre `water_fine_origin + ((i + 0.5), (j + 0.5)) * 0.02`, i along +X, j along +Z |
+
+Header fields `water_fine_origin_x`, `water_fine_origin_z` (metres), `water_fine_cell_m`, and `water_fine_res`; all 0 when the binding is not published.
+
+| Channel | Meaning | Units |
+|---|---|---|
+| R | water depth | m |
+| G | slurry depth | m |
+
+Each texel is its 20 cm column's depth (binding 3) plus the column's kept residual, exactly what the next solver step lays down on the patch. The residual sums to zero over each column, so the 10 × 10 texels of a column average to its binding 3 value: volume lives in the coarse sheet and this map adds no water. Texels of columns the patch does not hold carry the plain 20 cm depth. Depths are ≥ 0; non-finite samples are 0.
+
+Writer: `FluidCore::fine_window()`, called by `publish` / `publish_with_snow`. With `SILT_NEAR=0` the residual is off and the window is the flat 20 cm depth. The publisher does not step the solver.
+
+Valid: `VALID_WATER_FINE` is bit 16, set only while a tire holds the patch (the last step had tire pushes). The GPU copy (200 KB) is uploaded only on frames with the bit set. Debug modes 24 and 25 show water and slurry, with the 2 cm window inside and binding 3 outside.
+
 ## Header flags
 
 `header.version` is 4. `header.valid` is a bit mask:
@@ -315,6 +341,7 @@ Valid: `VALID_TRACK_FINE` is bit 15, set only by `publish_track_fine` with at le
 | 13 | `VALID_FOG` | fog |
 | 14 | `VALID_SNOW` | snow height, density, compaction |
 | 15 | `VALID_TRACK_FINE` | fine deformation window |
+| 16 | `VALID_WATER_FINE` | 2 cm water window, only while a tire holds the patch |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
 
@@ -410,6 +437,10 @@ The air grid is 4 m tall. `dust_fog` (binding 6), `air_velocity` (binding 11) an
 Fine deformation window. `track_fine`, binding 15, `rgba32float`, 640 × 640 at 0.025 m, a 16 m window around the Niva on the global 2.5 cm grid. R is the top surface over contract ground in metres, G the snow depth in metres (0 off snow), B the compaction of the material R reports (0..1), A the lug or sole print depth in metres. `VALID_TRACK_FINE` is bit 15 (`1 << 15`).
 
 The header grows from 96 to 112 bytes: `fine_origin_x`, `fine_origin_z`, `fine_cell_m`, `fine_res` give the window, 0 when it is not published. Two writers combine per texel: snow (G > 0) over soil prints, otherwise the first soil writer with a non-zero texel. Every texel in the window is valid. Version 9 was reserved for this map but 10 (the 4 m air column) landed first, so it ships as 11; 9 is unused. Debug modes 21, 22, 23 show R, B, A.
+
+### 12
+
+2 cm water window. `water_fine`, binding 16, `rg32float`, 160 × 160 at 0.02 m: the fine patch under the tires. R water depth, G slurry depth, metres; each 20 cm column's depth plus its zero-sum near-field residual. `VALID_WATER_FINE` is bit 16 (`1 << 16`), set while a tire holds the patch. The header grows from 112 to 128 bytes: `water_fine_origin_x`, `water_fine_origin_z`, `water_fine_cell_m`, `water_fine_res`, 0 when not published. Bindings and bits agreed with the snow and spray threads; spray takes 13. Debug modes 24 and 25.
 
 ### Turbidity fill (no bump)
 

@@ -899,6 +899,98 @@ fn belly_chase(world: &World) -> CameraPose {
     }
 }
 
+/// Low close-up beside the wheels, looking back along the wake.
+#[cfg(not(target_arch = "wasm32"))]
+fn wheel_wake_pose(world: &World) -> CameraPose {
+    let fwd = world.vehicle.forward();
+    let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+    let eye = world.vehicle.pos - fwd * 0.4 - right * 2.6 + Vec3::Y * 1.05;
+    let target = world.vehicle.pos - fwd * 1.5 - right * 0.55 - Vec3::Y * 0.35;
+    CameraPose {
+        eye,
+        target,
+        ortho_width: None,
+    }
+}
+
+/// The 2 cm water window (contract binding 16) on screen: the same through
+/// drive with the near field on and off, same step, same camera.
+/// Writes `near-on.png`, `near-off.png` and the chase view of each.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_water_fine(renderer: &mut Renderer, parsed: &CaptureArgs, dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("proof dir");
+    let stop_z: f32 = std::env::var("SILT_PROOF_Z")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7.5);
+    for near in [true, false] {
+        let mut drive = silt::ThroughDrive::new();
+        drive.fluid.set_near_field(near);
+        let mut steps = 0u32;
+        while drive.world.vehicle.pos.z < stop_z && steps < 20_000 {
+            drive.step(1.0 / 30.0);
+            steps += 1;
+        }
+        let tag = if near { "near-on" } else { "near-off" };
+        println!(
+            "{tag}: z {:.2} after {steps} steps, near tiles {}",
+            drive.world.vehicle.pos.z,
+            drive.fluid.near_tiles()
+        );
+        // Top-down binding 16 as published: water + slurry depth, 0..12 cm.
+        let mut frame = silt::render_contract::ContractFrame::new();
+        silt::render_contract::publish(
+            &mut frame,
+            &drive.world.soil,
+            &[],
+            [drive.world.vehicle.pos.x, drive.world.vehicle.pos.z],
+            drive.world.time,
+            0,
+            Some(&drive.fluid),
+            None,
+        );
+        let n = frame.header.water_fine_res as usize;
+        if n > 0 {
+            let up = 4usize;
+            let mut rgba = vec![0u8; n * up * n * up * 4];
+            for y in 0..n * up {
+                for x in 0..n * up {
+                    // Image row 0 is far +Z.
+                    let k = ((n - 1 - y / up) * n + x / up) * 2;
+                    let d = frame.water_fine[k] + frame.water_fine[k + 1];
+                    let t = (d / 0.12).clamp(0.0, 1.0);
+                    let o = (y * n * up + x) * 4;
+                    let dry = d < 0.002;
+                    let px = if dry {
+                        [150, 110, 70, 255]
+                    } else {
+                        [(20.0 + 40.0 * t) as u8, (90.0 + 120.0 * t) as u8, (140.0 + 115.0 * t) as u8, 255]
+                    };
+                    rgba[o..o + 4].copy_from_slice(&px);
+                }
+            }
+            let side = (n * up) as u32;
+            write_png(&dir.join(format!("{tag}-fine-map.png")), side, side, &rgba).expect("png");
+        }
+        for (name, pose) in [
+            (format!("{tag}.png"), wheel_wake_pose(&drive.world)),
+            (format!("{tag}-chase.png"), through_chase(&drive.world)),
+        ] {
+            let rgba = renderer
+                .draw_with_sheet(
+                    &drive.world,
+                    pose,
+                    None,
+                    true,
+                    Some(&drive.fluid),
+                    Some(drive.dust()),
+                )
+                .expect("readback");
+            write_png(&dir.join(&name), parsed.width, parsed.height, &rgba).expect("png");
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     let media = PathBuf::from(MEDIA);
@@ -1616,6 +1708,7 @@ fn capture(args: &[String]) {
     let mut bench_out: Option<PathBuf> = None;
     let mut bench_scenes = PathBuf::from("bench/scenes.txt");
     let mut terrain_proof: Option<PathBuf> = None;
+    let mut water_fine_proof: Option<PathBuf> = None;
     let mut route_out: Option<PathBuf> = None;
     let mut route_scenes = PathBuf::from("bench/route.txt");
     let mut kept: Vec<String> = Vec::with_capacity(args.len());
@@ -1632,6 +1725,10 @@ fn capture(args: &[String]) {
             }
             "--terrain-proof" => {
                 terrain_proof = Some(PathBuf::from(it.next().expect("--terrain-proof <dir>")))
+            }
+            "--water-fine-proof" => {
+                water_fine_proof =
+                    Some(PathBuf::from(it.next().expect("--water-fine-proof <dir>")))
             }
             _ => kept.push(arg.clone()),
         }
@@ -1662,6 +1759,15 @@ fn capture(args: &[String]) {
     );
     if let Some(dir) = terrain_proof {
         capture_terrain(&mut renderer, &parsed, &dir);
+        return;
+    }
+    if let Some(dir) = water_fine_proof {
+        renderer.show_bike = false;
+        renderer.show_props = false;
+        renderer.show_hills = false;
+        renderer.niva_picture = true;
+        renderer.water_column = true;
+        capture_water_fine(&mut renderer, &parsed, &dir);
         return;
     }
     if let Some(out) = route_out {

@@ -6,7 +6,7 @@
 // Change this contract only by bumping RENDER_CONTRACT_VERSION and
 // recording the change in docs/RENDER_CONTRACT.md.
 
-const RENDER_CONTRACT_VERSION: u32 = 11u;
+const RENDER_CONTRACT_VERSION: u32 = 12u;
 
 struct ContractHeader {
     version: u32,
@@ -38,6 +38,11 @@ struct ContractHeader {
     fine_origin_z: f32,
     fine_cell_m: f32,
     fine_res: u32,
+    // 2 cm water window, binding 16: minimum corner, texel size, texels per side.
+    water_fine_origin_x: f32,
+    water_fine_origin_z: f32,
+    water_fine_cell_m: f32,
+    water_fine_res: u32,
 }
 
 struct SprayParticle {
@@ -66,8 +71,26 @@ struct SprayParticle {
 @group(0) @binding(14) var snow_tex: texture_2d<f32>;
 // R top surface over ground m, G snow depth m, B compaction, A print depth m.
 @group(0) @binding(15) var track_fine: texture_2d<f32>;
+// R water depth m, G slurry depth m, on the 2 cm patch under the tires.
+@group(0) @binding(16) var water_fine: texture_2d<f32>;
 
 const VALID_TRACK_FINE: u32 = 32768u;
+const VALID_WATER_FINE: u32 = 65536u;
+
+// 2 cm water and slurry depth at a world point; vec2(-1) outside the window.
+fn water_fine_at(world_xz: vec2<f32>) -> vec2<f32> {
+    if ((header.valid & VALID_WATER_FINE) == 0u || header.water_fine_res == 0u) {
+        return vec2<f32>(-1.0);
+    }
+    let rel = (world_xz - vec2<f32>(header.water_fine_origin_x, header.water_fine_origin_z))
+        / header.water_fine_cell_m;
+    let i = vec2<i32>(floor(rel));
+    let n = i32(header.water_fine_res);
+    if (any(i < vec2<i32>(0)) || any(i >= vec2<i32>(n))) {
+        return vec2<f32>(-1.0);
+    }
+    return textureLoad(water_fine, i, 0).rg;
+}
 
 fn fine_at(world_xz: vec2<f32>) -> vec4<f32> {
     if ((header.valid & VALID_TRACK_FINE) == 0u || header.fine_res == 0u) {
@@ -175,6 +198,13 @@ fn field_color(ij: vec2<i32>, world_xz: vec2<f32>) -> vec3<f32> {
     if (mode == 21u) { return ramp(fine_at(world_xz).r, -0.05, 0.40); }
     if (mode == 22u) { return ramp(fine_at(world_xz).b, 0.0, 1.0); }
     if (mode == 23u) { return ramp(fine_at(world_xz).a, 0.0, 0.03); }
+    if (mode == 24u || mode == 25u) {
+        // Inside the 2 cm window its depth, outside the 20 cm film.
+        let wf = water_fine_at(world_xz);
+        var d = select(film.r, film.g, mode == 25u);
+        if (wf.x >= 0.0) { d = select(wf.x, wf.y, mode == 25u); }
+        return ramp(d, 0.0, 0.12);
+    }
     if (mode == 20u) {
         let mix = textureLoad(soil_mix, ij, 0);
         return vec3<f32>(
@@ -235,6 +265,14 @@ fn fs_debug(in: DebugOut) -> @location(0) vec4<f32> {
         }
         let t = clamp(n / 4.0, 0.0, 1.0);
         return vec4<f32>(t, 0.35 * t, 0.1, 1.0);
+    }
+    if (header.debug_mode == 24u || header.debug_mode == 25u) {
+        // Per fragment, so the 2 cm texels show inside a 20 cm quad.
+        let wf = water_fine_at(in.world_xz);
+        if (wf.x >= 0.0) {
+            let d = select(wf.x, wf.y, header.debug_mode == 25u);
+            return vec4<f32>(ramp(d, 0.0, 0.12), 1.0);
+        }
     }
     // Keep the header time in the compiled view so a stale uniform is visible
     // as a one-lsb shift, not as lighting.

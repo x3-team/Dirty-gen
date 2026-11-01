@@ -44,6 +44,31 @@ pub fn take_draw_stats() -> (u32, u64) {
     DRAW_STATS.with(|c| c.replace((0, 0)))
 }
 const MODEL_SLOTS: u64 = 12;
+/// Texels per side of the picture copy of contract binding 16.
+const WATER_FINE_RES: usize = 160;
+/// Depth that the 16-bit water/slurry pack maps to 1.0, metres.
+/// Matches `WATER_FINE_PACK_M` in shader.wgsl.
+const WATER_FINE_PACK_M: f32 = 0.5;
+
+/// `SILT_WATER_FINE=0` keeps the picture on the 20 cm sheet (the contract
+/// still publishes binding 16).
+#[cfg(not(target_arch = "wasm32"))]
+fn water_fine_picture_on() -> bool {
+    std::env::var("SILT_WATER_FINE").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn water_fine_picture_on() -> bool {
+    true
+}
+
+/// 0..1 to a 16-bit code, clamped; NaN is 0.
+fn pack_u16(v: f32) -> u16 {
+    if !(v > 0.0) {
+        return 0;
+    }
+    (v.min(1.0) * 65535.0 + 0.5) as u16
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -70,6 +95,9 @@ struct FrameData {
     /// x: water detail (0 low, 1 medium, 2 high). y: 1 when the water_fx
     /// texture holds a fluid sheet. z, w: 0.
     water_fx: [f32; 4],
+    /// 2 cm water window (contract binding 16): origin x, origin z, cell m,
+    /// 1 while live.
+    water_fine: [f32; 4],
 }
 
 #[repr(C)]
@@ -115,6 +143,9 @@ pub struct Renderer {
     /// Turbidity, foam and flow from the render contract, resampled on the
     /// soil grid. Zero without a fluid sheet.
     water_fx_tex: wgpu::Texture,
+    /// 2 cm water and slurry under the tires from contract binding 16,
+    /// 16-bit packed: RG water, BA slurry, over [`WATER_FINE_PACK_M`].
+    water_fine_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     /// Format of `color` and of the scene copies (see [`GpuFormats::scene`]).
@@ -210,6 +241,9 @@ pub struct Renderer {
     water_fx_scratch: Vec<u8>,
     /// True while the last upload carried a fluid sheet.
     water_fx_live: bool,
+    water_fine_scratch: Vec<u8>,
+    /// Origin x, origin z, cell, live, for the frame uniform.
+    water_fine_frame: [f32; 4],
     imprint_scratch: Vec<u8>,
     height_scratch: Vec<f32>,
     height_bytes: Vec<u8>,
@@ -597,6 +631,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Contract binding 16, the 2 cm water window, 16-bit packed.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -744,6 +789,20 @@ impl Renderer {
             size: wgpu::Extent3d {
                 width: MAP_RES as u32,
                 height: MAP_RES as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let water_fine_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("water-fine"),
+            size: wgpu::Extent3d {
+                width: WATER_FINE_RES as u32,
+                height: WATER_FINE_RES as u32,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -977,6 +1036,7 @@ impl Renderer {
             &scene_samp,
             &reflect_sample_view,
             &water_fx_tex,
+            &water_fine_tex,
             &tg_tex,
         );
         let tex_bg_pool_encode = build_tex_bg(
@@ -997,6 +1057,7 @@ impl Renderer {
             &scene_samp,
             &scene_color_view,
             &water_fx_tex,
+            &water_fine_tex,
             &tg_tex,
         );
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1437,6 +1498,7 @@ impl Renderer {
             mat_tex,
             crust_tex,
             water_fx_tex,
+            water_fine_tex,
             color,
             color_view,
             scene_format,
@@ -1517,6 +1579,8 @@ impl Renderer {
             // Flow 0 m/s is the byte 128.
             water_fx_scratch: [0u8, 0, 128, 128].repeat(MAP_RES * MAP_RES),
             water_fx_live: true,
+            water_fine_scratch: vec![0u8; WATER_FINE_RES * WATER_FINE_RES * 4],
+            water_fine_frame: [0.0; 4],
             imprint_scratch: vec![0; MAP_RES * MAP_RES * 4],
             height_scratch: vec![0.0; MAP_RES * MAP_RES * 2],
             height_bytes: vec![0; MAP_RES * MAP_RES * 4],
@@ -1771,6 +1835,7 @@ impl Renderer {
         }
         self.upload_soil(&world.soil);
         self.upload_water_fx(fluid.is_some());
+        self.upload_water_fine();
         let bike_susp = bike_suspension(&world.bike);
         let bike_susp_count = bike_susp.indices.len() as u32;
         self.queue
@@ -1871,6 +1936,7 @@ impl Renderer {
                 // 1: linear HDR scene target, tone curve in the tonemap pass.
                 if self.scene_format != LDR_FORMAT { 1.0 } else { 0.0 },
             ],
+            water_fine: self.water_fine_frame,
         };
         let mut frame = frame;
         if let Some(reflect_vp) = reflect_view_proj {
@@ -2543,6 +2609,54 @@ impl Renderer {
         );
     }
 
+    /// Pack contract binding 16 (2 cm water and slurry) into `water_fine_tex`.
+    /// Reads `contract_cpu` only, after `publish`. Skipped while the window
+    /// is not published; the frame uniform then says it is off.
+    fn upload_water_fine(&mut self) {
+        use silt::render_contract::{VALID_WATER_FINE, WATER_FINE_CELLS};
+        let header = &self.contract_cpu.header;
+        let live = header.valid & VALID_WATER_FINE != 0
+            && water_fine_picture_on()
+            && header.water_fine_res == WATER_FINE_CELLS
+            && WATER_FINE_CELLS as usize == WATER_FINE_RES;
+        if !live {
+            self.water_fine_frame = [0.0; 4];
+            return;
+        }
+        self.water_fine_frame = [
+            header.water_fine_origin_x,
+            header.water_fine_origin_z,
+            header.water_fine_cell_m,
+            1.0,
+        ];
+        let src = &self.contract_cpu.water_fine;
+        for (k, px) in self.water_fine_scratch.chunks_exact_mut(4).enumerate() {
+            let w = pack_u16(src[k * 2] / WATER_FINE_PACK_M);
+            let s = pack_u16(src[k * 2 + 1] / WATER_FINE_PACK_M);
+            px.copy_from_slice(&[(w >> 8) as u8, w as u8, (s >> 8) as u8, s as u8]);
+        }
+        let res = WATER_FINE_RES as u32;
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.water_fine_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.water_fine_scratch,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(res * 4),
+                rows_per_image: Some(res),
+            },
+            wgpu::Extent3d {
+                width: res,
+                height: res,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Resample the published turbidity, foam and flow onto the soil grid.
     /// Reads `contract_cpu` only, after `publish`. Nearest texel: the contract
     /// cell is 0.20 m and the soil cell 0.208 m, so the two grids are close
@@ -2722,6 +2836,7 @@ impl Renderer {
             &self.scene_samp,
             &self.reflect_sample_view,
             &self.water_fx_tex,
+            &self.water_fine_tex,
             &self.terrain_geom.bind_entries(),
         );
     }
@@ -3525,6 +3640,7 @@ fn build_tex_bg(
     scene_samp: &wgpu::Sampler,
     pool_reflect_view: &wgpu::TextureView,
     water_fx_tex: &wgpu::Texture,
+    water_fine_tex: &wgpu::Texture,
     tg: &[wgpu::BindGroupEntry<'_>; 2],
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3601,6 +3717,12 @@ fn build_tex_bg(
                 binding: 16,
                 resource: wgpu::BindingResource::TextureView(
                     &water_fx_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(
+                    &water_fine_tex.create_view(&Default::default()),
                 ),
             },
         ],
