@@ -76,9 +76,14 @@ fn wgsl_loop_bounds_under_cap() {
 
 #[test]
 fn shader_validates_and_runs_on_webgl2() {
-    let src =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shader.wgsl"))
-            .unwrap();
+    // The renderer compiles shader.wgsl with terrain_geom.wgsl appended
+    // (render.rs), so validate that same module.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = format!(
+        "{}\n{}",
+        std::fs::read_to_string(dir.join("shader.wgsl")).unwrap(),
+        std::fs::read_to_string(dir.join("terrain_geom.wgsl")).unwrap()
+    );
     let module = naga::front::wgsl::parse_str(&src).expect("shader.wgsl parses");
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
