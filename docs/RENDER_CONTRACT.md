@@ -1,6 +1,6 @@
 # Render contract
 
-Version **6**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, fog, headlights, and wet sheen are not maps in this contract.
+Version **7**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Turbidity is the A channel of binding 4, `VALID_TURBIDITY` bit 11 (`1 << 11`). Snow is binding 14, `VALID_SNOW` bit 14 (`1 << 14`).
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -27,7 +27,7 @@ Valid after the solver step that produced the frame, and until the next step. Th
 
 Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 96 bytes. Spray slot: `SprayGpu`, 48 bytes.
 
-`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 turbidity, 16 snow height, 17 snow density, 18 snow compaction). It is not a solver map. Changing which mode is on screen does not bump the version.
+`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 turbidity, 17 snow height, 18 snow density, 19 snow compaction). It is not a solver map. Changing which mode is on screen does not bump the version.
 
 | Binding | Name | Format | Channels | Units |
 |---|---|---|---|---|
@@ -43,9 +43,10 @@ Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `Cont
 | 9 | `foam_crest` | `rg32float` | R foam, G crest | 0..1, m |
 | 10 | `spray` | storage, read-only | `SprayGpu` × 4096 | see below |
 | 11 | `air_velocity` | `rgba32float` 3D | R +X, G +Y, B +Z, A 0 | m/s |
-| 12 | `snow` | `rgba32float` | R height, G density, B compaction, A 0 | m, kg/m³, 0..1, — |
+| 12 | `fog` | `r32float` 3D | R water volume fraction | m³/m³ |
+| 14 | `snow` | `rgba32float` | R height, G density, B compaction, A 0 | m, kg/m³, 0..1, — |
 
-Ground maps, including `snow`, are 200 × 200. `dust_fog` is not that grid. Spray is a buffer, not a grid.
+Ground maps, including `snow`, are 200 × 200. `dust_fog`, `air_velocity`, and `fog` share one air grid. Spray is a buffer, not a grid.
 
 ### Ground and rut — binding 1
 
@@ -62,6 +63,8 @@ Valid: `VALID_GROUND` is set on every publish.
 Pore moisture, 0 dry to 1 saturated. Not the film thickness.
 
 Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness. With both, the texel is the greater of the two. That is how a wet tire track painted on the soil stays in this map after the sheet is attached. The sheet keeps its own moisture as well: pore moisture is parked with the ground cell when the window follows the Niva, and a disk raised along the drained track is the same channel. Around the puddle the same channel is a wet band: saturated on the floor, still wet on the bank past the shoreline, then back to the pad. A hard step from saturated to the pad is not that band.
+
+On the river ford and beach (`silt::ford`), the sheet also writes the swash into this channel: a cell under at least 3 mm of film is saturated, and once the film has gone it drains back to the pad, sand fastest, silt three times slower, clay eight times slower. The dark band a receding wave leaves on the sand is this channel, not a picture effect. Same channel, same unit; the version does not change.
 
 Valid: `VALID_MOISTURE` is set on every publish.
 
@@ -141,9 +144,9 @@ Valid: `VALID_AIR` when `dust_source` is 1 or 2, the same publishes as `dust_fog
 
 Crust thickness and crack opening, both metres. Opening is the gap in the crust, not a second height and not a colour.
 
-Writer: the soil crust state. This sheet has no thickness or opening arrays, so both channels are 0 and `VALID_CRUST` is still set. A dry-crust soil kind is not a stand-in for either channel. When those arrays exist, the same binding carries them in metres. That fill does not bump the version.
+Writer: the soil `crust` and `crack` arrays, copied at the texel centre. R is thickness. G is opening. They are separate fields from the dry spell: opening is not a copy of thickness, and neither channel is added to ground height. Thickness is at most 0.05 m. Opening does not exceed that thickness. Off the soil square both channels are 0, because the fluid sheet has no thickness or opening arrays of its own and does not replace the soil sample. A dry-crust soil kind is not a stand-in for either channel. Cells that have not dried stay 0. This fill does not bump the version.
 
-Valid: every publish, including the zeros.
+Valid: every publish. A zero cell is a valid sample of ground that has no skin.
 
 ### Wet / dry edge — binding 8
 
@@ -159,15 +162,11 @@ Valid: `VALID_WET_EDGE` on every publish.
 
 Foam is a fraction from 0 to 1. Crest is a height in metres.
 
-Foam is 0 when the film is thinner than 4 mm. A dry cell, film under 0.01 mm, publishes foam 0. It does not publish NaN. Otherwise foam is the maximum of three readings of the same sheet, each from 0 to 1:
+Foam is 0 when the film is thinner than 4 mm. A dry cell, film under 0.01 mm, publishes foam 0. It does not publish NaN. Otherwise foam is the sheet's own fraction, 0 to 1, copied from the coarse window. The sheet builds that fraction where the free surface cuts a moving tire, where the film runs onto the shore, where the film's own Froude number is breaking, and where the film stands above its neighbours (a crest, smoothstep from 4 mm to 18 mm). The amount follows the shear and the impact, and the source shuts off as the fraction approaches 0.85, so a sustained breaker does not fill the cell to 1. A tire that is not moving adds none. The fraction is then carried with the film and decays. Only cells with at least 4 mm of film are visited. It is not a disc under the tire, and the publisher does not paint it.
 
-- Froude: a smoothstep of `speed / sqrt(9.81 * thickness)` from 0.85 to 1.45. Speed 0 stays 0.
-- Wave crest: a smoothstep of how far the film stands above the mean of its four in-window neighbours, from 4 mm to 18 mm.
-- Tires: the wet footprint of a tire that shoved the sheet on this step, full near the contact and 0 at 1.45 tire radii.
+Crest is the placed berm, metres, plus how far the film stands above the mean of its four in-window neighbours. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. On a dry cell the crest is that berm when the berm is finite, and 0 when there is no berm. A non-finite foam or crest sample is written as 0, not NaN.
 
-Crest is the placed berm, metres, plus that same film excess. A flat pond adds nothing. A bow or a berm does. Foam does not use the berm. On a dry cell the crest is that berm when the berm is finite, and 0 when there is no berm. A non-finite foam or crest sample is written as 0, not NaN.
-
-Writer: the publisher, from flow, film, placed height, and the tire shoves of the step that just ran. It does not feed back into the solver. This field did not exist on the sheet before version 1.
+Writer: the fluid sheet, then the publisher. The publisher does not feed the fraction back into the solver. Stirred silt is a separate column on that sheet, metres of bed soil lifted by the same shear. It is not this binding and it is not the standing slurry pour.
 
 Valid: `VALID_FOAM` on every publish. Without a fluid sheet, foam is 0. Crest from placed soil is still real.
 
@@ -204,7 +203,7 @@ Writer: the particle list, after the particle step, then the water drops the she
 
 Valid: `VALID_SPRAY` on every publish. A count of 0 is a valid empty frame. A non-finite position, velocity, mass, or age is written as 0.
 
-### Snow — binding 12
+### Snow — binding 14
 
 Geometric thickness, bulk density, and compaction of the snow column. Same 200 × 200 window, same texel centre. The snow solver's own grid is 192 × 192 over the same 40 m square, centred on the origin. Each texel copies the snow cell that contains its centre. It does not blend across cells. A virgin blanket cell is the constant column (blanket height, 130 kg/m³, compaction 0). Only a cell the solver has changed is read.
 
@@ -223,7 +222,7 @@ Without a snow field every texel is 0 and `VALID_SNOW` is clear. Those zeros are
 
 Writer: `publish_with_snow` when a `SnowField` is attached. `publish` passes none. The publisher does not step the snow solver and does not write back into it.
 
-Valid: `VALID_SNOW` is bit 12, set only when the field is attached. Bit 11 stays `VALID_TURBIDITY`. Bit 13 is `VALID_FOG` from main (binding 12). The header stays 96 bytes. There is no separate snow-source word. Debug modes 16, 17, and 18 show height, density, and compaction. Mode 15 stays turbidity. The picture cache does not gain a snow channel.
+Valid: `VALID_SNOW` is bit 14, set only when the field is attached. Bit 11 is `VALID_TURBIDITY`, bit 12 is reserved for the soil mix, bit 13 is `VALID_FOG` (binding 12). The header stays 96 bytes. There is no separate snow-source word. Debug modes 17, 18, and 19 show height, density, and compaction. Mode 15 is fog and mode 16 is turbidity. The picture cache does not gain a snow channel.
 
 ## Header flags
 
@@ -243,7 +242,8 @@ Valid: `VALID_SNOW` is bit 12, set only when the field is attached. Bit 11 stays
 | 9 | `VALID_SPRAY` | spray |
 | 10 | `VALID_AIR` | air velocity |
 | 11 | `VALID_TURBIDITY` | turbidity, only with the fluid sheet |
-| 12 | `VALID_SNOW` | snow height, density, compaction |
+| 13 | `VALID_FOG` | fog |
+| 14 | `VALID_SNOW` | snow height, density, compaction |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
 
@@ -292,16 +292,30 @@ The wet tire track does not bump this version either. Binding 2, pore moisture, 
 
 The rut's water surface does not bump this version either. Binding 1 R stays the pressed ground, bed plus placed. Binding 3 R is the water column on that ground. A rut connected to the puddle is filled up to the puddle surface and no higher. The original height is not the datum. Same channels, same units, same resolution.
 
-Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is set where the sheet is a wave or a tire footprint, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.
+Dry cells of flow and foam do not bump this version either. Binding 4 on a dry cell is `(0, 0)`, not NaN. Binding 9's foam channel is 0 on that cell, not NaN. A non-finite crest is 0. A finite placed berm on a dry cell stays in the crest channel. While the Niva is in the puddle, foam is the sheet fraction at the tire waterline, along the shore, and on a breaking crest, advected and decaying, and the spray buffer carries the water drops the sheet has peeled. The picture mesh does not draw those drops: the white dots around the bow were a ring, so that picture path stays empty on purpose. The contract buffer is not that picture. Same channels, same units, same resolution.
 
 ### 3
 
 Binding 4, `flow`, is `rgba32float`. R and G stay the flow vector, metres per second, +X and +Z. B is the flow speed, `hypot(vx, vz)`. A is turbidity, suspended-solids concentration in the water, 0..1.
 
-The wheel lifts solids behind the contact. The column advects with the flow vector. Dry water publishes 0, not NaN. Suspended mass is in the volume ledger: the live column, the part that settled out of a dry or over-full cell, and the part parked off the window. Those three sum to the volume the wheels lifted. `VALID_TURBIDITY` is bit 11, set with the fluid sheet. The header stays 96 bytes. Debug mode 5 reads the stored speed. Debug mode 15 reads turbidity.
+`dust_fog` and `air_velocity` are unchanged. Fog does not replace either channel and it does not add a velocity. With the dust ledger, `inject_fog` writes the scalar and the existing wind step plus `advect_density_by_air` move it. Without the ledger, `FluidCore::inject_fog` takes the water and the same wind step moves the slab. The header stays 96 bytes. Debug mode 15 shows this channel. Debug mode 13 remains airborne dust.
 
-### 4
+### 6
 
-`snow`, binding 12, `rgba32float`, 200 × 200. R is geometric snow thickness in metres. G is bulk density in kg/m³. B is compaction, 0..1, the solver's `(density − 130) / (260 − 130)`. A is 0. `VALID_SNOW` is bit 12, set only when a snow field is attached. Bit 11 stays turbidity. The header stays 96 bytes.
+Turbidity, from #99 (written as version 3 on its branch; fog had already taken 5 on `main`, so the merge is 6).
 
-The height channel is the column the snow solver already integrates. The tire rut is that column pressed down, the berm is the shoulder above the blanket, and the strip cut by the underbody is the shelf between the ruts. Density and compaction are the other two channels of the same cell, with their own units. A column under 0.1 mm publishes 0 on all three, not the fresh density left in an emptied cell. Off the snow square the texel is 0. Without a field the bit is clear and the zeros are not a blanket. Virgin blanket cells are the constant column; only cells the solver has changed are read. Debug modes 16, 17, and 18 show height, density, and compaction. The picture cache does not gain a snow channel.
+Binding 4, `flow`, is `rgba32float`. R and G stay the flow vector, metres per second, +X and +Z. B is the flow speed, `hypot(vx, vz)`. A is turbidity, suspended-solids concentration in the water, 0..1.
+
+The wheel lifts solids behind the contact. The column advects with the flow vector. Dry water publishes 0, not NaN. Suspended mass is in the volume ledger: the live column, the part that settled out of a dry or over-full cell, and the part parked off the window. Those three sum to the volume the wheels lifted. `VALID_TURBIDITY` is bit 11, set with the fluid sheet. The header stays 96 bytes. Debug mode 5 reads the stored speed. Debug mode 16 reads turbidity.
+
+Filling binding 7 from the soil drying arrays does not bump this version. R is crust thickness in metres, at most 0.05. G is crack opening in metres and does not exceed the thickness. The dry spell writes those arrays on clay. The bed, the placed pile, and the cloud stay put, so the skin is not extra solid mass and a fissure is not a cut. Sand and silt stay at 0. A dry-crust kind with empty arrays stays at 0. Same channels, same units, same resolution.
+
+Filling foam from the sheet does not bump this version. The channel, the unit, and the resolution are unchanged. A footprint mask is not the writer.
+
+### 7
+
+Snow, from #105 (written as version 6 with binding 13 and bit 12 on its branch; those were also claimed by the soil mix, so snow lands as version 7 on binding 14 and bit 14).
+
+`snow`, binding 14, `rgba32float`, 200 × 200. R is geometric snow thickness in metres. G is bulk density in kg/m³. B is compaction, 0..1, the solver's `(density − 130) / (260 − 130)`. A is 0. `VALID_SNOW` is bit 14, set only when a snow field is attached. Bit 11 stays turbidity. The header stays 96 bytes.
+
+The height channel is the column the snow solver already integrates. The tire rut is that column pressed down, the berm is the shoulder above the blanket, and the strip cut by the underbody is the shelf between the ruts. Density and compaction are the other two channels of the same cell, with their own units. A column under 0.1 mm publishes 0 on all three, not the fresh density left in an emptied cell. Off the snow square the texel is 0. Without a field the bit is clear and the zeros are not a blanket. Virgin blanket cells are the constant column; only cells the solver has changed are read. Debug modes 17, 18, and 19 show height, density, and compaction. The picture cache does not gain a snow channel.

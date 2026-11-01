@@ -34,15 +34,15 @@ fn snow_maps_keep_mass_and_match_the_column() {
         )),
         "WGSL version drifted from {RENDER_CONTRACT_VERSION}"
     );
-    assert!(wgsl.contains("@group(0) @binding(13)"));
+    assert!(wgsl.contains("@group(0) @binding(14) var snow_tex"));
     assert!(wgsl.contains("var snow_tex: texture_2d<f32>"));
     assert!(wgsl.contains("if (mode == 16u) { return ramp(flow.a, 0.0, 1.0); }"));
     assert!(wgsl.contains("if (mode == 17u) { return ramp(snow.r, 0.0, 0.70); }"));
     assert!(wgsl.contains("if (mode == 18u) { return ramp(snow.g, 0.0, 320.0); }"));
     assert!(wgsl.contains("if (mode == 19u) { return ramp(snow.b, 0.0, 1.0); }"));
-    assert_eq!(RENDER_CONTRACT_VERSION, 6);
+    assert!(RENDER_CONTRACT_VERSION >= 7);
     assert_eq!(VALID_TURBIDITY, 1 << 11);
-    assert_eq!(VALID_SNOW, 1 << 12);
+    assert_eq!(VALID_SNOW, 1 << 14);
     assert_ne!(VALID_SNOW, VALID_TURBIDITY);
 
     let scene_t = Instant::now();

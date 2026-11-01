@@ -1,0 +1,23 @@
+name: gpu-time
+
+# Manual only. Pull requests do not run this job. A software adapter or a
+# missing GPU exits 0 and does not print a millisecond number.
+on:
+  workflow_dispatch:
+
+jobs:
+  win-release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: Release build
+        run: cargo build --release
+      - name: GPU timestamps
+        shell: pwsh
+        run: |
+          & .\target\release\silt.exe capture --gpu-time
+          exit $LASTEXITCODE

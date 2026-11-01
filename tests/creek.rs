@@ -7,8 +7,7 @@ use glam::Vec3;
 use silt::fluid_core::{CoarseCell, FluidCore, StreamCycle, COARSE_CELL_M, WINDOW_RES};
 use silt::particles::Particle;
 use silt::render_contract::{
-    publish, ContractFrame, FLOW_CHANNELS, FLOW_FLUID_SHEET, RENDER_CONTRACT_VERSION,
-    VALID_FLOW,
+    publish, ContractFrame, FLOW_CHANNELS, FLOW_FLUID_SHEET, RENDER_CONTRACT_VERSION, VALID_FLOW,
 };
 use silt::soil::{SoilField, SurfaceKind};
 use silt::vehicle::Vehicle;

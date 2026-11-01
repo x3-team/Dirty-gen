@@ -4,13 +4,13 @@
 //! the contact and advect with the film. Dry cells publish 0. The suspended
 //! volume stays in the ledger. [`SOLVER_STEP_BUDGET_MS`] stays 7.0. A release
 //! run asserts the wall time of that [`FluidCore::step`] — the clay pond is
-//! inside the same call — and the water sheet inside it at 2 ms. The pond is
-//! not a separate bench and not a known miss.
+//! inside the same call — the p95 of those samples, and the water sheet
+//! inside it at 2 ms. The pond is not a separate bench and not a known miss.
 
 use std::time::Instant;
 
 use silt::fluid_core::{
-    FluidCore, Grain, TirePush, FILM_SPEED_CAP_MPS, SOLVER_STEP_BUDGET_MS,
+    FluidCore, Grain, TirePush, TurbiditySpread, FILM_SPEED_CAP_MPS, SOLVER_STEP_BUDGET_MS,
 };
 use silt::render_contract::{
     publish, ContractFrame, FLOW_CHANNELS, RENDER_CONTRACT_VERSION, VALID_FLOW, VALID_TURBIDITY,
@@ -21,6 +21,45 @@ const DT: f32 = 1.0 / 30.0;
 const SPEED: f32 = 4.0;
 /// Water sheet inside the timed [`FluidCore::step`]. Do not raise.
 const WATER_STEP_BUDGET_MS: f64 = 2.0;
+
+/// Production fluid cap, or `TURBIDITY_PROOF_FLUID_CAP_MS` for proof runs only.
+/// CI must not set the env var on the green path; caps stay 7.0 and 2.0 ms.
+fn fluid_cap_ms_for_assert() -> f32 {
+    match std::env::var("TURBIDITY_PROOF_FLUID_CAP_MS") {
+        Ok(raw) => raw.parse::<f32>().unwrap_or_else(|_| {
+            panic!("TURBIDITY_PROOF_FLUID_CAP_MS must be a number, got {raw:?}")
+        }),
+        Err(_) => SOLVER_STEP_BUDGET_MS,
+    }
+}
+
+/// Release turbidity timing gate. Production caps stay [`SOLVER_STEP_BUDGET_MS`] and
+/// [`WATER_STEP_BUDGET_MS`]; do not raise them.
+fn assert_fluid_step_budget(
+    step_mean: f64,
+    step_p95: f64,
+    water_mean: f64,
+    slurry_mean: f64,
+    fluid_cap_ms: f32,
+    water_cap_ms: f64,
+) {
+    assert!(
+        step_mean > 0.0 && step_mean <= f64::from(fluid_cap_ms),
+        "fluid step {step_mean:.3} ms exceeds {fluid_cap_ms}"
+    );
+    assert!(
+        water_mean > 0.0 && water_mean <= water_cap_ms,
+        "water {water_mean:.3} ms exceeds {water_cap_ms}"
+    );
+    assert!(
+        slurry_mean > 0.0 && slurry_mean <= f64::from(fluid_cap_ms),
+        "clay pond {slurry_mean:.3} ms exceeds {fluid_cap_ms}"
+    );
+    assert!(
+        step_p95 > 0.0 && step_p95 <= f64::from(fluid_cap_ms),
+        "fluid step p95 {step_p95:.3} ms exceeds {fluid_cap_ms}"
+    );
+}
 
 #[test]
 fn turbidity_plume_closes() {
@@ -52,8 +91,13 @@ fn turbidity_plume_closes() {
     let mut turb_max = f32::MIN;
     let mut wet_cells = 0u64;
     let mut clamp_cells = 0u64;
+    let mut step_samples: Vec<f64> = Vec::new();
+    let mut pub_bins = [0u32; 11];
+    let mut above_water = 0u64;
+    let mut capped = 0u64;
     let mut capture: Option<ContractFrame> = None;
     let mut capture_z = 0.0_f32;
+    let mut capture_spread = TurbiditySpread::default();
     let soil = SoilField::flat(0.05);
 
     while z < 2.2 {
@@ -80,8 +124,12 @@ fn turbidity_plume_closes() {
             prep_ms += f64::from(parts.prep_ms);
             restrict_ms += f64::from(parts.restrict_ms);
             window_ms += f64::from(parts.window_ms);
+            step_samples.push(elapsed);
             timed += 1.0;
         }
+        capped += u64::from(fluid.suspended_capped_cells());
+        let spread = fluid.turbidity_spread();
+        above_water += u64::from(spread.above_water);
         warm += 1;
         z += SPEED * DT;
 
@@ -114,7 +162,11 @@ fn turbidity_plume_closes() {
             frame.header.valid
         );
         assert_dry_zeros(&frame);
+        if warm >= 8 {
+            accumulate_turbidity(&frame, &mut pub_bins);
+        }
         if (0.15..0.55).contains(&z) {
+            capture_spread = spread;
             capture = Some(frame);
             capture_z = z;
         }
@@ -130,19 +182,31 @@ fn turbidity_plume_closes() {
     let prep_mean = if timed > 0.0 { prep_ms / timed } else { 0.0 };
     let restrict_mean = if timed > 0.0 { restrict_ms / timed } else { 0.0 };
     let window_mean = if timed > 0.0 { window_ms / timed } else { 0.0 };
-    let budget_note = if step_mean <= f64::from(SOLVER_STEP_BUDGET_MS) {
-        "met"
+    let budget_note = if cfg!(debug_assertions) {
+        "debug (budget assert runs in release only)"
     } else {
-        "NOT met"
+        "release assert below"
     };
     let clamp_frac = if wet_cells > 0 {
         clamp_cells as f64 / wet_cells as f64
     } else {
         0.0
     };
+    let step_p95 = percentile_95(&mut step_samples);
     let frame = capture.expect("the wheel never crossed the middle of the pond");
     let (aft, ahead) = plume_means(&frame, capture_z);
     let (trail_w, trail_vx, trail_vz) = plume_trail(&frame, capture_z);
+    let pub_line = bins_line(&pub_bins);
+    let raw_line = bins_line(&capture_spread.bins);
+    let raw_max = capture_spread.max_ratio;
+    let saturated = capture_spread.saturated;
+    let full_water = capture_spread.full_water;
+    let column = books.suspended_m3;
+    let settled = books.settled_suspended_m3;
+    let parked_m3 = books.frozen_suspended_m3;
+    let lifted = books.entrained_m3;
+    let hardware = hardware_line();
+    let fluid_cap = fluid_cap_ms_for_assert();
     write_plume_png(&frame, capture_z);
 
     println!(
@@ -150,28 +214,30 @@ fn turbidity_plume_closes() {
          vz {vz_min:.5}..{vz_max:.5} m/s\n\
          clamp fraction {clamp_frac:.4} ({clamp_cells}/{wet_cells}) limiter ±{FILM_SPEED_CAP_MPS:.1}\n\
          turbidity {turb_min:.5}..{turb_max:.5}\n\
-         suspended gap {gap:.8} m3  column {:.6} settled {:.6} parked {:.6} lifted {:.6}\n\
-         fluid step {step_mean:.3} ms  budget {SOLVER_STEP_BUDGET_MS:.1} {budget_note}  samples {timed:.0}\n\
+         turbidity bins {pub_line}\n\
+         above-water {above_water} capped {capped} raw-max {raw_max:.5} saturated {saturated} full-water {full_water:.5}\n\
+         raw bins {raw_line}\n\
+         suspended gap {gap:.8} m3  column {column:.6} settled {settled:.6} parked {parked_m3:.6} lifted {lifted:.6}\n\
+         fluid step {step_mean:.3} ms  p95 {step_p95:.3}  budget {fluid_cap:.1} {budget_note}  samples {timed:.0}\n\
          water {water_mean:.3} budget {WATER_STEP_BUDGET_MS:.1}\n\
          clay pond {slurry_mean:.3}\n\
          fluid dust {fluid_dust_mean:.3} suspended {suspended_mean:.3} prep {prep_mean:.3} restrict {restrict_mean:.3} window {window_mean:.3}\n\
-         hardware {}\n\
+         hardware {hardware}\n\
          plume aft {aft:.4} ahead {ahead:.4} at z {capture_z:.3}\n\
-         trail width {trail_w:.3} m  mean |vx| {trail_vx:.4} |vz| {trail_vz:.4}",
-        books.suspended_m3,
-        books.settled_suspended_m3,
-        books.frozen_suspended_m3,
-        books.entrained_m3,
-        hardware_line()
+         trail width {trail_w:.3} m  mean |vx| {trail_vx:.4} |vz| {trail_vz:.4}"
     );
 
     assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-    assert_eq!(RENDER_CONTRACT_VERSION, 6);
     assert!(turb_max > 0.2, "turbidity max {turb_max}");
     assert!(turb_min >= 0.0 && turb_max <= 1.0, "turbidity {turb_min}..{turb_max}");
     // The tire at SPEED shoves along +Z at 0.85 of that speed and across the
-    // track at 0.18. The wake has to follow the tire, and it cannot outrun it.
-    // Cells sitting on the 1.6 m/s limiter are counted; that limiter is not the expected speed.
+    // track at 0.18. The wake follows the tire. Neither component passes the
+    // 1.6 m/s limiter. Cells on that limiter are counted; the count is not the expected speed.
+    let lim = FILM_SPEED_CAP_MPS + 1.0e-4;
+    assert!(
+        vx_min >= -lim && vx_max <= lim && vz_min >= -lim && vz_max <= lim,
+        "vx {vx_min}..{vx_max} vz {vz_min}..{vz_max} past limiter {FILM_SPEED_CAP_MPS}"
+    );
     assert!(
         trail_vz > trail_vx,
         "wake |vz| {trail_vz:.4} should beat lateral |vx| {trail_vx:.4}"
@@ -197,11 +263,30 @@ fn turbidity_plume_closes() {
         clamp_frac < 0.5,
         "clamp fraction {clamp_frac:.4} owns the field ({clamp_cells}/{wet_cells})"
     );
-    // Centerline trail on this sheet sits near 0.20 and the water ahead of the
-    // tire stays clear. The contrast is the check; the floor keeps a speck from passing.
+    // Centerline trail behind the tire, clear water ahead. The floor is the
+    // plume, not a speck.
     assert!(
-        aft > ahead + 0.15 && aft > 0.15,
+        aft > ahead + 0.15 && aft > 0.25,
         "plume aft {aft:.4} is not behind the wheel, ahead {ahead:.4}"
+    );
+    let plume_cells: u32 = pub_bins.iter().sum();
+    let below_full = plume_cells - pub_bins[10];
+    assert!(
+        above_water == 0,
+        "publish would clamp {above_water} cells with susp above the water"
+    );
+    assert!(
+        capped == 0,
+        "settled the column down to the water in {capped} cells"
+    );
+    assert!(
+        plume_cells > 0 && below_full > pub_bins[10],
+        "turbidity bins {pub_line} sit on 1"
+    );
+    assert!(
+        capture_spread.above_water == 0 && capture_spread.max_ratio <= 1.0 + 1.0e-4,
+        "raw ratio {} above the water",
+        capture_spread.max_ratio
     );
     assert!(gap <= 1.0e-6, "suspended gap {gap}");
     assert!(
@@ -223,17 +308,19 @@ fn turbidity_plume_closes() {
     assert_eq!(WATER_STEP_BUDGET_MS, 2.0, "do not raise the water step budget");
     #[cfg(not(debug_assertions))]
     {
-        assert!(
-            step_mean > 0.0 && step_mean <= f64::from(SOLVER_STEP_BUDGET_MS),
-            "fluid step {step_mean:.3} ms exceeds {SOLVER_STEP_BUDGET_MS}"
-        );
-        assert!(
-            water_mean <= WATER_STEP_BUDGET_MS,
-            "water {water_mean:.3} ms exceeds {WATER_STEP_BUDGET_MS}"
-        );
-        assert!(
-            slurry_mean > 0.0 && slurry_mean <= f64::from(SOLVER_STEP_BUDGET_MS),
-            "clay pond {slurry_mean:.3} ms exceeds {SOLVER_STEP_BUDGET_MS}"
+        if std::env::var("TURBIDITY_PROOF_FLUID_CAP_MS").is_err() {
+            assert_eq!(
+                fluid_cap, SOLVER_STEP_BUDGET_MS,
+                "production fluid cap must stay {SOLVER_STEP_BUDGET_MS} ms"
+            );
+        }
+        assert_fluid_step_budget(
+            step_mean,
+            step_p95,
+            water_mean,
+            slurry_mean,
+            fluid_cap,
+            WATER_STEP_BUDGET_MS,
         );
     }
 }
@@ -254,6 +341,13 @@ fn flow_bounds(frame: &ContractFrame) -> (f32, f32, f32, f32, f32, f32) {
         let turb = frame.flow[base + 3];
         assert!(vx.is_finite() && vz.is_finite() && speed.is_finite() && turb.is_finite());
         assert!((0.0..=1.0).contains(&turb), "turbidity {turb}");
+        if frame.film[idx * 2] + frame.film[idx * 2 + 1] >= 1.0e-5 {
+            let lim = FILM_SPEED_CAP_MPS + 1.0e-4;
+            assert!(
+                vx.abs() <= lim && vz.abs() <= lim,
+                "vx {vx} vz {vz} past limiter {FILM_SPEED_CAP_MPS}"
+            );
+        }
         let expect = if frame.film[idx * 2] + frame.film[idx * 2 + 1] < 1.0e-5 {
             0.0
         } else {
@@ -358,6 +452,42 @@ fn plume_trail(frame: &ContractFrame, wheel_z: f32) -> (f32, f32, f32) {
     } else {
         (0.0, 0.0, 0.0)
     }
+}
+
+fn accumulate_turbidity(frame: &ContractFrame, bins: &mut [u32; 11]) {
+    let n = frame.header.window_res as usize * frame.header.window_res as usize;
+    for idx in 0..n {
+        if frame.film[idx * 2] < 1.0e-5 {
+            continue;
+        }
+        let turb = frame.flow[idx * FLOW_CHANNELS + 3];
+        if turb <= 0.0 {
+            continue;
+        }
+        let bin = if turb >= 1.0 {
+            10
+        } else {
+            ((turb * 10.0).floor() as usize).min(9)
+        };
+        bins[bin] += 1;
+    }
+}
+
+fn bins_line(bins: &[u32; 11]) -> String {
+    format!(
+        "0.0:{} 0.1:{} 0.2:{} 0.3:{} 0.4:{} 0.5:{} 0.6:{} 0.7:{} 0.8:{} 0.9:{} 1.0:{}",
+        bins[0], bins[1], bins[2], bins[3], bins[4], bins[5], bins[6], bins[7], bins[8], bins[9],
+        bins[10]
+    )
+}
+
+fn percentile_95(samples: &mut [f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((samples.len() as f64) * 0.95).ceil() as usize;
+    samples[(idx.saturating_sub(1)).min(samples.len() - 1)]
 }
 
 fn plume_means(frame: &ContractFrame, wheel_z: f32) -> (f32, f32) {

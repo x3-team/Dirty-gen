@@ -16,7 +16,7 @@ use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 6;
+pub const RENDER_CONTRACT_VERSION: u32 = 7;
 
 /// Floats per flow texel: vx, vz, speed, turbidity.
 pub const FLOW_CHANNELS: usize = 4;
@@ -71,7 +71,7 @@ pub const VALID_FOAM: u32 = 1 << 8;
 pub const VALID_SPRAY: u32 = 1 << 9;
 pub const VALID_AIR: u32 = 1 << 10;
 pub const VALID_TURBIDITY: u32 = 1 << 11;
-pub const VALID_SNOW: u32 = 1 << 12;
+pub const VALID_SNOW: u32 = 1 << 14;
 pub const VALID_FOG: u32 = 1 << 13;
 
 pub const BIND_HEADER: u32 = 0;
@@ -87,7 +87,7 @@ pub const BIND_FOAM: u32 = 9;
 pub const BIND_SPRAY: u32 = 10;
 pub const BIND_AIR: u32 = 11;
 pub const BIND_FOG: u32 = 12;
-pub const BIND_SNOW: u32 = 13;
+pub const BIND_SNOW: u32 = 14;
 
 /// Uniform header. 96 bytes. Layout matches `ContractHeader` in the WGSL.
 ///
@@ -209,31 +209,6 @@ pub fn foam_fraction(speed_m_s: f32, thickness_m: f32) -> f32 {
     finite0(smooth01(FOAM_FROUDE_0, FOAM_FROUDE_1, froude))
 }
 
-/// Foam on a lip that stands above the neighbouring film. Not the placed berm.
-fn crest_foam(excess_m: f32, thickness_m: f32) -> f32 {
-    if !excess_m.is_finite() || thickness_m < FOAM_MIN_FILM_M {
-        return 0.0;
-    }
-    smooth01(0.004, 0.018, excess_m)
-}
-
-/// Foam in the wet footprint of a tire that shoved the sheet this step.
-fn tire_foam(x: f32, z: f32, thickness_m: f32, pushes: &[crate::fluid_core::TirePush]) -> f32 {
-    if thickness_m < FOAM_MIN_FILM_M {
-        return 0.0;
-    }
-    let mut best = 0.0f32;
-    for push in pushes {
-        let reach = (push.radius * 1.45).max(0.2);
-        let d = (x - push.x).hypot(z - push.z);
-        if d >= reach {
-            continue;
-        }
-        best = best.max(smooth01(0.05, 0.55, 1.0 - d / reach));
-    }
-    best
-}
-
 fn finite0(v: f32) -> f32 {
     if v.is_finite() {
         v
@@ -334,7 +309,7 @@ fn write_snow_binding(dst: &mut [f32], snow: &SnowField, origin_x: f32, origin_z
 /// through-drive sheet is attached, the fluid window and the dust ledger.
 ///
 /// Does not step the solver and does not write back into it. Snow stays empty:
-/// pass the field to [`publish_with_snow`] to fill binding 13.
+/// pass the field to [`publish_with_snow`] to fill binding 14.
 pub fn publish(
     out: &mut ContractFrame,
     soil: &SoilField,
@@ -408,8 +383,19 @@ pub fn publish_with_snow(
             } else {
                 (0.0, 0.0, 0.0)
             };
-            // Crust thickness and crack opening stay 0. [`SOIL_KIND_DRY_CRUST`]
-            // is not written into this map.
+            // Thickness and opening are the soil arrays, in metres. They are
+            // not added to ground. A dry-crust kind is not a stand-in, and the
+            // sheet has no arrays of its own, so a texel off the soil stays 0.
+            let (thickness, opening) = if let Some(sidx) = soil_idx {
+                (
+                    finite0(soil.crust[sidx].max(0.0)),
+                    finite0(soil.crack[sidx].max(0.0)),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            out.crust[idx * 2] = thickness;
+            out.crust[idx * 2 + 1] = opening;
             out.ground_rut[idx * 4] = finite0(bed + placed);
             out.ground_rut[idx * 4 + 1] = finite0(rut);
             out.ground_rut[idx * 4 + 2] = finite0(bed);
@@ -538,22 +524,11 @@ pub fn publish_with_snow(
             let mean = if count > 0.0 { sum / count } else { h };
             let excess = finite0((h - mean).max(0.0));
             let placed = finite0(out.ground_rut[idx * 4 + 3].max(0.0));
-            let u = out.flow[idx * FLOW_CHANNELS];
-            let v = out.flow[idx * FLOW_CHANNELS + 1];
-            let speed = if u.is_finite() && v.is_finite() {
-                (u * u + v * v).sqrt()
-            } else {
-                0.0
-            };
-            let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
-            let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
             let foam = match fluid {
-                Some(fluid) => foam_fraction(speed, h)
-                    .max(crest_foam(excess, h))
-                    .max(tire_foam(x, z, h, fluid.tire_pushes())),
-                None => foam_fraction(speed, h),
+                Some(fluid) if h >= FOAM_MIN_FILM_M => finite0(fluid.foam_grid()[idx]).clamp(0.0, 1.0),
+                _ => 0.0,
             };
-            out.foam_crest[idx * 2] = finite0(foam);
+            out.foam_crest[idx * 2] = foam;
             out.foam_crest[idx * 2 + 1] = finite0(placed + excess);
         }
     }
@@ -1293,10 +1268,17 @@ mod tests {
         assert!(wgsl.contains("@group(0) @binding(11)"));
         assert!(wgsl.contains("@group(0) @binding(12)"));
         assert!(wgsl.contains("var fog_mist: texture_3d<f32>"));
-        assert!(wgsl.contains("@group(0) @binding(13)"));
+        assert_eq!(VALID_FOG, 1 << 13);
+        assert_eq!(BIND_FOG, 12);
+        assert_ne!(VALID_FOG, 1 << 11);
+        assert_ne!(VALID_FOG, 1 << 12);
+        assert!(wgsl.contains("@group(0) @binding(14)"));
         assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
         assert!(wgsl.contains("var snow_tex: texture_2d<f32>"));
+        assert_eq!(VALID_SNOW, 1 << 14);
+        assert_eq!(BIND_SNOW, 14);
         assert!(wgsl.contains("flow.a"));
+        assert!(wgsl.contains("flow.b"));
         let air_row = padded_row_bytes(AIR_CELLS, 4);
         assert_eq!(air_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
         assert!(!wgsl.contains("height_tex"));
@@ -1380,8 +1362,93 @@ mod tests {
         );
         assert!((spray.vel_age[3] - 0.75).abs() < 1.0e-4);
         assert_eq!(spray.material, 0);
-        assert!(frame.crust.iter().all(|c| *c == 0.0));
+        assert!(
+            frame.crust.iter().all(|c| *c == 0.0),
+            "a dry-crust kind with empty arrays is not the field"
+        );
         assert_eq!(SOIL_KIND_DRY_CRUST, 3);
+    }
+
+    #[test]
+    fn crust_arrays_publish_in_metres_and_stay_off_the_ground() {
+        let mut soil = SoilField::flat(0.1);
+        assert_eq!(soil.kind[0], SOIL_KIND_DRY_CRUST);
+        let idx = soil.idx_at(0.25, -0.15).expect("cell");
+        soil.bed[idx] = 0.40;
+        soil.placed[idx] = 0.03;
+        soil.crust[idx] = 0.021;
+        soil.crack[idx] = 0.007;
+        let mut frame = ContractFrame::new();
+        publish(&mut frame, &soil, &[], [0.0, 0.0], 2.0, 7, None, None);
+        assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
+        assert_eq!(frame.header.valid & VALID_CRUST, VALID_CRUST);
+        assert_published_crust(&soil, &frame);
+
+        let mut fluid = crate::fluid_core::FluidCore::new([0.0, 0.0]);
+        let _ = fluid.step(1.0 / 60.0);
+        let mut with_sheet = ContractFrame::new();
+        publish(
+            &mut with_sheet,
+            &soil,
+            &[],
+            [0.0, 0.0],
+            2.0,
+            8,
+            Some(&fluid),
+            None,
+        );
+        assert_eq!(with_sheet.header.version, RENDER_CONTRACT_VERSION);
+        assert_published_crust(&soil, &with_sheet);
+    }
+
+    fn assert_published_crust(soil: &SoilField, frame: &ContractFrame) {
+        let res = frame.header.window_res as usize;
+        let mut hit = false;
+        let mut kind_only = 0u32;
+        let mut ground_err = 0.0f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = frame.header.origin_x + (i as f32 + 0.5) * frame.header.cell_m;
+                let z = frame.header.origin_z + (j as f32 + 0.5) * frame.header.cell_m;
+                let Some(sidx) = soil.idx_at(x, z) else {
+                    continue;
+                };
+                let cidx = j * res + i;
+                let thickness = frame.crust[cidx * 2];
+                let opening = frame.crust[cidx * 2 + 1];
+                assert!(
+                    (thickness - soil.crust[sidx]).abs() < 1.0e-6,
+                    "thickness {thickness} soil {}",
+                    soil.crust[sidx]
+                );
+                assert!(
+                    (opening - soil.crack[sidx]).abs() < 1.0e-6,
+                    "opening {opening} soil {}",
+                    soil.crack[sidx]
+                );
+                let ground = frame.ground_rut[cidx * 4];
+                let expect = soil.bed[sidx] + soil.placed[sidx];
+                ground_err = ground_err.max((ground - expect).abs());
+                if (soil.crust[sidx] - 0.021).abs() < 1.0e-6
+                    && (soil.crack[sidx] - 0.007).abs() < 1.0e-6
+                {
+                    hit = true;
+                    assert!((thickness - 0.021).abs() < 1.0e-6, "thickness {thickness}");
+                    assert!((opening - 0.007).abs() < 1.0e-6, "opening {opening}");
+                    assert!(
+                        (ground - (expect + thickness)).abs() > 0.01,
+                        "ground absorbed the skin"
+                    );
+                } else if soil.crust[sidx] == 0.0 && soil.crack[sidx] == 0.0 {
+                    kind_only += 1;
+                    assert_eq!(thickness, 0.0);
+                    assert_eq!(opening, 0.0);
+                }
+            }
+        }
+        assert!(hit, "the painted cell missed the window");
+        assert!(kind_only > 100, "kind-only cells {kind_only}");
+        assert!(ground_err < 1.0e-5, "ground moved by {ground_err}");
     }
 
     #[test]
@@ -1509,7 +1576,6 @@ mod tests {
             None,
         );
         assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-        assert_eq!(RENDER_CONTRACT_VERSION, 6);
         let res = frame.header.window_res as usize;
         let mut moist = 0.0_f32;
         let mut n = 0.0_f32;
