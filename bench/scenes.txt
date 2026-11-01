@@ -36,5 +36,5 @@ beach-rock    river    6.0  car   -7.0 2.0 4.0     2.0 0.2 -3.0   ue5-99.jpg   S
 wade-swash    wade     4.0  walker -3.5 1.8 -2.6    1.2 0.35 0.2   ue5-98.jpg   Beach: person wading the swash
 wade-buoys    wade     6.5  world  -1.0 2.4 -7.5    1.8 0.0 -0.3   ue5-100.jpg  Sea: person and buoys in the shallows
 wade-rock     wade     8.0  walker -2.6 1.3 2.4     1.0 0.4 -0.4   ue5-99.jpg   Beach: shallows around a rock
-turbid-water  missing  0    car    0 0 0           0 0 0          ue5-100.jpg  Open muddy water with turbidity: no open-water scene yet
+turbid-water  river   12.0  car   -9.0 4.0 -3.0    3.0 0.0 1.0    ue5-100.jpg  Turbid water: silt plume behind the wheels drifting downstream, foam at rocks and shore
 smoke-column  missing  0    car    0 0 0           0 0 0          ue5-89.jpg   Smoke column in still air: no point-source smoke yet (dust & fog thread)
