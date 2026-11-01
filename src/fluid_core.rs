@@ -309,6 +309,12 @@ pub struct RiverReach {
     pub inlet_eta: f32,
     pub outlet_eta: f32,
     pub inlet_speed_m_s: f32,
+    /// Suspended solids the inflow carries, volume of solids over volume of
+    /// water (0 a clear river, 0.05–0.15 a brown flood river). The inlet
+    /// rows are held at this concentration; the solids are booked as
+    /// `entrained_m3` like the wheel's, settle at the same fall speed and
+    /// leave through the outlet with the water.
+    pub inlet_turbidity: f32,
 }
 
 /// Water as a river, not a film in a rut.
@@ -7534,6 +7540,12 @@ impl FluidCore {
             }
         }
         // Inlet: fill from the bank toward the stage and push the water in.
+        let inflow_c = if self.turbidity_enabled && r.inlet_turbidity.is_finite() {
+            r.inlet_turbidity.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let mut inflow_m3 = 0.0f64;
         let mut deep = 0.0f32;
         for cross in c0..c1 {
             let idx = at(row(0), cross);
@@ -7561,8 +7573,55 @@ impl FluidCore {
                 let speed = r.inlet_speed_m_s * (self.water[idx] / deep).clamp(0.0, 1.0).sqrt();
                 self.uw[idx] = speed * dx;
                 self.vw[idx] = speed * dz;
+                if inflow_c > 0.0 {
+                    let w = self.water[idx];
+                    let want = inflow_c * w;
+                    let have = self.susp[idx];
+                    if w >= 1.0e-5 && have.is_finite() && have < want {
+                        self.susp[idx] = want;
+                        inflow_m3 += f64::from((want - have) * area);
+                    }
+                }
             }
         }
+        self.entrained_m3 += inflow_m3 as f32;
+    }
+
+    /// Hold `fraction` of the water column as suspended solids on every wet
+    /// coarse cell inside the box, as if the water had arrived carrying it.
+    /// Solids added are booked as `entrained_m3`. Returns cubic metres added.
+    pub fn suspend_uniform(&mut self, fraction: f32, x0: f32, x1: f32, z0: f32, z1: f32) -> f32 {
+        let c = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+        if c <= 0.0 {
+            return 0.0;
+        }
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut added = 0.0f64;
+        for j in 0..WINDOW_RES {
+            let z = self.origin[1] + (j as f32 + 0.5) * COARSE_CELL_M;
+            if z < z0 || z > z1 {
+                continue;
+            }
+            for i in 0..WINDOW_RES {
+                let x = self.origin[0] + (i as f32 + 0.5) * COARSE_CELL_M;
+                if x < x0 || x > x1 {
+                    continue;
+                }
+                let idx = j * WINDOW_RES + i;
+                let w = self.water[idx];
+                if !w.is_finite() || w < 1.0e-5 {
+                    continue;
+                }
+                let want = c * w;
+                let have = self.susp[idx];
+                if have.is_finite() && have < want {
+                    self.susp[idx] = want;
+                    added += f64::from((want - have) * area);
+                }
+            }
+        }
+        self.entrained_m3 += added as f32;
+        added as f32
     }
 
     /// Saturate the ground under the film and drain it once the film has gone.
