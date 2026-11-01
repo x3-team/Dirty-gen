@@ -30,6 +30,9 @@ const DRIVE_SOLVER_BUDGET_MS: f64 = 7.0;
 /// Release dust row. Do not raise.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 const DRIVE_DUST_BUDGET_MS: f64 = 1.0;
+/// Release water row of [`ThroughDrive::step`]. Do not raise.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const DRIVE_WATER_BUDGET_MS: f64 = 2.0;
 /// Release p95 of one `ThroughDrive::step`. Do not raise.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 const DRIVE_P95_BUDGET_MS: f64 = 7.0;
@@ -389,6 +392,7 @@ fn e2e_niva() {
         let t0 = Instant::now();
         dust.step_pads(&tires, &moisture, &water, DT);
         fluid.step(DT);
+        stretch_hold(t0);
         let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
         if step_i >= 20 {
             step_ms += elapsed;
@@ -683,6 +687,7 @@ fn e2e_niva() {
         final_books.gap,
         max_gap
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     assert!(
         (puddle_n - 18.0).abs() < 0.5,
@@ -812,12 +817,12 @@ fn e2e_niva() {
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        step_mean <= E2E_STEP_BUDGET_MS,
+        gate_median() || step_mean <= E2E_STEP_BUDGET_MS,
         "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} on {hardware}"
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        air_mean <= AIR_RELEASE_BUDGET_MS,
+        gate_median() || air_mean <= AIR_RELEASE_BUDGET_MS,
         "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
     );
     #[cfg(not(debug_assertions))]
@@ -873,6 +878,7 @@ fn print_through_drive() {
          DRIVE_SHEET_REST ms={:.3}\n\
          DRIVE_OTHER ms={:.3}\n\
          DRIVE_SOLVER ms={solver:.3}\n\
+         DRIVE_WATER_BUDGET ms={DRIVE_WATER_BUDGET_MS:.3}\n\
          DRIVE_SOLVER_BUDGET ms={DRIVE_SOLVER_BUDGET_MS:.3}\n\
          DRIVE_P95_BUDGET ms={DRIVE_P95_BUDGET_MS:.3}\n\
          DRIVE_DUST_BUDGET ms={DRIVE_DUST_BUDGET_MS:.3}",
@@ -888,22 +894,47 @@ fn print_through_drive() {
         acc.sheet_rest_ms / k,
         acc.other_ms / k,
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let water = acc.water_ms / k;
     let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
-    assert!(
-        solver <= DRIVE_SOLVER_BUDGET_MS,
-        "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        p95 <= DRIVE_P95_BUDGET_MS,
-        "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
-    );
-    #[cfg(not(debug_assertions))]
-    assert!(
-        dust <= DRIVE_DUST_BUDGET_MS,
-        "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
-    );
+    if !gate_median() {
+        assert!(
+            solver <= DRIVE_SOLVER_BUDGET_MS,
+            "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
+        );
+        assert!(
+            p95 <= DRIVE_P95_BUDGET_MS,
+            "DRIVE_P95 {p95:.3} ms over {DRIVE_P95_BUDGET_MS}"
+        );
+        assert!(
+            dust <= DRIVE_DUST_BUDGET_MS,
+            "DRIVE_DUST {dust:.3} ms over {DRIVE_DUST_BUDGET_MS}"
+        );
+        assert!(
+            water <= DRIVE_WATER_BUDGET_MS,
+            "DRIVE_WATER {water:.3} ms over {DRIVE_WATER_BUDGET_MS}"
+        );
+    }
+}
+
+/// Burn extra time inside a measurement when `PERF_STRETCH` is above 1.
+/// CI leaves it unset. A proof run sets it on the pull-request side only.
+fn stretch_hold(started: Instant) {
+    let Ok(raw) = std::env::var("PERF_STRETCH") else {
+        return;
+    };
+    let Ok(factor) = raw.parse::<f64>() else {
+        return;
+    };
+    if !factor.is_finite() || factor <= 1.0 {
+        return;
+    }
+    let extra = started.elapsed().mul_f64(factor - 1.0);
+    let spin = Instant::now();
+    while spin.elapsed() < extra {
+        std::hint::spin_loop();
+    }
 }
 
 /// Open 2 cm sheet and open wind, the trimmed branch.
@@ -1088,4 +1119,12 @@ fn hardware_line() -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown cpu".to_string());
     format!("{model}, {cores} cores")
+}
+
+/// Set by `scripts/perf_ratio.py` for its paired runs. The script compares
+/// the median of those runs with the same caps, so a single slow run does
+/// not fail the gate. Every other run asserts the caps here.
+#[allow(dead_code)]
+fn gate_median() -> bool {
+    std::env::var_os("PERF_GATE_MEDIAN").is_some()
 }
