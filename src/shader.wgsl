@@ -1936,9 +1936,11 @@ fn water_vertex(in: TerrIn) -> WaterOut {
     let free = water_column_on() && column > 0.004;
     let rip_scale = select(1.0, 1.0, beauty);
     let rip = ripple_height(in.xz, frame.misc.x) * smoothstep(0.0, 0.03, depth) * rip_scale;
-    // Wake ripples stay in the normal on beauty pools; lifting the sheet here
-    // reads as blue spheres under the tires.
-    let wake = select(tire_wake_ripples(in.xz, frame.misc.x), 0.0, beauty);
+    // Wake rings live in the normal only. `solver_shock_rings` sums unit
+    // sines per tire, so as a height it stood the sheet up in metre-tall
+    // spikes at the wheels (the "cards over the roof" on the route). The
+    // height of the surface is the solved column and nothing else.
+    let wake = 0.0;
     // Film on the bed, but never below the soil. A bump left uncovered
     // reads as a black hole. bed + full depth was a sheet 30 cm up that
     // cut the tire like a clip plane. The pond stays that blurred surface.
@@ -2829,4 +2831,41 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     let fall = smoothstep(0.40, 0.12, d);
     // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
     return vec4<f32>(from_display(in.color.rgb * mix(0.65, 1.0, fall)), in.color.a * fall);
+}
+
+// Hybrid H2 splash: sheet drops and flying slurry as small soft sprites,
+// stretched along the velocity on the CPU (`mesh::splash_sprites`).
+// uv.x >= 2 is slurry. The quad is a capsule: round ends, flat run.
+@fragment
+fn fs_splash(in: PartOut) -> @location(0) vec4<f32> {
+    let slurry = in.uv.x >= 1.5;
+    let uv = vec2<f32>(select(in.uv.x, in.uv.x - 2.0, slurry), in.uv.y);
+    // Distance to the capsule spine in quad units (v is the short side).
+    let q = vec2<f32>(abs(uv.x - 0.5) * 2.0, abs(uv.y - 0.5) * 2.0);
+    let d = length(vec2<f32>(max(q.x - 0.5, 0.0) * 2.0, q.y));
+    if (d > 1.0) {
+        discard;
+    }
+    // A lens normal across the short axis, facing the camera.
+    let nz = sqrt(max(1.0 - d * d, 0.0));
+    let sun = normalize(frame.sun_dir.xyz);
+    let up_light = clamp(0.5 + 0.5 * (uv.y - 0.5) * -2.0, 0.0, 1.0);
+    let sky = mix(frame.sky_horizon.rgb, frame.sky_zenith.rgb, 0.45);
+    let glint = pow(clamp(1.0 - length(uv - vec2<f32>(0.40, 0.32)) * 3.2, 0.0, 1.0), 6.0);
+    if (slurry) {
+        // Wet clay: diffuse body, a tight wet glint.
+        let ndl = 0.35 + 0.65 * up_light * clamp(sun.y + 0.3, 0.0, 1.0);
+        let lit = in.color.rgb * (frame.amb.rgb * 0.9 + frame.sun_color.rgb * ndl * 0.85)
+            + frame.sun_color.rgb * glint * 0.35;
+        let edge = smoothstep(1.0, 0.75, d);
+        let c = present(lit);
+        return vec4<f32>(c.rgb, in.color.a * edge);
+    }
+    // Water: mostly the sky it refracts, a bright rim and a sun glint.
+    let fres = pow(1.0 - nz, 3.0);
+    let body = sky * (0.55 + 0.45 * up_light) * in.color.rgb;
+    let lit = body * (0.6 + 0.6 * fres) + frame.sun_color.rgb * glint * 0.9;
+    let edge = smoothstep(1.0, 0.55, d);
+    let c = present(lit);
+    return vec4<f32>(c.rgb, in.color.a * edge * (0.55 + 0.45 * fres + glint));
 }

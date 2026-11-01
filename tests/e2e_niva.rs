@@ -179,6 +179,26 @@ fn bow_head(frame: &ContractFrame, front_z: f32) -> (f32, f32, f32) {
     (ahead - side, ahead, side)
 }
 
+/// Spray that soaked into dry ground (`FluidLedger::spray_soaked_m3`), read as
+/// the part of `total_m3` no other account holds. Written with fields every
+/// tree has, because the perf gate builds this harness against its base too.
+fn soaked_spray_m3(b: &silt::fluid_core::FluidLedger) -> f64 {
+    let named = b.water_m3 as f64
+        + b.slurry_m3 as f64
+        + b.dust_air_m3 as f64
+        + b.dust_settled_m3 as f64
+        + b.frozen_water_m3 as f64
+        + b.frozen_slurry_m3 as f64
+        + b.frozen_dust_m3 as f64
+        + b.fog_air_m3 as f64
+        + b.reach_m3 as f64
+        + b.spray_m3 as f64
+        + b.suspended_m3 as f64
+        + b.settled_suspended_m3 as f64
+        + b.frozen_suspended_m3 as f64;
+    (b.total_m3 as f64 - named).max(0.0)
+}
+
 fn books_of(
     fluid: &FluidCore,
     dust: &Dust,
@@ -188,7 +208,7 @@ fn books_of(
 ) -> Books {
     let b = fluid.ledger();
     let eroded = fluid.hydro_load().eroded_m3 as f64;
-    let water = b.water_m3 as f64 + b.frozen_water_m3 as f64 + b.spray_m3 as f64 + held_water;
+    let water = b.water_m3 as f64 + b.frozen_water_m3 as f64 + b.spray_m3 as f64 + soaked_spray_m3(&b) + held_water;
     let slurry = b.slurry_m3 as f64 + b.frozen_slurry_m3 as f64 + held_slurry;
     let soil = dust.soil_m3() - eroded;
     let dust_v = dust.dust_air_m3() as f64

@@ -74,7 +74,7 @@ fn run(drive: bool, seconds: f32) -> Run {
     let held = |f: &FluidCore| {
         let l = f.ledger();
         // Slurry the wheels scoured is bed soil, booked as eroded volume.
-        l.water_m3 + l.reach_m3 + l.slurry_m3 + l.spray_m3 + l.fog_air_m3 + l.frozen_water_m3
+        l.water_m3 + l.reach_m3 + l.slurry_m3 + l.spray_m3 + l.spray_soaked_m3 + l.fog_air_m3 + l.frozen_water_m3
             - f.hydro_load().eroded_m3
     };
     let water0 = held(&ford.fluid);

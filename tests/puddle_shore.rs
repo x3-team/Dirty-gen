@@ -276,6 +276,7 @@ fn puddle_shore_follows_relief() {
     let held = (books.water_m3
         + books.slurry_m3
         + books.spray_m3
+        + books.spray_soaked_m3
         + books.frozen_water_m3
         + books.frozen_slurry_m3) as f64;
     let gap = (held - drive.sheet_opened_m3()).abs();
@@ -441,6 +442,7 @@ fn ledger_gap(drive: &ThroughDrive) -> (f32, f32, f32, f64) {
     let held = (books.water_m3
         + books.slurry_m3
         + books.spray_m3
+        + books.spray_soaked_m3
         + books.frozen_water_m3
         + books.frozen_slurry_m3) as f64;
     (
@@ -482,7 +484,10 @@ fn shore_snap(drive: &ThroughDrive, other_film: Option<&[f32]>) -> (ShoreSnap, V
     let stats = mask_stats(&film, COARSE_CELL_M);
     let (ox, oz, _) = drive.fluid.window_bounds();
     let (tongues, span) = shore_tongues(&film, ox, oz);
-    let (water_m3, slurry_m3, spray_m3, gap) = ledger_gap(drive);
+    let (water_m3, slurry_m3, _in_air_m3, gap) = ledger_gap(drive);
+    // Spray in the air is a moment; what the two paces must agree on is how
+    // much the sheet threw. Landed drops are back in `water_m3`.
+    let spray_m3 = drive.fluid.spray_thrown_m3();
     let (l1_m3, max_dh) = match other_film {
         Some(other) => film_delta(&film, other),
         None => (0.0, 0.0),
