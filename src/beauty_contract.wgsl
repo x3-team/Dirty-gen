@@ -535,10 +535,15 @@ fn smoke_at(p: vec3<f32>) -> vec4<f32> {
     if (s.r < 1e-4 && s.b < 1e-3) {
         return vec4<f32>(0.0);
     }
+    // Detail displaces the soot (and its sun transmittance) only. The flame
+    // (temperature, burn rate) keeps the undisplaced sample, and the detail
+    // fades inside it: per-pixel noise on an emitter printed as confetti that
+    // the half-res upsample cannot average.
     let flow = textureSampleLevel(smoke_flow, smoke_samp, uvw, 0.0);
-    let off = smoke_detail_offset(p, flow);
+    let off = smoke_detail_offset(p, flow) * (1.0 - saturate(s.b));
     if (dot(off, off) > 0.0) {
-        s = textureSampleLevel(smoke_vol, smoke_samp, (p + off - bmin) / sd.size.xyz, 0.0);
+        let d = textureSampleLevel(smoke_vol, smoke_samp, (p + off - bmin) / sd.size.xyz, 0.0);
+        s = vec4<f32>(d.r, s.g, s.b, d.a);
     }
     return max(s, vec4<f32>(0.0));
 }
