@@ -883,6 +883,99 @@ fn step_down2(
     });
 }
 
+/// [`step_down2`] for a dust volume whose fine velocity is `gu` everywhere
+/// and `col_v[i]` down each column, with `eps` 0. The 2x2 sums use those
+/// values in the same order, and only the volume is scattered back: the
+/// caller rebuilds the fine wind on the next call.
+fn step_down2_wind(
+    h: &mut [f32],
+    gu: f32,
+    col_v: &[f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    drive: SheetDrive,
+) {
+    let c = res / 2;
+    let cn = c * c;
+    DOWN2.with(|plane| {
+        let mut plane = plane.borrow_mut();
+        plane.fit(cn);
+        let Down2 {
+            h: ch,
+            u: cu,
+            v: cv,
+            bed: cbed,
+            nu: cnu,
+            gate: cgate,
+            w,
+        } = &mut *plane;
+        let (ch, cu, cv) = (&mut ch[..cn], &mut cu[..cn], &mut cv[..cn]);
+        let (cbed, cnu, cgate) = (&mut cbed[..cn], &mut cnu[..cn], &mut cgate[..cn]);
+        let w = &mut w[..cn * 4];
+        let fh = &h[..res * res];
+        for j in 0..c {
+            let r0 = (j * 2) * res;
+            let r1 = r0 + res;
+            for i in 0..c {
+                let id = j * c + i;
+                let f = [r0 + i * 2, r0 + i * 2 + 1, r1 + i * 2, r1 + i * 2 + 1];
+                let fv = [col_v[i * 2], col_v[i * 2 + 1], col_v[i * 2], col_v[i * 2 + 1]];
+                let mut sum = 0.0f32;
+                let mut su = 0.0f32;
+                let mut sv = 0.0f32;
+                for k in 0..4 {
+                    let hv = fh[f[k]];
+                    w[id * 4 + k] = hv;
+                    sum += hv;
+                    let m = hv.max(0.0);
+                    su += gu * m;
+                    sv += fv[k] * m;
+                }
+                ch[id] = sum;
+                if sum > 1.0e-12 {
+                    cu[id] = su / sum;
+                    cv[id] = sv / sum;
+                } else {
+                    cu[id] = 0.0;
+                    cv[id] = 0.0;
+                }
+                let fidx = f[0];
+                cbed[id] = bed.get(fidx).copied().unwrap_or(0.0);
+                cnu[id] = nu.get(fidx).copied().unwrap_or(0.4);
+                cgate[id] = gate.get(fidx).copied().unwrap_or(1);
+            }
+        }
+        step_sheet_eps(ch, cu, cv, cbed, cnu, cgate, c, cell * 2.0, dt, drive, 0.0, None);
+        let fh = &mut h[..res * res];
+        for j in 0..c {
+            let r0 = (j * 2) * res;
+            let r1 = r0 + res;
+            for i in 0..c {
+                let id = j * c + i;
+                let new_h = ch[id];
+                let ws = [w[id * 4], w[id * 4 + 1], w[id * 4 + 2], w[id * 4 + 3]];
+                let mut s = 0.0f32;
+                for wk in ws {
+                    s += wk.max(0.0);
+                }
+                let f = [r0 + i * 2, r0 + i * 2 + 1, r1 + i * 2, r1 + i * 2 + 1];
+                for k in 0..4 {
+                    let share = if s > 1.0e-12 {
+                        ws[k].max(0.0) / s * new_h
+                    } else {
+                        new_h * 0.25
+                    };
+                    fh[f[k]] = share.max(0.0);
+                }
+            }
+        }
+    });
+}
+
 /// Seven live dust layers share the workers. The inner 64² sheet stays on the
 /// worker that owns the layer. The ground-sheet scratch is put back afterwards
 /// so water still sees the buffer it left.
@@ -968,44 +1061,43 @@ fn advect_one_dust_layer(
             &[][..]
         };
         let stride = res * layers;
+        let drive = SheetDrive::Wind {
+            x: gu,
+            z: gv,
+            vorticity: 0.35,
+        };
+        // The wind is one value per column, so the halved plane reads it
+        // straight from `hold` and the full-size u/v copies are skipped.
+        let direct = !hold.is_empty() && res >= 4 && res % 2 == 0;
         let mut before = 0.0f64;
         for iz in 0..res {
             let src = &vol[layer * res + iz * stride..][..res];
             let row = iz * res;
-            let (hr, ur, vr) = (&mut h[row..row + res], &mut u[row..row + res], &mut v[row..row + res]);
+            let hr = &mut h[row..row + res];
             for ix in 0..res {
                 let cell_v = src[ix];
                 hr[ix] = cell_v;
-                ur[ix] = gu;
-                vr[ix] = if hold.is_empty() {
-                    gv * dust_stream_hold(-8.0 + (ix as f32 + 0.5) * cell)
-                } else {
-                    hold[ix]
-                };
                 before += cell_v as f64;
+            }
+            if !direct {
+                for ix in 0..res {
+                    u[row + ix] = gu;
+                    v[row + ix] = if hold.is_empty() {
+                        gv * dust_stream_hold(-8.0 + (ix as f32 + 0.5) * cell)
+                    } else {
+                        hold[ix]
+                    };
+                }
             }
         }
         if before <= 0.0 {
             return;
         }
-        step_down2(
-            h,
-            u,
-            v,
-            bed,
-            nu,
-            gate,
-            res,
-            cell,
-            dt,
-            SheetDrive::Wind {
-                x: gu,
-                z: gv,
-                vorticity: 0.35,
-            },
-            0.0,
-            true,
-        );
+        if direct {
+            step_down2_wind(h, gu, hold, bed, nu, gate, res, cell, dt, drive);
+        } else {
+            step_down2(h, u, v, bed, nu, gate, res, cell, dt, drive, 0.0, true);
+        }
         let after = h.iter().map(|c| *c as f64).sum::<f64>();
         let scale = if after > 0.0 {
             (before / after) as f32
@@ -4600,7 +4692,11 @@ impl FluidCore {
                 let moisture = moisture.clamp(0.0, 1.0);
                 self.bed[idx] = bed;
                 self.moisture[idx] = moisture;
-                let bucket = (moisture * 100.0).round() as usize;
+                // Round half away from zero without the libm call: for
+                // 0..=100 the fraction after truncation is exact.
+                let pct = moisture * 100.0;
+                let whole = pct as usize;
+                let bucket = if pct - whole as f32 >= 0.5 { whole + 1 } else { whole };
                 hist[bucket.min(100)] += 1;
                 if self.slurry[idx] > 1.0e-5 {
                     self.grain[idx] = grain as u8;
