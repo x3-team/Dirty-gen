@@ -107,10 +107,10 @@ Airborne dust and fog as a volume fraction, cubic metres of dust per cubic metre
 
 | | Ledger (`dust_source` 1) | Fluid air (`dust_source` 2) |
 |---|---|---|
-| Size | 128 × 8 × 128 | 128 × 8 × 128 |
+| Size | 128 × 16 × 128 | 128 × 16 × 128; the sheet fills layers 0–7, layers 8–15 are 0 |
 | Cell | 0.125 m × 0.25 m × 0.125 m | `(40/128)` m × 0.25 m × `(40/128)` m |
-| Coverage | 16 m × 2 m × 16 m, vehicle frame | the 40 m window |
-| Index | `x + layer * 128 + z * 128 * 8` | same index after conversion |
+| Coverage | 16 m × 4 m × 16 m, vehicle frame | the 40 m window, 2 m tall |
+| Index | `x + layer * 128 + z * 128 * 16` | same index after conversion |
 
 Texel centre is `air_origin + (i + 0.5) * air_cell`. `air_origin` is the corner of texel (0, 0, 0), Y up. The ledger origin moves with the Niva. The fluid-air fallback stores a depth in metres in each slab and publishes `depth / 0.25`.
 
@@ -122,26 +122,45 @@ Valid: `VALID_DUST_FOG` under the same rule as settled dust. `dust_source` 0 mea
 
 ### Air velocity — binding 11
 
-World air velocity on the same 128 × 8 × 128 grid as `dust_fog`. Same origin and cell: `header.air_origin_*`, `header.air_cell_*`. Texel centre is `air_origin + (i + 0.5) * air_cell`.
+World air velocity on the same 128 × 16 × 128 grid as `dust_fog`. Same origin and cell: `header.air_origin_*`, `header.air_cell_*`. Texel centre is `air_origin + (i + 0.5) * air_cell`.
 
 | | |
 |---|---|
 | Format | `rgba32float` 3D |
-| Index | `(x + layer * 128 + z * 128 * 8) * 4` |
+| Index | `(x + layer * 128 + z * 128 * 16) * 4` |
 | R | velocity +X, east, m/s |
 | G | velocity +Y, up, m/s |
 | B | velocity +Z, north, m/s |
 | A | 0 |
-| Resolution | 128 × 8 × 128 |
+| Resolution | 128 × 16 × 128 |
 | Cell | the `dust_fog` cell for this `dust_source` |
 
-The step is 2.5D. Advection and vorticity confinement run in the horizontal plane of each layer. The vertical channel is stored. Wheel spin writes it. The horizontal step does not advect between layers.
+The velocity step is 2.5D. Advection and vorticity confinement run in the horizontal plane of each layer. The vertical channel is stored. Wheel spin writes it. The horizontal step does not advect between layers.
 
-Writer, when `dust_source` is 1: `step_vehicle_air` on the dust ledger, packed by `Dust::write_air_velocity`. The Niva body and the four wheels inject velocity. Vorticity confinement rolls the wake. Wind relaxes the field toward the free stream outside the solids. The solve runs on a 0.25 m × 0.50 m × 0.25 m active window around the Niva and is copied onto this 128 × 8 × 128 grid. This grid is valid after `Dust::step` / `Dust::step_pads`. Before the first air step the samples are 0.
+Dust and fog do move between layers. On the ledger, each column exchanges with its neighbours above and below: upwind along G, plus eddy diffusion K = 0.15 m × |v − free stream| wherever the wake residual is at least 0.3 m/s (`dust::mix_vertical`). The wake lifts a dry plume to the 4 m ceiling; still air does not mix. Dust falls at 0.24 m/s on the slow stride as before. Horizontally both scalars ride the relative wind (`dust::shift_layers`): below the roof (1.58 m) with the lee hold, above it by whole cells. Mass that crosses the window edge is booked as settled where it left.
+
+Writer, when `dust_source` is 1: `step_vehicle_air` on the dust ledger, packed by `Dust::write_air_velocity`. The Niva body and the four wheels inject velocity. Vorticity confinement rolls the wake. Wind relaxes the field toward the free stream outside the solids. The solve runs on a 0.25 m × 0.50 m × 0.25 m active window around the Niva and is copied onto this 128 × 16 × 128 grid. This grid is valid after `Dust::step` / `Dust::step_pads`. Before the first air step the samples are 0.
 
 Writer, when `dust_source` is 2 and the ledger is absent: `FluidCore::write_air_velocity`. R and B are that sheet's horizontal dust velocity, G is 0. That path does not run the body wake.
 
 Valid: `VALID_AIR` when `dust_source` is 1 or 2, the same publishes as `dust_fog`. `dust_source` 0 leaves the binding 0 and the bit clear. A non-finite sample is written as 0.
+
+### Fog — binding 12
+
+Suspended water, as a volume fraction, cubic metres of water per cubic metre of air. Not dust. Not clamped. Same 128 × 16 × 128 grid, origin, and cell as `dust_fog` and `air_velocity`. Index `x + layer * 128 + z * 128 * 16`.
+
+| | Ledger (`dust_source` 1) | Fluid air (`dust_source` 2) |
+|---|---|---|
+| Stored | cubic metres on the dust grid | depth, metres, on the fluid air slabs |
+| Published | cubic metres / cell volume | `depth / 0.25` |
+
+The ledger wins when both are present. `air_velocity` is not written again for this channel. Fog is advected by the wind step and by the residual of the velocity that binding 11 already holds.
+
+A tire lofts fog only where standing water is at least 4 mm. Dry ground lofts none. On the dust grid the lofted volume is what `inject_fog` returns, and the caller takes that out of the water sheet. On the fluid sheet `FluidCore::inject_fog` takes the water itself. Settled fog on the fluid sheet returns to the water column. Settled fog on the dust grid is booked as cubic metres the caller still owns. It is not a second ground sheet and it is not added to settled dust.
+
+Writer, ledger: `Dust::write_fog` after `Dust::step` / `Dust::step_pads`. Writer, fluid air: `FluidCore::fog_depth` when the ledger is absent.
+
+Valid: `VALID_FOG` under the same rule as `dust_fog` and `air_velocity`. `dust_source` 0 leaves the binding 0 and the bit clear. A non-finite sample is written as 0. An empty grid is a valid publish.
 
 ### Crust and cracks — binding 7
 
@@ -301,7 +320,7 @@ Dry cells and any other non-finite sample are written as 0. Layout unchanged. Fo
 
 ### 2
 
-`air_velocity`, binding 11, `rgba32float` 3D, 128 × 8 × 128. R, G, B are world velocity in m/s (+X, +Y, +Z). A is 0. Same origin and cell as `dust_fog`. `VALID_AIR` is bit 10, set when `dust_source` is 1 or 2.
+`air_velocity`, binding 11, `rgba32float` 3D, 128 × 16 × 128. R, G, B are world velocity in m/s (+X, +Y, +Z). A is 0. Same origin and cell as `dust_fog`. `VALID_AIR` is bit 10, set when `dust_source` is 1 or 2.
 
 With the dust ledger, `step_vehicle_air` writes the field: the Niva body and wheels inject velocity, vorticity confinement leaves a wake, and wind advects the field. Without the ledger, the samples are the fluid sheet's horizontal dust velocity and a zero vertical channel. The header stays 96 bytes. Debug mode 14 shows air speed.
 
@@ -351,6 +370,10 @@ A cell whose material is one of those four sums to 1, including through the join
 
 The solver builds the shares from the cell kind, then runs four Jacobi passes. Across an edge whose two cells both carry one of the four and whose shares differ, each pass moves 1/4 of the difference from one cell to the other. The sum of each channel over the map does not change. The sum of the four channels on a cell does not change. Pore moisture is not a fifth channel: the same edges exchange the soil wetness, and binding 2 publishes that wetness.
 
-### 8 (fill, no bump)
+### 10
 
-Binding 4 A, turbidity, now publishes `clamp((susp + turbid) / water, 0, 1)`. Before, it was `susp / water`, and the stirred silt from #104 was not published. `susp` now settles at 4 mm/s fall speed into `settled_suspended_m3`, so a still pool clears. Both ledgers still close: `suspended_m3 + settled_suspended_m3 + frozen_suspended_m3 = entrained_m3`, and the stirred-silt book is unchanged. The channel, unit, and resolution stay the same, and the version stays 8.
+The air grid is 4 m tall. `dust_fog` (binding 6), `air_velocity` (binding 11) and `fog` (binding 12) are 128 × 16 × 128, layer height still 0.25 m, so the window is 16 × 4 × 16 m. Index `x + layer * 128 + z * 128 * 16`. Units and channels are unchanged. The fluid-sheet fallback (`dust_source` 2) publishes its 8 slabs into layers 0–7 and leaves 8–15 at 0. Version 9 stays reserved for snow `track_fine` (binding 15). The header stays 96 bytes.
+
+### Turbidity fill (no bump)
+
+Binding 4 A, turbidity, now publishes `clamp((susp + turbid) / water, 0, 1)`. Before, it was `susp / water`, and the stirred silt from #104 was not published. `susp` now settles at 4 mm/s fall speed into `settled_suspended_m3`, so a still pool clears. Both ledgers still close: `suspended_m3 + settled_suspended_m3 + frozen_suspended_m3 = entrained_m3`, and the stirred-silt book is unchanged. The channel, unit, and resolution stay the same, so this is not a version bump.

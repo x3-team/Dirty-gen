@@ -438,7 +438,7 @@ fn depth_near(fluid: &FluidCore, x: f32, z: f32) -> f32 {
 }
 
 /// Copy the sheet's bed and water onto the soil the tires read.
-fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
+pub(crate) fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
     use crate::soil::SurfaceKind;
     let half = soil.size * 0.5;
     for j in 0..soil.res {
