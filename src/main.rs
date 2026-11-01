@@ -563,6 +563,8 @@ struct CaptureArgs {
     snow_ruts_proof: PathBuf,
     snow_belly: bool,
     snow_belly_proof: PathBuf,
+    snow_track: bool,
+    snow_track_proof: PathBuf,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -971,6 +973,10 @@ fn capture(args: &[String]) {
         capture_snow_ruts(&mut renderer, &parsed);
         return;
     }
+    if parsed.snow_track {
+        capture_snow_track(&mut renderer, &parsed);
+        return;
+    }
     if parsed.snow_belly {
         capture_snow_belly(&mut renderer, &parsed);
         return;
@@ -1200,6 +1206,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         PathBuf::from(format!("{MEDIA}/drying-crust-proof.png"));
     let mut snow_ruts = false;
     let mut snow_ruts_proof = PathBuf::from(format!("{MEDIA}/snow-ruts-proof.png"));
+    let mut snow_track = false;
+    let mut snow_track_proof = PathBuf::from(format!("{MEDIA}/snow-track-proof.png"));
     let mut snow_belly = false;
     let mut snow_belly_proof = PathBuf::from(format!("{MEDIA}/snow-belly-proof.png"));
     let mut i = 0;
@@ -1365,6 +1373,12 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
                     snow_ruts_proof = PathBuf::from(val(&mut i));
                 }
             }
+            "--snow-track-proof" => {
+                snow_track = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    snow_track_proof = PathBuf::from(val(&mut i));
+                }
+            }
             "--snow-belly-proof" => {
                 snow_belly = true;
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
@@ -1490,6 +1504,8 @@ fn parse_capture(args: &[String]) -> CaptureArgs {
         snow_ruts_proof,
         snow_belly,
         snow_belly_proof,
+        snow_track,
+        snow_track_proof,
     }
 }
 
@@ -3210,6 +3226,126 @@ fn capture_snow_ruts(renderer: &mut Renderer, parsed: &CaptureArgs) {
         world.vehicle.pos.x,
         world.vehicle.pos.y,
         world.vehicle.pos.z
+    );
+}
+
+/// The real Niva drives the reference loop on the fine snow track: straight
+/// in, a tight left circle and a bit more, then out. The frame is the track
+/// the tires left, read from the 2.5 cm field.
+#[cfg(not(target_arch = "wasm32"))]
+fn capture_snow_track(renderer: &mut Renderer, parsed: &CaptureArgs) {
+    use silt::particles::Particles;
+    use glam::Vec2;
+    use silt::snow_track::{circle_script, drive_script, SnowTrack};
+    use silt::soil::SoilField;
+
+    renderer.daylight = true;
+    renderer.show_props = false;
+    renderer.show_environment = false;
+    renderer.show_bike = false;
+    renderer.niva_picture = true;
+    renderer.water_column = false;
+    renderer.snow = true;
+
+    let blanket = 0.25;
+    let mut track = SnowTrack::new(blanket, 0.0);
+    track.rho_blanket = 160.0;
+    let mut world = World::flat(0.1);
+    world.soil = SoilField::flat(0.1);
+    world.particles = Particles::new();
+    world.vehicle.clear_loose_mud();
+    world.vehicle.vel = Vec3::ZERO;
+    world.vehicle.yaw = 0.0;
+    world.vehicle.pos = Vec3::new(0.0, blanket + 0.38 + 0.45, -6.0);
+    let soil = world.soil.clone();
+    let script = circle_script();
+    let mut lo = Vec2::splat(f32::MAX);
+    let mut hi = Vec2::splat(f32::MIN);
+    let mut total = silt::snow_track::DriveLog::default();
+    let t0 = std::time::Instant::now();
+    for seg in &script {
+        // Sample the path every half second for the frame bounds.
+        let mut left = seg.seconds;
+        while left > 1.0e-4 {
+            let mut part = *seg;
+            part.seconds = left.min(0.5);
+            left -= part.seconds;
+            let log = drive_script(&mut track, &mut world.vehicle, &soil, std::slice::from_ref(&part));
+            total.path_m += log.path_m;
+            total.bulldozed_kg += log.bulldozed_kg;
+            total.dug_kg += log.dug_kg;
+            total.sink_max_m = total.sink_max_m.max(log.sink_max_m);
+            total.sink_mean_m += log.sink_mean_m * log.seconds;
+            total.seconds += log.seconds;
+            let p = Vec2::new(world.vehicle.pos.x, world.vehicle.pos.z);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+    }
+    // Let the last clods land.
+    for _ in 0..240 {
+        track.step_clods(1.0 / 120.0);
+    }
+    let wall = t0.elapsed().as_secs_f32();
+    total.sink_mean_m /= total.seconds.max(1.0e-3);
+    let (m0, m1) = track.ledger_kg();
+    println!(
+        "snow-track drive {:.1} s path {:.1} m sink mean {:.3} max {:.3} m pushed {:.1} kg dug {:.2} kg tiles {} wall {:.2} s",
+        total.seconds, total.path_m, total.sink_mean_m, total.sink_max_m, total.bulldozed_kg, total.dug_kg,
+        track.tile_count(), wall
+    );
+    println!("snow-track mass {m0:.4} -> {m1:.4} kg ({:+.2e})", (m1 - m0) / m0.max(1.0));
+
+    // Coarse height outside the window: the same field at the coarse cell centre.
+    let res = silt::soil::MAP_RES;
+    let cell = silt::soil::MAP_SIZE / res as f32;
+    let half = silt::soil::MAP_SIZE * 0.5;
+    for j in 0..res {
+        for i in 0..res {
+            let x = (i as f32 + 0.5) * cell - half;
+            let z = (j as f32 + 0.5) * cell - half;
+            let idx = j * res + i;
+            world.soil.height[idx] = track.surface_at(x, z);
+            world.soil.darken[idx] = 0.0;
+            world.soil.water[idx] = 0.0;
+            world.soil.slurry[idx] = 0.0;
+            world.soil.wetness[idx] = 0.0;
+        }
+    }
+    let mid = (lo + hi) * 0.5;
+    renderer.snow_bed = 0.0;
+    renderer.snow_arc = None;
+    // The 2.5 cm window (contract binding 15 layout) is built here. The
+    // terrain reader for it lands with the LOD ground (#120); until then the
+    // frame shows the same field sampled on the 20 cm grid.
+    let win = track.window(mid);
+    let deep = win.texels.iter().map(|t| t[0]).fold(f32::MAX, f32::min);
+    println!("snow-track window {}x{} origin=({:.3},{:.3}) min surface {:.3} m", win.res, win.res, win.origin.x, win.origin.y, deep);
+
+    let v3 = |key: &str| -> Option<Vec3> {
+        let v: Vec<f32> = std::env::var(key).ok()?.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+    };
+    let look = v3("SILT_SNOW_LOOK").unwrap_or(Vec3::new(mid.x + 0.2, blanket, mid.y + 0.4));
+    let eye = v3("SILT_SNOW_EYE").unwrap_or(look + Vec3::new(-6.6, 10.4, -10.2));
+    let pose = CameraPose {
+        eye,
+        target: look,
+        ortho_width: None,
+    };
+    let rgba = renderer.draw(&world, pose, None, true).expect("readback");
+    if let Some(parent) = parsed.snow_track_proof.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_png(&parsed.snow_track_proof, parsed.width, parsed.height, &rgba).expect("snow track still");
+    println!(
+        "snow-track {} niva=({:.2},{:.2},{:.2}) window=({:.2},{:.2})",
+        parsed.snow_track_proof.display(),
+        world.vehicle.pos.x,
+        world.vehicle.pos.y,
+        world.vehicle.pos.z,
+        mid.x,
+        mid.y
     );
 }
 
