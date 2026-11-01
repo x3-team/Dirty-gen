@@ -76,10 +76,28 @@ fn tg_height_cubic(xz: vec2<f32>) -> f32 {
     );
 }
 
-fn tg_fine_load(ij: vec2<i32>) -> f32 {
-    let dims = vec2<i32>(textureDimensions(track_fine_tex));
+// Ground spacing the current invocation resolves, metres. A LOD vertex
+// sets its vertex step; a ground fragment its pixel footprint. 0 reads the
+// full-resolution field.
+var<private> tg_footprint: f32 = 0.0;
+
+fn tg_fine_load(ij: vec2<i32>, level: i32) -> f32 {
+    let dims = vec2<i32>(textureDimensions(track_fine_tex, level));
     let c = clamp(ij, vec2<i32>(0), dims - vec2<i32>(1));
-    return textureLoad(track_fine_tex, c, 0).r;
+    return textureLoad(track_fine_tex, c, level).r;
+}
+
+fn tg_fine_level(xz: vec2<f32>, cell: f32, level: i32) -> f32 {
+    let lc = cell * exp2(f32(level));
+    let g = (xz - tgeom.fine.xy) / lc - vec2<f32>(0.5);
+    let g0 = floor(g);
+    let f = g - g0;
+    let i0 = vec2<i32>(g0);
+    let a = tg_fine_load(i0, level);
+    let b = tg_fine_load(i0 + vec2<i32>(1, 0), level);
+    let c = tg_fine_load(i0 + vec2<i32>(0, 1), level);
+    let d = tg_fine_load(i0 + vec2<i32>(1, 1), level);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 // x: surface height (m), y: weight (1 inside the window, 0 past its feathered edge).
@@ -95,15 +113,20 @@ fn tg_fine(xz: vec2<f32>) -> vec2<f32> {
     if (w <= 0.0) {
         return vec2<f32>(0.0);
     }
-    let g = local - vec2<f32>(0.5);
-    let g0 = floor(g);
-    let f = g - g0;
-    let i0 = vec2<i32>(g0);
-    let a = tg_fine_load(i0);
-    let b = tg_fine_load(i0 + vec2<i32>(1, 0));
-    let c = tg_fine_load(i0 + vec2<i32>(0, 1));
-    let d = tg_fine_load(i0 + vec2<i32>(1, 1));
-    return vec2<f32>(mix(mix(a, b, f.x), mix(c, d, f.x), f.y), w);
+    // A vertex 10 cm apart that point-samples a 2.5 cm field lands on lugs
+    // and gaps at random: the far ruts read as speckle. Read the box-filtered
+    // level that matches the spacing (mips built on upload).
+    // TRACK_FINE_MIPS - 1 (terrain_draw.rs). textureNumLevels is not in
+    // GLSL ES 3.00, and the packed path never turns the field on.
+    let top = 4.0;
+    let lod = clamp(log2(max(tg_footprint, cell) / cell), 0.0, top);
+    let l0 = i32(floor(lod));
+    let h0 = tg_fine_level(xz, cell, l0);
+    var h = h0;
+    if (lod > f32(l0) + 0.01) {
+        h = mix(h0, tg_fine_level(xz, cell, min(l0 + 1, i32(top))), lod - f32(l0));
+    }
+    return vec2<f32>(h, w);
 }
 
 // Called by height_raw with its bilinear read. Inside the fine window the
@@ -118,6 +141,11 @@ fn tg_refine(xz: vec2<f32>, bilinear: f32) -> f32 {
         h = mix(h, fine.x, fine.y);
     }
     return h;
+}
+
+// Fragment side: the ground one pixel covers. Call first, in uniform flow.
+fn tg_set_pixel_footprint(xz: vec2<f32>) {
+    tg_footprint = max(length(dpdx(xz)), length(dpdy(xz)));
 }
 
 // ---- LOD placement --------------------------------------------------------
@@ -156,7 +184,9 @@ fn tg_lod_place_range(g: vec2<f32>, node: vec4<f32>, range_steps: f32) -> vec3<f
 }
 
 fn tg_terr_in(g: vec2<f32>, node: vec4<f32>) -> TerrIn {
-    let xz = tg_lod_place(g, node).xy;
+    let p = tg_lod_place(g, node);
+    let xz = p.xy;
+    tg_footprint = tgeom.lod.x * exp2(node.w) * (1.0 + p.z);
     return TerrIn(xz, world_to_ij(xz));
 }
 
@@ -189,7 +219,9 @@ fn vs_shadow_terrain(in: TerrIn) -> ShadowOut {
 // morph here must use that ring too or the seams open.
 @vertex
 fn vs_shadow_terrain_lod(in: LodIn) -> ShadowOut {
-    let xz = tg_lod_place_range(in.g, in.node, tgeom.recon.w).xy;
+    let p = tg_lod_place_range(in.g, in.node, tgeom.recon.w);
+    let xz = p.xy;
+    tg_footprint = tgeom.lod.x * exp2(in.node.w) * (1.0 + p.z);
     return shadow_terrain_vertex(TerrIn(xz, world_to_ij(xz)));
 }
 
@@ -207,6 +239,7 @@ struct LodDebugOut {
 @vertex
 fn vs_terrain_lod_debug(in: LodIn) -> LodDebugOut {
     let p = tg_lod_place(in.g, in.node);
+    tg_footprint = tgeom.lod.x * exp2(in.node.w) * (1.0 + p.z);
     let t = terrain_vertex(TerrIn(p.xy, world_to_ij(p.xy)));
     let step = tgeom.lod.x * exp2(in.node.w);
     var o: LodDebugOut;
@@ -230,6 +263,7 @@ fn tg_level_color(l: f32) -> vec3<f32> {
 // Ground lit plainly, tinted by level, with the triangle grid drawn on it.
 @fragment
 fn fs_terrain_lod_debug(in: LodDebugOut) -> @location(0) vec4<f32> {
+    tg_set_pixel_footprint(in.world.xz);
     let n = terrain_normal(in.world.xz);
     let lo = tg_level_color(in.level);
     let hi = tg_level_color(in.level + 1.0);
