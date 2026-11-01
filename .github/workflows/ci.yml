@@ -35,6 +35,11 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test puddle_rut -- --nocapture
+      - name: Turbid cloud settles
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test turbid_settle -- --nocapture
       - name: Niva crust and cracks
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -61,12 +66,17 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test snow_maps -- --nocapture
+      - name: Windows demo playground
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test win_demo -- --nocapture
       - name: Release solver budget
         env:
-          # 3aa2377 is main with #119 merged. Its tree is #119 head 40ab33f,
-          # which passed the flat caps on an EPYC 7763 in run 41319551811.
-          # An exit 101 from the base is an error.
-          PERF_BASE_SHA: 3aa2377d67536b737fcb3c7d98618e9623b7a2c4
+          # d0eeb1b is main with #145 (shore headroom) and #147 merged. The
+          # gate checks the caps on the median of its paired runs; the single
+          # runs below still assert every cap. A base exit 101 is an error.
+          PERF_BASE_SHA: d0eeb1bb96363321d32b270c3dc565101134bb58
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
@@ -74,7 +84,7 @@ jobs:
           python3 scripts/perf_ratio.py
           RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore one_fine_substep_matches_eight -- --nocapture
           cargo test --release --test puddle_shore puddle_shore_follows_relief -- --nocapture
-          cargo test --release --test ford_beach --test ford_drive -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive --test bodies -- --nocapture
           cargo test --release --test scripted_drive --test turbidity -- --nocapture
           cargo test --release --test crust_cracks -- --nocapture
           cargo test --release --test puddle_rut -- --nocapture

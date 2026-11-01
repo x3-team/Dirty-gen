@@ -817,12 +817,12 @@ fn e2e_niva() {
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        step_mean <= E2E_STEP_BUDGET_MS,
+        gate_median() || step_mean <= E2E_STEP_BUDGET_MS,
         "e2e step {step_mean:.3} ms over {E2E_STEP_BUDGET_MS} on {hardware}"
     );
     #[cfg(not(debug_assertions))]
     assert!(
-        air_mean <= AIR_RELEASE_BUDGET_MS,
+        gate_median() || air_mean <= AIR_RELEASE_BUDGET_MS,
         "air step {air_mean:.3} ms over {AIR_RELEASE_BUDGET_MS}"
     );
     #[cfg(not(debug_assertions))]
@@ -898,7 +898,7 @@ fn print_through_drive() {
     let water = acc.water_ms / k;
     let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
-    {
+    if !gate_median() {
         assert!(
             solver <= DRIVE_SOLVER_BUDGET_MS,
             "DRIVE_SOLVER {solver:.3} ms over {DRIVE_SOLVER_BUDGET_MS}"
@@ -1119,4 +1119,12 @@ fn hardware_line() -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown cpu".to_string());
     format!("{model}, {cores} cores")
+}
+
+/// Set by `scripts/perf_ratio.py` for its paired runs. The script compares
+/// the median of those runs with the same caps, so a single slow run does
+/// not fail the gate. Every other run asserts the caps here.
+#[allow(dead_code)]
+fn gate_median() -> bool {
+    std::env::var_os("PERF_GATE_MEDIAN").is_some()
 }

@@ -19,7 +19,7 @@ Release only (`cargo test --release`). Debug builds keep the air check under 4 m
 
 Release CI runs on pull requests only. A push to main does not start this workflow.
 
-The job builds this pull request and pinned commit `3aa2377d67536b737fcb3c7d98618e9623b7a2c4` (main with #119 merged), then runs both in this job. Its tree is #119 head `40ab33f`, which passed the flat caps on an EPYC 7763 in run 41319551811 (e2e 8.034 ms, air 0.509 ms, dust 0.280 ms, solver 4.711 ms, water 1.390 ms, solver water 1.427 ms, drive p95 5.122 ms).
+The job builds this pull request and pinned commit `d0eeb1bb96363321d32b270c3dc565101134bb58` (main with #145 and #147 merged), then runs both in this job. The paired runs set `PERF_GATE_MEDIAN`, so `e2e_niva`, `frame_bench` and `fog_air` skip their own cap asserts there and the script checks the same caps on the median of the measured runs. One slow run on a slow runner does not fail the gate; a slow median does. If the pinned base predates that switch, the base is measured with this tree's copy of those three test files. The single release runs after the gate still assert every cap on every run.
 
 Base samples are collected first. One warmup round is discarded, then 4 measured rounds. Warmup plus measured is at most 9. The caps stay flat: `E2E_BUDGET ms=11.820`, `E2E_AIR_BUDGET ms=1.500`, `DRIVE_SOLVER_BUDGET ms=7.000`, `DRIVE_P95_BUDGET ms=7.000`, `DRIVE_DUST_BUDGET ms=1.000`, `DRIVE_WATER_BUDGET ms=2.000`, `SOLVER_FRAME` with `budget=7`, `SOLVER_WATER` with `budget=2.000`, and `FOG_STEP_BUDGET ms=7.000`. A base or head median above its cap fails. `k_runner` is the median of head/base. It fails above 1.10. A median of exactly 1.10 passes. `k_runner` does not scale a cap.
 
@@ -27,7 +27,6 @@ A base process that exits non-zero fails the job with `base_exit`. That includes
 
 The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
 
-The drive p95 tail was the 40 m window parking every pad cell. `pull_substrate` writes the flat wetness onto the whole sheet, and each forward step inserted that strip into `parked`. The map doubled through 16384 and 32768 during the timed run and rehashed on that step. Cells that only hold the pad moisture are not inserted; a wet track still is, and a cell that enters without a record is written back to that pad. Gravity on this drive stays at one CFL substep. Open wind on the dust plane uses Courant 0.85, so the headwind is one substep at 1/60 and two at 1/30, and it skips the divergence tweak the wind force does not read.
 
 A pull request that changes the solver prints, in the release CI log, the step count, the mean, p95, the hardware line, and the milliseconds of each subsystem (`DRIVE_*` from `ThroughDrive::step` at dt = 1/30).
 

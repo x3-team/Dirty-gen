@@ -30,7 +30,7 @@ fn baseline_solver_frame() {
     );
     let _ = std::io::Write::flush(&mut std::io::stderr());
     #[cfg(not(debug_assertions))]
-    {
+    if !gate_median() {
         assert!(
             ms <= SOLVER_FRAME_BUDGET_MS,
             "SOLVER_FRAME {ms:.3} ms over {SOLVER_FRAME_BUDGET_MS}"
@@ -47,7 +47,7 @@ fn baseline_solver_frame() {
     eprintln!("SOLVER_WATER ms={water_ms:.3} budget={SOLVER_WATER_BUDGET_MS:.3}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
     #[cfg(not(debug_assertions))]
-    {
+    if !gate_median() {
         assert!(
             water_ms <= SOLVER_WATER_BUDGET_MS,
             "SOLVER_WATER {water_ms:.3} ms over {SOLVER_WATER_BUDGET_MS}"
@@ -72,3 +72,10 @@ fn stretch_hold(started: Instant) {
     }
 }
 
+/// Set by `scripts/perf_ratio.py` for its paired runs. The script compares
+/// the median of those runs with the same caps, so a single slow run does
+/// not fail the gate. Every other run asserts the caps here.
+#[allow(dead_code)]
+fn gate_median() -> bool {
+    std::env::var_os("PERF_GATE_MEDIAN").is_some()
+}

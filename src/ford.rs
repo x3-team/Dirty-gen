@@ -289,6 +289,13 @@ impl Default for Swell {
 /// Lay the ford into `fluid`, whose window must be centred near the origin.
 /// Returns the water volume on the sheet, cubic metres.
 pub fn seed_ford(fluid: &mut FluidCore, swell: Option<Swell>) -> f32 {
+    seed_ford_turbid(fluid, swell, 0.0)
+}
+
+/// [`seed_ford`] with a river that carries `inlet_turbidity` of suspended
+/// solids (0 clear, ~0.1 a brown flood river). The water already on the
+/// sheet starts at that concentration, as if it had come down the river.
+pub fn seed_ford_turbid(fluid: &mut FluidCore, swell: Option<Swell>, inlet_turbidity: f32) -> f32 {
     fluid.read_substrate(|x, z| {
         let (bed, _) = ford_bed(x, z);
         (bed, initial_moisture(x, z), ford_grain(x, z))
@@ -315,6 +322,7 @@ pub fn seed_ford(fluid: &mut FluidCore, swell: Option<Swell>) -> f32 {
         inlet_eta: still_surface(ox),
         outlet_eta: still_surface(ox + extent),
         inlet_speed_m_s: RIVER_SPEED,
+        inlet_turbidity,
     }));
     fluid.set_wave_maker(swell.map(|s| WaveMaker {
         x0: ox + 1.0,
@@ -337,6 +345,9 @@ pub fn seed_ford(fluid: &mut FluidCore, swell: Option<Swell>) -> f32 {
         wet_film_m: 0.003,
         drain_s: 25.0,
     }));
+    if inlet_turbidity > 0.0 {
+        fluid.suspend_uniform(inlet_turbidity, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
+    }
     vol
 }
 
@@ -361,8 +372,13 @@ pub struct FordDrive {
 impl FordDrive {
     /// Ford with the river settled for `settle_s` seconds, swell optional.
     pub fn new(swell: Option<Swell>, settle_s: f32) -> Self {
+        Self::new_turbid(swell, settle_s, 0.0)
+    }
+
+    /// [`FordDrive::new`] on a river carrying `inlet_turbidity` of silt.
+    pub fn new_turbid(swell: Option<Swell>, settle_s: f32, inlet_turbidity: f32) -> Self {
         let mut fluid = FluidCore::new([0.0, 0.0]);
-        seed_ford(&mut fluid, swell);
+        seed_ford_turbid(&mut fluid, swell, inlet_turbidity);
         let dt = 1.0 / 60.0;
         for _ in 0..(settle_s.max(0.0) / dt) as u32 {
             fluid.step(dt);
@@ -400,6 +416,20 @@ impl FordDrive {
         vehicle.update_steer(0.0, dt);
         let throttle = ((self.pace_m_s - vehicle.speed()) * 1.2 + 0.25).clamp(0.0, 1.0);
         let contacts = vehicle.compute_contacts(&self.world.soil, throttle, 0.0, dt);
+        // Wheels in the water stir the bed: the sheet lifts silt aft of each
+        // contact and foams where the surface cuts the tire. Next step's input.
+        for c in contacts.iter().filter(|c| c.active) {
+            fluid.push_stir(crate::fluid_core::TirePush {
+                x: c.contact_point.x,
+                z: c.contact_point.z,
+                forward_x: c.forward.x,
+                forward_z: c.forward.z,
+                radius: crate::vehicle::WHEEL_RADIUS,
+                width: crate::vehicle::WHEEL_WIDTH,
+                speed: c.speed.abs(),
+                slip: c.slip,
+            });
+        }
         vehicle.integrate(&contacts, &self.world.soil, dt);
         self.time_s += dt;
     }
@@ -424,7 +454,7 @@ fn depth_near(fluid: &FluidCore, x: f32, z: f32) -> f32 {
 }
 
 /// Copy the sheet's bed and water onto the soil the tires read.
-fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
+pub(crate) fn sync_soil(fluid: &FluidCore, soil: &mut crate::soil::SoilField, initial: bool) {
     use crate::soil::SurfaceKind;
     let half = soil.size * 0.5;
     for j in 0..soil.res {

@@ -38,12 +38,22 @@ both sides. `shared_edges_close` checks that on every seam, including seams
 between levels. Nodes outside the camera are culled; the shadow list is
 culled to the light's box.
 
-The shadow pass picks its own list with a coarser ring (96 steps: 1.56 cm
-to 1.5 m, 25 cm past 24 m) and morphs with that same ring.
+The shadow pass picks its own list (not culled to the camera) with the same
+ring as the view. A coarser shadow ring (96 steps) was tried: wherever the
+fine track has relief, the coarse shadow ground sits above or below the
+drawn one and the ruts fill with blocky self-shadow. It stays a knob.
 
 On the proof frames: 4.67 M → 0.37–0.40 M ground triangles in view (ground
-and water pass each), and 4.67 M → 0.31–0.37 M in the shadow pass. Ground
-across all three passes: 14.0 M → about 1.1 M. The vertex step under the camera
+and water pass each), and 4.67 M → 1.26–1.32 M in the shadow pass. Ground
+across all three passes: 14.0 M → about 2.1 M on `high`.
+
+### Fine track filtering
+
+The fine field is 2.5 cm; a LOD vertex 10 cm out reads it 4 texels apart and
+would land on lugs and gaps at random (far ruts read as speckle). On upload
+the field gets 5 box-filtered levels (2.5 to 40 cm). A LOD vertex reads the
+level that matches its step, a ground fragment the level that matches its
+pixel footprint (`tg_footprint`). The vertex step under the camera
 goes from 2.6 cm to 1.56 cm.
 
 ### Height between solver samples (`src/terrain_geom.wgsl`)
@@ -88,10 +98,12 @@ at least one vertex per texel out to 4 m.
 | `SILT_TERRAIN_CUBIC` | 1 | 0 is bilinear between samples |
 | `SILT_TERRAIN_DEBUG` | 0 | 1 tints by level and draws the triangle grid |
 | `SILT_TERRAIN_LOD_RANGE` | 256 | ring radius in vertex steps (≥ 64) |
-| `SILT_TERRAIN_SHADOW_RANGE` | 96 | shadow pass ring radius (≥ 32) |
+| `SILT_TERRAIN_SHADOW_RANGE` | = view | shadow pass ring radius (≥ 32) |
 
-Quality presets (#126) should set `range_steps` / `shadow_range_steps` on
-`Renderer::terrain_geom`; that wiring lands after #126.
+Quality presets (`silt::quality::active().rut_tess`, docs/GPU_BUDGET.md)
+pick the ring: low (1) 128, medium (2) 192, high (4) 256 steps, the same
+for view and shadow. The env knobs override the preset. `silt budget`
+counts the ground's instanced draws.
 
 ## Proof
 

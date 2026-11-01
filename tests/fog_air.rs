@@ -315,7 +315,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
     assert!(frame.fog.iter().all(|v| v.is_finite()));
 
     #[cfg(not(debug_assertions))]
-    {
+    if !gate_median() {
         assert!(
             step_mean <= FOG_STEP_BUDGET_MS,
             "FOG_STEP {step_mean:.3} ms over {FOG_STEP_BUDGET_MS}, max {step_max:.3}"
@@ -445,4 +445,12 @@ fn fluid_sheet_fog_is_not_dust_and_closes_the_ledger() {
         .chunks(4)
         .all(|texel| texel[1] == 0.0 && texel[3] == 0.0));
     assert!(frame.fog.iter().all(|v| v.is_finite()));
+}
+
+/// Set by `scripts/perf_ratio.py` for its paired runs. The script compares
+/// the median of those runs with the same caps, so a single slow run does
+/// not fail the gate. Every other run asserts the caps here.
+#[allow(dead_code)]
+fn gate_median() -> bool {
+    std::env::var_os("PERF_GATE_MEDIAN").is_some()
 }

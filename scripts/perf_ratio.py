@@ -13,8 +13,10 @@ Fail when any of these is true:
 
 k_runner is only the paired head/base comparison. It does not scale a cap.
 
-The pinned base is 3aa2377 (main with #119 merged). Its tree is 40ab33f,
-which passed these caps on an EPYC 7763 in run 41319551811. Pairs are at most 9.
+The pinned base is d0eeb1b (main with #145 and #147 merged). Pairs are at
+most 9. The paired runs set PERF_GATE_MEDIAN, so the tests skip their own
+cap asserts and the caps are checked on the median here. A base pinned
+before that switch gets this tree's timing harness.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ MAX_PAIRS = 9
 # Release CI run 41319551811 passed the flat caps on this tree (#119 head 40ab33f, EPYC 7763).
 # e2e 10.347, air 0.191, dust 0.748, solver 3.741, water 0.565,
 # solver water 0.450, frame 2.517, fog step 0.766.
-PINNED_BASE_SHA = "3aa2377d67536b737fcb3c7d98618e9623b7a2c4"
+PINNED_BASE_SHA = "d0eeb1bb96363321d32b270c3dc565101134bb58"
 CAPS = {
     "E2E_MEAN": 11.820,
     "E2E_AIR": 1.5,
@@ -394,6 +396,21 @@ def prove_stretch() -> str:
     return f"{factor:.4f}"
 
 
+GATE_HARNESS = ("tests/e2e_niva.rs", "tests/frame_bench.rs", "tests/fog_air.rs")
+
+
+def borrow_gate_harness(base_dir: Path) -> None:
+    """A base pinned before PERF_GATE_MEDIAN existed still asserts the caps on
+    every run. Its solver is what is measured; the timing harness comes from
+    this tree, so both sides skip the in-test asserts the same way."""
+    for rel in GATE_HARNESS:
+        theirs = base_dir / rel
+        if theirs.exists() and "PERF_GATE_MEDIAN" in theirs.read_text():
+            continue
+        shutil.copyfile(ROOT / rel, theirs)
+        print(f"PERF_BASE_HARNESS file={rel} from=head", flush=True)
+
+
 def fail_gate(reason: str, detail: str) -> int:
     print(detail)
     print("PERF_GATE result=fail")
@@ -411,10 +428,13 @@ def run_gate(sha: str) -> int:
     base_dir = Path(tempfile.gettempdir()) / "silt-perf-base"
     try:
         prepare_tree(sha, base_dir)
+        borrow_gate_harness(base_dir)
         shared = ROOT / "target"
         head_bins = cargo_bins(ROOT, shared, Path(tempfile.gettempdir()) / "silt-perf-head")
         base_bins = cargo_bins(base_dir, shared, Path(tempfile.gettempdir()) / "silt-perf-basebins")
-        plain = child_env()
+        # The paired runs skip the in-test cap asserts; evaluate() compares
+        # the median of the measured runs with the same caps.
+        plain = child_env({"PERF_GATE_MEDIAN": "1"})
         run_must_pass(head_bins["e2e_niva"], "fine_open", plain)
         run_must_pass(head_bins["fog_air"], "fluid_sheet_fog_is_not_dust_and_closes_the_ledger", plain)
         base_all, base_fatals = collect_side(
@@ -430,7 +450,7 @@ def run_gate(sha: str) -> int:
         if any(len(values) != warmup + measured for values in base_all.values()):
             return fail_gate("base_exit", "PERF_BASE_ERROR incomplete base samples")
         samples_base = {key: values[warmup:] for key, values in base_all.items()}
-        head_env = child_env({"PERF_STRETCH": stretch} if stretch else None)
+        head_env = child_env({"PERF_GATE_MEDIAN": "1", **({"PERF_STRETCH": stretch} if stretch else {})})
         head_all, head_fatals = collect_side(
             head_bins,
             "head",

@@ -12,8 +12,13 @@ use silt::terrain_lod::{self, LodNode, LodParams};
 /// Fine track texels the texture holds. The solver's proposed window is
 /// 640 × 640 at 2.5 cm (16 m around the Niva).
 pub const TRACK_FINE_RES: u32 = 640;
-/// Default shadow ring: 1.56 cm to 1.5 m, 25 cm past 24 m.
-pub const SHADOW_RANGE_STEPS: f32 = 96.0;
+/// Box-filtered levels of the fine track: 2.5, 5, 10, 20, 40 cm. A far LOD
+/// vertex reads the level that matches its spacing instead of aliasing.
+const TRACK_FINE_MIPS: u32 = 5;
+/// Default shadow ring: the view's. A coarser shadow ground sits above or
+/// below the drawn one wherever the fine track has relief, and the ruts fill
+/// with blocky self-shadow (seen on the snow track at 13 m with 96 steps).
+pub const SHADOW_RANGE_STEPS: f32 = terrain_lod::RANGE_STEPS;
 /// Most nodes one view can draw. Two views share the buffer.
 const MAX_NODES: usize = 4096;
 
@@ -62,6 +67,51 @@ pub struct TerrainGeometry {
     pub shadow_range_steps: f32,
 }
 
+/// Rings for a preset, with `SILT_TERRAIN_LOD_RANGE` and
+/// `SILT_TERRAIN_SHADOW_RANGE` overriding it.
+fn rings_for(rut_tess: u32) -> (f32, f32) {
+    let (view, shadow) = preset_rings(rut_tess);
+    let env = |name: &str, min: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v >= min)
+    };
+    (
+        env("SILT_TERRAIN_LOD_RANGE", 64.0).unwrap_or(view),
+        env("SILT_TERRAIN_SHADOW_RANGE", 32.0).unwrap_or(shadow),
+    )
+}
+
+/// View and shadow ring radii, in vertex steps, for a preset's `rut_tess`.
+/// High (4) is the default tree: 1.56 cm out to 4 m in view.
+pub fn preset_rings(rut_tess: u32) -> (f32, f32) {
+    match rut_tess {
+        0 | 1 => (128.0, 128.0),
+        2 | 3 => (192.0, 192.0),
+        _ => (terrain_lod::RANGE_STEPS, SHADOW_RANGE_STEPS),
+    }
+}
+
+/// Halve an rgba f32 square by averaging 2 × 2 texels.
+fn box_down(src: &[f32], side: usize) -> Vec<f32> {
+    let half = side / 2;
+    let mut out = vec![0.0f32; half * half * 4];
+    for j in 0..half {
+        for i in 0..half {
+            for c in 0..4 {
+                let at = |x: usize, y: usize| src[(y * side + x) * 4 + c];
+                out[(j * half + i) * 4 + c] = 0.25
+                    * (at(2 * i, 2 * j)
+                        + at(2 * i + 1, 2 * j)
+                        + at(2 * i, 2 * j + 1)
+                        + at(2 * i + 1, 2 * j + 1));
+            }
+        }
+    }
+    out
+}
+
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => !matches!(v.as_str(), "0" | "false" | "off" | ""),
@@ -105,7 +155,7 @@ impl TerrainGeometry {
                 height: side,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: if float_textures { TRACK_FINE_MIPS } else { 1 },
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: if float_textures {
@@ -117,16 +167,7 @@ impl TerrainGeometry {
             view_formats: &[],
         });
         let fine_view = fine_tex.create_view(&Default::default());
-        let range_steps = std::env::var("SILT_TERRAIN_LOD_RANGE")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v >= 64.0)
-            .unwrap_or(terrain_lod::RANGE_STEPS);
-        let shadow_range_steps = std::env::var("SILT_TERRAIN_SHADOW_RANGE")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v >= 32.0)
-            .unwrap_or(SHADOW_RANGE_STEPS);
+        let (range_steps, shadow_range_steps) = rings_for(silt::quality::active().rut_tess);
         Self {
             patch_v,
             patch_i,
@@ -145,6 +186,13 @@ impl TerrainGeometry {
             range_steps,
             shadow_range_steps,
         }
+    }
+
+    /// Switch rings when the quality preset changes at run time.
+    pub fn apply_quality(&mut self, rut_tess: u32) {
+        let (view, shadow) = rings_for(rut_tess);
+        self.range_steps = view;
+        self.shadow_range_steps = shadow;
     }
 
     /// Layout entries for group 1. The ground and the shadow layouts both
@@ -248,25 +296,35 @@ impl TerrainGeometry {
                 clean[k] += if g.is_finite() { g } else { 0.0 };
             }
         }
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.fine_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&clean),
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(window.res * 16),
-                rows_per_image: Some(window.res),
-            },
-            wgpu::Extent3d {
-                width: window.res,
-                height: window.res,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Level 0 is the publish. Each next level averages 2 × 2 texels.
+        let mut level = clean;
+        let mut side = window.res as usize;
+        for mip in 0..TRACK_FINE_MIPS {
+            if side == 0 {
+                break;
+            }
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.fine_tex,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&level),
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(side as u32 * 16),
+                    rows_per_image: Some(side as u32),
+                },
+                wgpu::Extent3d {
+                    width: side as u32,
+                    height: side as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            level = box_down(&level, side);
+            side /= 2;
+        }
         self.fine_window = Some(window);
     }
 
@@ -381,6 +439,7 @@ impl TerrainGeometry {
         pass.set_vertex_buffer(1, self.instances.slice(start..end));
         pass.set_index_buffer(self.patch_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.patch_count, 0, 0..count);
+        crate::render::count_draw(self.patch_count * count);
     }
 
     /// The patches in the camera's view.
