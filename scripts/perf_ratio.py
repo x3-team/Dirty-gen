@@ -13,7 +13,7 @@ Fail when any of these is true:
 
 k_runner is only the paired head/base comparison. It does not scale a cap.
 
-The pinned base is d0eeb1b (main with #145 and #147 merged). Pairs are at
+The pinned base is ad39a39 (main with #153 merged). Pairs are at
 most 9. The paired runs set PERF_GATE_MEDIAN, so the tests skip their own
 cap asserts and the caps are checked on the median here. A base pinned
 before that switch gets this tree's timing harness.
@@ -39,7 +39,7 @@ MAX_PAIRS = 9
 # Release CI run 41319551811 passed the flat caps on this tree (#119 head 40ab33f, EPYC 7763).
 # e2e 10.347, air 0.191, dust 0.748, solver 3.741, water 0.565,
 # solver water 0.450, frame 2.517, fog step 0.766.
-PINNED_BASE_SHA = "d0eeb1bb96363321d32b270c3dc565101134bb58"
+PINNED_BASE_SHA = "ad39a39c5faeceac4dd236be7099a605d1126bdf"
 CAPS = {
     "E2E_MEAN": 11.820,
     "E2E_AIR": 1.5,
