@@ -1018,6 +1018,7 @@ fn capture_through_drive(renderer: &mut Renderer, width: u32, height: u32) {
     println!("video {}", video.display());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The through-drive for the beauty pass: puddle, bow wave, slurry rut,
 /// spray off the arches, out onto dry ground in its own dust. The solver and
 /// the contract are the through-drive's; only cameras are chosen here.
@@ -1146,6 +1147,7 @@ fn capture_beauty_drive(renderer: &mut Renderer, width: u32, height: u32, dir: &
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// A drying puddle bed for the crust: wet mud in the middle, cracking clay
 /// around it, baked crust at the rim, sand beyond. The scene only sets the
 /// soil's own kind and wetness fields; the shaders read them as they would
@@ -1888,6 +1890,7 @@ fn win_demo_stage_bow_in_pool(world: &mut World) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn win_demo_seed_pool_splashes(world: &mut World) {
     use silt::vehicle::WHEEL_RADIUS;
     let ori = world.vehicle.orientation();
@@ -1911,6 +1914,7 @@ fn win_demo_seed_pool_splashes(world: &mut World) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn win_demo_seat_wheel_in_puddle(world: &mut World, wheel: usize, yaw: f32) {
     use silt::vehicle::WHEEL_RADIUS;
     let (tx, tz) = WIN_DEMO_SEAM_PUDDLE;
