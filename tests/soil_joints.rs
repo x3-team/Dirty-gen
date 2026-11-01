@@ -19,7 +19,8 @@ const GRASS_WET: f32 = 0.42;
 
 #[test]
 fn joint_shares_keep_mass_and_blend() {
-    assert_eq!(RENDER_CONTRACT_VERSION, 6);
+    assert!(RENDER_CONTRACT_VERSION >= 8, "soil mix landed as contract v8");
+    assert_eq!(VALID_MIX, 1 << 12);
 
     let mut soil = SoilField::flat(0.5);
     paint_strips(&mut soil);

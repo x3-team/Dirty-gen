@@ -704,6 +704,11 @@ pub struct SoilField {
     pub crust: Vec<f32>,
     /// Crack opening, metres. A shader reads this. It does not move the bed.
     pub crack: Vec<f32>,
+    /// Cubic metres of skin written onto the field, including what later left.
+    /// Not solid mass. The bed, the placed pile, and the cloud stay out of it.
+    skin_grown_m3: f64,
+    /// Cubic metres of skin soaked off or faded by the drying front.
+    skin_lost_m3: f64,
     /// Mud, sand, gravel, grass per cell, `MIX_CHANNELS` floats.
     /// Filled by [`SoilField::blend_material_joints`].
     pub mix: Vec<f32>,
@@ -1312,6 +1317,8 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust: vec![0.0; n],
             crack: vec![0.0; n],
+            skin_grown_m3: 0.0,
+            skin_lost_m3: 0.0,
             mix: vec![0.0; n * MIX_CHANNELS],
             mix_ready: false,
         }
@@ -5925,6 +5932,31 @@ impl SoilField {
         }
     }
 
+    /// Skin and fissure volumes. Thickness is the closed book: what grew,
+    /// minus what soaked or faded, is what is still on the field. Opening is
+    /// the fissure volume. Neither is the solid column.
+    pub fn crust_book(&self) -> CrustBook {
+        let area = f64::from(self.cell) * f64::from(self.cell);
+        let mut thickness = 0.0f64;
+        let mut opening = 0.0f64;
+        for idx in 0..self.crust.len() {
+            let t = self.crust[idx];
+            let o = self.crack[idx];
+            if t.is_finite() && t > 0.0 {
+                thickness += f64::from(t);
+            }
+            if o.is_finite() && o > 0.0 {
+                opening += f64::from(o);
+            }
+        }
+        CrustBook {
+            thickness_m3: thickness * area,
+            opening_m3: opening * area,
+            grown_m3: self.skin_grown_m3,
+            lost_m3: self.skin_lost_m3,
+        }
+    }
+
     /// Displace puddle water out of a wheel footprint. Returns displaced depth scale.
     pub fn displace_water(&mut self, x: f32, z: f32, forward: Vec3, amount: f32) {
         let Some(idx) = self.idx_at(x, z) else {
@@ -5969,51 +6001,55 @@ impl SoilField {
         // Time away from a cell is what makes the next visit a new pass.
         self.age_passes(dt);
         self.infiltrate(dt);
-        let res = self.res;
-        let dx = self.cell;
-        let area = dx * dx;
-        let mut next = self.water.clone();
-        let cond = 1.35; // m/s per metre of head, scaled below by dt
+        // When any cell still holds mobile water, dry neighbours still pipe.
+        // A field with none skips the clone and the edge loop.
+        if self.water.iter().any(|w| *w > 0.0) {
+            let res = self.res;
+            let dx = self.cell;
+            let area = dx * dx;
+            let mut next = self.water.clone();
+            let cond = 1.35; // m/s per metre of head, scaled below by dt
 
-        for j in 0..res {
-            for i in 0..res {
-                let a = j * res + i;
-                if i + 1 < res {
-                    let b = a + 1;
-                    transfer(
-                        &self.height,
-                        &self.water,
-                        &self.kind,
-                        &mut next,
-                        a,
-                        b,
-                        dt,
-                        dx,
-                        area,
-                        cond,
-                    );
-                }
-                if j + 1 < res {
-                    let b = a + res;
-                    transfer(
-                        &self.height,
-                        &self.water,
-                        &self.kind,
-                        &mut next,
-                        a,
-                        b,
-                        dt,
-                        dx,
-                        area,
-                        cond,
-                    );
+            for j in 0..res {
+                for i in 0..res {
+                    let a = j * res + i;
+                    if i + 1 < res {
+                        let b = a + 1;
+                        transfer(
+                            &self.height,
+                            &self.water,
+                            &self.kind,
+                            &mut next,
+                            a,
+                            b,
+                            dt,
+                            dx,
+                            area,
+                            cond,
+                        );
+                    }
+                    if j + 1 < res {
+                        let b = a + res;
+                        transfer(
+                            &self.height,
+                            &self.water,
+                            &self.kind,
+                            &mut next,
+                            a,
+                            b,
+                            dt,
+                            dx,
+                            area,
+                            cond,
+                        );
+                    }
                 }
             }
+            for w in &mut next {
+                *w = w.clamp(0.0, 0.34);
+            }
+            self.water = next;
         }
-        for w in &mut next {
-            *w = w.clamp(0.0, 0.34);
-        }
-        self.water = next;
         self.step_moisture(dt, rain);
         self.step_slurry(dt);
     }
@@ -6114,37 +6150,39 @@ impl SoilField {
         if dt <= 0.0 {
             return;
         }
+        let mut thickness = self.crust[idx];
+        let mut opening = self.crack[idx];
         let pond = rain > 1.0e-6 || self.water[idx] > water_hold(kind) + 0.012;
         if !crustable(kind) || pond {
             let soak = if pond { CRUST_SOAK } else { CRUST_SOAK * 0.35 };
-            self.crust[idx] = (self.crust[idx] - soak * dt).max(0.0);
-            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * dt).max(0.0);
+            thickness = (thickness - soak * dt).max(0.0);
+            opening = (opening - CRACK_CLOSE * dt).max(0.0);
+            self.commit_skin(idx, thickness, opening);
             return;
         }
         if self.wetness[idx] <= REWET_AT {
             let deficit = ((REWET_AT - self.wetness[idx]) / REWET_AT).clamp(0.0, 1.0);
             let track = if self.passes[idx] > 0 { 1.35 } else { 1.0 };
-            let room = (CRUST_MAX_M - self.crust[idx]).max(0.0);
+            let room = (CRUST_MAX_M - thickness).max(0.0);
             let grow = (CRUST_GROW * deficit * track * dt).min(room);
-            self.crust[idx] += grow;
+            thickness += grow;
         } else {
-            self.crust[idx] = (self.crust[idx] - CRUST_SOAK * 0.15 * dt).max(0.0);
+            thickness = (thickness - CRUST_SOAK * 0.15 * dt).max(0.0);
         }
-        self.open_crack(idx, dt);
+        opening = self.next_crack(idx, thickness, opening, dt);
+        self.commit_skin(idx, thickness, opening);
     }
 
-    fn open_crack(&mut self, idx: usize, dt: f32) {
-        if self.crust[idx] <= CRACK_ONSET_M {
-            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * dt).max(0.0);
-            return;
+    fn next_crack(&self, idx: usize, thickness: f32, opening: f32, dt: f32) -> f32 {
+        if thickness <= CRACK_ONSET_M {
+            return (opening - CRACK_CLOSE * dt).max(0.0);
         }
         let (x, z) = self.cell_xz(idx);
         let mask = crack_mask(x, z);
         if mask < 0.12 {
-            self.crack[idx] = (self.crack[idx] - CRACK_CLOSE * 0.25 * dt).max(0.0);
-            return;
+            return (opening - CRACK_CLOSE * 0.25 * dt).max(0.0);
         }
-        let skin = ((self.crust[idx] - CRACK_ONSET_M) / (CRUST_MAX_M - CRACK_ONSET_M)).clamp(0.0, 1.0);
+        let skin = ((thickness - CRACK_ONSET_M) / (CRUST_MAX_M - CRACK_ONSET_M)).clamp(0.0, 1.0);
         let plate = if self.passes[idx] > 0 {
             let age = ((self.rest[idx] - 0.40) / 12.0).clamp(0.0, 1.0);
             0.55 + 0.45 * age
@@ -6153,7 +6191,33 @@ impl SoilField {
         };
         let target = CRACK_MAX_M * skin * mask * plate;
         let a = 1.0 - (-0.09 * dt).exp();
-        self.crack[idx] = lerp(self.crack[idx], target, a).clamp(0.0, CRACK_MAX_M);
+        lerp(opening, target, a).clamp(0.0, CRACK_MAX_M)
+    }
+
+    /// Store the skin. Thickness stays at or under [`CRUST_CAP_M`]. Opening
+    /// does not exceed thickness. The cubic metres go into the crust book.
+    fn commit_skin(&mut self, idx: usize, thickness: f32, opening: f32) {
+        let thickness = if thickness.is_finite() {
+            thickness.clamp(0.0, CRUST_CAP_M)
+        } else {
+            0.0
+        };
+        let opening = if opening.is_finite() {
+            opening.max(0.0).min(thickness)
+        } else {
+            0.0
+        };
+        let prev = self.crust[idx];
+        let prev = if prev.is_finite() && prev > 0.0 { prev } else { 0.0 };
+        let area = f64::from(self.cell) * f64::from(self.cell);
+        let delta = f64::from(thickness) - f64::from(prev);
+        if delta > 0.0 {
+            self.skin_grown_m3 += delta * area;
+        } else if delta < 0.0 {
+            self.skin_lost_m3 += -delta * area;
+        }
+        self.crust[idx] = thickness;
+        self.crack[idx] = opening;
     }
 
     fn cell_xz(&self, idx: usize) -> (f32, f32) {
@@ -6438,10 +6502,20 @@ impl SoilField {
         for idx in 0..n {
             height[idx] = bed[idx] + placed[idx] + slurry[idx];
         }
+        let cell = size / res as f32;
+        // The snapshot has no ledger. Skin already on the field is grown.
+        let area = f64::from(cell) * f64::from(cell);
+        let mut skin_grown_m3 = 0.0f64;
+        for t in &crust {
+            if t.is_finite() && *t > 0.0 {
+                skin_grown_m3 += f64::from(*t);
+            }
+        }
+        skin_grown_m3 *= area;
         Ok(Self {
             res,
             size,
-            cell: size / res as f32,
+            cell,
             height,
             initial_height,
             loose,
@@ -6464,6 +6538,8 @@ impl SoilField {
             cloud: vec![0.0; n],
             crust,
             crack,
+            skin_grown_m3,
+            skin_lost_m3: 0.0,
             mix,
             mix_ready,
         })
@@ -7372,8 +7448,9 @@ impl SoilField {
             field.wetness[idx] = lerp(wet_snap.0[idx], field.wetness[idx], d);
             field.water[idx] = lerp(wet_snap.1[idx], field.water[idx], d);
             field.roughness[idx] = lerp(wet_snap.3[idx], field.roughness[idx], d);
-            field.crust[idx] *= d;
-            field.crack[idx] *= d;
+            let thickness = field.crust[idx] * d;
+            let opening = field.crack[idx] * d;
+            field.commit_skin(idx, thickness, opening);
             if d < 0.82 {
                 field.kind[idx] = wet_snap.2[idx];
             }
@@ -7807,6 +7884,23 @@ pub struct FordContactMask {
     water: Vec<(usize, f32)>,
 }
 
+/// Skin volume on the heightfield. Thickness is a closed book. Opening is
+/// the fissure volume and is not added to the solid column.
+#[derive(Clone, Copy, Debug)]
+pub struct CrustBook {
+    pub thickness_m3: f64,
+    pub opening_m3: f64,
+    pub grown_m3: f64,
+    pub lost_m3: f64,
+}
+
+impl CrustBook {
+    /// `|grown − lost − still on the field|`, cubic metres.
+    pub fn gap(self) -> f64 {
+        (self.grown_m3 - self.lost_m3 - self.thickness_m3).abs()
+    }
+}
+
 /// Water plus soil, split into the solid, the free column, and the slurry.
 #[derive(Clone, Copy, Debug)]
 pub struct MixVolumes {
@@ -8061,6 +8155,8 @@ const CRUST_AT: f32 = 0.34;
 const REWET_AT: f32 = 0.44;
 /// Thickest dry skin, metres. The shader's red channel is this over [`CRUST_SHADER_METRES`].
 pub const CRUST_MAX_M: f32 = 0.036;
+/// Thickness ceiling, metres. The dry spell stops at [`CRUST_MAX_M`], under this.
+pub const CRUST_CAP_M: f32 = 0.05;
 /// Widest shrinkage opening, metres. The shader's green channel is this over [`CRACK_SHADER_METRES`].
 pub const CRACK_MAX_M: f32 = 0.016;
 /// Skin that has to form before a fissure opens.
@@ -9399,6 +9495,41 @@ mod tests {
             west.kind()
         );
         assert!(west.crust < 1.0e-4, "the wet track kept a skin, {}", west.crust);
+        let book = field.crust_book();
+        eprintln!(
+            "crust book thickness {:.6} opening {:.6} grown {:.6} lost {:.6} gap {:.8}",
+            book.thickness_m3, book.opening_m3, book.grown_m3, book.lost_m3, book.gap()
+        );
+        assert!(
+            book.thickness_m3 > 1.0,
+            "crust book stayed empty, {:.6}",
+            book.thickness_m3
+        );
+        assert!(
+            book.opening_m3 > 0.05,
+            "opening book stayed empty, {:.6}",
+            book.opening_m3
+        );
+        assert!(
+            book.gap() < 1.0e-3,
+            "crust book gap {:.6} grown {:.6} lost {:.6} still {:.6}",
+            book.gap(),
+            book.grown_m3,
+            book.lost_m3,
+            book.thickness_m3
+        );
+        for idx in 0..field.crust.len() {
+            let thickness = field.crust[idx];
+            let opening = field.crack[idx];
+            assert!(
+                thickness <= CRUST_CAP_M,
+                "thickness {thickness} over {CRUST_CAP_M}"
+            );
+            assert!(
+                opening <= thickness,
+                "opening {opening} over thickness {thickness}"
+            );
+        }
     }
 
     #[test]

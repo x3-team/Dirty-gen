@@ -12,6 +12,8 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS, WHEEL_WID
 use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
+use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime};
+use crate::overlay::Overlay;
 use crate::mesh::{
     bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_with_ground,
     terrain_mesh,
@@ -19,7 +21,27 @@ use crate::mesh::{
     MeshVertex, ParticleVertex, TerrainVertex,
 };
 
+/// Sun shadow map side on the `high` preset. The renderer builds with
+/// [`silt::quality::active`]`().shadow_res`.
+#[allow(dead_code)]
 const SHADOW: u32 = 2048;
+
+thread_local! {
+    /// Draw calls and triangles encoded since the last [`take_draw_stats`].
+    static DRAW_STATS: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn count_draw(vertices: u32) {
+    DRAW_STATS.with(|c| {
+        let (d, t) = c.get();
+        c.set((d + 1, t + vertices as u64 / 3));
+    });
+}
+
+/// Draw calls and triangles since the previous call.
+pub fn take_draw_stats() -> (u32, u64) {
+    DRAW_STATS.with(|c| c.replace((0, 0)))
+}
 const MODEL_SLOTS: u64 = 12;
 
 #[repr(C)]
@@ -65,6 +87,12 @@ pub struct Renderer {
     pub adapter_name: String,
     width: u32,
     height: u32,
+    /// Window size the blit fills. `width × height` is this times the render scale.
+    out_width: u32,
+    out_height: u32,
+    quality: silt::quality::Quality,
+    shadow_res: u32,
+    overlay: Option<Overlay>,
     model_stride: u32,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
@@ -124,6 +152,7 @@ pub struct Renderer {
     pipe_blit_srgb: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
+    present_format: Option<wgpu::TextureFormat>,
     mat_scratch: Vec<u8>,
     crust_scratch: Vec<u8>,
     imprint_scratch: Vec<u8>,
@@ -143,6 +172,10 @@ pub struct Renderer {
     pub niva_picture: bool,
     /// Draw the solved water column, including a bow above the film range.
     pub water_column: bool,
+    /// River or sea shore: the solved column is drawn as the free surface
+    /// (bed + depth) with sky reflection, instead of a film on the bed.
+    /// Implies the `water_column` pack.
+    pub open_water: bool,
     /// Paint the snow layer. Compaction in the darken channel tints the blanket.
     pub snow: bool,
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
@@ -159,6 +192,8 @@ pub struct Renderer {
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
     pub debug_mode: u32,
+    /// Set by [`Renderer::enable_gpu_time`]. Absent for the window and for captures.
+    gpu_time: Option<GpuTime>,
 }
 
 pub struct GpuFormats {
@@ -258,6 +293,88 @@ pub fn open_adapter(
     (instance, adapter, device, queue)
 }
 
+/// Open an adapter for `capture --gpu-time`. Missing adapter is an error the
+/// caller prints, not a panic. Timestamp queries are requested when the
+/// adapter offers them.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn try_open_adapter(
+    software: bool,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: if software {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all()
+        },
+        ..Default::default()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: software,
+        compatible_surface: surface,
+    }))
+    .ok_or_else(|| {
+        format!(
+            "no wgpu adapter (software={software}). For lavapipe set VK_DRIVER_FILES to lvp_icd.json and unset DISPLAY."
+        )
+    })?;
+    let info = adapter.get_info();
+    println!(
+        "wgpu adapter: {} {:?} {:?}",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = open_timed_device(&adapter)?;
+    Ok((instance, adapter, device, queue))
+}
+
+/// Adapter and device on the instance that made `surface`. Timestamp
+/// queries are requested when the adapter offers them.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_for_surface(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: Some(surface),
+    }))
+    .ok_or_else(|| "no wgpu adapter for the window surface".to_string())?;
+    let info = adapter.get_info();
+    println!(
+        "wgpu adapter: {} {:?} {:?}",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = open_timed_device(&adapter)?;
+    Ok((adapter, device, queue))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_timed_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        let timed = wgpu::DeviceDescriptor {
+            label: Some("silt"),
+            required_features: wgpu::Features::TIMESTAMP_QUERY,
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        };
+        if let Ok(pair) = pollster::block_on(adapter.request_device(&timed, None)) {
+            return Ok(pair);
+        }
+    }
+    pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("silt"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .map_err(|err| format!("request_device: {err}"))
+}
+
 impl Renderer {
     pub fn new(
         device: wgpu::Device,
@@ -268,6 +385,8 @@ impl Renderer {
         formats: GpuFormats,
         cc0: crate::cc0::Cc0Scene,
     ) -> Self {
+        let quality = silt::quality::active();
+        let shadow_res = quality.shadow_res;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -505,8 +624,8 @@ impl Renderer {
         let shadow = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow"),
             size: wgpu::Extent3d {
-                width: SHADOW,
-                height: SHADOW,
+                width: shadow_res,
+                height: shadow_res,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -520,8 +639,8 @@ impl Renderer {
         let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow-depth"),
             size: wgpu::Extent3d {
-                width: SHADOW,
-                height: SHADOW,
+                width: shadow_res,
+                height: shadow_res,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1116,6 +1235,7 @@ impl Renderer {
             pipe_blit_srgb,
             blit_shader,
             blit_layout,
+            present_format: None,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
             crust_scratch: vec![0; MAP_RES * MAP_RES * 4],
             imprint_scratch: vec![0; MAP_RES * MAP_RES * 4],
@@ -1130,6 +1250,7 @@ impl Renderer {
             show_bike: true,
             niva_picture: false,
             water_column: false,
+            open_water: false,
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
@@ -1141,12 +1262,82 @@ impl Renderer {
             pipe_debug,
             debug_contract: false,
             debug_mode: 0,
+            gpu_time: None,
+            out_width: width,
+            out_height: height,
+            quality,
+            shadow_res,
+            overlay: None,
         }
+    }
+
+    pub fn quality(&self) -> silt::quality::Quality {
+        self.quality
+    }
+
+    /// Switch preset live. Render scale applies now. Shadow resolution is
+    /// fixed when the renderer is built; the window prints that it applies
+    /// on the next start when it differs.
+    pub fn set_quality(&mut self, quality: silt::quality::Quality) -> bool {
+        self.quality = quality;
+        let (w, h) = (self.out_width, self.out_height);
+        self.resize_internal(w, h);
+        quality.shadow_res == self.shadow_res
+    }
+
+    /// Internal target size (after render scale).
+    pub fn internal_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Text drawn over the top-left corner of the presented frame. `None` hides it.
+    pub fn set_overlay_text(&mut self, lines: Option<&[String]>) {
+        let Some(lines) = lines else {
+            if let Some(o) = self.overlay.as_mut() {
+                o.visible = false;
+            }
+            return;
+        };
+        if self.overlay.is_none() {
+            let format = self.present_format.unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+            self.overlay = Some(Overlay::new(&self.device, format));
+        }
+        let o = self.overlay.as_mut().unwrap();
+        o.visible = true;
+        o.write(&self.queue, lines);
+    }
+
+    /// Arm timestamp queries. The window leaves this off.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn enable_gpu_time(&mut self) -> bool {
+        if self.gpu_time.is_none() {
+            self.gpu_time = GpuTime::try_new(&self.device, &self.queue);
+        }
+        self.gpu_time.is_some()
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn take_gpu_time(&mut self) -> GpuSample {
+        let Self {
+            gpu_time, device, ..
+        } = self;
+        match gpu_time {
+            Some(clock) => clock.read(device),
+            None => GpuSample::empty(),
+        }
+    }
+
+    /// Newest finished GPU frame without waiting.
+    pub fn poll_gpu_time(&mut self) -> Option<GpuSample> {
+        let clock = self.gpu_time.as_ref()?;
+        clock.poll(&self.device)
     }
 
     /// Point the window blit at the swapchain format. Offscreen frames stay linear-in-a-Unorm-buffer
     /// (gamma already applied); an sRGB surface must undo that before it encodes again.
     pub fn set_present_format(&mut self, format: wgpu::TextureFormat) {
+        self.present_format = Some(format);
+        self.overlay = None;
         self.pipe_blit = pipeline(
             &self.device,
             &self.blit_shader,
@@ -1173,8 +1364,19 @@ impl Renderer {
         );
     }
 
+    /// Window size. Internal targets follow at the preset's render scale.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 || (width == self.width && height == self.height) {
+        self.resize_internal(width, height);
+    }
+
+    fn resize_internal(&mut self, out_w: u32, out_h: u32) {
+        if out_w == 0 || out_h == 0 {
+            return;
+        }
+        self.out_width = out_w;
+        self.out_height = out_h;
+        let (width, height) = self.quality.scaled(out_w, out_h);
+        if width == self.width && height == self.height {
             return;
         }
         self.width = width;
@@ -1311,9 +1513,15 @@ impl Renderer {
             ],
             misc: [
                 world.time,
-                SHADOW as f32,
+                self.shadow_res as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
-                if self.water_column { 1.0 } else { 0.0 },
+                if self.open_water {
+                    2.0
+                } else if self.water_column {
+                    1.0
+                } else {
+                    0.0
+                },
             ],
             tires: tire_frame(&world.vehicle),
             snow_arc: [0.0; 4],
@@ -1352,6 +1560,11 @@ impl Renderer {
                 .write_buffer(&self.dust_i, 0, bytemuck::cast_slice(&dust.indices));
         }
 
+        // Each pass takes one begin/end timestamp pair, labelled with the pass
+        // label (`silt::quality::pass_budgets` names the same labels). The
+        // clock is out of `self` for the frame.
+        let clock = self.gpu_time.take();
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1359,6 +1572,7 @@ impl Renderer {
             });
 
         {
+            let shadow_time = pass_timestamps(clock.as_ref(), "shadow");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1377,10 +1591,10 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: shadow_time,
                 occlusion_query_set: None,
             });
-            pass.set_viewport(0.0, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
+            pass.set_viewport(0.0, 0.0, self.shadow_res as f32, self.shadow_res as f32, 0.0, 1.0);
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.height_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[0]);
@@ -1408,6 +1622,7 @@ impl Renderer {
         }
 
         {
+            let main_time = pass_timestamps(clock.as_ref(), "main");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1426,12 +1641,13 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: main_time,
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_pipeline(&self.pipe_sky);
             pass.draw(0..3, 0..1);
+            count_draw(3);
 
             // Floor outside the heightfield, under the terrain so the rim stays the field.
             pass.set_bind_group(1, &self.tex_bg, &[]);
@@ -1487,6 +1703,7 @@ impl Renderer {
 
         if self.debug_contract {
             if let (Some(pipe), Some(gpu)) = (&self.pipe_debug, &self.contract) {
+                let debug_time = pass_timestamps(clock.as_ref(), "contract-debug");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("contract-debug"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1503,7 +1720,7 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: debug_time,
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(pipe);
@@ -1512,10 +1729,12 @@ impl Renderer {
                     * silt::render_contract::WINDOW_CELLS
                     * 6;
                 pass.draw(0..n, 0..1);
+                count_draw(n);
             }
         }
 
         if let Some((view, srgb)) = present {
+            let blit_time = pass_timestamps(clock.as_ref(), "blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1527,7 +1746,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: blit_time,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(if srgb {
@@ -1537,6 +1756,21 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.blit_bg, &[]);
             pass.draw(0..3, 0..1);
+            count_draw(3);
+        }
+
+        if let (Some((view, _)), Some(overlay)) = (present, self.overlay.as_ref()) {
+            if overlay.visible {
+                let overlay_time = pass_timestamps(clock.as_ref(), "overlay");
+                overlay.draw(
+                    &mut encoder,
+                    &self.queue,
+                    view,
+                    self.out_width,
+                    self.out_height,
+                    overlay_time,
+                );
+            }
         }
 
         if readback {
@@ -1563,7 +1797,14 @@ impl Renderer {
             );
         }
 
+        if let Some(clock) = clock.as_ref() {
+            clock.resolve(&mut encoder);
+        }
         self.queue.submit(Some(encoder.finish()));
+        if let Some(clock) = clock.as_ref() {
+            clock.after_submit();
+        }
+        self.gpu_time = clock;
 
         if !readback {
             return None;
@@ -1648,7 +1889,11 @@ impl Renderer {
             // Free water and the mixed body share this channel. The mesh
             // already sits on the slurry, so the tint is that one surface.
             let liquid = soil.water[i] + soil.slurry[i];
-            let liquid_scale = if self.water_column { 0.90 } else { 0.34 };
+            let liquid_scale = if self.water_column || self.open_water {
+                0.90
+            } else {
+                0.34
+            };
             px[1] = ((liquid / liquid_scale).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
@@ -1821,6 +2066,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
         pass.set_index_buffer(self.bike_susp_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..susp_indices, 0, 0..1);
+        count_draw(susp_indices);
     }
 
     fn draw_chunks(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -1832,6 +2078,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.chunk_v.slice(..));
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+        count_draw(count);
     }
 
     fn draw_dust(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -1842,6 +2089,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.dust_v.slice(..));
         pass.set_index_buffer(self.dust_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+        count_draw(count);
     }
 }
 
@@ -1952,6 +2200,7 @@ fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.count, 0, 0..1);
+    count_draw(mesh.count);
 }
 
 fn filter_array(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {

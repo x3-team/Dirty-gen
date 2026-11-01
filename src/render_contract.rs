@@ -12,10 +12,14 @@ use bytemuck::Zeroable;
 use crate::dust::{DensityTexture, Dust, AIR_DY_M, SETTLED_CELL_M};
 use crate::fluid_core::{FluidCore, AIR_LAYERS, AIR_RES, COARSE_CELL_M, WINDOW_RES};
 use crate::particles::Particle;
-use crate::soil::{mix_channel, SoilField, SurfaceKind, MIX_CHANNELS};
+use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
+use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 6;
+pub const RENDER_CONTRACT_VERSION: u32 = 8;
+
+/// Floats per flow texel: vx, vz, speed, turbidity.
+pub const FLOW_CHANNELS: usize = 4;
 
 /// Coarse ground window. 200 × 0.20 m = 40 m. The 2 cm tire patch is restricted
 /// back into this window before publish. It is not a second map.
@@ -66,8 +70,10 @@ pub const VALID_WET_EDGE: u32 = 1 << 7;
 pub const VALID_FOAM: u32 = 1 << 8;
 pub const VALID_SPRAY: u32 = 1 << 9;
 pub const VALID_AIR: u32 = 1 << 10;
-pub const VALID_FOG: u32 = 1 << 11;
+pub const VALID_TURBIDITY: u32 = 1 << 11;
 pub const VALID_MIX: u32 = 1 << 12;
+pub const VALID_SNOW: u32 = 1 << 14;
+pub const VALID_FOG: u32 = 1 << 13;
 
 pub const BIND_HEADER: u32 = 0;
 pub const BIND_GROUND: u32 = 1;
@@ -83,6 +89,7 @@ pub const BIND_SPRAY: u32 = 10;
 pub const BIND_AIR: u32 = 11;
 pub const BIND_FOG: u32 = 12;
 pub const BIND_MIX: u32 = 13;
+pub const BIND_SNOW: u32 = 14;
 
 /// Uniform header. 96 bytes. Layout matches `ContractHeader` in the WGSL.
 ///
@@ -142,10 +149,11 @@ pub struct ContractFrame {
     pub dust_fog: Vec<f32>,
     /// World air velocity, rgba, same index as `dust_fog` times 4.
     pub air_velocity: Vec<f32>,
-    /// Fog volume fraction, same index as `dust_fog`. Not dust.
     pub fog: Vec<f32>,
     /// Mud, sand, gravel, grass shares. Four floats per texel.
     pub soil_mix: Vec<f32>,
+    /// Snow column. RGBA: height m, density kg/m³, compaction 0..1, 0.
+    pub snow: Vec<f32>,
     pub spray: Vec<SprayGpu>,
 }
 
@@ -158,7 +166,7 @@ impl ContractFrame {
             ground_rut: vec![0.0; n * 4],
             moisture: vec![0.0; n],
             film: vec![0.0; n * 2],
-            flow: vec![0.0; n * 2],
+            flow: vec![0.0; n * FLOW_CHANNELS],
             dust_settled: vec![0.0; n],
             crust: vec![0.0; n * 2],
             wet_edge: vec![0.0; n],
@@ -167,6 +175,7 @@ impl ContractFrame {
             air_velocity: vec![0.0; air * 4],
             fog: vec![0.0; air],
             soil_mix: vec![0.0; n * 4],
+            snow: vec![0.0; n * 4],
             spray: vec![SprayGpu::zeroed(); SPRAY_CAPACITY as usize],
         }
     }
@@ -205,31 +214,6 @@ pub fn foam_fraction(speed_m_s: f32, thickness_m: f32) -> f32 {
     finite0(smooth01(FOAM_FROUDE_0, FOAM_FROUDE_1, froude))
 }
 
-/// Foam on a lip that stands above the neighbouring film. Not the placed berm.
-fn crest_foam(excess_m: f32, thickness_m: f32) -> f32 {
-    if !excess_m.is_finite() || thickness_m < FOAM_MIN_FILM_M {
-        return 0.0;
-    }
-    smooth01(0.004, 0.018, excess_m)
-}
-
-/// Foam in the wet footprint of a tire that shoved the sheet this step.
-fn tire_foam(x: f32, z: f32, thickness_m: f32, pushes: &[crate::fluid_core::TirePush]) -> f32 {
-    if thickness_m < FOAM_MIN_FILM_M {
-        return 0.0;
-    }
-    let mut best = 0.0f32;
-    for push in pushes {
-        let reach = (push.radius * 1.45).max(0.2);
-        let d = (x - push.x).hypot(z - push.z);
-        if d >= reach {
-            continue;
-        }
-        best = best.max(smooth01(0.05, 0.55, 1.0 - d / reach));
-    }
-    best
-}
-
 fn finite0(v: f32) -> f32 {
     if v.is_finite() {
         v
@@ -255,218 +239,82 @@ fn is_wet(moisture: f32, water_m: f32, slurry_m: f32) -> bool {
     moisture >= WET_MOISTURE || water_m + slurry_m >= WET_FILM_M
 }
 
-#[inline]
-fn write_soil_mix(out: &mut [f32], idx: usize, soil: &SoilField, sidx: usize) {
-    let base = idx * 4;
-    if soil.mix_ready && soil.mix.len() >= (sidx + 1) * MIX_CHANNELS {
-        let sb = sidx * MIX_CHANNELS;
-        out[base..base + 4].copy_from_slice(&soil.mix[sb..sb + 4]);
-    } else if let Some(ch) = mix_channel(SurfaceKind::from_u8(soil.kind[sidx])) {
-        out[base + ch] = 1.0;
-    }
-}
-
-/// Disjoint row stripes in the coarse window. The scope joins before `out` is read again.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Copy, Clone)]
-struct ShareMutF32(*mut f32);
-#[cfg(not(target_arch = "wasm32"))]
-unsafe impl Send for ShareMutF32 {}
-#[cfg(not(target_arch = "wasm32"))]
-unsafe impl Sync for ShareMutF32 {}
-#[cfg(not(target_arch = "wasm32"))]
-impl ShareMutF32 {
-    unsafe fn slice<'a>(self, n: usize) -> &'a mut [f32] {
-        unsafe { std::slice::from_raw_parts_mut(self.0, n) }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Copy, Clone)]
-struct ShareMutBool(*mut bool);
-#[cfg(not(target_arch = "wasm32"))]
-unsafe impl Send for ShareMutBool {}
-#[cfg(not(target_arch = "wasm32"))]
-unsafe impl Sync for ShareMutBool {}
-#[cfg(not(target_arch = "wasm32"))]
-impl ShareMutBool {
-    unsafe fn slice<'a>(self, n: usize) -> &'a mut [bool] {
-        unsafe { std::slice::from_raw_parts_mut(self.0, n) }
-    }
-}
-
-fn fill_coarse_row(
-    j: usize,
-    ground_rut: &mut [f32],
-    moisture_out: &mut [f32],
-    film: &mut [f32],
-    flow: &mut [f32],
-    dust_settled: &mut [f32],
-    soil_mix: &mut [f32],
-    wet: &mut [bool],
-    soil: &SoilField,
-    fluid: Option<&FluidCore>,
-    origin_x: f32,
-    origin_z: f32,
-    dust_settled_from_sheet: bool,
-) {
-    for i in 0..WINDOW_RES {
-        let idx = j * WINDOW_RES + i;
-        let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
-        let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
-        let sheet = fluid.and_then(|fluid| fluid.coarse_cell(i, j));
-        let soil_idx = soil.idx_at(x, z);
-
-        let (bed, placed, rut) = if let Some(sidx) = soil_idx {
-            (
-                soil.bed[sidx],
-                soil.placed[sidx],
-                (soil.initial_height[sidx] - soil.bed[sidx]).max(0.0),
-            )
-        } else if let Some(cell) = sheet {
-            (cell.bed_m, 0.0, 0.0)
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        ground_rut[idx * 4] = finite0(bed + placed);
-        ground_rut[idx * 4 + 1] = finite0(rut);
-        ground_rut[idx * 4 + 2] = finite0(bed);
-        ground_rut[idx * 4 + 3] = finite0(placed);
-
-        let (sheet_moisture, water_m, slurry_m, u, v, settled) = if let Some(cell) = sheet {
-            (
-                cell.moisture,
-                cell.water_m,
-                cell.slurry_m,
-                cell.u,
-                cell.v,
-                cell.settled_dust_m,
-            )
-        } else if let Some(sidx) = soil_idx {
-            (
-                soil.wetness[sidx],
-                soil.water[sidx],
-                soil.slurry[sidx],
-                0.0,
-                0.0,
-                0.0,
-            )
-        } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        };
-        let wetness = if let Some(sidx) = soil_idx {
-            sheet_moisture.max(soil.wetness[sidx])
-        } else {
-            sheet_moisture
-        };
-        let dry = !water_m.is_finite() || !slurry_m.is_finite() || water_m + slurry_m < 1.0e-5;
-        let (u, v) = if dry {
-            (0.0, 0.0)
-        } else {
-            (finite0(u), finite0(v))
-        };
-        moisture_out[idx] = finite0(wetness);
-        film[idx * 2] = finite0(water_m);
-        film[idx * 2 + 1] = finite0(slurry_m);
-        if let Some(sidx) = soil_idx {
-            write_soil_mix(soil_mix, idx, soil, sidx);
+/// Copy the snow cell that contains each texel centre.
+///
+/// The untouched blanket is one constant, so only a column the solver has
+/// changed is read. Height is the geometric thickness. Density is that
+/// column's bulk density. Compaction is [`SnowField::compaction`]. A column
+/// thinner than [`SNOW_EMPTY_M`] is left at 0, density included. Off the snow
+/// square the texel stays 0. A is 0.
+fn write_snow_binding(dst: &mut [f32], snow: &SnowField, origin_x: f32, origin_z: f32) {
+    let n = WINDOW_RES;
+    let half = snow.size * 0.5;
+    let blanket = snow.blanket_m();
+    for j in 0..n {
+        let z = origin_z + (j as f32 + 0.5) * WINDOW_CELL_M;
+        if z < -half || z >= half {
+            continue;
         }
-        flow[idx * 2] = u;
-        flow[idx * 2 + 1] = v;
-        if dust_settled_from_sheet {
-            dust_settled[idx] = settled;
-        }
-        wet[idx] = is_wet(wetness, water_m, slurry_m);
-    }
-}
-
-fn fill_coarse_window(
-    out: &mut ContractFrame,
-    wet: &mut [bool],
-    soil: &SoilField,
-    fluid: Option<&FluidCore>,
-    origin_x: f32,
-    origin_z: f32,
-    dust_settled_from_sheet: bool,
-) {
-    #[cfg(not(target_arch = "wasm32"))]
-    if rayon::current_num_threads() > 1 {
-        let ground = ShareMutF32(out.ground_rut.as_mut_ptr());
-        let moist = ShareMutF32(out.moisture.as_mut_ptr());
-        let film = ShareMutF32(out.film.as_mut_ptr());
-        let flow = ShareMutF32(out.flow.as_mut_ptr());
-        let settled = ShareMutF32(out.dust_settled.as_mut_ptr());
-        let mix = ShareMutF32(out.soil_mix.as_mut_ptr());
-        let wet_ptr = ShareMutBool(wet.as_mut_ptr());
-        let g_len = out.ground_rut.len();
-        let m_len = out.moisture.len();
-        let f_len = out.film.len();
-        let fl_len = out.flow.len();
-        let d_len = out.dust_settled.len();
-        let mix_len = out.soil_mix.len();
-        let w_len = wet.len();
-        let threads = rayon::current_num_threads().clamp(1, 4);
-        let chunk = WINDOW_RES.div_ceil(threads);
-        rayon::scope(|s| {
-            for t in 0..threads {
-                let j0 = t * chunk;
-                if j0 >= WINDOW_RES {
-                    break;
-                }
-                let j1 = (j0 + chunk).min(WINDOW_RES);
-                s.spawn(move |_| {
-                    let ground_rut = unsafe { ground.slice(g_len) };
-                    let moisture_out = unsafe { moist.slice(m_len) };
-                    let film = unsafe { film.slice(f_len) };
-                    let flow = unsafe { flow.slice(fl_len) };
-                    let dust_settled = unsafe { settled.slice(d_len) };
-                    let soil_mix = unsafe { mix.slice(mix_len) };
-                    let wet = unsafe { wet_ptr.slice(w_len) };
-                    for j in j0..j1 {
-                        fill_coarse_row(
-                            j,
-                            ground_rut,
-                            moisture_out,
-                            film,
-                            flow,
-                            dust_settled,
-                            soil_mix,
-                            wet,
-                            soil,
-                            fluid,
-                            origin_x,
-                            origin_z,
-                            dust_settled_from_sheet,
-                        );
-                    }
-                });
+        let row = j * n;
+        for i in 0..n {
+            let x = origin_x + (i as f32 + 0.5) * WINDOW_CELL_M;
+            if x < -half || x >= half {
+                continue;
             }
-        });
-        return;
+            let o = (row + i) * 4;
+            dst[o] = blanket;
+            dst[o + 1] = RHO_FRESH;
+            dst[o + 2] = 0.0;
+            dst[o + 3] = 0.0;
+        }
     }
-    for j in 0..WINDOW_RES {
-        fill_coarse_row(
-            j,
-            &mut out.ground_rut,
-            &mut out.moisture,
-            &mut out.film,
-            &mut out.flow,
-            &mut out.dust_settled,
-            &mut out.soil_mix,
-            wet,
-            soil,
-            fluid,
-            origin_x,
-            origin_z,
-            dust_settled_from_sheet,
-        );
+    let margin = snow.cell + WINDOW_CELL_M;
+    for src in 0..snow.depth.len() {
+        if !snow.is_active(src) {
+            continue;
+        }
+        let (x0, x1, z0, z1) = snow.cell_bounds(src);
+        let i0 = ((x0 - margin - origin_x) / WINDOW_CELL_M).floor() as i32;
+        let i1 = ((x1 + margin - origin_x) / WINDOW_CELL_M).ceil() as i32;
+        let j0 = ((z0 - margin - origin_z) / WINDOW_CELL_M).floor() as i32;
+        let j1 = ((z1 + margin - origin_z) / WINDOW_CELL_M).ceil() as i32;
+        let height = snow.depth[src];
+        let sample = if !height.is_finite() || height < SNOW_EMPTY_M {
+            [0.0_f32; 4]
+        } else {
+            [
+                height,
+                finite0(snow.density[src]),
+                finite0(snow.compaction(src)),
+                0.0,
+            ]
+        };
+        let j_lo = j0.max(0) as usize;
+        let j_hi = j1.min(n as i32 - 1).max(0) as usize;
+        let i_lo = i0.max(0) as usize;
+        let i_hi = i1.min(n as i32 - 1).max(0) as usize;
+        if j_lo > j_hi || i_lo > i_hi {
+            continue;
+        }
+        for j in j_lo..=j_hi {
+            let z = origin_z + (j as f32 + 0.5) * WINDOW_CELL_M;
+            for i in i_lo..=i_hi {
+                let x = origin_x + (i as f32 + 0.5) * WINDOW_CELL_M;
+                if snow.idx_at(x, z) != Some(src) {
+                    continue;
+                }
+                let o = (j * n + i) * 4;
+                dst[o..o + 4].copy_from_slice(&sample);
+            }
+        }
     }
 }
 
 /// Fill `out` from the soil heightfield, the live particles, and, when the
 /// through-drive sheet is attached, the fluid window and the dust ledger.
 ///
-/// Does not step the solver and does not write back into it.
+/// Does not step the solver and does not write back into it. Snow stays empty:
+/// pass the field to [`publish_with_snow`] to fill binding 14.
 pub fn publish(
     out: &mut ContractFrame,
     soil: &SoilField,
@@ -476,6 +324,25 @@ pub fn publish(
     debug_mode: u32,
     fluid: Option<&FluidCore>,
     dust: Option<&Dust>,
+) {
+    publish_with_snow(
+        out, soil, particles, center, time_s, debug_mode, fluid, dust, None,
+    );
+}
+
+/// [`publish`], plus the snow column when `snow` is attached.
+///
+/// Does not step the solver and does not write back into it.
+pub fn publish_with_snow(
+    out: &mut ContractFrame,
+    soil: &SoilField,
+    particles: &[Particle],
+    center: [f32; 2],
+    time_s: f32,
+    debug_mode: u32,
+    fluid: Option<&FluidCore>,
+    dust: Option<&Dust>,
+    snow: Option<&SnowField>,
 ) {
     out.ground_rut.fill(0.0);
     out.moisture.fill(0.0);
@@ -489,6 +356,7 @@ pub fn publish(
     out.air_velocity.fill(0.0);
     out.fog.fill(0.0);
     out.soil_mix.fill(0.0);
+    out.snow.fill(0.0);
     for slot in &mut out.spray {
         *slot = SprayGpu::zeroed();
     }
@@ -502,15 +370,113 @@ pub fn publish(
     };
 
     let mut wet = vec![false; WINDOW_RES * WINDOW_RES];
-    fill_coarse_window(
-        out,
-        &mut wet,
-        soil,
-        fluid,
-        origin_x,
-        origin_z,
-        dust.is_none(),
-    );
+    for j in 0..WINDOW_RES {
+        for i in 0..WINDOW_RES {
+            let idx = j * WINDOW_RES + i;
+            let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
+            let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
+            let sheet = fluid.and_then(|fluid| fluid.coarse_cell(i, j));
+            let soil_idx = soil.idx_at(x, z);
+
+            let (bed, placed, rut) = if let Some(sidx) = soil_idx {
+                (
+                    soil.bed[sidx],
+                    soil.placed[sidx],
+                    (soil.initial_height[sidx] - soil.bed[sidx]).max(0.0),
+                )
+            } else if let Some(cell) = sheet {
+                (cell.bed_m, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            // Thickness and opening are the soil arrays, in metres. They are
+            // not added to ground. A dry-crust kind is not a stand-in, and the
+            // sheet has no arrays of its own, so a texel off the soil stays 0.
+            let (thickness, opening) = if let Some(sidx) = soil_idx {
+                (
+                    finite0(soil.crust[sidx].max(0.0)),
+                    finite0(soil.crack[sidx].max(0.0)),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            out.crust[idx * 2] = thickness;
+            out.crust[idx * 2 + 1] = opening;
+            out.ground_rut[idx * 4] = finite0(bed + placed);
+            out.ground_rut[idx * 4 + 1] = finite0(rut);
+            out.ground_rut[idx * 4 + 2] = finite0(bed);
+            out.ground_rut[idx * 4 + 3] = finite0(placed);
+
+            let (sheet_moisture, water_m, slurry_m, u, v, settled, turbidity) =
+                if let Some(cell) = sheet {
+                    (
+                        cell.moisture,
+                        cell.water_m,
+                        cell.slurry_m,
+                        cell.u,
+                        cell.v,
+                        cell.settled_dust_m,
+                        cell.turbidity,
+                    )
+                } else if let Some(sidx) = soil_idx {
+                    (
+                        soil.wetness[sidx],
+                        soil.water[sidx],
+                        soil.slurry[sidx],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                } else {
+                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                };
+            // Wet tire track: soil wetness under this texel is part of the same
+            // moisture channel. The drained film stays in the water channel.
+            // Neither fill adds a map, a unit, or a resolution.
+            let moisture = if let Some(sidx) = soil_idx {
+                sheet_moisture.max(soil.wetness[sidx])
+            } else {
+                sheet_moisture
+            };
+            let dry = !water_m.is_finite() || !slurry_m.is_finite() || water_m + slurry_m < 1.0e-5;
+            let (u, v) = if dry {
+                (0.0, 0.0)
+            } else {
+                (finite0(u), finite0(v))
+            };
+            let speed = if dry {
+                0.0
+            } else {
+                finite0((u * u + v * v).sqrt())
+            };
+            // Turbidity is solids in the water column. No water, no sample: 0, not NaN.
+            let turb = if !water_m.is_finite() || water_m < 1.0e-5 {
+                0.0
+            } else {
+                finite0(turbidity).clamp(0.0, 1.0)
+            };
+            out.moisture[idx] = finite0(moisture);
+            out.film[idx * 2] = finite0(water_m);
+            out.film[idx * 2 + 1] = finite0(slurry_m);
+            let mix = soil_idx
+                .map(|sidx| soil.mix_texel(sidx))
+                .unwrap_or([0.0; 4]);
+            out.soil_mix[idx * 4] = finite0(mix[0]);
+            out.soil_mix[idx * 4 + 1] = finite0(mix[1]);
+            out.soil_mix[idx * 4 + 2] = finite0(mix[2]);
+            out.soil_mix[idx * 4 + 3] = finite0(mix[3]);
+            let flow = idx * FLOW_CHANNELS;
+            out.flow[flow] = u;
+            out.flow[flow + 1] = v;
+            out.flow[flow + 2] = speed;
+            out.flow[flow + 3] = turb;
+            if dust.is_none() {
+                out.dust_settled[idx] = settled;
+            }
+            wet[idx] = is_wet(moisture, water_m, slurry_m);
+        }
+    }
 
     if let Some(dust) = dust {
         let area = SETTLED_CELL_M * SETTLED_CELL_M;
@@ -571,22 +537,11 @@ pub fn publish(
             let mean = if count > 0.0 { sum / count } else { h };
             let excess = finite0((h - mean).max(0.0));
             let placed = finite0(out.ground_rut[idx * 4 + 3].max(0.0));
-            let u = out.flow[idx * 2];
-            let v = out.flow[idx * 2 + 1];
-            let speed = if u.is_finite() && v.is_finite() {
-                (u * u + v * v).sqrt()
-            } else {
-                0.0
-            };
-            let x = origin_x + (i as f32 + 0.5) * COARSE_CELL_M;
-            let z = origin_z + (j as f32 + 0.5) * COARSE_CELL_M;
             let foam = match fluid {
-                Some(fluid) => foam_fraction(speed, h)
-                    .max(crest_foam(excess, h))
-                    .max(tire_foam(x, z, h, fluid.tire_pushes())),
-                None => foam_fraction(speed, h),
+                Some(fluid) if h >= FOAM_MIN_FILM_M => finite0(fluid.foam_grid()[idx]).clamp(0.0, 1.0),
+                _ => 0.0,
             };
-            out.foam_crest[idx * 2] = finite0(foam);
+            out.foam_crest[idx * 2] = foam;
             out.foam_crest[idx * 2 + 1] = finite0(placed + excess);
         }
     }
@@ -626,20 +581,21 @@ pub fn publish(
     } else {
         (DUST_NONE, [0.0; 3], [0.0; 3])
     };
+    let mut fog_valid = false;
     if let Some(dust) = dust {
         dust.write_air_velocity(&mut out.air_velocity);
-        dust.write_fog(&mut out.fog);
+        if dust.fog_air_m3() > 1.0e-12 {
+            dust.write_fog(&mut out.fog);
+            fog_valid = true;
+        }
     } else if let Some(fluid) = fluid {
         fluid.write_air_velocity(&mut out.air_velocity);
         for iz in 0..AIR_RES {
             for layer in 0..AIR_LAYERS {
                 for ix in 0..AIR_RES {
                     let depth = fluid.fog_depth(ix, layer, iz);
-                    let frac = if AIR_DY_M > 0.0 {
-                        depth / AIR_DY_M
-                    } else {
-                        0.0
-                    };
+                    let frac = if AIR_DY_M > 0.0 { depth / AIR_DY_M } else { 0.0 };
+                    if frac > 1.0e-12 { fog_valid = true; }
                     let dst = ix + layer * AIR_RES + iz * AIR_RES * AIR_LAYERS;
                     out.fog[dst] = frac;
                 }
@@ -725,10 +681,17 @@ pub fn publish(
         | VALID_SPRAY
         | VALID_MIX;
     if flow_source == FLOW_FLUID_SHEET {
-        valid |= VALID_FLOW;
+        valid |= VALID_FLOW | VALID_TURBIDITY;
+    }
+    if fog_valid {
+        valid |= VALID_FOG;
     }
     if dust_source != DUST_NONE {
-        valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR | VALID_FOG;
+        valid |= VALID_DUST_SETTLED | VALID_DUST_FOG | VALID_AIR;
+    }
+    if let Some(snow) = snow {
+        write_snow_binding(&mut out.snow, snow, origin_x, origin_z);
+        valid |= VALID_SNOW;
     }
 
     scrub(&mut out.ground_rut);
@@ -743,6 +706,7 @@ pub fn publish(
     scrub(&mut out.air_velocity);
     scrub(&mut out.fog);
     scrub(&mut out.soil_mix);
+    scrub(&mut out.snow);
     for slot in &mut out.spray {
         scrub(&mut slot.pos_mass);
         scrub(&mut slot.vel_age);
@@ -853,6 +817,7 @@ pub fn contract_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
             float_entry(BIND_AIR, wgpu::TextureViewDimension::D3),
             float_entry(BIND_FOG, wgpu::TextureViewDimension::D3),
             float_entry(BIND_MIX, wgpu::TextureViewDimension::D2),
+            float_entry(BIND_SNOW, wgpu::TextureViewDimension::D2),
         ],
     })
 }
@@ -882,11 +847,11 @@ pub struct ContractGpu {
     dust_settled: Map2,
     dust_fog: Map3,
     air_velocity: Map3,
-    fog: Map3,
     crust: Map2,
     wet_edge: Map2,
     foam: Map2,
     soil_mix: Map2,
+    snow: Map2,
 }
 
 impl ContractGpu {
@@ -952,8 +917,8 @@ impl ContractGpu {
             device,
             "contract-flow",
             res,
-            wgpu::TextureFormat::Rg32Float,
-            2,
+            wgpu::TextureFormat::Rgba32Float,
+            FLOW_CHANNELS,
         )?;
         let dust_settled = map2(
             device,
@@ -974,7 +939,28 @@ impl ContractGpu {
             wgpu::TextureFormat::Rgba32Float,
             4,
         )?;
-        let fog = map3(
+        let crust = map2(
+            device,
+            "contract-crust",
+            res,
+            wgpu::TextureFormat::Rg32Float,
+            2,
+        )?;
+        let wet_edge = map2(
+            device,
+            "contract-wet-edge",
+            res,
+            wgpu::TextureFormat::R32Float,
+            1,
+        )?;
+        let foam = map2(
+            device,
+            "contract-foam-crest",
+            res,
+            wgpu::TextureFormat::Rg32Float,
+            2,
+        )?;
+let fog = map3(
             device,
             "contract-fog",
             wgpu::TextureFormat::R32Float,
@@ -1028,6 +1014,33 @@ impl ContractGpu {
                 bind_tex(BIND_MIX, &soil_mix.view),
             ],
         });
+        let snow = map2(
+            device,
+            "contract-snow",
+            res,
+            wgpu::TextureFormat::Rgba32Float,
+            4,
+        )?;
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render-contract-bg"),
+            layout: &layout,
+            entries: &[
+                bind_buf(BIND_HEADER, header.as_entire_binding()),
+                bind_tex(BIND_GROUND, &ground.view),
+                bind_tex(BIND_MOISTURE, &moisture.view),
+                bind_tex(BIND_FILM, &film.view),
+                bind_tex(BIND_FLOW, &flow.view),
+                bind_tex(BIND_DUST_SETTLED, &dust_settled.view),
+                bind_tex(BIND_DUST_FOG, &dust_fog.view),
+                bind_tex(BIND_CRUST, &crust.view),
+                bind_tex(BIND_WET_EDGE, &wet_edge.view),
+                bind_tex(BIND_FOAM, &foam.view),
+                bind_buf(BIND_SPRAY, spray.as_entire_binding()),
+                bind_tex(BIND_AIR, &air_velocity.view),
+                bind_tex(BIND_FOG, &fog.view),
+                bind_tex(BIND_SNOW, &snow.view),
+            ],
+        });
         Some(Self {
             layout,
             bind_group,
@@ -1040,11 +1053,11 @@ impl ContractGpu {
             dust_settled,
             dust_fog,
             air_velocity,
-            fog,
             crust,
             wet_edge,
             foam,
             soil_mix,
+            snow,
         })
     }
 
@@ -1062,7 +1075,7 @@ impl ContractGpu {
         write_map2(queue, &self.soil_mix, &frame.soil_mix, WINDOW_CELLS);
         write_map3(queue, &self.dust_fog, &frame.dust_fog);
         write_map3(queue, &self.air_velocity, &frame.air_velocity);
-        write_map3(queue, &self.fog, &frame.fog);
+        write_map2(queue, &self.snow, &frame.snow, WINDOW_CELLS);
     }
 }
 
@@ -1249,6 +1262,7 @@ fn contract_frame_is_finite(frame: &ContractFrame) -> bool {
         frame.air_velocity.as_slice(),
         frame.fog.as_slice(),
         frame.soil_mix.as_slice(),
+        frame.snow.as_slice(),
     ];
     if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
         return false;
@@ -1281,10 +1295,22 @@ mod tests {
         assert!(wgsl.contains("@group(0) @binding(10)"));
         assert!(wgsl.contains("@group(0) @binding(11)"));
         assert!(wgsl.contains("@group(0) @binding(12)"));
-        assert!(wgsl.contains("@group(0) @binding(13)"));
-        assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
         assert!(wgsl.contains("var fog_mist: texture_3d<f32>"));
+        assert_eq!(VALID_FOG, 1 << 13);
+        assert_eq!(BIND_FOG, 12);
+        assert_ne!(VALID_FOG, 1 << 11);
+        assert_ne!(VALID_FOG, 1 << 12);
+        assert!(wgsl.contains("@group(0) @binding(13) var soil_mix"));
         assert!(wgsl.contains("var soil_mix: texture_2d<f32>"));
+        assert_eq!(VALID_MIX, 1 << 12);
+        assert_eq!(BIND_MIX, 13);
+        assert!(wgsl.contains("@group(0) @binding(14)"));
+        assert!(wgsl.contains("var air_velocity: texture_3d<f32>"));
+        assert!(wgsl.contains("var snow_tex: texture_2d<f32>"));
+        assert_eq!(VALID_SNOW, 1 << 14);
+        assert_eq!(BIND_SNOW, 14);
+        assert!(wgsl.contains("flow.a"));
+        assert!(wgsl.contains("flow.b"));
         let air_row = padded_row_bytes(AIR_CELLS, 4);
         assert_eq!(air_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
         assert!(!wgsl.contains("height_tex"));
@@ -1368,8 +1394,93 @@ mod tests {
         );
         assert!((spray.vel_age[3] - 0.75).abs() < 1.0e-4);
         assert_eq!(spray.material, 0);
-        assert!(frame.crust.iter().all(|c| *c == 0.0));
+        assert!(
+            frame.crust.iter().all(|c| *c == 0.0),
+            "a dry-crust kind with empty arrays is not the field"
+        );
         assert_eq!(SOIL_KIND_DRY_CRUST, 3);
+    }
+
+    #[test]
+    fn crust_arrays_publish_in_metres_and_stay_off_the_ground() {
+        let mut soil = SoilField::flat(0.1);
+        assert_eq!(soil.kind[0], SOIL_KIND_DRY_CRUST);
+        let idx = soil.idx_at(0.25, -0.15).expect("cell");
+        soil.bed[idx] = 0.40;
+        soil.placed[idx] = 0.03;
+        soil.crust[idx] = 0.021;
+        soil.crack[idx] = 0.007;
+        let mut frame = ContractFrame::new();
+        publish(&mut frame, &soil, &[], [0.0, 0.0], 2.0, 7, None, None);
+        assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
+        assert_eq!(frame.header.valid & VALID_CRUST, VALID_CRUST);
+        assert_published_crust(&soil, &frame);
+
+        let mut fluid = crate::fluid_core::FluidCore::new([0.0, 0.0]);
+        let _ = fluid.step(1.0 / 60.0);
+        let mut with_sheet = ContractFrame::new();
+        publish(
+            &mut with_sheet,
+            &soil,
+            &[],
+            [0.0, 0.0],
+            2.0,
+            8,
+            Some(&fluid),
+            None,
+        );
+        assert_eq!(with_sheet.header.version, RENDER_CONTRACT_VERSION);
+        assert_published_crust(&soil, &with_sheet);
+    }
+
+    fn assert_published_crust(soil: &SoilField, frame: &ContractFrame) {
+        let res = frame.header.window_res as usize;
+        let mut hit = false;
+        let mut kind_only = 0u32;
+        let mut ground_err = 0.0f32;
+        for j in 0..res {
+            for i in 0..res {
+                let x = frame.header.origin_x + (i as f32 + 0.5) * frame.header.cell_m;
+                let z = frame.header.origin_z + (j as f32 + 0.5) * frame.header.cell_m;
+                let Some(sidx) = soil.idx_at(x, z) else {
+                    continue;
+                };
+                let cidx = j * res + i;
+                let thickness = frame.crust[cidx * 2];
+                let opening = frame.crust[cidx * 2 + 1];
+                assert!(
+                    (thickness - soil.crust[sidx]).abs() < 1.0e-6,
+                    "thickness {thickness} soil {}",
+                    soil.crust[sidx]
+                );
+                assert!(
+                    (opening - soil.crack[sidx]).abs() < 1.0e-6,
+                    "opening {opening} soil {}",
+                    soil.crack[sidx]
+                );
+                let ground = frame.ground_rut[cidx * 4];
+                let expect = soil.bed[sidx] + soil.placed[sidx];
+                ground_err = ground_err.max((ground - expect).abs());
+                if (soil.crust[sidx] - 0.021).abs() < 1.0e-6
+                    && (soil.crack[sidx] - 0.007).abs() < 1.0e-6
+                {
+                    hit = true;
+                    assert!((thickness - 0.021).abs() < 1.0e-6, "thickness {thickness}");
+                    assert!((opening - 0.007).abs() < 1.0e-6, "opening {opening}");
+                    assert!(
+                        (ground - (expect + thickness)).abs() > 0.01,
+                        "ground absorbed the skin"
+                    );
+                } else if soil.crust[sidx] == 0.0 && soil.crack[sidx] == 0.0 {
+                    kind_only += 1;
+                    assert_eq!(thickness, 0.0);
+                    assert_eq!(opening, 0.0);
+                }
+            }
+        }
+        assert!(hit, "the painted cell missed the window");
+        assert!(kind_only > 100, "kind-only cells {kind_only}");
+        assert!(ground_err < 1.0e-5, "ground moved by {ground_err}");
     }
 
     #[test]
@@ -1497,7 +1608,6 @@ mod tests {
             None,
         );
         assert_eq!(frame.header.version, RENDER_CONTRACT_VERSION);
-        assert_eq!(RENDER_CONTRACT_VERSION, 6);
         let res = frame.header.window_res as usize;
         let mut moist = 0.0_f32;
         let mut n = 0.0_f32;
@@ -1550,6 +1660,7 @@ mod tests {
             frame.air_velocity.as_slice(),
             frame.fog.as_slice(),
             frame.soil_mix.as_slice(),
+            frame.snow.as_slice(),
         ];
         if maps.iter().any(|map| map.iter().any(|v| !v.is_finite())) {
             return false;

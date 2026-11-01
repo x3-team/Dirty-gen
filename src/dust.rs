@@ -2,7 +2,7 @@
 //!
 //! This is the dust-trail API (`Dust`, `inject_dust`, `step_pads`, `set_wind`).
 //! The cubic metres live here. Advection is `fluid_core::advect_dust_density`:
-//! the shared upwind flux, pressure filter, and vorticity confinement.
+//! donor-cell upwind on cells that hold volume. Empty layers are not visited.
 //! The same grid carries air velocity. `step_vehicle_air` injects the Niva
 //! body and wheels, confines the wake, and `advect_density_by_air` moves
 //! dust on that residual. Fog is a second scalar on this grid. It is advected
@@ -327,7 +327,7 @@ impl Dust {
             row_lo: vec![1; AIR_RES as usize],
             row_hi: vec![0; AIR_RES as usize],
             settled_cells: HashMap::new(),
-            fog: vec![0.0; n],
+            fog: Vec::new(),
             fog_emitted: 0.0,
             fog_air: 0.0,
             fog_settled: 0.0,
@@ -669,6 +669,13 @@ impl Dust {
         if dst.len() < n {
             return;
         }
+        if self.fog_air <= 1.0e-12 {
+            dst[..n].fill(0.0);
+            for v in dst.iter_mut().skip(n) {
+                *v = 0.0;
+            }
+            return;
+        }
         let inv = 1.0 / CELL_VOL_M3;
         for i in 0..n {
             let v = self.fog[i] * inv;
@@ -693,13 +700,7 @@ impl Dust {
         }
     }
 
-    fn air_layout(&self) -> (
-        crate::fluid_core::AirDrive,
-        [crate::fluid_core::AirSolid; 5],
-        [f32; 3],
-        [f32; 3],
-        [usize; 3],
-    ) {
+    fn solve_air(&mut self, dt: f32) {
         let (drive, solids) = crate::fluid_core::niva_air(
             [self.chassis_x, CHASSIS_Y, self.chassis_z],
             [self.forward.x, self.forward.y, self.forward.z],
@@ -712,18 +713,6 @@ impl Dust {
         let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
         let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
         let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
-        (drive, solids, origin, cell, res)
-    }
-
-    fn solve_air(
-        &mut self,
-        dt: f32,
-        drive: &crate::fluid_core::AirDrive,
-        solids: &[crate::fluid_core::AirSolid],
-        origin: [f32; 3],
-        cell: [f32; 3],
-        res: [usize; 3],
-    ) {
         let key = [
             self.wind_x.to_bits(),
             self.wind_z.to_bits(),
@@ -791,12 +780,10 @@ impl Dust {
 
     fn finish_frame(&mut self, dt: f32) {
         self.transport_dust(dt);
-        let (drive, solids, origin, cell, res) = self.air_layout();
-        self.solve_air(dt, &drive, &solids[..], origin, cell, res);
+        self.solve_air(dt);
         if self.fog_air > 1.0e-12 {
-            self.transport_fog(dt, &drive, &solids[..], origin, cell, res);
+            self.transport_fog(dt);
         }
-        self.rebuild_rows_from_volume();
         self.frame = self.frame.wrapping_add(1);
         self.settle_dt += dt;
         if self.frame.is_multiple_of(SLOW_STRIDE) {
@@ -1020,19 +1007,19 @@ impl Dust {
         }
     }
 
+    fn ensure_fog_grid(&mut self) {
+        let n = self.vol.len();
+        if self.fog.len() != n {
+            self.fog.resize(n, 0.0);
+        }
+    }
+
     /// Same wind step and the same wake residual as dust. No second velocity solve.
-    fn transport_fog(
-        &mut self,
-        dt: f32,
-        drive: &crate::fluid_core::AirDrive,
-        solids: &[crate::fluid_core::AirSolid],
-        origin: [f32; 3],
-        cell: [f32; 3],
-        res: [usize; 3],
-    ) {
+    fn transport_fog(&mut self, dt: f32) {
         if dt <= 0.0 || self.fog_air <= 1.0e-12 {
             return;
         }
+        self.ensure_fog_grid();
         let _outflow = crate::fluid_core::advect_dust_density(
             &mut self.fog,
             self.wind_x,
@@ -1047,6 +1034,18 @@ impl Dust {
         let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
         if !self.fog_occupied.is_empty() && self.frame % stride == 0 {
             let n = self.fog.len();
+            let origin = [AIR_X0_M, AIR_Y0_M, self.chassis_z + AIR_Z0_M];
+            let cell = [AIR_DX_M, AIR_DY_M, AIR_DZ_M];
+            let res = [AIR_RES as usize, AIR_LAYERS as usize, AIR_RES as usize];
+            let (drive, solids) = crate::fluid_core::niva_air(
+                [self.chassis_x, CHASSIS_Y, self.chassis_z],
+                [self.forward.x, self.forward.y, self.forward.z],
+                [self.right.x, self.right.y, self.right.z],
+                self.speed,
+                self.wheel_slip,
+                self.wind_x,
+                self.wind_z,
+            );
             let _gap = crate::fluid_core::advect_density_by_air(
                 &mut self.fog,
                 &mut self.vel_scratch[..n],
@@ -1054,8 +1053,8 @@ impl Dust {
                 origin,
                 cell,
                 res,
-                drive,
-                solids,
+                &drive,
+                &solids,
                 dt * stride as f32,
                 &self.fog_occupied,
             );
@@ -1361,6 +1360,7 @@ pub fn inject_fog(air: &mut Dust, inject: FogInject, dt: f32) -> f32 {
     if wsum <= 0.0 {
         return 0.0;
     }
+    air.ensure_fog_grid();
     let budget = (inject.offer_m3_s * dt) as f64;
     let mut added = 0.0f64;
     for iz in iz0..=iz1 {
@@ -1748,12 +1748,15 @@ mod tests {
                 peak = air;
             }
             approx(dust.emitted_m3(), emitted, 1.0e-6);
+            // One upwind step at 1/60 leaves more of the plume inside the 16 m
+            // window. The open face used to book that smear as settled. The
+            // fall still clears it: under 8% stays aloft after 7 s on wet ground.
             assert!(
-                dust.dust_air_m3() < air_before * 0.05,
+                dust.dust_air_m3() < air_before * 0.08,
                 "still airborne {} after wet ({wet_m},{wet_w})",
                 dust.dust_air_m3()
             );
-            assert!(dust.dust_settled_m3() > emitted * 0.95);
+            assert!(dust.dust_settled_m3() > emitted * 0.92);
             closes(&dust);
             let settled = dust.dust_settled_m3();
             dust.step(&tires_at(z, 8.0, 2.0), wet_m, wet_w, dt);
@@ -1888,14 +1891,16 @@ mod tests {
             "settled film did not lean with the wind ({cx}, {cz})"
         );
         approx(dust.emitted as f32, 0.02070, 5.0e-5);
-        approx(dust.air as f32, 0.01154, 2.5e-4);
-        approx(dust.settled as f32, 0.00916, 2.5e-4);
+        // One donor-cell step at Courant 0.85. The previous pair of half-steps
+        // smeared more volume out of the window, so the airborne share was 0.01154.
+        approx(dust.air as f32, 0.01373, 2.5e-4);
+        approx(dust.settled as f32, 0.00697, 2.5e-4);
         assert!(
-            (on_wet - 0.000998).abs() < 2.5e-4,
+            (on_wet - 0.000115).abs() < 5.0e-5,
             "wet track settled {on_wet}"
         );
         assert!(
-            (max_lateral - 1.0).abs() < 0.15,
+            (max_lateral - 1.25).abs() < 0.15,
             "plume lean {max_lateral} m"
         );
 
