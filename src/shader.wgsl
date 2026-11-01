@@ -1895,16 +1895,9 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // Wet / dry edge from the contract: a damp halo darkens the dry side and
     // a pale silt tide line marks where the water stopped. Broken by noise so
     // the 0.20 m cells do not print as a staircase.
-    let edge_c = select(bc_wet_edge(xz), 0.0, sand_field());
-    if (edge_c > 0.0) {
-        let wob = noise(xz * 5.0) * 0.7 + noise(xz * 17.0) * 0.3;
-        let band = smoothstep(0.05, 0.9, edge_c * (0.55 + 0.9 * wob));
-        let dry_side = 1.0 - smoothstep(0.35, 0.55, wet);
-        albedo = mix(albedo, albedo * vec3<f32>(0.72, 0.68, 0.64), band * dry_side);
-        rough_out = mix(rough_out, rough_out * 0.8, band * dry_side);
-        let tide = smoothstep(0.55, 0.85, edge_c * (0.5 + wob)) * (1.0 - band * 0.5) * dry_side;
-        albedo = mix(albedo, albedo * 1.1 + vec3<f32>(0.01, 0.009, 0.007), tide * 0.2);
-    }
+    // No contract wet-edge tint here: on the sand field it was off, and on
+    // main's scenes a 17th texture (binding 8) in fs_terrain segfaulted
+    // lavapipe's fragment JIT on the LOD terrain (gpu-budget CI, #152).
     // The airborne plume (b6) shades the ground under it: optical depth
     // toward the sun through the published volume, as a soft darkening.
     if (bc_inside(xz) > 0.0) {
