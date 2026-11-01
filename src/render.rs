@@ -171,6 +171,8 @@ pub struct Renderer {
     pub puddle_beauty: bool,
     /// Win-demo PNG stills: skip tire seat on the heightfield (avoids spikes/holes).
     pub win_demo_still: bool,
+    /// Latest pool reflect RT readback (win-demo still capture, same resolution as the frame).
+    pub win_demo_reflect_rgba: Vec<u8>,
     /// Slurry drops and dust cards. Off for win-demo stills (water carries splash).
     pub show_mud_particles: bool,
     /// Round slurry drops. Off when solver sheets carry the splash read.
@@ -1200,6 +1202,7 @@ impl Renderer {
             water_column: false,
             puddle_beauty: false,
             win_demo_still: false,
+            win_demo_reflect_rgba: Vec::new(),
             show_mud_particles: true,
             show_mud_drops: true,
             snow: false,
@@ -1641,6 +1644,7 @@ impl Renderer {
                 self.queue.submit(Some(encoder.finish()));
                 self.device.poll(wgpu::Maintain::Wait);
                 self.rebuild_tex_bg_pool_reflect();
+                self.stash_win_demo_reflect_readback();
                 self.queue.write_buffer(
                     &self.frame_buf,
                     0,
@@ -1992,6 +1996,54 @@ impl Renderer {
                 bytemuck::bytes_of(slot),
             );
         }
+    }
+
+    fn stash_win_demo_reflect_readback(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("reflect-readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.reflect_sample,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        let slice = self.readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().expect("map").expect("map buffer");
+        let padded = slice.get_mapped_range();
+        let row = (self.width * 4) as usize;
+        let stride = self.padded_row as usize;
+        let mut out = Vec::with_capacity(row * self.height as usize);
+        for y in 0..self.height as usize {
+            out.extend_from_slice(&padded[y * stride..y * stride + row]);
+        }
+        drop(padded);
+        self.readback.unmap();
+        self.win_demo_reflect_rgba = out;
     }
 
     fn rebuild_tex_bg_pool_reflect(&mut self) {

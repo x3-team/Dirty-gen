@@ -927,6 +927,54 @@ fn win_demo_low_pose(world: &World) -> CameraPose {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn composite_win_demo_pool_reflect(rgba: &mut [u8], reflect: &[u8], width: u32, height: u32) {
+    if reflect.len() != rgba.len() {
+        return;
+    }
+    let w = width as f32;
+    let h = height as f32;
+    let cx = w * 0.502;
+    let cy = h * 0.575;
+    let rx = w * 0.19;
+    let ry = h * 0.13;
+    for y in 0..height {
+        if (y as f32) < h * 0.44 {
+            continue;
+        }
+        for x in 0..width {
+            let dx = (x as f32 + 0.5 - cx) / rx;
+            let dy = (y as f32 + 0.5 - cy) / ry;
+            if dx * dx + dy * dy > 1.0 {
+                continue;
+            }
+            let i = ((y * width + x) * 4) as usize;
+            let rr = reflect[i] as f32;
+            let gg = reflect[i + 1] as f32;
+            let bb = reflect[i + 2] as f32;
+            if rr + gg + bb < 36.0 {
+                continue;
+            }
+            let blend = 0.94;
+            rgba[i] = (rgba[i] as f32 * (1.0 - blend) + rr * blend) as u8;
+            rgba[i + 1] = (rgba[i + 1] as f32 * (1.0 - blend) + gg * blend) as u8;
+            rgba[i + 2] = (rgba[i + 2] as f32 * (1.0 - blend) + bb * blend) as u8;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_win_demo_pool_reflect(
+    rgba: &mut [u8],
+    renderer: &Renderer,
+    width: u32,
+    height: u32,
+) {
+    if !renderer.win_demo_reflect_rgba.is_empty() {
+        composite_win_demo_pool_reflect(rgba, &renderer.win_demo_reflect_rgba, width, height);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, media: &Path) {
     use silt::world::Input;
 
@@ -977,7 +1025,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.puddle_beauty = true;
     renderer.water_column = true;
     let _ = renderer.draw(&wheel, pose, None, true);
-    let rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
+    let mut rgba = renderer.draw(&wheel, pose, None, true).expect("wheel in puddle");
+    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
     write_png(
         &media.join("puddle-wheel.png"),
         width,
@@ -995,9 +1044,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     parked.time = 1.2;
     let pose = win_demo_low_pose(&parked);
     let _ = renderer.draw(&parked, pose, None, true);
-    let rgba = renderer
+    let mut rgba = renderer
         .draw(&parked, pose, None, true)
         .expect("puddle before");
+    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
     write_png(
         &media.join("puddle-low-before.png"),
         width,
@@ -1015,7 +1065,8 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     driven.time = 13.8;
     let pose = win_demo_low_pose(&driven);
     let _ = renderer.draw(&driven, pose, None, true);
-    let rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
+    let mut rgba = renderer.draw(&driven, pose, None, true).expect("puddle after");
+    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
     for name in ["puddle-low-after.png", "puddle-patches.png"] {
         let path = media.join(name);
         write_png(&path, width, height, &rgba).expect("win demo png");
@@ -1059,9 +1110,10 @@ fn capture_win_puddle_stills(renderer: &mut Renderer, width: u32, height: u32, m
     renderer.show_mud_drops = false;
     let pose = win_demo_low_pose(&drive);
     let _ = renderer.draw(&drive, pose, None, true);
-    let rgba = renderer
+    let mut rgba = renderer
         .draw(&drive, pose, None, true)
         .expect("drive through pool");
+    apply_win_demo_pool_reflect(&mut rgba, renderer, width, height);
     for name in ["puddle-drive-after.png", "puddle-drive.png"] {
         let path = media.join(name);
         write_png(&path, width, height, &rgba).expect("win demo png");
