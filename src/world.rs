@@ -4434,7 +4434,7 @@ impl ThroughDrive {
         self.ribbon_tick = self.ribbon_tick.wrapping_add(1);
         other_ms += tick.ms();
         let spray = self.fluid.step(dt);
-        self.report.spray_m3 = self.fluid.ledger().spray_m3;
+        self.report.spray_m3 = self.fluid.spray_m3();
         let tick = ProfTick::start();
         self.spawn_spray(&spray, forward);
         // The cut is already on the bed. Pond water into it so the free
