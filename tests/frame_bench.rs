@@ -25,6 +25,7 @@ fn baseline_solver_frame() {
         "SOLVER_FRAME ms={ms:.3} budget={SOLVER_FRAME_BUDGET_MS:.0} frames={frames} t={:.2} pos=({:.1},{:.1})",
         world.time, world.vehicle.pos.x, world.vehicle.pos.z
     );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
     #[cfg(not(debug_assertions))]
     assert!(
         ms <= SOLVER_FRAME_BUDGET_MS,

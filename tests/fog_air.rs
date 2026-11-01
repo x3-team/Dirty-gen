@@ -18,6 +18,9 @@ use silt::render_contract::{
 use silt::soil::SoilField;
 
 const DT: f32 = 1.0 / 60.0;
+
+/// Release fog step. Do not raise this. Every build prints it.
+const FOG_STEP_BUDGET_MS: f64 = 7.0;
 const SPEED: f32 = 8.0;
 const OFFER_M3_S: f32 = 0.0012;
 const DUMP_DIR: &str = "/cursor/stores/bc-2f1d8ac8-9cfa-48e7-b1ed-3090c0c4926e/media/fog-air";
@@ -251,6 +254,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
          step_mean_ms {step_mean:.3}\n\
          step_max_ms {step_max:.3}\n\
          step_n {timed:.0}\n\
+         FOG_STEP_BUDGET ms={FOG_STEP_BUDGET_MS:.3}\n\
          contract_version {version}\n",
         peak = read.peak,
         z_cm = read.z_cm,
@@ -263,6 +267,7 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
     write_dump("niva-columns.csv", &columns);
     write_dump("niva-settled.csv", &settled_txt);
     println!("{numbers}");
+    let _ = std::io::stdout().flush();
 
     assert!(taken > 0.004, "taken {taken:.6} m3");
     assert!(water_gap < 1.0e-3, "water gap {water_gap:.6}");
@@ -310,8 +315,8 @@ fn niva_fog_rides_the_dust_air_and_keeps_its_water() {
 
     #[cfg(not(debug_assertions))]
     assert!(
-        step_mean <= 7.0,
-        "FOG_STEP {step_mean:.3} ms over 7, max {step_max:.3}"
+        step_mean <= FOG_STEP_BUDGET_MS,
+        "FOG_STEP {step_mean:.3} ms over {FOG_STEP_BUDGET_MS}, max {step_max:.3}"
     );
 }
 

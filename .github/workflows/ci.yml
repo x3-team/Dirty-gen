@@ -38,8 +38,24 @@ jobs:
           export CXX=g++ CC=gcc
           cargo test --test e2e_niva -- --nocapture
       - name: Release solver budget
+        env:
+          PERF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
+          python3 scripts/perf_ratio.py
+  win-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: Release win-demo
+        run: cargo build --release
+      - name: GPU timestamps
+        shell: pwsh
+        run: |
+          & .\target\release\silt.exe capture --gpu-time
+          exit $LASTEXITCODE

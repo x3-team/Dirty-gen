@@ -682,6 +682,7 @@ fn e2e_niva() {
         final_books.gap,
         max_gap
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     #[cfg(not(debug_assertions))]
     print_through_drive();
@@ -885,6 +886,7 @@ fn print_through_drive() {
         acc.sheet_rest_ms / k,
         acc.other_ms / k,
     );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     let dust = acc.dust_ms / k;
     #[cfg(not(debug_assertions))]
     assert!(
