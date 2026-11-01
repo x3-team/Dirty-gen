@@ -1,6 +1,6 @@
 # Render contract
 
-Version **8**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Turbidity is the A channel of binding 4, `VALID_TURBIDITY` bit 11 (`1 << 11`). Material shares are binding 13, `VALID_MIX` bit 12 (`1 << 12`). Snow is binding 14, `VALID_SNOW` bit 14 (`1 << 14`).
+Version **9**. The solver publishes this and the debug view reads only this. Picture shading is separate: materials, light, HDRI, picture fog, headlights, and wet sheen are not maps in this contract. Solver fog is binding 12. `VALID_FOG` is bit 13 (`1 << 13`). Turbidity is the A channel of binding 4, `VALID_TURBIDITY` bit 11 (`1 << 11`). Material shares are binding 13, `VALID_MIX` bit 12 (`1 << 12`). Snow is binding 14, `VALID_SNOW` bit 14 (`1 << 14`). The fine deformation window is binding 15, `VALID_TRACK_FINE` bit 15 (`1 << 15`).
 
 Change the contract only by bumping `RENDER_CONTRACT_VERSION` in `src/render_contract.rs` and in `src/render_contract.wgsl`, and by adding a row to the changelog below. A new channel, a new unit, or a new resolution is a version bump. Filling a channel that was already defined is not. Writing 0 for a non-finite sample is not. Recording that foam and spray were empty, and filling those same fields from the sheet, is not.
 
@@ -25,9 +25,9 @@ Valid after the solver step that produced the frame, and until the next step. Th
 
 ## Bind group
 
-Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 96 bytes. Spray slot: `SprayGpu`, 48 bytes.
+Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `ContractHeader`, 112 bytes. Spray slot: `SprayGpu`, 48 bytes.
 
-`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 turbidity, 17 snow height, 18 snow density, 19 snow compaction, 20 material mix). It is not a solver map. Changing which mode is on screen does not bump the version.
+`debug_mode` in the header is a viewer selector (0 ground, 1 rut, 2 moisture, 3 water, 4 slurry, 5 flow speed, 6 settled dust, 7 crust, 8 crack, 9 wet edge, 10 foam, 11 crest, 12 spray count, 13 airborne dust, 14 air speed, 15 fog, 16 turbidity, 17 snow height, 18 snow density, 19 snow compaction, 20 material mix, 21 fine surface over ground, 22 fine compaction, 23 fine print depth). It is not a solver map. Changing which mode is on screen does not bump the version.
 
 | Binding | Name | Format | Channels | Units |
 |---|---|---|---|---|
@@ -46,6 +46,7 @@ Group 0 of the debug shader. Layout: `contract_bind_group_layout`. Header: `Cont
 | 12 | `fog` | `r32float` 3D | R water volume fraction | m³/m³ |
 | 13 | `soil_mix` | `rgba32float` | R mud, G sand, B gravel, A grass | 0..1 |
 | 14 | `snow` | `rgba32float` | R height, G density, B compaction, A 0 | m, kg/m³, 0..1, — |
+| 15 | `track_fine` | `rgba32float`, 640 × 640 | R surface over ground, G snow depth, B compaction, A print depth | m, m, 0..1, m |
 
 Ground maps, including `snow`, are 200 × 200. `dust_fog`, `air_velocity`, and `fog` share one air grid. Spray is a buffer, not a grid.
 
@@ -244,6 +245,35 @@ Writer: `publish_with_snow` when a `SnowField` is attached. `publish` passes non
 
 Valid: `VALID_SNOW` is bit 14, set only when the field is attached. Bit 11 is `VALID_TURBIDITY`, bit 12 is `VALID_MIX` (binding 13), bit 13 is `VALID_FOG` (binding 12). The header stays 96 bytes. There is no separate snow-source word. Debug modes 17, 18, and 19 show height, density, and compaction. Mode 15 is fog, mode 16 is turbidity, mode 20 is the material mix. The picture cache does not gain a snow channel.
 
+### Fine deformation — binding 15
+
+Ruts, berms, clumps, lug prints and boot prints at 2.5 cm. One window for every deformable surface: snow and soil.
+
+| | |
+|---|---|
+| Texels | 640 × 640 |
+| Texel | 0.025 m (`TRACK_FINE_CELL_M`) |
+| Extent | 16 m × 16 m around the Niva |
+| Origin | minimum corner, on the global 2.5 cm grid: `floor(center / 0.025) − 320` cells |
+| Texel (i, j) | centre `fine_origin + ((i + 0.5), (j + 0.5)) * 0.025`, i along +X, j along +Z |
+
+The window does not share the 200 × 200 grid. The header carries it: `fine_origin_x`, `fine_origin_z` (minimum corner, metres), `fine_cell_m`, and `fine_res`. They are 0 when the binding is not published.
+
+| Channel | Meaning | Units |
+|---|---|---|
+| R | top surface over contract ground (binding 1 R, bed + placed, bilinear at the texel centre) | m |
+| G | snow depth; 0 where there is no snow | m |
+| B | compaction of the material R reports. Snow: `(ρ − 130) / (560 − 130)`. Soil prints: their writer's own 0..1 | 0..1 |
+| A | lug or sole print depth: how far the tread or sole band pressed below the carcass or sole | m |
+
+Every texel is valid while the bit is set. Untouched ground publishes its undisturbed value: the virgin snow blanket (R = G = blanket depth, B and A 0), or 0 for soil without a print. Readers blend to the 20 cm maps only at the window rim.
+
+Two writers can fill the window: the snow track (`SnowTrack`, `src/snow_track.rs`) and the 2.5 cm soil prints. They combine per texel. A texel with snow on it (G > 0) takes R, G, B, A from the snow: snow lies over a soil print. Otherwise the first soil writer with a non-zero texel gives all four channels. With no writer that has something there, the texel is 0. Non-finite samples are 0.
+
+Writer: `publish_track_fine(out, center, writers)` after `publish` / `publish_with_snow`, which clear the window, its header fields, and the bit. Writers implement `FineDeform`. The publisher does not step any solver and does not write back into one.
+
+Valid: `VALID_TRACK_FINE` is bit 15, set only by `publish_track_fine` with at least one writer. The GPU copy (6.5 MB) is uploaded only on frames with the bit set. Debug modes 21, 22, and 23 show R, B, and A.
+
 ## Header flags
 
 `header.version` is 4. `header.valid` is a bit mask:
@@ -265,6 +295,7 @@ Valid: `VALID_SNOW` is bit 14, set only when the field is attached. Bit 11 is `V
 | 12 | `VALID_MIX` | material shares |
 | 13 | `VALID_FOG` | fog |
 | 14 | `VALID_SNOW` | snow height, density, compaction |
+| 15 | `VALID_TRACK_FINE` | fine deformation window |
 
 `header.frame` is the fluid sheet's frame counter, or 0 when the sheet is not attached. `header.time_s` is the world clock.
 
@@ -350,3 +381,11 @@ Material shares, from #107 (written as version 6 with fog on bit 11 on its branc
 A cell whose material is one of those four sums to 1, including through the joint. Silt, crust, undisturbed ground, a berm, and a cut that is not one of the four are 0 in every channel. Off the soil square the texel is 0.
 
 The solver builds the shares from the cell kind, then runs four Jacobi passes. Across an edge whose two cells both carry one of the four and whose shares differ, each pass moves 1/4 of the difference from one cell to the other. The sum of each channel over the map does not change. The sum of the four channels on a cell does not change. Pore moisture is not a fifth channel: the same edges exchange the soil wetness, and binding 2 publishes that wetness.
+
+### 9
+
+Fine deformation window. `track_fine`, binding 15, `rgba32float`, 640 × 640 at 0.025 m, a 16 m window around the Niva on the global 2.5 cm grid. R is the top surface over contract ground in metres, G the snow depth in metres (0 off snow), B the compaction of the material R reports (0..1), A the lug or sole print depth in metres. `VALID_TRACK_FINE` is bit 15 (`1 << 15`).
+
+The header grows from 96 to 112 bytes: `fine_origin_x`, `fine_origin_z`, `fine_cell_m`, `fine_res` give the window, 0 when it is not published. Two writers combine per texel: snow (G > 0) over soil prints, otherwise the first soil writer with a non-zero texel. Every texel in the window is valid. Debug modes 21, 22, 23 show R, B, A.
+
+The same change puts binding 13 back in the GPU bind group: since version 8 the group was built twice, once without snow and once without the material mix, so `ContractGpu::try_new` failed validation and the contract maps were not on the GPU.
