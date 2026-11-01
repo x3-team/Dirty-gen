@@ -692,8 +692,11 @@ fn e2e_niva() {
         (puddle_mean - 0.0893).abs() < 0.003,
         "puddle depth {puddle_mean:.4} m"
     );
+    // The 2 cm patch keeps its sub-cell detail between steps (fluid_core/near.rs).
+    // The bow a tire pushed stays ahead of it, so the column it rolls into holds
+    // more water: the hole read 0.0021-0.0025 m while each step started flat.
     assert!(
-        (puddle_hole - 0.0020).abs() < 0.002 && puddle_hole < puddle_mean - 0.04,
+        (puddle_hole - 0.0046).abs() < 0.002 && puddle_hole < puddle_mean - 0.04,
         "tire hole {puddle_hole:.4} m puddle {puddle_mean:.4} m"
     );
     assert!(
@@ -788,13 +791,16 @@ fn e2e_niva() {
         "slurry {:.6}",
         final_books.slurry
     );
+    // Soil and dust moved together with the near-field residual: settled dust
+    // that lands on the wetter track is bound into the soil. Their sum moved by
+    // 2e-4 m3 (0.99635 -> 0.99617); soil 0.9730 -> 0.9738, dust 0.02336 -> 0.02241.
     assert!(
-        (final_books.soil - 0.9723).abs() < 1.0e-3,
+        (final_books.soil - 0.9738).abs() < 1.0e-3,
         "soil {:.6}",
         final_books.soil
     );
     assert!(
-        (final_books.dust - 0.02407).abs() < 1.0e-3,
+        (final_books.dust - 0.02241).abs() < 1.0e-3,
         "dust {:.6}",
         final_books.dust
     );
