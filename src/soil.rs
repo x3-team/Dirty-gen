@@ -1511,6 +1511,38 @@ impl SoilField {
         self.mix_ready = true;
     }
 
+    /// Slurry conductance of one cell, as [`slurry_flow_conduct`]. On a
+    /// material joint the slurry is a blend: its viscosity is the log mean
+    /// (Arrhenius mixing rule) of the mud, sand, and grass-topsoil slurries,
+    /// weighted by their shares. Grass topsoil slurries like silt. Gravel
+    /// does not slurry and is left out of the blend. Off a joint this is
+    /// [`slurry_flow_conduct`] of the cell's kind.
+    pub fn slurry_conduct_at(&self, idx: usize, moisture: f32) -> f32 {
+        let kind = SurfaceKind::from_u8(self.kind[idx]);
+        if !self.mix_ready || !mixes_as_slurry(kind) {
+            return slurry_flow_conduct(kind, moisture);
+        }
+        let mix = self.mix_texel(idx);
+        let peak = mix.iter().cloned().fold(0.0f32, f32::max);
+        if peak >= 0.999 {
+            return slurry_flow_conduct(kind, moisture);
+        }
+        let parts = [
+            (mix[MIX_MUD], SurfaceKind::WetMud),
+            (mix[MIX_SAND], SurfaceKind::Sand),
+            (mix[MIX_GRASS], SurfaceKind::Silt),
+        ];
+        let total: f32 = parts.iter().map(|p| p.0.max(0.0)).sum();
+        if total < 0.05 {
+            return slurry_flow_conduct(kind, moisture);
+        }
+        let ln_visc: f32 = parts
+            .iter()
+            .map(|(w, k)| w.max(0.0) / total * slurry_viscosity(*k, moisture).max(0.05).ln())
+            .sum();
+        (22.0 / ln_visc.exp()).clamp(0.02, 3.0)
+    }
+
     /// Mud, sand, gravel, grass at one cell. A field that has not been
     /// blended reports a one-hot share of those four, or zeros.
     pub fn mix_texel(&self, idx: usize) -> [f32; 4] {
@@ -4162,9 +4194,8 @@ impl SoilField {
         if head_slurry[recv] <= 1.0e-4 && !self.in_rut_or_hole(recv) {
             return;
         }
-        let kind = SurfaceKind::from_u8(self.kind[donor]);
         let moisture = self.wetness[donor].clamp(0.08, 0.92);
-        let conduct = slurry_flow_conduct(kind, moisture);
+        let conduct = self.slurry_conduct_at(donor, moisture);
         let mut depth = head * conduct * dt / dx.max(1.0e-3) * 0.55;
         depth = depth.min(head * 0.48).min(budget[donor]);
         if depth <= 1.0e-6 {
@@ -9873,6 +9904,27 @@ mod tests {
         assert_eq!(pre_crust.crust[crust_cell], 0.0);
         assert_eq!(pre_crust.crack[crust_cell], 0.0);
         assert!((pre_crust.slurry[idx] - soil.slurry[idx]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn joint_slurry_runs_between_its_two_materials() {
+        let mut soil = SoilField::flat(0.7);
+        let idx = soil.idx_at(0.0, 0.0).expect("cell");
+        soil.kind[idx] = SurfaceKind::WetMud as u8;
+        let m = 0.6;
+        let clay = slurry_flow_conduct(SurfaceKind::WetMud, m);
+        let sand = slurry_flow_conduct(SurfaceKind::Sand, m);
+        // Not blended yet: the kind alone.
+        assert_eq!(soil.slurry_conduct_at(idx, m), clay);
+        soil.mix_ready = true;
+        let base = idx * MIX_CHANNELS;
+        soil.mix[base..base + MIX_CHANNELS].copy_from_slice(&[0.5, 0.5, 0.0, 0.0]);
+        let half = soil.slurry_conduct_at(idx, m);
+        assert!(half > clay && half < sand, "clay {clay} joint {half} sand {sand}");
+        let eta = (slurry_viscosity(SurfaceKind::WetMud, m) * slurry_viscosity(SurfaceKind::Sand, m)).sqrt();
+        assert!((half - (22.0 / eta).clamp(0.02, 3.0)).abs() < 1.0e-4, "log mean {half}");
+        soil.mix[base..base + MIX_CHANNELS].copy_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(soil.slurry_conduct_at(idx, m), clay);
     }
 
     #[test]
