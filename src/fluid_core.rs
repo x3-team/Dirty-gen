@@ -19,7 +19,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+mod near;
 mod wet;
+pub use near::NEAR_RESIDUAL_LIFE_S;
 pub use wet::{WetBody, WetLoad, WetShape, SLURRY_RHO, WATER_RHO};
 
 /// Wall time of one timed region. Absent on wasm so the solver does not read a clock there.
@@ -4797,6 +4799,8 @@ pub struct FluidCore {
     /// 1 when this coarse cell's sheet was moved onto the 2 cm patch.
     /// Survives `restrict_fine` so the coarse shove does not hit it twice.
     fine_hold: Vec<u8>,
+    /// Sub-cell detail of the 2 cm sheet, kept between steps (`near.rs`).
+    near: near::NearField,
     dust: Vec<f32>,
     dust_u: Vec<f32>,
     dust_v: Vec<f32>,
@@ -4927,6 +4931,7 @@ impl FluidCore {
             fine_grain: vec![Grain::Other as u8; fine_n],
             fine_on: false,
             fine_hold: vec![0; n],
+            near: near::NearField::default(),
             dust: vec![0.0; air_n],
             dust_u: vec![0.0; air_n],
             dust_v: vec![0.0; air_n],
@@ -5973,7 +5978,7 @@ impl FluidCore {
         if wet {
             self.wet_prepare_coarse();
         }
-        self.refine(&pushes);
+        self.refine(&pushes, dt);
         if wet {
             self.wet_prepare_fine();
         }
@@ -8264,9 +8269,10 @@ impl FluidCore {
             && z1 <= rect[3] + 1.0e-4
     }
 
-    fn refine(&mut self, pushes: &[TirePush]) {
+    fn refine(&mut self, pushes: &[TirePush], dt: f32) {
         self.restrict_fine();
         if pushes.is_empty() {
+            self.near_fade(dt);
             return;
         }
         let mut cx = 0.0f32;
@@ -8363,6 +8369,7 @@ impl FluidCore {
             }
             acc.end_clear();
         });
+        self.near_apply(dt);
         self.fine_on = true;
     }
 
@@ -8371,6 +8378,7 @@ impl FluidCore {
             return;
         }
         let tick = ProfTick::start();
+        self.near_capture();
         let fine_area = FINE_CELL_M * FINE_CELL_M;
         let coarse_area = COARSE_CELL_M * COARSE_CELL_M;
         COLUMN_ACC.with(|slot| {

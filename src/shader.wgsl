@@ -25,6 +25,7 @@ struct Frame {
     reflect_view_proj: mat4x4<f32>,
     reflect_flags: vec4<f32>,
     // x: water detail (0 low, 1 medium, 2 high). y: 1 with a fluid sheet.
+    // w: 1 when the scene target is linear HDR (see `present`).
     water_fx: vec4<f32>,
 }
 
@@ -114,9 +115,47 @@ fn mud_of(panel: i32) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
 
-fn present(c: vec3<f32>) -> vec4<f32> {
+// Scene colour target (docs/LOOK_GAP.md, thread 1). With an HDR target
+// (`water_fx.w` = 1, `Rgba16Float`) the scene shaders write linear light and
+// the tone curve runs once, in the tonemap pass (`fs_tonemap` in render.rs).
+// Without one (an adapter that cannot render and blend half floats) they
+// write the display value straight into the 8-bit target, as before.
+fn scene_hdr() -> bool {
+    return frame.water_fx.w > 0.5;
+}
+
+// The tone curve. `fs_tonemap` in render.rs is the same expression.
+fn display_curve(c: vec3<f32>) -> vec3<f32> {
     let mapped = vec3<f32>(1.0) - exp(-max(c, vec3<f32>(0.0)) * 1.08);
-    return vec4<f32>(pow(mapped, vec3<f32>(1.0 / 2.2)), 1.0);
+    return pow(mapped, vec3<f32>(1.0 / 2.2));
+}
+
+fn present(c: vec3<f32>) -> vec4<f32> {
+    if (scene_hdr()) {
+        return vec4<f32>(max(c, vec3<f32>(0.0)), 1.0);
+    }
+    return vec4<f32>(display_curve(c), 1.0);
+}
+
+// A colour that was authored as the final display value (particles, debug
+// tints) into what the scene target holds. Inverse of `display_curve`; the
+// clamp keeps a display 1.0 finite (about 5.5 in linear light).
+fn from_display(d: vec3<f32>) -> vec3<f32> {
+    if (!scene_hdr()) {
+        return d;
+    }
+    let m = pow(clamp(d, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+    return -log(max(vec3<f32>(1.0) - m, vec3<f32>(1.0 / 400.0))) / 1.08;
+}
+
+// A sample of the scene colour copy (SSR, refraction, planar pass) as the
+// display value the water shading was tuned on. Keeps the reflections as
+// they were; water shading v2 (LOOK_GAP thread 3) can read linear light.
+fn scene_to_display(c: vec3<f32>) -> vec3<f32> {
+    if (scene_hdr()) {
+        return display_curve(c);
+    }
+    return c;
 }
 
 fn sky_color(dir_in: vec3<f32>) -> vec3<f32> {
@@ -1294,7 +1333,7 @@ fn pool_reflect_tex_sample(uv: vec2<f32>) -> vec3<f32> {
         i32(clamp(uv.x, 0.0, 1.0) * f32(dims.x - 1u)),
         i32(clamp(uv.y, 0.0, 1.0) * f32(dims.y - 1u)),
     );
-    return textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb;
+    return scene_to_display(textureSampleLevel(pool_reflect_tex, scene_samp, uv, 0.0).rgb);
 }
 
 // Win-demo pool: sample the mirrored-geometry pass (Niva + sky), not SSR over terrain.
@@ -1332,7 +1371,7 @@ fn pool_scene_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3
         p = p + refl * 0.07;
         let uv = scene_uv_from_world(p);
         if (uv.x > 0.03 && uv.x < 0.97 && uv.y > 0.03 && uv.y < 0.97) {
-            let s = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
+            let s = scene_to_display(textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb);
             let w = 1.0 / (1.0 + f32(i) * 0.22);
             accum += s * w;
             wsum += w;
@@ -1369,7 +1408,7 @@ fn scene_ssr(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
     if (!found) {
         return vec3<f32>(0.0);
     }
-    return textureSampleLevel(scene_color, scene_samp, hit_uv, 0.0).rgb;
+    return scene_to_display(textureSampleLevel(scene_color, scene_samp, hit_uv, 0.0).rgb);
 }
 
 fn reflect_vehicle_scene(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec3<f32> {
@@ -1405,7 +1444,7 @@ fn reflect_vehicle_scene(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> v
         if (veh_uv.x < 0.02 || veh_uv.x > 0.98 || veh_uv.y < 0.02 || veh_uv.y > 0.98) {
             continue;
         }
-        let samp = textureSampleLevel(scene_color, scene_samp, veh_uv, 0.0).rgb;
+        let samp = scene_to_display(textureSampleLevel(scene_color, scene_samp, veh_uv, 0.0).rgb);
         let w = pow(aim, select(select(0.28, 0.18, beauty), 0.12, demo_side));
         accum += samp * w;
         wt += w;
@@ -1477,7 +1516,7 @@ fn niva_planar_reflect(world: vec3<f32>, nrm: vec3<f32>, view: vec3<f32>) -> vec
         if (uv.x < 0.04 || uv.x > 0.96 || uv.y < 0.04 || uv.y > 0.96) {
             continue;
         }
-        let samp = textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb;
+        let samp = scene_to_display(textureSampleLevel(scene_color, scene_samp, uv, 0.0).rgb);
         let w = aim * (0.55 + tire_meta.w * 0.45);
         accum += samp * w;
         wt += w;
@@ -1863,8 +1902,7 @@ fn open_water_fragment(in: WaterOut, bed_col: vec3<f32>) -> vec4<f32> {
     let fc = foam_color(bed_col, mk.cloud, nrm, in.world);
     col = mix(col, fc, mk.foam);
     let a_out = mix(max(alpha, min(spec * 2.0, 1.0) * shore), shore, mk.foam);
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    let gamma = present(col).rgb;
     return vec4<f32>(gamma, a_out);
 }
 
@@ -1956,7 +1994,7 @@ fn shade_seam_pool(
     if (win_demo_flat_terrain()) {
         if (frame.reflect_flags.y > 0.5) {
             let planar = pool_planar_reflect_sample(in.world);
-            return vec4<f32>(pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)), 0.96);
+            return vec4<f32>(from_display(pow(max(planar, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2))), 0.96);
         }
         let reflect_ready = pool_reflect_ready();
         let bow = beauty_bow_wave(xz, t);
@@ -1996,8 +2034,7 @@ fn shade_seam_pool(
         if (reflect_ready && win_demo_in_pool(xz)) {
             alpha = max(alpha, 0.94);
         }
-        let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
-        let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+        let gamma = present(col * (1.05 / 1.08)).rgb;
         return vec4<f32>(gamma, alpha);
     }
     let view = normalize(frame.cam_pos.xyz - in.world);
@@ -2048,8 +2085,7 @@ fn shade_seam_pool(
     col = mix(mix(bed * vec3<f32>(0.36, 0.30, 0.24), col, 0.65), col, edge_a);
     var alpha = mix(0.76, 0.91, deep) * edge_a;
     alpha = max(alpha, select(0.74, 0.82, ultra) * edge_a);
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.05);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    let gamma = present(col * (1.05 / 1.08)).rgb;
     return vec4<f32>(gamma, alpha);
 }
 
@@ -2220,7 +2256,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
             }
             let sky_uv = scene_uv_from_world(in.world + normalize(refl_dir) * 0.55);
             if (sky_uv.x > 0.02 && sky_uv.x < 0.98) {
-                let sky_samp = textureSampleLevel(scene_color, scene_samp, sky_uv, 0.0).rgb;
+                let sky_samp = scene_to_display(textureSampleLevel(scene_color, scene_samp, sky_uv, 0.0).rgb);
                 reflect_col = mix(reflect_col, mix(sky_base, sky_samp, 0.78), select(0.32, 0.48, ultra));
             }
             let ibl_lit = reflect_col;
@@ -2265,8 +2301,7 @@ fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
         col = mix(col, foam_color(bed, mk.cloud, nrm, in.world), mk.foam);
         alpha = mix(alpha, shore_fade, mk.foam);
     }
-    let mapped = vec3<f32>(1.0) - exp(-max(col, vec3<f32>(0.0)) * 1.08);
-    let gamma = pow(mapped, vec3<f32>(1.0 / 2.2));
+    let gamma = present(col).rgb;
     return vec4<f32>(gamma, alpha);
 }
 
@@ -2793,5 +2828,5 @@ fn fs_particle(in: PartOut) -> @location(0) vec4<f32> {
     }
     let fall = smoothstep(0.40, 0.12, d);
     // Color is already the dirty brown we want on screen. A gamma lift turned spray white.
-    return vec4<f32>(in.color.rgb * mix(0.65, 1.0, fall), in.color.a * fall);
+    return vec4<f32>(from_display(in.color.rgb * mix(0.65, 1.0, fall)), in.color.a * fall);
 }
