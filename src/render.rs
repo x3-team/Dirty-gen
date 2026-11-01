@@ -12,7 +12,9 @@ use silt::vehicle::{Vehicle, PANEL_COUNT, PANEL_MUD_CAP, WHEEL_RADIUS, WHEEL_WID
 use silt::world::{CameraPose, World};
 
 use crate::cc0::{buggy_fit, RgbaTex};
-use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime, Q_FRAME_BEGIN, Q_FRAME_END};
+use crate::gpu_time::{pass_timestamps, GpuSample, GpuTime};
+use crate::overlay::Overlay;
+use crate::terrain_draw::TerrainGeometry;
 use crate::mesh::{
     bike_body, bike_suspension, dust_cloud, environment_mesh, horizon_mesh, mud_chunks_with_ground,
     terrain_mesh,
@@ -20,7 +22,27 @@ use crate::mesh::{
     MeshVertex, ParticleVertex, TerrainVertex,
 };
 
+/// Sun shadow map side on the `high` preset. The renderer builds with
+/// [`silt::quality::active`]`().shadow_res`.
+#[allow(dead_code)]
 const SHADOW: u32 = 2048;
+
+thread_local! {
+    /// Draw calls and triangles encoded since the last [`take_draw_stats`].
+    static DRAW_STATS: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn count_draw(vertices: u32) {
+    DRAW_STATS.with(|c| {
+        let (d, t) = c.get();
+        c.set((d + 1, t + vertices as u64 / 3));
+    });
+}
+
+/// Draw calls and triangles since the previous call.
+pub fn take_draw_stats() -> (u32, u64) {
+    DRAW_STATS.with(|c| c.replace((0, 0)))
+}
 const MODEL_SLOTS: u64 = 12;
 
 #[repr(C)]
@@ -68,6 +90,12 @@ pub struct Renderer {
     pub adapter_name: String,
     width: u32,
     height: u32,
+    /// Window size the blit fills. `width × height` is this times the render scale.
+    out_width: u32,
+    out_height: u32,
+    quality: silt::quality::Quality,
+    shadow_res: u32,
+    overlay: Option<Overlay>,
     model_stride: u32,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
@@ -114,7 +142,12 @@ pub struct Renderer {
     readback: wgpu::Buffer,
     reflect_readback: wgpu::Buffer,
     padded_row: u32,
-    terrain: GpuMesh,
+    terrain: Option<GpuMesh>,
+    pub terrain_geom: TerrainGeometry,
+    pipe_terrain_lod: wgpu::RenderPipeline,
+    pipe_terrain_lod_debug: wgpu::RenderPipeline,
+    pipe_water_lod: wgpu::RenderPipeline,
+    pipe_shadow_terrain_lod: wgpu::RenderPipeline,
     body: GpuMesh,
     glass: GpuMesh,
     wheels: [GpuMesh; 4],
@@ -150,6 +183,7 @@ pub struct Renderer {
     pipe_blit_srgb: wgpu::RenderPipeline,
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
+    present_format: Option<wgpu::TextureFormat>,
     mat_scratch: Vec<u8>,
     crust_scratch: Vec<u8>,
     imprint_scratch: Vec<u8>,
@@ -181,6 +215,10 @@ pub struct Renderer {
     pub show_mud_particles: bool,
     /// Round slurry drops. Off when solver sheets carry the splash read.
     pub show_mud_drops: bool,
+    /// River or sea shore: the solved column is drawn as the free surface
+    /// (bed + depth) with sky reflection, instead of a film on the bed.
+    /// Implies the `water_column` pack.
+    pub open_water: bool,
     /// Paint the snow layer. Compaction in the darken channel tints the blanket.
     pub snow: bool,
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
@@ -333,6 +371,28 @@ pub fn try_open_adapter(
     Ok((instance, adapter, device, queue))
 }
 
+/// Adapter and device on the instance that made `surface`. Timestamp
+/// queries are requested when the adapter offers them.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_for_surface(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: Some(surface),
+    }))
+    .ok_or_else(|| "no wgpu adapter for the window surface".to_string())?;
+    let info = adapter.get_info();
+    println!(
+        "wgpu adapter: {} {:?} {:?}",
+        info.name, info.backend, info.device_type
+    );
+    let (device, queue) = open_timed_device(&adapter)?;
+    Ok((adapter, device, queue))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn open_timed_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
     if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -368,9 +428,14 @@ impl Renderer {
         formats: GpuFormats,
         cc0: crate::cc0::Cc0Scene,
     ) -> Self {
+        let quality = silt::quality::active();
+        let shadow_res = quality.shadow_res;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("silt"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", include_str!("shader.wgsl"), include_str!("terrain_geom.wgsl"))
+                    .into(),
+            ),
         });
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -385,6 +450,7 @@ impl Renderer {
                 std::mem::size_of::<FrameData>() as u64,
             )],
         });
+        let tg_layout = TerrainGeometry::layout_entries();
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-tex"),
             entries: &[
@@ -450,9 +516,11 @@ impl Renderer {
                     },
                     count: None,
                 },
-                filter_tex(10, wgpu::ShaderStages::FRAGMENT),
+                tg_layout[0],
+                tg_layout[1],
+                filter_tex(12, wgpu::ShaderStages::FRAGMENT),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 11,
+                    binding: 13,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -461,8 +529,8 @@ impl Renderer {
                     },
                     count: None,
                 },
-                filter_samp(12, wgpu::ShaderStages::FRAGMENT),
-                filter_tex(13, wgpu::ShaderStages::FRAGMENT),
+                filter_samp(14, wgpu::ShaderStages::FRAGMENT),
+                filter_tex(15, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let paint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -482,16 +550,20 @@ impl Renderer {
         });
         let height_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("height-only"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                tg_layout[0],
+                tg_layout[1],
+            ],
         });
         let model_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model"),
@@ -618,8 +690,8 @@ impl Renderer {
         let shadow = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow"),
             size: wgpu::Extent3d {
-                width: SHADOW,
-                height: SHADOW,
+                width: shadow_res,
+                height: shadow_res,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -633,8 +705,8 @@ impl Renderer {
         let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow-depth"),
             size: wgpu::Extent3d {
-                width: SHADOW,
-                height: SHADOW,
+                width: shadow_res,
+                height: shadow_res,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -710,6 +782,8 @@ impl Renderer {
             niva_nor,
             niva_mr,
         ];
+        let terrain_geom = TerrainGeometry::new(&device, !formats.height_packed);
+        let tg_tex = terrain_geom.bind_entries();
         let paint_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("paint-bg"),
             layout: &paint_bgl,
@@ -756,15 +830,20 @@ impl Renderer {
                 },
             ],
         });
+        let [tg_fine, tg_uniform] = terrain_geom.bind_entries();
         let height_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("height-bg"),
             layout: &height_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &height_tex.create_view(&Default::default()),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &height_tex.create_view(&Default::default()),
+                    ),
+                },
+                tg_fine.clone(),
+                tg_uniform.clone(),
+            ],
         });
 
         let (color, color_view, depth, depth_view, readback, padded_row) =
@@ -813,6 +892,7 @@ impl Renderer {
             &scene_depth_view,
             &scene_samp,
             &reflect_sample_view,
+            &tg_tex,
         );
         let tex_bg_pool_encode = build_tex_bg(
             &device,
@@ -831,6 +911,7 @@ impl Renderer {
             &scene_depth_view,
             &scene_samp,
             &scene_color_view,
+            &tg_tex,
         );
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
@@ -1020,6 +1101,54 @@ impl Renderer {
             false,
             Some(wgpu::Face::Back),
         );
+        let pipe_terrain_lod = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_terrain_lod",
+            Some("fs_terrain"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, true, wgpu::CompareFunction::Less)),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_terrain_lod_debug = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_terrain_lod_debug",
+            Some("fs_terrain_lod_debug"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, true, wgpu::CompareFunction::Less)),
+            false,
+            Some(wgpu::Face::Back),
+        );
+        let pipe_water_lod = pipeline(
+            &device,
+            &shader,
+            terrain_layout_ref,
+            "vs_water_lod",
+            Some("fs_water"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(depth_state(formats.depth, false, wgpu::CompareFunction::Less)),
+            true,
+            None,
+        );
+        let pipe_shadow_terrain_lod = pipeline(
+            &device,
+            &shader,
+            &shadow_layout,
+            "vs_shadow_terrain_lod",
+            Some("fs_shadow"),
+            TerrainGeometry::buffers(),
+            color_format,
+            Some(shadow_depth_state(formats.depth)),
+            false,
+            Some(wgpu::Face::Back),
+        );
         let pipe_shadow_mesh = pipeline(
             &device,
             &shader,
@@ -1112,8 +1241,12 @@ impl Renderer {
             });
         }
 
-        let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
-        let terrain = upload_mesh(&device, &tverts, &tidx, "terrain");
+        // The old uniform grid is 2.5 M vertices. Only build it when asked for.
+        let terrain = if terrain_geom.lod {
+            None
+        } else {
+            Some(legacy_terrain(&device))
+        };
         let body = upload_cpu(&device, &cc0.body, "body");
         let glass = upload_cpu(&device, &cc0.glass, "glass");
         let wheels = [
@@ -1227,6 +1360,11 @@ impl Renderer {
             reflect_readback,
             padded_row,
             terrain,
+            terrain_geom,
+            pipe_terrain_lod,
+            pipe_terrain_lod_debug,
+            pipe_water_lod,
+            pipe_shadow_terrain_lod,
             body,
             glass,
             wheels,
@@ -1259,6 +1397,7 @@ impl Renderer {
             pipe_blit_srgb,
             blit_shader,
             blit_layout,
+            present_format: None,
             mat_scratch: vec![0; MAP_RES * MAP_RES * 4],
             crust_scratch: vec![0; MAP_RES * MAP_RES * 4],
             imprint_scratch: vec![0; MAP_RES * MAP_RES * 4],
@@ -1279,6 +1418,7 @@ impl Renderer {
             win_demo_pool_reflect_debug: false,
             show_mud_particles: true,
             show_mud_drops: true,
+            open_water: false,
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
@@ -1291,7 +1431,48 @@ impl Renderer {
             debug_contract: false,
             debug_mode: 0,
             gpu_time: None,
+            out_width: width,
+            out_height: height,
+            quality,
+            shadow_res,
+            overlay: None,
         }
+    }
+
+    pub fn quality(&self) -> silt::quality::Quality {
+        self.quality
+    }
+
+    /// Switch preset live. Render scale applies now. Shadow resolution is
+    /// fixed when the renderer is built; the window prints that it applies
+    /// on the next start when it differs.
+    pub fn set_quality(&mut self, quality: silt::quality::Quality) -> bool {
+        self.quality = quality;
+        let (w, h) = (self.out_width, self.out_height);
+        self.resize_internal(w, h);
+        quality.shadow_res == self.shadow_res
+    }
+
+    /// Internal target size (after render scale).
+    pub fn internal_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Text drawn over the top-left corner of the presented frame. `None` hides it.
+    pub fn set_overlay_text(&mut self, lines: Option<&[String]>) {
+        let Some(lines) = lines else {
+            if let Some(o) = self.overlay.as_mut() {
+                o.visible = false;
+            }
+            return;
+        };
+        if self.overlay.is_none() {
+            let format = self.present_format.unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+            self.overlay = Some(Overlay::new(&self.device, format));
+        }
+        let o = self.overlay.as_mut().unwrap();
+        o.visible = true;
+        o.write(&self.queue, lines);
     }
 
     /// Arm timestamp queries. The window leaves this off.
@@ -1314,9 +1495,17 @@ impl Renderer {
         }
     }
 
+    /// Newest finished GPU frame without waiting.
+    pub fn poll_gpu_time(&mut self) -> Option<GpuSample> {
+        let clock = self.gpu_time.as_ref()?;
+        clock.poll(&self.device)
+    }
+
     /// Point the window blit at the swapchain format. Offscreen frames stay linear-in-a-Unorm-buffer
     /// (gamma already applied); an sRGB surface must undo that before it encodes again.
     pub fn set_present_format(&mut self, format: wgpu::TextureFormat) {
+        self.present_format = Some(format);
+        self.overlay = None;
         self.pipe_blit = pipeline(
             &self.device,
             &self.blit_shader,
@@ -1343,8 +1532,19 @@ impl Renderer {
         );
     }
 
+    /// Window size. Internal targets follow at the preset's render scale.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 || (width == self.width && height == self.height) {
+        self.resize_internal(width, height);
+    }
+
+    fn resize_internal(&mut self, out_w: u32, out_h: u32) {
+        if out_w == 0 || out_h == 0 {
+            return;
+        }
+        self.out_width = out_w;
+        self.out_height = out_h;
+        let (width, height) = self.quality.scaled(out_w, out_h);
+        if width == self.width && height == self.height {
             return;
         }
         self.width = width;
@@ -1385,6 +1585,15 @@ impl Renderer {
                 },
             ],
         });
+    }
+
+    /// The old uniform grid, when the LOD tree is off.
+    fn legacy_terrain(&self) -> Option<&GpuMesh> {
+        if self.terrain_geom.lod {
+            None
+        } else {
+            self.terrain.as_ref()
+        }
     }
 
     pub fn draw(
@@ -1501,12 +1710,13 @@ impl Renderer {
             ],
             misc: [
                 world.time,
-                SHADOW as f32,
+                self.shadow_res as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
-                (if self.water_column { 1.0 } else { 0.0 })
+                (if self.water_column || self.open_water { 1.0 } else { 0.0 })
                     + (if self.puddle_beauty { 2.0 } else { 0.0 })
                     + (if self.win_demo_still { 4.0 } else { 0.0 })
-                    + (if reflect_view_proj.is_some() { 8.0 } else { 0.0 }),
+                    + (if reflect_view_proj.is_some() { 8.0 } else { 0.0 })
+                    + (if self.open_water { 32.0 } else { 0.0 }),
             ],
             tires: tire_frame(&world.vehicle),
             snow_arc: [0.0; 4],
@@ -1534,6 +1744,11 @@ impl Renderer {
         }
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
+        if !self.terrain_geom.lod && self.terrain.is_none() {
+            self.terrain = Some(legacy_terrain(&self.device));
+        }
+        self.terrain_geom
+            .prepare(&self.queue, &world.soil, cam.eye, &view_proj, &light_vp);
         self.write_models(&world.vehicle);
         self.write_bike_models(&world.bike);
 
@@ -1566,15 +1781,9 @@ impl Renderer {
             (0, 0)
         };
 
-        // Queries 0 and 1 bracket the frame. Queries 2 and 3 are reserved for a
-        // pool reflect pass, which this tree does not encode. The clock is out
-        // of `self` for the frame: a reflect pass added here calls
-        // `clock.mark_reflect()` after it.
-        let debug_pass =
-            self.debug_contract && self.pipe_debug.is_some() && self.contract.is_some();
-        let end_on_blit = present.is_some();
-        let end_on_debug = debug_pass && !end_on_blit;
-        let end_on_main = !end_on_blit && !debug_pass;
+        // Each pass takes one begin/end timestamp pair, labelled with the pass
+        // label (`silt::quality::pass_budgets` names the same labels). The
+        // clock is out of `self` for the frame.
         let clock = self.gpu_time.take();
 
         let mut encoder = self
@@ -1584,7 +1793,7 @@ impl Renderer {
             });
 
         {
-            let shadow_time = pass_timestamps(clock.as_ref(), Some(Q_FRAME_BEGIN), None);
+            let shadow_time = pass_timestamps(clock.as_ref(), "shadow");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1606,12 +1815,17 @@ impl Renderer {
                 timestamp_writes: shadow_time,
                 occlusion_query_set: None,
             });
-            pass.set_viewport(0.0, 0.0, SHADOW as f32, SHADOW as f32, 0.0, 1.0);
+            pass.set_viewport(0.0, 0.0, self.shadow_res as f32, self.shadow_res as f32, 0.0, 1.0);
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.height_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[0]);
-            pass.set_pipeline(&self.pipe_shadow_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_shadow_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_shadow_terrain_lod);
+                self.terrain_geom.draw_all(&mut pass);
+            }
             pass.set_pipeline(&self.pipe_shadow_mesh);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
             if self.show_environment {
@@ -1635,15 +1849,7 @@ impl Renderer {
 
         let water_ssr = self.puddle_beauty || self.win_demo_still;
         {
-            let main_time = pass_timestamps(
-                clock.as_ref(),
-                None,
-                if end_on_main {
-                    Some(Q_FRAME_END)
-                } else {
-                    None
-                },
-            );
+            let main_time = pass_timestamps(clock.as_ref(), "main");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1668,6 +1874,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_pipeline(&self.pipe_sky);
             pass.draw(0..3, 0..1);
+            count_draw(3);
 
             pass.set_bind_group(1, &self.tex_bg, &[]);
             pass.set_pipeline(&self.pipe_mesh);
@@ -1678,8 +1885,17 @@ impl Renderer {
             }
 
             pass.set_bind_group(1, &self.tex_bg, &[]);
-            pass.set_pipeline(&self.pipe_terrain);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_terrain);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(if self.terrain_geom.debug {
+                    &self.pipe_terrain_lod_debug
+                } else {
+                    &self.pipe_terrain_lod
+                });
+                self.terrain_geom.draw_view(&mut pass);
+            }
 
             pass.set_pipeline(&self.pipe_mesh);
             pass.set_bind_group(3, &self.paint_bg, &[]);
@@ -1700,8 +1916,13 @@ impl Renderer {
             }
 
             if !water_ssr {
-                pass.set_pipeline(&self.pipe_water);
-                draw_indexed(&mut pass, &self.terrain);
+                if let Some(legacy) = self.legacy_terrain() {
+                    pass.set_pipeline(&self.pipe_water);
+                    draw_indexed(&mut pass, legacy);
+                } else {
+                    pass.set_pipeline(&self.pipe_water_lod);
+                    self.terrain_geom.draw_view(&mut pass);
+                }
                 pass.set_pipeline(&self.pipe_mesh_double);
                 pass.set_bind_group(3, &self.paint_bg, &[]);
                 if chunk_count > 0 {
@@ -1824,8 +2045,13 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.frame_bg, &[]);
             pass.set_bind_group(1, &self.tex_bg, &[]);
-            pass.set_pipeline(&self.pipe_water);
-            draw_indexed(&mut pass, &self.terrain);
+            if let Some(legacy) = self.legacy_terrain() {
+                pass.set_pipeline(&self.pipe_water);
+                draw_indexed(&mut pass, legacy);
+            } else {
+                pass.set_pipeline(&self.pipe_water_lod);
+                self.terrain_geom.draw_view(&mut pass);
+            }
             pass.set_pipeline(&self.pipe_mesh_double);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             pass.set_bind_group(2, &self.model_bg, &[self.model_stride * 5]);
@@ -1844,15 +2070,7 @@ impl Renderer {
 
         if self.debug_contract {
             if let (Some(pipe), Some(gpu)) = (&self.pipe_debug, &self.contract) {
-                let debug_time = pass_timestamps(
-                    clock.as_ref(),
-                    None,
-                    if end_on_debug {
-                        Some(Q_FRAME_END)
-                    } else {
-                        None
-                    },
-                );
+                let debug_time = pass_timestamps(clock.as_ref(), "contract-debug");
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("contract-debug"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1878,19 +2096,12 @@ impl Renderer {
                     * silt::render_contract::WINDOW_CELLS
                     * 6;
                 pass.draw(0..n, 0..1);
+                count_draw(n);
             }
         }
 
         if let Some((view, srgb)) = present {
-            let blit_time = pass_timestamps(
-                clock.as_ref(),
-                None,
-                if end_on_blit {
-                    Some(Q_FRAME_END)
-                } else {
-                    None
-                },
-            );
+            let blit_time = pass_timestamps(clock.as_ref(), "blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1912,6 +2123,21 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.blit_bg, &[]);
             pass.draw(0..3, 0..1);
+            count_draw(3);
+        }
+
+        if let (Some((view, _)), Some(overlay)) = (present, self.overlay.as_ref()) {
+            if overlay.visible {
+                let overlay_time = pass_timestamps(clock.as_ref(), "overlay");
+                overlay.draw(
+                    &mut encoder,
+                    &self.queue,
+                    view,
+                    self.out_width,
+                    self.out_height,
+                    overlay_time,
+                );
+            }
         }
 
         if readback {
@@ -1939,10 +2165,12 @@ impl Renderer {
         }
 
         if let Some(clock) = clock.as_ref() {
-            clock.note_frame();
             clock.resolve(&mut encoder);
         }
         self.queue.submit(Some(encoder.finish()));
+        if let Some(clock) = clock.as_ref() {
+            clock.after_submit();
+        }
         self.gpu_time = clock;
 
         if readback && self.win_demo_still && self.win_demo_pool_reflect_debug {
@@ -2036,7 +2264,7 @@ impl Renderer {
                 0.28
             } else if self.win_demo_still {
                 0.90
-            } else if self.water_column {
+            } else if self.water_column || self.open_water {
                 0.90
             } else {
                 0.34
@@ -2215,6 +2443,7 @@ impl Renderer {
             &self.scene_depth_view,
             &self.scene_samp,
             &self.reflect_sample_view,
+            &self.terrain_geom.bind_entries(),
         );
     }
 
@@ -2326,6 +2555,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.bike_susp_v.slice(..));
         pass.set_index_buffer(self.bike_susp_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..susp_indices, 0, 0..1);
+        count_draw(susp_indices);
     }
 
     fn draw_chunks(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -2337,6 +2567,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.chunk_v.slice(..));
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+        count_draw(count);
     }
 
     fn draw_dust(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -2347,6 +2578,7 @@ impl Renderer {
         pass.set_vertex_buffer(0, self.dust_v.slice(..));
         pass.set_index_buffer(self.dust_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
+        count_draw(count);
     }
 }
 
@@ -2465,10 +2697,16 @@ fn vec4(v: Vec3, w: f32) -> [f32; 4] {
     [v.x, v.y, v.z, w]
 }
 
+fn legacy_terrain(device: &wgpu::Device) -> GpuMesh {
+    let (tverts, tidx) = terrain_mesh(MAP_RES, MAP_SIZE);
+    upload_mesh(device, &tverts, &tidx, "terrain")
+}
+
 fn draw_indexed(pass: &mut wgpu::RenderPass<'_>, mesh: &GpuMesh) {
     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.count, 0, 0..1);
+    count_draw(mesh.count);
 }
 
 fn filter_array(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -2984,6 +3222,7 @@ fn build_tex_bg(
     scene_depth_view: &wgpu::TextureView,
     scene_samp: &wgpu::Sampler,
     pool_reflect_view: &wgpu::TextureView,
+    tg: &[wgpu::BindGroupEntry<'_>; 2],
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tex-bg"),
@@ -3037,20 +3276,22 @@ fn build_tex_bg(
                     &crust_tex.create_view(&Default::default()),
                 ),
             },
+            tg[0].clone(),
+            tg[1].clone(),
             wgpu::BindGroupEntry {
-                binding: 10,
+                binding: 12,
                 resource: wgpu::BindingResource::TextureView(scene_color_view),
             },
             wgpu::BindGroupEntry {
-                binding: 11,
+                binding: 13,
                 resource: wgpu::BindingResource::TextureView(scene_depth_view),
             },
             wgpu::BindGroupEntry {
-                binding: 12,
+                binding: 14,
                 resource: wgpu::BindingResource::Sampler(scene_samp),
             },
             wgpu::BindGroupEntry {
-                binding: 13,
+                binding: 15,
                 resource: wgpu::BindingResource::TextureView(pool_reflect_view),
             },
         ],

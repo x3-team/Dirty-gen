@@ -1,13 +1,14 @@
 //! Dust caller for `silt::fluid_core`.
 //!
 //! This is the dust-trail API (`Dust`, `inject_dust`, `step_pads`, `set_wind`).
-//! The cubic metres live here. Advection is `fluid_core::advect_dust_density`:
-//! the shared upwind flux, pressure filter, and vorticity confinement.
-//! The same grid carries air velocity. `step_vehicle_air` injects the Niva
-//! body and wheels, confines the wake, and `advect_density_by_air` moves
-//! dust on that residual. Fog is a second scalar on this grid. It is advected
-//! by `advect_dust_density` and by that same air velocity. There is no second
-//! dust solver, no second air grid, and no second ledger.
+//! The cubic metres live here, on a 128 × 16 × 128 air window 4 m tall.
+//! Dust is a passive scalar. Each step it rides the relative wind
+//! ([`shift_layers`]: the lee hold up to the roof, whole cells over it), the
+//! wake mixes it up and down ([`mix_vertical`]), and it falls on the slow
+//! stride. The same grid carries air velocity. `step_vehicle_air` injects the
+//! Niva body and wheels, confines the wake, and `advect_density_by_air` moves
+//! dust on that residual. Fog is a second scalar on this grid, moved the same
+//! way. There is no second air grid and no second ledger.
 
 use std::collections::HashMap;
 
@@ -19,8 +20,22 @@ pub const DUST_WET_MOISTURE: f32 = 0.55;
 pub const DUST_WET_WATER_M: f32 = 0.008;
 /// Horizontal cells in the air window. Dust plan.
 pub const AIR_RES: u32 = 128;
-/// Vertical layers. The bottom layer settles.
-pub const AIR_LAYERS: u32 = 8;
+/// Vertical layers. The bottom layer settles. 16 × 0.25 m = 4 m of air.
+pub const AIR_LAYERS: u32 = 16;
+/// Eddy diffusivity of the open air, m²/s. 0: the ledger keeps still air
+/// still, as before the 16 layers; only the resolved wake mixes.
+pub const MIX_K_AIR: f32 = 0.0;
+/// Eddy diffusivity per m/s of air speed the Niva induces (|v − wind|), m²/s.
+/// Mixing-length model: K = c · |u'| · ℓ with c ≈ 0.3 and ℓ = 0.5 m.
+pub const MIX_K_WAKE: f32 = 0.15;
+/// Wake residual below this mixes nothing, m/s. Keeps the far, settled
+/// plume from smearing a film of dust into every layer.
+pub const MIX_WAKE_MIN_M_S: f32 = 0.3;
+/// The wind shift runs on every `SHIFT_STRIDE`-th dust step, `dt` scaled:
+/// one shift per 1/30 s frame at the 1/60 dust step.
+pub const SHIFT_STRIDE: u32 = 2;
+/// The vertical mix runs on every `MIX_STRIDE`-th dust step with `dt` scaled.
+pub const MIX_STRIDE: u32 = 4;
 /// Settle cadence, frames. Inside the 4–8 band.
 pub const SLOW_STRIDE: u32 = 6;
 /// Cubic metres per second offered at 1 m/s slip and dryness 1.
@@ -35,7 +50,7 @@ pub const FRAME_BUDGET_MS: f32 = 1.5;
 pub const AIR_X0_M: f32 = -8.0;
 pub const AIR_X1_M: f32 = 8.0;
 pub const AIR_Y0_M: f32 = 0.0;
-pub const AIR_Y1_M: f32 = 2.0;
+pub const AIR_Y1_M: f32 = 4.0;
 pub const AIR_Z0_M: f32 = -12.0;
 pub const AIR_Z1_M: f32 = 4.0;
 pub const AIR_DX_M: f32 = (AIR_X1_M - AIR_X0_M) / AIR_RES as f32;
@@ -253,6 +268,12 @@ pub struct Dust {
     /// World air velocity, xyz, same index as `vol`.
     vel: Vec<f32>,
     vel_scratch: Vec<f32>,
+    /// Two 128² planes for [`shift_layers`]: the shifted layer and the
+    /// volume that left the window. The second plane is all zero between calls.
+    shift_scratch: Vec<f32>,
+    /// Running sub-cell offset of the layers over the roof, cells (x, z), for
+    /// dust and for fog. Whole cells are moved, the remainder carried.
+    roof_carry: [(f32, f32); 2],
     /// Coarse air velocity for the active window. Same layout, `AIR_COARSE` times fewer X/Z cells.
     coarse_vel: Vec<f32>,
     coarse_scratch: Vec<f32>,
@@ -309,6 +330,8 @@ impl Dust {
             wheel_slip: [0.0; 4],
             vel: vec![0.0; n * 3],
             vel_scratch: vec![0.0; n * 3],
+            shift_scratch: vec![0.0; (AIR_RES * AIR_RES * 2) as usize],
+            roof_carry: [(0.0, 0.0); 2],
             coarse_vel: vec![0.0; coarse_n * 3],
             coarse_scratch: vec![0.0; coarse_n * 3],
             air_stamp_key: [0; 6],
@@ -806,23 +829,83 @@ impl Dust {
         if dt <= 0.0 || self.x0 > self.x1 {
             return;
         }
-        let _outflow = crate::fluid_core::advect_dust_density(
-            &mut self.vol,
-            self.wind_x,
-            self.wind_z,
-            self.speed,
-            self.forward,
-            self.right,
-            dt,
-        );
-        // The sheet stops on the last cell. The same wind carries that face
-        // out of the window and onto the ground cell under it.
-        self.settle_open_face(dt);
+        let (gu, gv) = self.relative_wind();
+        let shift_dt = self.shift_dt(dt);
+        let whole = self.roof_whole(0, gu, gv, shift_dt);
+        if shift_layers(&mut self.vol, &mut self.shift_scratch, gu, gv, shift_dt, whole) > 0.0 {
+            self.book_outflow(false);
+        }
+        if self.frame.is_multiple_of(MIX_STRIDE) {
+            let drive = self.air_drive();
+            mix_vertical(&mut self.vol, &self.vel, &drive, dt * MIX_STRIDE as f32);
+        }
         self.rebuild_rows_from_volume();
     }
 
-    /// Volume the wind carries off the air window, booked where it lands.
-    fn settle_open_face(&mut self, dt: f32) {
+    /// Book what [`shift_layers`] carried off the window (its `lost`
+    /// plane, the second plane of `shift_scratch`) on the ground under the edge.
+    fn book_outflow(&mut self, fog: bool) {
+        let res = AIR_RES as usize;
+        let plane = res * res;
+        for iz in 0..AIR_RES {
+            for ix in 0..AIR_RES {
+                let i = plane + ix as usize + iz as usize * res;
+                let m = self.shift_scratch[i] as f64;
+                if m <= 0.0 {
+                    continue;
+                }
+                self.shift_scratch[i] = 0.0;
+                let p = cell_center(self.chassis_z, ix, 0, iz);
+                if fog {
+                    self.fog_air -= m;
+                    self.fog_settled += m;
+                    self.note_fog(p.x, p.z, m);
+                } else {
+                    self.air -= m;
+                    self.settled += m;
+                    self.note_settled(p.x, p.z, m);
+                }
+            }
+        }
+    }
+
+    fn air_drive(&self) -> crate::fluid_core::AirDrive {
+        crate::fluid_core::niva_air(
+            [self.chassis_x, CHASSIS_Y, self.chassis_z],
+            [self.forward.x, self.forward.y, self.forward.z],
+            [self.right.x, self.right.y, self.right.z],
+            self.speed,
+            self.wheel_slip,
+            self.wind_x,
+            self.wind_z,
+        )
+        .0
+    }
+
+    /// Whole cells the layers over the roof move this step, with the remainder
+    /// carried to the next. `which` 0 is dust, 1 fog.
+    fn roof_whole(&mut self, which: usize, gu: f32, gv: f32, shift_dt: f32) -> (i32, i32) {
+        let c = &mut self.roof_carry[which];
+        c.0 += gu * shift_dt / AIR_DX_M;
+        c.1 += gv * shift_dt / AIR_DZ_M;
+        let w = (c.0.round() as i32, c.1.round() as i32);
+        c.0 -= w.0 as f32;
+        c.1 -= w.1 as f32;
+        w
+    }
+
+    /// `dt` for [`shift_layers`] on this step: the shift runs on every
+    /// [`SHIFT_STRIDE`]-th dust step for that many steps, 0 otherwise.
+    fn shift_dt(&self, dt: f32) -> f32 {
+        if self.frame.is_multiple_of(SHIFT_STRIDE) {
+            dt * SHIFT_STRIDE as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// Wind relative to the window along `right` and `forward`, m/s.
+    fn relative_wind(&self) -> (f32, f32) {
         let forward = if self.forward.length_squared() > 1.0e-8 {
             self.forward.normalize()
         } else {
@@ -834,97 +917,10 @@ impl Dust {
             Vec3::X
         };
         let rel = Vec3::new(self.wind_x, 0.0, self.wind_z) - forward * self.speed.max(0.0);
-        let gu = rel.dot(right);
-        let gv = rel.dot(forward);
-        let depth_x = gu.abs() * dt / AIR_DX_M;
-        if gu > 0.0 {
-            self.shed_rows(depth_x, true, false);
-        } else if gu < 0.0 {
-            self.shed_rows(depth_x, false, false);
-        }
-        if gv.abs() <= 1.0e-8 {
-            return;
-        }
-        let positive = gv > 0.0;
-        let mut n = 0u32;
-        let mut left_depth = Vec::with_capacity(AIR_RES as usize);
-        for ix in 0..AIR_RES {
-            let x = AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M;
-            left_depth.push(gv.abs() * crate::fluid_core::dust_stream_hold(x) * dt / AIR_DZ_M);
-        }
-        let max_depth = left_depth.iter().copied().fold(0.0f32, f32::max);
-        let mut remaining = vec![0.0f32; AIR_RES as usize];
-        remaining.copy_from_slice(&left_depth);
-        while n < AIR_RES && remaining.iter().any(|d| *d > 1.0e-6) && n as f32 <= max_depth {
-            let index = if positive { AIR_RES - 1 - n } else { n };
-            for ix in 0..AIR_RES {
-                let frac = remaining[ix as usize].min(1.0);
-                if frac <= 0.0 {
-                    continue;
-                }
-                remaining[ix as usize] -= frac;
-                let (col_ix, iz) = (ix, index);
-                let mut dropped = 0.0f64;
-                for iy in 0..AIR_LAYERS {
-                    let i = at(col_ix, iy, iz);
-                    let take = self.vol[i] * frac;
-                    if take <= 0.0 {
-                        continue;
-                    }
-                    self.vol[i] -= take;
-                    dropped += take as f64;
-                }
-                if dropped <= 0.0 {
-                    continue;
-                }
-                let x = AIR_X0_M + (col_ix as f32 + 0.5) * AIR_DX_M;
-                let z = if positive {
-                    self.chassis_z + AIR_Z1_M + 0.5 * AIR_DZ_M
-                } else {
-                    self.chassis_z + AIR_Z0_M - 0.5 * AIR_DZ_M
-                };
-                self.note_settled(x, z, dropped);
-                self.air -= dropped;
-                self.settled += dropped;
-            }
-            n += 1;
-        }
+        (rel.dot(right), rel.dot(forward))
     }
 
-    fn shed_rows(&mut self, depth: f32, positive: bool, along_z: bool) {
-        let mut left = depth;
-        let mut n = 0u32;
-        while left > 1.0e-6 && n < AIR_RES {
-            let frac = left.min(1.0);
-            left -= frac;
-            let index = if positive { AIR_RES - 1 - n } else { n };
-            for cross in 0..AIR_RES {
-                let (ix, iz) = if along_z {
-                    (cross, index)
-                } else {
-                    (index, cross)
-                };
-                let mut dropped = 0.0f64;
-                for iy in 0..AIR_LAYERS {
-                    let i = at(ix, iy, iz);
-                    let take = self.vol[i] * frac;
-                    if take <= 0.0 {
-                        continue;
-                    }
-                    self.vol[i] -= take;
-                    dropped += take as f64;
-                }
-                if dropped <= 0.0 {
-                    continue;
-                }
-                let p = cell_center(self.chassis_z, ix, 0, iz);
-                self.note_settled(p.x, p.z, dropped);
-                self.air -= dropped;
-                self.settled += dropped;
-            }
-            n += 1;
-        }
-    }
+
 
     /// `fluid_core` writes `vol` directly. Recover the row spans settle scans.
     fn rebuild_rows_from_volume(&mut self) {
@@ -937,9 +933,11 @@ impl Dust {
             self.row_lo[iz] = 1;
             self.row_hi[iz] = 0;
         }
+        let mut live = [false; AIR_RES as usize];
         for iz in 0..AIR_RES {
+            occupied_columns(&self.vol, iz, &mut live);
             for ix in 0..AIR_RES {
-                if (0..AIR_LAYERS).any(|iy| self.vol[at(ix, iy, iz)] > 0.0) {
+                if live[ix as usize] {
                     self.touch(ix, iz);
                     self.occupied.push(ix | (iz << 16));
                 }
@@ -1020,16 +1018,16 @@ impl Dust {
             return;
         }
         self.ensure_fog_grid();
-        let _outflow = crate::fluid_core::advect_dust_density(
-            &mut self.fog,
-            self.wind_x,
-            self.wind_z,
-            self.speed,
-            self.forward,
-            self.right,
-            dt,
-        );
-        self.shed_fog_face(dt);
+        let (gu, gv) = self.relative_wind();
+        let shift_dt = self.shift_dt(dt);
+        let whole = self.roof_whole(1, gu, gv, shift_dt);
+        if shift_layers(&mut self.fog, &mut self.shift_scratch, gu, gv, shift_dt, whole) > 0.0 {
+            self.book_outflow(true);
+        }
+        if self.frame.is_multiple_of(MIX_STRIDE) {
+            let drive = self.air_drive();
+            mix_vertical(&mut self.fog, &self.vel, &drive, dt * MIX_STRIDE as f32);
+        }
         self.rebuild_fog_columns();
         let stride = crate::fluid_core::AIR_FLUX_STRIDE.max(1);
         if !self.fog_occupied.is_empty() && self.frame % stride == 0 {
@@ -1063,103 +1061,8 @@ impl Dust {
         self.sync_fog_air();
     }
 
-    fn shed_fog_face(&mut self, dt: f32) {
-        let forward = if self.forward.length_squared() > 1.0e-8 {
-            self.forward.normalize()
-        } else {
-            Vec3::Z
-        };
-        let right = if self.right.length_squared() > 1.0e-8 {
-            self.right.normalize()
-        } else {
-            Vec3::X
-        };
-        let rel = Vec3::new(self.wind_x, 0.0, self.wind_z) - forward * self.speed.max(0.0);
-        let gu = rel.dot(right);
-        let gv = rel.dot(forward);
-        let depth_x = gu.abs() * dt / AIR_DX_M;
-        if gu > 0.0 {
-            self.shed_fog_rows(depth_x, true, false);
-        } else if gu < 0.0 {
-            self.shed_fog_rows(depth_x, false, false);
-        }
-        if gv.abs() <= 1.0e-8 {
-            return;
-        }
-        let positive = gv > 0.0;
-        let mut n = 0u32;
-        let mut left_depth = Vec::with_capacity(AIR_RES as usize);
-        for ix in 0..AIR_RES {
-            let x = AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M;
-            left_depth.push(gv.abs() * crate::fluid_core::dust_stream_hold(x) * dt / AIR_DZ_M);
-        }
-        let max_depth = left_depth.iter().copied().fold(0.0f32, f32::max);
-        let mut remaining = left_depth;
-        while n < AIR_RES && remaining.iter().any(|d| *d > 1.0e-6) && n as f32 <= max_depth {
-            let index = if positive { AIR_RES - 1 - n } else { n };
-            for ix in 0..AIR_RES {
-                let frac = remaining[ix as usize].min(1.0);
-                if frac <= 0.0 {
-                    continue;
-                }
-                remaining[ix as usize] -= frac;
-                let dropped = self.take_fog_column(ix, index, frac);
-                if dropped <= 0.0 {
-                    continue;
-                }
-                let x = AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M;
-                let z = if positive {
-                    self.chassis_z + AIR_Z1_M + 0.5 * AIR_DZ_M
-                } else {
-                    self.chassis_z + AIR_Z0_M - 0.5 * AIR_DZ_M
-                };
-                self.note_fog(x, z, dropped);
-            }
-            n += 1;
-        }
-    }
 
-    fn shed_fog_rows(&mut self, depth: f32, positive: bool, along_z: bool) {
-        let mut left = depth;
-        let mut n = 0u32;
-        while left > 1.0e-6 && n < AIR_RES {
-            let frac = left.min(1.0);
-            left -= frac;
-            let index = if positive { AIR_RES - 1 - n } else { n };
-            for cross in 0..AIR_RES {
-                let (ix, iz) = if along_z {
-                    (cross, index)
-                } else {
-                    (index, cross)
-                };
-                let dropped = self.take_fog_column(ix, iz, frac);
-                if dropped <= 0.0 {
-                    continue;
-                }
-                let p = cell_center(self.chassis_z, ix, 0, iz);
-                self.note_fog(p.x, p.z, dropped);
-            }
-            n += 1;
-        }
-    }
 
-    fn take_fog_column(&mut self, ix: u32, iz: u32, frac: f32) -> f64 {
-        let mut dropped = 0.0f64;
-        for iy in 0..AIR_LAYERS {
-            let i = at(ix, iy, iz);
-            let take = self.fog[i] * frac;
-            if take <= 0.0 {
-                continue;
-            }
-            self.fog[i] -= take;
-            dropped += take as f64;
-        }
-        if dropped > 0.0 {
-            self.fog_air -= dropped;
-            self.fog_settled += dropped;
-        }
-        dropped
-    }
 
     fn note_fog(&mut self, world_x: f32, world_z: f32, volume: f64) {
         if volume <= 0.0 {
@@ -1172,9 +1075,11 @@ impl Dust {
 
     fn rebuild_fog_columns(&mut self) {
         self.fog_occupied.clear();
+        let mut live = [false; AIR_RES as usize];
         for iz in 0..AIR_RES {
+            occupied_columns(&self.fog, iz, &mut live);
             for ix in 0..AIR_RES {
-                if (0..AIR_LAYERS).any(|iy| self.fog[at(ix, iy, iz)] > 0.0) {
+                if live[ix as usize] {
                     self.fog_occupied.push(ix | (iz << 16));
                 }
             }
@@ -1274,6 +1179,19 @@ impl Dust {
 impl Default for Dust {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Which columns of z slab `iz` hold anything, reading the slab row by row.
+fn occupied_columns(field: &[f32], iz: u32, live: &mut [bool; AIR_RES as usize]) {
+    live.fill(false);
+    let res = AIR_RES as usize;
+    let base = at(0, 0, iz);
+    for iy in 0..AIR_LAYERS as usize {
+        let row = &field[base + iy * res..base + iy * res + res];
+        for (l, v) in live.iter_mut().zip(row) {
+            *l |= *v > 0.0;
+        }
     }
 }
 
@@ -1456,6 +1374,400 @@ pub fn reference_samples() -> [Sample; 8] {
         dryness: dryness(moisture, water_m),
         offer_m3_s: offer_m3_s(slip, moisture, water_m),
     })
+}
+
+/// Move every layer by the relative wind `(gu, gv)` m/s along +X and +Z for
+/// `dt`, one layer per worker. Below the roof each column keeps the lee hold
+/// (`fluid_core::dust_stream_hold`) and moves by a linear split between the
+/// two cells it lands on; over the roof the layer moves by `whole` cells.
+/// Nothing is made or lost inside the window. What crosses its edge is added
+/// to the second plane of `scratch` at the edge cell it left from
+/// (`x + z * 128`); the caller books it on the ground there. Returns that
+/// volume.
+fn shift_layers(
+    field: &mut [f32],
+    scratch: &mut [f32],
+    gu: f32,
+    gv: f32,
+    dt: f32,
+    whole: (i32, i32),
+) -> f64 {
+    let res = AIR_RES as usize;
+    let plane = res * res;
+    if dt <= 0.0 || field.len() < plane * AIR_LAYERS as usize || scratch.len() < plane * 2 {
+        return 0.0;
+    }
+    if (gu * dt / AIR_DX_M).abs() < 1.0e-6 && (gv * dt / AIR_DZ_M).abs() < 1.0e-6 && whole == (0, 0) {
+        return 0.0;
+    }
+    let lost = &mut scratch[plane..plane * 2];
+    let layers: Vec<u32> = (0..AIR_LAYERS).collect();
+    #[cfg(not(target_arch = "wasm32"))]
+    let outs: Vec<Vec<(usize, f32)>> = {
+        use rayon::prelude::*;
+        let n = field.len();
+        let ptr = LayerPtr(field.as_mut_ptr());
+        layers
+            .par_iter()
+            .map(|&iy| {
+                let ptr = &ptr;
+                // SAFETY: the worker for layer `iy` reads and writes only the
+                // indices `at(_, iy, _)`. Layers are disjoint index sets and the
+                // parallel map ends before `field` is used again.
+                let field = unsafe { std::slice::from_raw_parts_mut(ptr.get(), n) };
+                shift_layer(field, iy, gu, gv, dt, whole)
+            })
+            .collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let outs: Vec<Vec<(usize, f32)>> = layers
+        .iter()
+        .map(|&iy| shift_layer(field, iy, gu, gv, dt, whole))
+        .collect();
+    let mut gone = 0.0f64;
+    for out in outs {
+        for (i, m) in out {
+            lost[i] += m;
+            gone += m as f64;
+        }
+    }
+    gone
+}
+
+/// Lee layers (below the roof) take the fractional per-column shift. Layers
+/// over the roof all ride one uniform wind, so they move by whole cells
+/// (`whole`, from the caller's running offset): a row copy, no smearing.
+fn shift_layer(field: &mut [f32], iy: u32, gu: f32, gv: f32, dt: f32, whole: (i32, i32)) -> Vec<(usize, f32)> {
+    if layer_in_lee(iy) {
+        SHIFT_PLANE.with(|tmp| shift_one_layer(field, &mut tmp.borrow_mut(), iy, gu, gv, dt))
+    } else {
+        shift_layer_whole(field, iy, whole.0, whole.1)
+    }
+}
+
+fn layer_in_lee(iy: u32) -> bool {
+    AIR_Y0_M + (iy as f32 + 0.5) * AIR_DY_M < BODY_TOP_M
+}
+
+/// Move layer `iy` by `nx` cells along x and `nz` along z. What crosses the
+/// window edge is returned at the edge cell it left from.
+fn shift_layer_whole(field: &mut [f32], iy: u32, nx: i32, nz: i32) -> Vec<(usize, f32)> {
+    let res = AIR_RES as usize;
+    let mut lost = Vec::new();
+    if nx == 0 && nz == 0 {
+        return lost;
+    }
+    let r = res as i32;
+    let edge_x = if nx > 0 { res - 1 } else { 0 };
+    let edge_z = if nz > 0 { res - 1 } else { 0 };
+    // What leaves: cells whose destination is outside the window. A cell
+    // that leaves through both faces is booked once, at its z edge.
+    let mut gone_z = [0.0f64; AIR_RES as usize];
+    let mut any = false;
+    for iz in 0..r {
+        let row = at(0, iy, iz as u32);
+        let rr = &field[row..row + res];
+        let dz_out = !(0..r).contains(&(iz + nz));
+        for (ix, v) in rr.iter().enumerate() {
+            if *v <= 0.0 {
+                continue;
+            }
+            any = true;
+            if dz_out {
+                gone_z[ix] += *v as f64;
+            } else if !(0..r).contains(&(ix as i32 + nx)) {
+                lost.push((edge_x + iz as usize * res, *v));
+            }
+        }
+    }
+    if !any {
+        return lost;
+    }
+    for (ix, g) in gone_z.iter().enumerate() {
+        if *g > 0.0 {
+            lost.push((ix + edge_z * res, *g as f32));
+        }
+    }
+    // One pass of row copies, walking against the motion so no source row is
+    // overwritten before it is read.
+    let k = nx.unsigned_abs() as usize;
+    let walk: Vec<i32> = if nz > 0 { (0..r).rev().collect() } else { (0..r).collect() };
+    for dz in walk {
+        let sz = dz - nz;
+        let dst = at(0, iy, dz as u32);
+        if !(0..r).contains(&sz) || k >= res {
+            field[dst..dst + res].fill(0.0);
+            continue;
+        }
+        let src = at(0, iy, sz as u32);
+        if nx >= 0 {
+            field.copy_within(src..src + res - k, dst + k);
+            field[dst..dst + k].fill(0.0);
+        } else {
+            field.copy_within(src + k..src + res, dst);
+            field[dst + res - k..dst + res].fill(0.0);
+        }
+    }
+    lost
+}
+
+struct LayerPtr(*mut f32);
+
+impl LayerPtr {
+    fn get(&self) -> *mut f32 {
+        self.0
+    }
+}
+// SAFETY: see `shift_upper_layers`; each worker touches its own layer only.
+unsafe impl Send for LayerPtr {}
+// SAFETY: as above.
+unsafe impl Sync for LayerPtr {}
+
+thread_local! {
+    static SHIFT_PLANE: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Top of the Niva body above the ground, metres. Below it, shifted layers
+/// keep the sheet's lee hold: the slipstream drags that air along.
+const BODY_TOP_M: f32 = CHASSIS_Y
+    + crate::fluid_core::NIVA_BODY_OFFSET[1]
+    + crate::fluid_core::NIVA_BODY_HALF[1];
+
+/// One layer of [`shift_layers`]. Returns the volume that left the
+/// window as `(x + z * 128, volume)` at the edge cell it left from.
+///
+/// Separable: the whole layer moves `sx` cells along x (linear split between
+/// the two cells it lands on), then each column moves its own `sz` along z.
+/// Both passes are gathers. What a row or column loses is booked at its
+/// downstream edge.
+fn shift_one_layer(field: &mut [f32], tmp: &mut Vec<f32>, iy: u32, gu: f32, gv: f32, dt: f32) -> Vec<(usize, f32)> {
+    let res = AIR_RES as usize;
+    let mut lost = Vec::new();
+    // Bounding box of the layer's dust. Most of the upper air is empty.
+    let (mut x0, mut x1, mut z0, mut z1) = (res, 0usize, res, 0usize);
+    for iz in 0..res {
+        let row = at(0, iy, iz as u32);
+        let r = &field[row..row + res];
+        let Some(a) = r.iter().position(|v| *v > 0.0) else {
+            continue;
+        };
+        let b = r.iter().rposition(|v| *v > 0.0).unwrap_or(a);
+        x0 = x0.min(a);
+        x1 = x1.max(b);
+        z0 = z0.min(iz);
+        z1 = z1.max(iz);
+    }
+    if x0 > x1 {
+        return lost;
+    }
+    if tmp.len() < res * res {
+        tmp.resize(res * res, 0.0);
+    }
+    let last = res as i32 - 1;
+    // Pass 1, x: rows z0..=z1 into `tmp`.
+    let sx = gu * dt / AIR_DX_M;
+    let (nx, fx) = (sx.floor() as i32, sx - sx.floor());
+    let edge_x = if sx >= 0.0 { res - 1 } else { 0 };
+    let cx0 = (x0 as i32 + nx).clamp(0, last) as usize;
+    let cx1 = (x1 as i32 + nx + 1).clamp(0, last) as usize;
+    for iz in z0..=z1 {
+        let row = at(0, iy, iz as u32);
+        let src = &field[row..row + res];
+        let dst = &mut tmp[iz * res..iz * res + res];
+        dst.fill(0.0);
+        // Shares whose landing cell is outside the row.
+        let mut gone = 0.0f64;
+        for (x, v) in src.iter().enumerate().take(x1 + 1).skip(x0) {
+            if *v <= 0.0 {
+                continue;
+            }
+            let a = x as i32 + nx;
+            if !(0..=last).contains(&a) {
+                gone += (*v * (1.0 - fx)) as f64;
+            }
+            if !(0..=last).contains(&(a + 1)) {
+                gone += (*v * fx) as f64;
+            }
+        }
+        for (x, d) in dst.iter_mut().enumerate().take(cx1 + 1).skip(cx0) {
+            let a = x as i32 - nx;
+            let b = a - 1;
+            let va = if (0..=last).contains(&a) { src[a as usize] } else { 0.0 };
+            let vb = if (0..=last).contains(&b) { src[b as usize] } else { 0.0 };
+            *d = va * (1.0 - fx) + vb * fx;
+        }
+        if gone > 0.0 {
+            lost.push((edge_x + iz * res, gone as f32));
+        }
+    }
+    // Pass 2, z: each column moves its own `sz` (the lee hold up to the
+    // roof). Gathered row by row so the field is written in whole rows.
+    let lee = layer_in_lee(iy);
+    let edge_z = if gv >= 0.0 { res - 1 } else { 0 };
+    let mut nzs = [0i32; AIR_RES as usize];
+    let mut fzs = [0.0f32; AIR_RES as usize];
+    let (mut nz_lo, mut nz_hi) = (i32::MAX, i32::MIN);
+    for ix in cx0..=cx1 {
+        let hold = if lee {
+            crate::fluid_core::dust_stream_hold(AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M)
+        } else {
+            1.0
+        };
+        let sz = gv * hold * dt / AIR_DZ_M;
+        nzs[ix] = sz.floor() as i32;
+        fzs[ix] = sz - sz.floor();
+        nz_lo = nz_lo.min(nzs[ix]);
+        nz_hi = nz_hi.max(nzs[ix]);
+    }
+    // Shares whose landing cell is outside the column.
+    let mut col_gone = [0.0f64; AIR_RES as usize];
+    for iz in z0..=z1 {
+        let r = &tmp[iz * res..iz * res + res];
+        for ix in cx0..=cx1 {
+            let v = r[ix];
+            if v <= 0.0 {
+                continue;
+            }
+            let a = iz as i32 + nzs[ix];
+            if !(0..=last).contains(&a) {
+                col_gone[ix] += (v * (1.0 - fzs[ix])) as f64;
+            }
+            if !(0..=last).contains(&(a + 1)) {
+                col_gone[ix] += (v * fzs[ix]) as f64;
+            }
+        }
+        // The x pass already holds this row; clear the field row for the write.
+        let row = at(0, iy, iz as u32);
+        field[row..row + res].fill(0.0);
+    }
+    let lo = (z0 as i32 + nz_lo).clamp(0, last) as usize;
+    let hi = (z1 as i32 + nz_hi + 1).clamp(0, last) as usize;
+    let (zl, zh) = (z0 as i32, z1 as i32);
+    for z in lo..=hi {
+        let row = at(0, iy, z as u32);
+        let dst = &mut field[row..row + res];
+        for ix in cx0..=cx1 {
+            let a = z as i32 - nzs[ix];
+            let b = a - 1;
+            let va = if a >= zl && a <= zh { tmp[ix + a as usize * res] } else { 0.0 };
+            let vb = if b >= zl && b <= zh { tmp[ix + b as usize * res] } else { 0.0 };
+            dst[ix] = va * (1.0 - fzs[ix]) + vb * fzs[ix];
+        }
+    }
+    for ix in cx0..=cx1 {
+        let gone = col_gone[ix];
+        if gone > 0.0 {
+            lost.push((ix + edge_z * res, gone as f32));
+        }
+    }
+    lost
+}
+
+/// Vertical exchange in each occupied column: the air's own vertical speed
+/// (binding 11 G, upwind) and eddy diffusion. K is [`MIX_K_AIR`] plus
+/// [`MIX_K_WAKE`] times the wake residual (air velocity minus the free stream
+/// and slipstream, the same residual that moves dust sideways), so the
+/// resolved wake churns dust up and the air around it barely moves it. Fluxes run between
+/// neighbouring layers of one column: the column sum holds. The top and the
+/// ground are closed; settling is the slow stride's job.
+fn mix_vertical(field: &mut [f32], vel: &[f32], drive: &crate::fluid_core::AirDrive, dt: f32) {
+    let res = AIR_RES as usize;
+    let slab = res * AIR_LAYERS as usize;
+    let n = slab * res;
+    if dt <= 0.0 || field.len() < n || vel.len() < n * 3 {
+        return;
+    }
+    let mut stream = [[0.0f32; 3]; AIR_RES as usize];
+    for (ix, s) in stream.iter_mut().enumerate() {
+        *s = crate::fluid_core::stream_at(AIR_X0_M + (ix as f32 + 0.5) * AIR_DX_M, drive);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        field[..n]
+            .par_chunks_mut(slab)
+            .zip(vel[..n * 3].par_chunks(slab * 3))
+            .for_each(|(f, v)| mix_slab(f, v, &stream, dt));
+    }
+    #[cfg(target_arch = "wasm32")]
+    for (f, v) in field[..n].chunks_mut(slab).zip(vel[..n * 3].chunks(slab * 3)) {
+        mix_slab(f, v, &stream, dt);
+    }
+}
+
+/// [`mix_vertical`] on one z slab, `x + layer * 128`.
+fn mix_slab(field: &mut [f32], vel: &[f32], stream: &[[f32; 3]], dt: f32) {
+    let res = AIR_RES as usize;
+    let layers = AIR_LAYERS as usize;
+    // Explicit diffusion is stable to K dt / dy² = 0.5. Substep to stay at 0.4.
+    let k_cap = 0.4 * AIR_DY_M * AIR_DY_M;
+    for ix in 0..res {
+        let mut c = [0.0f32; AIR_LAYERS as usize];
+        let mut sum = 0.0f32;
+        for iy in 0..layers {
+            c[iy] = field[ix + iy * res];
+            sum += c[iy];
+        }
+        if sum <= 0.0 {
+            continue;
+        }
+        let mut k = [0.0f32; AIR_LAYERS as usize];
+        let mut w = [0.0f32; AIR_LAYERS as usize];
+        let mut k_max = 0.0f32;
+        let mut w_max = 0.0f32;
+        for iy in 0..layers {
+            let i = (ix + iy * res) * 3;
+            let vx = vel[i] - stream[ix][0];
+            let vz = vel[i + 2] - stream[ix][2];
+            let vy = finite_sample(vel[i + 1]);
+            let induced = (vx * vx + vz * vz + vy * vy).sqrt();
+            let induced = if induced.is_finite() && induced >= MIX_WAKE_MIN_M_S { induced } else { 0.0 };
+            k[iy] = MIX_K_AIR + MIX_K_WAKE * induced;
+            w[iy] = vy;
+            k_max = k_max.max(k[iy]);
+            w_max = w_max.max(vy.abs());
+        }
+        if k_max <= 0.0 && w_max <= 0.0 {
+            continue;
+        }
+        let rate = (k_max / (AIR_DY_M * AIR_DY_M)).max(w_max / AIR_DY_M);
+        let steps = ((rate * dt / 0.4).ceil() as usize).clamp(1, 8);
+        let h = dt / steps as f32;
+        // Past the cap, K is clipped rather than substepped further.
+        let k_lim = k_cap / h;
+        let mut flux = [0.0f32; AIR_LAYERS as usize];
+        for _ in 0..steps {
+            for f in 0..layers - 1 {
+                let kf = (0.5 * (k[f] + k[f + 1])).min(k_lim);
+                let wf = 0.5 * (w[f] + w[f + 1]);
+                let donor = if wf > 0.0 { c[f] } else { c[f + 1] };
+                // Upward volume through the face between layer f and f + 1.
+                flux[f] = (wf * donor / AIR_DY_M - kf * (c[f + 1] - c[f]) / (AIR_DY_M * AIR_DY_M)) * h;
+            }
+            // A layer never gives more than it holds.
+            for iy in 0..layers {
+                let up = if iy + 1 < layers { flux[iy].max(0.0) } else { 0.0 };
+                let down = if iy > 0 { (-flux[iy - 1]).max(0.0) } else { 0.0 };
+                let out = up + down;
+                if out > c[iy] && out > 0.0 {
+                    let s = c[iy] / out;
+                    if up > 0.0 {
+                        flux[iy] *= s;
+                    }
+                    if down > 0.0 {
+                        flux[iy - 1] *= s;
+                    }
+                }
+            }
+            for f in 0..layers - 1 {
+                c[f] -= flux[f];
+                c[f + 1] += flux[f];
+            }
+        }
+        for iy in 0..layers {
+            field[ix + iy * res] = c[iy].max(0.0);
+        }
+    }
 }
 
 fn at(ix: u32, iy: u32, iz: u32) -> usize {
@@ -1750,13 +2062,15 @@ mod tests {
             approx(dust.emitted_m3(), emitted, 1.0e-6);
             // One upwind step at 1/60 leaves more of the plume inside the 16 m
             // window. The open face used to book that smear as settled. The
-            // fall still clears it: under 8% stays aloft after 7 s on wet ground.
+            // fall still clears it. With 16 layers the wake mixes the dry
+            // plume up to 4 m, and dust at 3 m takes 12 s to fall at
+            // SETTLE_M_S: 15.5% stayed aloft after 7 s (8 layers: under 8%).
             assert!(
-                dust.dust_air_m3() < air_before * 0.08,
+                dust.dust_air_m3() < air_before * 0.20,
                 "still airborne {} after wet ({wet_m},{wet_w})",
                 dust.dust_air_m3()
             );
-            assert!(dust.dust_settled_m3() > emitted * 0.92);
+            assert!(dust.dust_settled_m3() > emitted * 0.80);
             closes(&dust);
             let settled = dust.dust_settled_m3();
             dust.step(&tires_at(z, 8.0, 2.0), wet_m, wet_w, dt);
@@ -1766,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    fn density_texture_is_128_by_eight_layers() {
+    fn density_texture_is_128_by_sixteen_layers() {
         let (dust, _) = drive(8.0, 1.6, 0.04, 0.0, proof_wind(), 1.0, PROOF_DT_S);
         let mut tex = DensityTexture::empty();
         dust.publish(&mut tex);
@@ -1786,7 +2100,7 @@ mod tests {
     fn through_drive() {
         // Puddle x −6..6, z −24..0, 20 mm. Slurry x −2..2, z −16..−8, 40 mm.
         assert_eq!(AIR_RES, 128);
-        assert_eq!(AIR_LAYERS, 8);
+        assert_eq!(AIR_LAYERS, 16);
 
         let mut fluid = crate::fluid_core::FluidCore::new([0.0, -12.0]);
         fluid.set_wind(1.5, -0.9);
@@ -1893,14 +2207,20 @@ mod tests {
         approx(dust.emitted as f32, 0.02070, 5.0e-5);
         // One donor-cell step at Courant 0.85. The previous pair of half-steps
         // smeared more volume out of the window, so the airborne share was 0.01154.
-        approx(dust.air as f32, 0.01373, 2.5e-4);
-        approx(dust.settled as f32, 0.00697, 2.5e-4);
+        // 16 layers moved by the conservative shift (lee hold up to the roof,
+        // full relative wind over it) instead of the sheet step, and the wake
+        // mixes the plume up to 4 m. More of it rides off the back of the
+        // window and lands on the wet track behind. The sheet's pressure
+        // filter no longer spreads the plume sideways. The 8-layer sheet read
+        // air 0.01373, settled 0.00697, wet track 0.000115, lean 1.25 m.
+        approx(dust.air as f32, 0.01085, 2.5e-4);
+        approx(dust.settled as f32, 0.00985, 2.5e-4);
         assert!(
-            (on_wet - 0.000115).abs() < 5.0e-5,
+            (on_wet - 0.000787).abs() < 1.0e-4,
             "wet track settled {on_wet}"
         );
         assert!(
-            (max_lateral - 1.25).abs() < 0.15,
+            (max_lateral - 1.0).abs() < 0.15,
             "plume lean {max_lateral} m"
         );
 

@@ -32,11 +32,32 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           cargo test --test puddle_rut -- --nocapture
+      - name: Niva crust and cracks
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test crust_cracks -- --nocapture
+      - name: Niva puddle shore
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          export RAYON_NUM_THREADS=1
+          cargo test --test puddle_shore -- --test-threads=1 --nocapture
       - name: Niva acceptance through-drive
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
-          cargo test --test e2e_niva -- --nocapture
+          cargo test --test e2e_niva -- --nocapture --test-threads=1
+      - name: Scripted drive
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test scripted_drive -- --nocapture
+      - name: Niva snow maps
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --test snow_maps -- --nocapture
       - name: Windows demo playground
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
@@ -47,4 +68,47 @@ jobs:
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
           unset DISPLAY
-          cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
+          RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore one_fine_substep_matches_eight -- --nocapture
+          cargo test --release --test puddle_shore puddle_shore_follows_relief -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach --test ford_drive -- --nocapture
+          cargo test --release --test scripted_drive --test turbidity -- --nocapture
+          cargo test --release --test crust_cracks -- --nocapture
+          cargo test --release --test puddle_rut -- --nocapture
+          cargo test --release --test snow_maps -- --nocapture
+          cargo test --release --test soil_joints -- --nocapture
+
+  # Static GPU budget (docs/GPU_BUDGET.md). No GPU on the runner: WGSL loop
+  # bounds and WebGL2 translation run in a test; draw calls, triangles and
+  # texture/buffer memory per quality preset are counted on lavapipe.
+  # Triangles are reported but allowed until the CDLOD terrain (#120) lands.
+  gpu-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Shader budget and WebGL2
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          cargo test --release --test gpu_budget -- --nocapture
+          cargo test --release --lib quality::
+      - name: Render contract reaches the GPU
+        run: |
+          # Builds the contract bind group on lavapipe, uploads a publish and
+          # draws the debug view. Fails if any binding is missing or doubled.
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          unset DISPLAY
+          cargo test --release --bin silt debug_contract_view -- --nocapture
+      - name: Draw calls and memory per preset
+        run: |
+          export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
+          export CXX=g++ CC=gcc
+          unset DISPLAY
+          cargo build --release
+          GPU_BUDGET_ALLOW=triangles ./target/release/silt budget --software 2>&1 | grep -E "GPU_BUDGET|exceeded|panicked"
+          exit ${PIPESTATUS[0]}
