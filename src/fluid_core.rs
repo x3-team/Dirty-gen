@@ -1363,14 +1363,20 @@ fn step_sheet_scratch(
         if let SheetDrive::Wind { x, z, .. } = drive {
             max_s = max_s.max(x.hypot(z));
         }
+        // Largest squared speed first, one square root after.
+        let mut max_s2 = 0.0f32;
         for &(i0, i1, j0, j1) in &boxes {
             for j in j0..=j1 {
                 let row = j * res;
-                for i in i0..=i1 {
-                    max_s = max_s.max(u[row + i].hypot(v[row + i]));
+                for (uu, vv) in u[row + i0..=row + i1].iter().zip(&v[row + i0..=row + i1]) {
+                    let s2 = uu * uu + vv * vv;
+                    if s2 > max_s2 {
+                        max_s2 = s2;
+                    }
                 }
             }
         }
+        max_s = max_s.max(max_s2.sqrt());
         // Open wind on the halved dust plane is an upwind donor cell. Courant
         // 0.85 is still under 1 for the Niva headwind, so that plane takes one
         // substep at 1/60 and two at 1/30. A wall and gravity stay on 0.42.
@@ -1906,7 +1912,7 @@ fn confine_jacobi(
     let nz = (wzp - wzm) / (2.0 * cell);
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         let idx = j * res + i;
         u[idx] += du;
         v[idx] += dv;
@@ -1965,7 +1971,7 @@ fn jacobi_confine_box(
                 let nz = (wzp - wzm) / two;
                 let du = vorticity * dt * (-nz * omega);
                 let dv = vorticity * dt * (nx * omega);
-                if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+                if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
                     u[idx] += du;
                     v[idx] += dv;
                 }
@@ -2000,7 +2006,7 @@ fn confine_jacobi_interior(
     let nz = (wzp - wzm) / two;
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         let idx = j * res + i;
         u[idx] += du;
         v[idx] += dv;
@@ -2320,7 +2326,7 @@ fn confine_interior(
     let nz = (wzp - wzm) / two;
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         let idx = j * res + i;
         u[idx] += du;
         v[idx] += dv;
@@ -2628,7 +2634,7 @@ fn confine_one(
     // the sheet velocity finite. A small confinement still applies.
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         u[idx] += du;
         v[idx] += dv;
     }
@@ -5421,33 +5427,36 @@ impl FluidCore {
                         &self.grain,
                     )
                 };
-                for idx in 0..n {
-                    scratch.bed[idx] = bed_s[idx];
-                    scratch.nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
-                }
-                // Soft edge of the window: slow the velocity, keep the mass.
-                if !fine {
-                    soften_border(uw, vw, res);
-                    soften_border(us, vs, res);
-                }
-                if let Some(mask) = &mask {
-                    displace_occupied(water, uw, vw, mask, res);
-                    displace_occupied(slurry, us, vs, mask, res);
-                }
+                scratch.bed[..n].copy_from_slice(&bed_s[..n]);
                 prep_ms = prep.ms();
-                let bed = &scratch.bed[..n];
-                let nu_w = &scratch.nu_w[..n];
-                let nu_s = &scratch.nu_s[..n];
-                let gate = &scratch.gate[..n];
+                let PairScratch {
+                    nu_w,
+                    nu_s,
+                    gate,
+                    bed,
+                } = &mut *scratch;
+                let bed = &bed[..n];
+                let nu_w = &nu_w[..n];
+                let nu_s = &mut nu_s[..n];
+                let gate = &gate[..n];
                 // Water and slurry are separate sheets: their depth and velocity
                 // arrays do not alias, and both only read the bed, gate, and
                 // mask. Each one steps exactly as it did in series, on its own
-                // worker with its own thread-local scratch.
+                // worker with its own scratch. The per-sheet preparation (the
+                // slurry viscosity, the soft window edge, the body displacement)
+                // runs inside each worker too.
                 let solid = mask.as_deref();
                 let [fine_w, fine_s, coarse_w, coarse_s] = &mut self.sheet_scratch;
                 let (sc_w, sc_s) = if fine { (fine_w, fine_s) } else { (coarse_w, coarse_s) };
                 let run_water = || {
                     let tw = ProfTick::start();
+                    // Soft edge of the window: slow the velocity, keep the mass.
+                    if !fine {
+                        soften_border(uw, vw, res);
+                    }
+                    if let Some(mask) = solid {
+                        displace_occupied(water, uw, vw, mask, res);
+                    }
                     step_sheet_eps_in(
                         water,
                         uw,
@@ -5467,6 +5476,16 @@ impl FluidCore {
                 };
                 let run_slurry = || {
                     let ts = ProfTick::start();
+                    for idx in 0..n {
+                        nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                    }
+                    if !fine {
+                        soften_border(us, vs, res);
+                    }
+                    if let Some(mask) = solid {
+                        displace_occupied(slurry, us, vs, mask, res);
+                    }
+                    let nu_s = &*nu_s;
                     step_sheet_eps_in(
                         slurry,
                         us,
