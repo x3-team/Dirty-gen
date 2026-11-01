@@ -4,7 +4,9 @@
 //! separable filter, a wide gaussian plus a steeper kernel. Viscosity is
 //! the mix, and it enters by overloading the divergence the projection
 //! removes. Dust is a 2.5D air grid on the same advection, projection, and
-//! vorticity confinement. The Niva body and wheels inject velocity on that
+//! vorticity confinement. Fog is a second scalar on that grid, moved by the
+//! same wind step and the same air velocity. It is not a second grid.
+//! The Niva body and wheels inject velocity on that
 //! grid, and the wake is confined there. The window moves with the Niva: a coarse sheet
 //! about 20 cm across the near field, a 2 cm sheet under the tires, and
 //! cells that leave the window are parked so the volume comes back.
@@ -93,6 +95,10 @@ pub const SLOW_STRIDE: u32 = 6;
 pub const DUST_WET_MOISTURE: f32 = 0.55;
 /// Settled dust does not lift at or above this standing water, metres.
 pub const DUST_WET_WATER_M: f32 = 0.008;
+/// Standing water, metres, at or above which a tire may loft fog.
+pub const FOG_MIN_WATER_M: f32 = 0.004;
+/// Fog droplets fall at this speed on the slow stride, metres per second.
+pub const FOG_SETTLE_M_S: f32 = 0.55;
 
 const GAUSS: [f32; 5] = [0.06, 0.24, 0.40, 0.24, 0.06];
 const STEEP: [f32; 5] = [0.02, 0.08, 0.80, 0.08, 0.02];
@@ -137,7 +143,14 @@ pub fn dynamic_viscosity(grain: Grain, moisture: f32) -> f32 {
 
 /// How hard a free-surface slope accelerates the sheet. A very thin mix,
 /// under about 12 Pa·s, moves more freely. Clay and silt do not.
+///
+/// A negative entry is not a viscosity. It is the mobility itself, for an
+/// open-water reach that runs at full gravity (see
+/// [`FluidCore::set_open_water`]).
 pub fn sheet_mobility_for(nu: f32) -> f32 {
+    if nu < 0.0 {
+        return -nu;
+    }
     let boost = if nu < 12.0 {
         let t = ((12.0 - nu.max(0.0)) / 12.0).clamp(0.0, 1.0);
         t * t * 1.6
@@ -162,6 +175,11 @@ pub fn sheet_damp(nu: f32) -> f32 {
 /// True when slip may loft dust. Wet pore moisture and a standing film may not.
 pub fn dust_may_lift(moisture: f32, water_m: f32) -> bool {
     moisture < DUST_WET_MOISTURE && water_m < DUST_WET_WATER_M
+}
+
+/// True when standing water is deep enough to loft fog. Dry ground returns false.
+pub fn fog_may_lift(water_m: f32) -> bool {
+    water_m >= FOG_MIN_WATER_M
 }
 
 /// What drives a sheet for one step.
@@ -227,6 +245,90 @@ pub struct StreamCycle {
     pub dir_z: f32,
 }
 
+/// A paddle strip in the coarse water sheet. Inside the strip the water
+/// velocity along `dir` is pulled toward `amplitude * sin(2π t / period)`.
+/// Only velocity is driven, never depth, so the strip cannot mint or delete
+/// water. The waves it sends out, their shoaling, and their run-up on a bank
+/// are whatever the height–velocity step does with that push.
+/// Off unless the caller sets one.
+#[derive(Clone, Copy, Debug)]
+pub struct WaveMaker {
+    pub x0: f32,
+    pub x1: f32,
+    pub z0: f32,
+    pub z1: f32,
+    /// Push direction in the ground plane. Normalised on use.
+    pub dir_x: f32,
+    pub dir_z: f32,
+    /// Peak paddle velocity, metres per second.
+    pub amplitude_m_s: f32,
+    pub period_s: f32,
+    /// Seconds over which the paddle ramps from 0 to full amplitude.
+    pub ramp_s: f32,
+}
+
+/// Open river reach through the window: an inlet at the upstream window
+/// edge and an outlet at the downstream edge, as in a recirculating flume.
+///
+/// The outlet rows hold the free surface at `outlet_eta` and copy the
+/// velocity of the first interior row, so the stream leaves without a wall
+/// to pile against. Water the outlet takes off goes into the reach bank. The
+/// inlet rows are filled from that bank toward `inlet_eta` and push the water
+/// in at `inlet_speed_m_s`, slower on the shallow margins. The bank is part of
+/// the ledger, so the reach neither mints nor deletes water: what arrives at
+/// the inlet is what left at the outlet. Off unless the caller sets one.
+#[derive(Clone, Copy, Debug)]
+pub struct RiverReach {
+    /// True for a river along Z, false for one along X.
+    pub along_z: bool,
+    /// True when the water runs toward +X (or +Z).
+    pub positive: bool,
+    /// Cross-stream band, metres of Z for a river along X (X for one along Z).
+    pub cross0: f32,
+    pub cross1: f32,
+    /// Rows at each window end that belong to the inlet and the outlet.
+    pub rows: usize,
+    /// World Y of the free surface the inlet and the outlet hold.
+    pub inlet_eta: f32,
+    pub outlet_eta: f32,
+    pub inlet_speed_m_s: f32,
+}
+
+/// Water as a river, not a film in a rut.
+///
+/// `mobility` is the share of gravity the free-surface slope applies to the
+/// water sheet (1 is full gravity). `manning_n` is the Manning roughness of
+/// the bed, s/m^(1/3), applied as bed friction on the coarse water sheet.
+/// Sand and gravel river beds sit around 0.025 to 0.04. Uniform flow on a
+/// slope S then runs at `h^(2/3) S^(1/2) / n`, and the thin water on a
+/// boulder's flank or in a swash is slowed far more than the deep thalweg.
+/// Typical depth-averaged eddy viscosity in a shallow gravel river is a few
+/// hundredths of m²/s.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenWater {
+    pub mobility: f32,
+    pub manning_n: f32,
+    /// Depth-averaged horizontal eddy viscosity, m²/s. Shear between wet
+    /// cells, and no slip against dry ground: a boulder or the bank holds the
+    /// water beside it back, which is the wake and the slow margin.
+    pub eddy_m2_s: f32,
+}
+
+/// Pore water that a passing film leaves in the ground.
+///
+/// A coarse cell under at least `wet_film_m` of water or slurry is saturated.
+/// A cell the film has left drains toward the pad moisture with an e-folding
+/// time of `drain_s` scaled by its grain: sand drains at `drain_s`, silt three
+/// times slower, clay eight times slower. This is the wet band a swash leaves
+/// on a beach and the dark sand behind a receding wave. Volume stays in the
+/// water sheet; pore water is a state of the ground, not a second column.
+/// Off unless the caller sets one.
+#[derive(Clone, Copy, Debug)]
+pub struct ShoreSoak {
+    pub wet_film_m: f32,
+    pub drain_s: f32,
+}
+
 /// One tire telling the sheet which way it is shoving.
 #[derive(Clone, Copy, Debug)]
 pub struct TirePush {
@@ -283,6 +385,18 @@ pub struct DustInject {
     pub offer_m3_s: f32,
 }
 
+/// Water a tire offers the air as fog. The sheet path removes that volume
+/// from the water column. The dust-ledger path returns it and the caller
+/// removes it. A thin film returns nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct FogInject {
+    pub x: f32,
+    pub z: f32,
+    pub water_m: f32,
+    /// Cubic metres per second offered by a tire in standing water.
+    pub offer_m3_s: f32,
+}
+
 /// One visible sample of the air column or the settled film. Not a volume.
 /// The cubic metres stay on the grid. Callers draw a mark and discard it.
 #[derive(Clone, Copy, Debug)]
@@ -320,6 +434,9 @@ pub struct CoarseCell {
     pub u: f32,
     pub v: f32,
     pub settled_dust_m: f32,
+    /// Suspended-solids concentration in the water column, 0..1.
+    /// Zero when the water column is under 0.01 mm.
+    pub turbidity: f32,
 }
 
 /// Maps a beauty pass can read. Coarse window, after the fine patch is put back.
@@ -346,7 +463,37 @@ pub struct FluidLedger {
     pub frozen_slurry_m3: f32,
     pub frozen_dust_m3: f32,
     pub spray_m3: f32,
+    /// Airborne fog plus fog parked off the air window, cubic metres.
+    /// Settled fog is already back in `water_m3`.
+    pub fog_air_m3: f32,
+    /// Suspended solids still in the water column, cubic metres.
+    pub suspended_m3: f32,
+    /// Suspended solids that left the column: a dry cell, or the part above the water.
+    pub settled_suspended_m3: f32,
+    /// Suspended solids parked with a coarse cell that slid off the window.
+    pub frozen_suspended_m3: f32,
+    /// Volume the wheels have lifted into suspension. The column, the settled
+    /// part, and the parked part sum to this.
+    pub entrained_m3: f32,
+    /// Water between the outlet and the inlet of a [`RiverReach`].
+    pub reach_m3: f32,
     pub total_m3: f32,
+}
+
+/// Suspended fraction on the coarse sheet after the step.
+///
+/// `bins` counts cells that hold solids: `[0, 0.1)`, …, `[0.9, 1)`, then
+/// `ratio >= 1`. Clear water is `clear`, not bin 0. `above_water` is the
+/// count the publish clamp would have painted as 1 because `susp > water`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurbiditySpread {
+    pub bins: [u32; 11],
+    pub clear: u32,
+    pub above_water: u32,
+    pub saturated: u32,
+    pub max_ratio: f32,
+    /// Mean water depth of the `ratio >= 1` bin. Zero when that bin is empty.
+    pub full_water: f32,
 }
 
 /// How a rounded rut in one mix levels.
@@ -399,10 +546,26 @@ impl Scratch {
 }
 
 thread_local! {
+    /// Set while a water or slurry sheet runs beside the other one. The two
+    /// sheets already fill the workers, so the row splits inside stay serial.
+    static INNER_SERIAL: Cell<bool> = const { Cell::new(false) };
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::new());
     /// Dust layers run together. Each one starts from a zero scratch so the
     /// pressure halo does not depend on which layer ran last.
     static ISOLATE_SCRATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Row and column splits are allowed on this thread.
+fn inner_par() -> bool {
+    !INNER_SERIAL.with(|flag| flag.get())
+}
+
+/// Runs `f` with the inner row splits off, then puts the flag back.
+fn serial_inner<R>(f: impl FnOnce() -> R) -> R {
+    let prev = INNER_SERIAL.with(|flag| flag.replace(true));
+    let out = f();
+    INNER_SERIAL.with(|flag| flag.set(prev));
+    out
 }
 
 fn park_sheet_scratch() -> Scratch {
@@ -583,7 +746,51 @@ pub fn step_sheet(
     dt: f32,
     drive: SheetDrive,
 ) {
-    step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, 1.0e-6, None);
+    step_sheet_eps(
+        h, u, v, bed, nu, gate, res, cell, dt, drive, 1.0e-6, None, false, 8.0, 0,
+    );
+}
+
+/// [`step_sheet_eps`] on a caller-owned scratch instead of the thread-local one.
+fn step_sheet_eps_in(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    drive: SheetDrive,
+    eps: f32,
+    solid: Option<&[u8]>,
+    banks: bool,
+    sub_cap: f32,
+    pace: u8,
+    sc: &mut Scratch,
+    sc2: &mut Scratch,
+) {
+    if dt <= 0.0 || res == 0 || h.len() < res * res {
+        return;
+    }
+    let mut sum = 0.0f32;
+    let mut any = false;
+    for s in h.iter() {
+        if *s > eps {
+            any = true;
+            sum += *s;
+        }
+    }
+    if !any || sum <= eps {
+        return;
+    }
+    sc.fit(res * res);
+    sc2.fit(res * res);
+    step_sheet_scratch(
+        h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, banks, sub_cap, pace, sc,
+        Some(sc2),
+    );
 }
 
 fn step_sheet_eps(
@@ -599,6 +806,9 @@ fn step_sheet_eps(
     drive: SheetDrive,
     eps: f32,
     solid: Option<&[u8]>,
+    banks: bool,
+    sub_cap: f32,
+    pace: u8,
 ) {
     if dt <= 0.0 || res == 0 || h.len() < res * res {
         return;
@@ -618,17 +828,17 @@ fn step_sheet_eps(
         let mut sc = sc.borrow_mut();
         sc.fit(res * res);
         step_sheet_scratch(
-            h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, &mut sc,
+            h, u, v, bed, nu, gate, res, cell, dt, drive, eps, solid, banks, sub_cap, pace,
+            &mut sc, None,
         );
     });
 }
 
 /// Advect one vehicle-frame dust volume, `x + layer * 128 + z * 128 * 8`.
 ///
-/// The dust caller owns the cubic metres. This is the shared wind step:
-/// the same upwind flux, pressure filter, and vorticity confinement as the
-/// ground sheets. Mass that stays in `vol` is still airborne. The return is
-/// the cubic metres that left the window, which the caller books as settled.
+/// Donor-cell upwind on cells that hold volume. Empty layers are not visited.
+/// Mass that stays in `vol` is still airborne. The return is the cubic metres
+/// that left the window, which the caller books as settled.
 pub fn advect_dust_density(
     vol: &mut [f32],
     wind_x: f32,
@@ -717,7 +927,9 @@ fn step_down2(
     as_volume: bool,
 ) {
     if res < 4 || res % 2 != 0 || h.len() < res * res {
-        step_sheet_eps(h, u, v, bed, nu, gate, res, cell, dt, drive, eps, None);
+        step_sheet_eps(
+            h, u, v, bed, nu, gate, res, cell, dt, drive, eps, None, false, 8.0, 0,
+        );
         return;
     }
     let c = res / 2;
@@ -725,78 +937,173 @@ fn step_down2(
     DOWN2.with(|plane| {
         let mut plane = plane.borrow_mut();
         plane.fit(cn);
+        let Down2 {
+            h: ch,
+            u: cu,
+            v: cv,
+            bed: cbed,
+            nu: cnu,
+            gate: cgate,
+            w,
+        } = &mut *plane;
+        let (ch, cu, cv) = (&mut ch[..cn], &mut cu[..cn], &mut cv[..cn]);
+        let (cbed, cnu, cgate) = (&mut cbed[..cn], &mut cnu[..cn], &mut cgate[..cn]);
+        let w = &mut w[..cn * 4];
+        let (fh, fu, fv) = (&h[..res * res], &u[..res * res], &v[..res * res]);
+        // Same 2x2 order as before: row dj, then column di.
         for j in 0..c {
+            let r0 = (j * 2) * res;
+            let r1 = r0 + res;
             for i in 0..c {
                 let id = j * c + i;
+                let f = [r0 + i * 2, r0 + i * 2 + 1, r1 + i * 2, r1 + i * 2 + 1];
                 let mut sum = 0.0f32;
                 let mut su = 0.0f32;
                 let mut sv = 0.0f32;
-                for dj in 0..2 {
-                    for di in 0..2 {
-                        let fidx = (j * 2 + dj) * res + (i * 2 + di);
-                        let hv = h[fidx];
-                        plane.w[id * 4 + dj * 2 + di] = hv;
-                        sum += hv;
-                        let m = hv.max(0.0);
-                        su += u[fidx] * m;
-                        sv += v[fidx] * m;
-                    }
+                for k in 0..4 {
+                    let hv = fh[f[k]];
+                    w[id * 4 + k] = hv;
+                    sum += hv;
+                    let m = hv.max(0.0);
+                    su += fu[f[k]] * m;
+                    sv += fv[f[k]] * m;
                 }
-                plane.h[id] = if as_volume { sum } else { sum * 0.25 };
+                ch[id] = if as_volume { sum } else { sum * 0.25 };
                 if sum > 1.0e-12 {
-                    plane.u[id] = su / sum;
-                    plane.v[id] = sv / sum;
+                    cu[id] = su / sum;
+                    cv[id] = sv / sum;
                 } else {
-                    plane.u[id] = 0.0;
-                    plane.v[id] = 0.0;
+                    cu[id] = 0.0;
+                    cv[id] = 0.0;
                 }
-                let fidx = (j * 2) * res + (i * 2);
-                plane.bed[id] = bed.get(fidx).copied().unwrap_or(0.0);
-                plane.nu[id] = nu.get(fidx).copied().unwrap_or(0.4);
-                plane.gate[id] = gate.get(fidx).copied().unwrap_or(1);
+                let fidx = f[0];
+                cbed[id] = bed.get(fidx).copied().unwrap_or(0.0);
+                cnu[id] = nu.get(fidx).copied().unwrap_or(0.4);
+                cgate[id] = gate.get(fidx).copied().unwrap_or(1);
             }
         }
-        {
-            let Down2 {
-                h,
-                u,
-                v,
-                bed,
-                nu,
-                gate,
-                w: _,
-            } = &mut *plane;
-            step_sheet_eps(h, u, v, bed, nu, gate, c, cell * 2.0, dt, drive, eps, None);
-        }
+        step_sheet_eps(ch, cu, cv, cbed, cnu, cgate, c, cell * 2.0, dt, drive, eps, None, false, 8.0, 0);
+        let (fh, fu, fv) = (&mut h[..res * res], &mut u[..res * res], &mut v[..res * res]);
         for j in 0..c {
+            let r0 = (j * 2) * res;
+            let r1 = r0 + res;
             for i in 0..c {
                 let id = j * c + i;
-                let new_h = plane.h[id];
+                let new_h = ch[id];
+                let ws = [w[id * 4], w[id * 4 + 1], w[id * 4 + 2], w[id * 4 + 3]];
                 let mut s = 0.0f32;
-                let mut ws = [0.0f32; 4];
-                for k in 0..4 {
-                    ws[k] = plane.w[id * 4 + k];
-                    s += ws[k].max(0.0);
+                for wk in ws {
+                    s += wk.max(0.0);
                 }
-                for dj in 0..2 {
-                    for di in 0..2 {
-                        let k = dj * 2 + di;
-                        let fidx = (j * 2 + dj) * res + (i * 2 + di);
-                        let share = if s > 1.0e-12 {
-                            if as_volume {
-                                ws[k].max(0.0) / s * new_h
-                            } else {
-                                ws[k].max(0.0) / s * new_h * 4.0
-                            }
-                        } else if as_volume {
-                            new_h * 0.25
+                let f = [r0 + i * 2, r0 + i * 2 + 1, r1 + i * 2, r1 + i * 2 + 1];
+                for k in 0..4 {
+                    let share = if s > 1.0e-12 {
+                        if as_volume {
+                            ws[k].max(0.0) / s * new_h
                         } else {
-                            new_h
-                        };
-                        h[fidx] = share.max(0.0);
-                        u[fidx] = plane.u[id];
-                        v[fidx] = plane.v[id];
-                    }
+                            ws[k].max(0.0) / s * new_h * 4.0
+                        }
+                    } else if as_volume {
+                        new_h * 0.25
+                    } else {
+                        new_h
+                    };
+                    fh[f[k]] = share.max(0.0);
+                    fu[f[k]] = cu[id];
+                    fv[f[k]] = cv[id];
+                }
+            }
+        }
+    });
+}
+
+/// [`step_down2`] for a dust volume whose fine velocity is `gu` everywhere
+/// and `col_v[i]` down each column, with `eps` 0. The 2x2 sums use those
+/// values in the same order, and only the volume is scattered back: the
+/// caller rebuilds the fine wind on the next call.
+fn step_down2_wind(
+    h: &mut [f32],
+    gu: f32,
+    col_v: &[f32],
+    bed: &[f32],
+    nu: &[f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dt: f32,
+    drive: SheetDrive,
+) {
+    let c = res / 2;
+    let cn = c * c;
+    DOWN2.with(|plane| {
+        let mut plane = plane.borrow_mut();
+        plane.fit(cn);
+        let Down2 {
+            h: ch,
+            u: cu,
+            v: cv,
+            bed: cbed,
+            nu: cnu,
+            gate: cgate,
+            w,
+        } = &mut *plane;
+        let (ch, cu, cv) = (&mut ch[..cn], &mut cu[..cn], &mut cv[..cn]);
+        let (cbed, cnu, cgate) = (&mut cbed[..cn], &mut cnu[..cn], &mut cgate[..cn]);
+        let w = &mut w[..cn * 4];
+        let fh = &h[..res * res];
+        for j in 0..c {
+            let r0 = (j * 2) * res;
+            let r1 = r0 + res;
+            for i in 0..c {
+                let id = j * c + i;
+                let f = [r0 + i * 2, r0 + i * 2 + 1, r1 + i * 2, r1 + i * 2 + 1];
+                let fv = [col_v[i * 2], col_v[i * 2 + 1], col_v[i * 2], col_v[i * 2 + 1]];
+                let mut sum = 0.0f32;
+                let mut su = 0.0f32;
+                let mut sv = 0.0f32;
+                for k in 0..4 {
+                    let hv = fh[f[k]];
+                    w[id * 4 + k] = hv;
+                    sum += hv;
+                    let m = hv.max(0.0);
+                    su += gu * m;
+                    sv += fv[k] * m;
+                }
+                ch[id] = sum;
+                if sum > 1.0e-12 {
+                    cu[id] = su / sum;
+                    cv[id] = sv / sum;
+                } else {
+                    cu[id] = 0.0;
+                    cv[id] = 0.0;
+                }
+                let fidx = f[0];
+                cbed[id] = bed.get(fidx).copied().unwrap_or(0.0);
+                cnu[id] = nu.get(fidx).copied().unwrap_or(0.4);
+                cgate[id] = gate.get(fidx).copied().unwrap_or(1);
+            }
+        }
+        step_sheet_eps(ch, cu, cv, cbed, cnu, cgate, c, cell * 2.0, dt, drive, 0.0, None, false, 8.0, 0);
+        let fh = &mut h[..res * res];
+        for j in 0..c {
+            let r0 = (j * 2) * res;
+            let r1 = r0 + res;
+            for i in 0..c {
+                let id = j * c + i;
+                let new_h = ch[id];
+                let ws = [w[id * 4], w[id * 4 + 1], w[id * 4 + 2], w[id * 4 + 3]];
+                let mut s = 0.0f32;
+                for wk in ws {
+                    s += wk.max(0.0);
+                }
+                let f = [r0 + i * 2, r0 + i * 2 + 1, r1 + i * 2, r1 + i * 2 + 1];
+                for k in 0..4 {
+                    let share = if s > 1.0e-12 {
+                        ws[k].max(0.0) / s * new_h
+                    } else {
+                        new_h * 0.25
+                    };
+                    fh[f[k]] = share.max(0.0);
                 }
             }
         }
@@ -875,39 +1182,56 @@ fn advect_one_dust_layer(
             nu,
             gate,
         } = &mut *plane;
+        let (h, u, v) = (&mut h[..n], &mut u[..n], &mut v[..n]);
+        // The stream hold depends on the column only.
+        let mut hold = [0.0f32; 128];
+        let hold = if res <= hold.len() {
+            for (ix, slot) in hold[..res].iter_mut().enumerate() {
+                let local_x = -8.0 + (ix as f32 + 0.5) * cell;
+                *slot = gv * dust_stream_hold(local_x);
+            }
+            &hold[..res]
+        } else {
+            &[][..]
+        };
+        let stride = res * layers;
+        let drive = SheetDrive::Wind {
+            x: gu,
+            z: gv,
+            vorticity: 0.35,
+        };
+        // The wind is one value per column, so the halved plane reads it
+        // straight from `hold` and the full-size u/v copies are skipped.
+        let direct = !hold.is_empty() && res >= 4 && res % 2 == 0;
         let mut before = 0.0f64;
         for iz in 0..res {
+            let src = &vol[layer * res + iz * stride..][..res];
+            let row = iz * res;
+            let hr = &mut h[row..row + res];
             for ix in 0..res {
-                let src = ix + layer * res + iz * res * layers;
-                let cell_v = vol[src];
-                let local_x = -8.0 + (ix as f32 + 0.5) * cell;
-                h[iz * res + ix] = cell_v;
-                u[iz * res + ix] = gu;
-                v[iz * res + ix] = gv * dust_stream_hold(local_x);
+                let cell_v = src[ix];
+                hr[ix] = cell_v;
                 before += cell_v as f64;
+            }
+            if !direct {
+                for ix in 0..res {
+                    u[row + ix] = gu;
+                    v[row + ix] = if hold.is_empty() {
+                        gv * dust_stream_hold(-8.0 + (ix as f32 + 0.5) * cell)
+                    } else {
+                        hold[ix]
+                    };
+                }
             }
         }
         if before <= 0.0 {
             return;
         }
-        step_down2(
-            h,
-            u,
-            v,
-            bed,
-            nu,
-            gate,
-            res,
-            cell,
-            dt,
-            SheetDrive::Wind {
-                x: gu,
-                z: gv,
-                vorticity: 0.35,
-            },
-            0.0,
-            true,
-        );
+        if direct {
+            step_down2_wind(h, gu, hold, bed, nu, gate, res, cell, dt, drive);
+        } else {
+            step_down2(h, u, v, bed, nu, gate, res, cell, dt, drive, 0.0, true);
+        }
         let after = h.iter().map(|c| *c as f64).sum::<f64>();
         let scale = if after > 0.0 {
             (before / after) as f32
@@ -915,18 +1239,15 @@ fn advect_one_dust_layer(
             1.0
         };
         for iz in 0..res {
+            let dst = &mut vol[layer * res + iz * stride..][..res];
+            let hr = &h[iz * res..iz * res + res];
             for ix in 0..res {
-                let src = ix + layer * res + iz * res * layers;
-                vol[src] = h[iz * res + ix] * scale;
+                dst[ix] = hr[ix] * scale;
             }
         }
     });
 }
 
-/// Work boxes are `(i0, i1, j0, j1)` inclusive. A solid wet rectangle stays
-/// one box with the historical halo of 3, so that path is unchanged. Separated
-/// blobs (the tire disks) each carry their own halo and are not stepped across
-/// the dry gap.
 fn sheet_work_boxes(h: &[f32], res: usize, eps: f32, allow_split: bool) -> Vec<(usize, usize, usize, usize)> {
     let mut i0 = res;
     let mut i1 = 0usize;
@@ -1230,7 +1551,11 @@ fn step_sheet_scratch(
     drive: SheetDrive,
     eps: f32,
     solid: Option<&[u8]>,
+    banks: bool,
+    sub_cap: f32,
+    pace: u8,
     sc: &mut Scratch,
+    sc2: Option<&mut Scratch>,
 ) {
     if ISOLATE_SCRATCH.with(|flag| flag.replace(false)) {
         sc.fit(res * res);
@@ -1244,14 +1569,19 @@ fn step_sheet_scratch(
     }
     // A mask does not glue separate tire disks into one rectangle. A single
     // connected sheet still returns the historical halo-3 box.
-    // The 2 cm sheet under the tires has no body mask. One CFL pass uses the
-    // velocity already in the cells as a warm start, so confinement runs once
-    // instead of once per substep. Flat tiles sleep. A wall (the creek, the
-    // e2e body) keeps the substep loop and the forward Gauss–Seidel sweep.
-    let fine_open = solid.is_none()
+    // Pace 0 is the open 2 cm sheet: one CFL pass, flat tiles asleep. Pace 1
+    // is adaptive CFL on awake tiles, capped at eight. Pace 2 and 3 split the
+    // whole wet rectangle the same way. A wall keeps the substep loop and the
+    // forward Gauss–Seidel sweep.
+    let open_fine = solid.is_none()
         && cell <= FINE_CELL_M + 1.0e-6
         && matches!(drive, SheetDrive::Gravity { .. });
-    let boxes = if fine_open {
+    let fine_open = open_fine && pace == 0;
+    // Pace 2 and 3 split the whole wet rectangle by adaptive CFL, capped at
+    // eight. Pace 0 keeps flat tiles asleep. Pace 1 uses awake tiles only.
+    let whole_wet = open_fine && (pace == 2 || pace == 3);
+    let awake = open_fine && !whole_wet && !fine_open;
+    let boxes = if fine_open || awake {
         awake_work_boxes(h, u, v, bed, res, cell, eps)
     } else {
         sheet_work_boxes(h, res, eps, true)
@@ -1259,6 +1589,11 @@ fn step_sheet_scratch(
     if boxes.is_empty() {
         return;
     }
+    let cap = if sub_cap.is_finite() {
+        sub_cap.clamp(1.0, 8.0)
+    } else {
+        8.0
+    };
     let nsub = if fine_open {
         1
     } else {
@@ -1266,26 +1601,117 @@ fn step_sheet_scratch(
         if let SheetDrive::Wind { x, z, .. } = drive {
             max_s = max_s.max(x.hypot(z));
         }
+        // Largest squared speed first, one square root after.
+        let mut max_s2 = 0.0f32;
         for &(i0, i1, j0, j1) in &boxes {
             for j in j0..=j1 {
                 let row = j * res;
-                for i in i0..=i1 {
-                    max_s = max_s.max(u[row + i].hypot(v[row + i]));
+                for (uu, vv) in u[row + i0..=row + i1].iter().zip(&v[row + i0..=row + i1]) {
+                    let s2 = uu * uu + vv * vv;
+                    if s2 > max_s2 {
+                        max_s2 = s2;
+                    }
                 }
             }
         }
-        ((dt * max_s) / (0.42 * cell.max(1.0e-3)))
+        max_s = max_s.max(max_s2.sqrt());
+        // Open wind on the halved dust plane is an upwind donor cell. Courant
+        // 0.85 is still under 1 for the Niva headwind, so that plane takes one
+        // substep at 1/60 and two at 1/30. A wall and gravity stay on 0.42.
+        let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
+        let courant = if open_wind { 0.85 } else { 0.42 };
+        ((dt * max_s) / (courant * cell.max(1.0e-3)))
             .ceil()
-            .clamp(1.0, 8.0) as u32
+            .clamp(1.0, cap) as u32
     };
     let dts = dt / nsub as f32;
+    // Pace 3: one pressure solve on the whole wet sheet, then one flux per
+    // Courant slice. Pace 2 repeats the Jacobi sweep every slice. The shore
+    // equality test keeps pace 2 as the reference.
+    if pace == 3 && whole_wet && nsub > 1 {
+        for &(i0, i1, j0, j1) in &boxes {
+            substep(
+                h, u, v, bed, nu, gate, res, cell, dt, drive, eps, i0, i1, j0, j1, solid, banks,
+                false, sc,
+            );
+        }
+        let frac_cap = 0.45f32;
+        for _ in 0..nsub {
+            for &(i0, i1, j0, j1) in &boxes {
+                transport_open(
+                    h, u, gate, res, cell, dts, i0, i1, j0, j1, true, None, frac_cap, sc,
+                );
+                transport_open(
+                    h, v, gate, res, cell, dts, i0, i1, j0, j1, false, None, frac_cap, sc,
+                );
+            }
+        }
+        if eps > 0.0 {
+            for &(i0, i1, j0, j1) in &boxes {
+                for j in j0..=j1 {
+                    let row = j * res;
+                    for i in i0..=i1 {
+                        let idx = row + i;
+                        if h[idx] < eps {
+                            h[idx] = 0.0;
+                            u[idx] = 0.0;
+                            v[idx] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // Two blobs far enough apart (the left and right tire tracks) touch
+    // disjoint cells: a substep writes its box and a 1-cell rim and reads a
+    // 2-cell rim. Those two boxes step on two workers, each on its own scratch.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(sc2) = sc2 {
+        if boxes.len() == 2 && boxes_apart(boxes[0], boxes[1], BOX_PAR_GAP) {
+            let (b0, b1) = (boxes[0], boxes[1]);
+            let n = res * res;
+            let hp = ShareMut(h.as_mut_ptr());
+            let up = ShareMut(u.as_mut_ptr());
+            let vp = ShareMut(v.as_mut_ptr());
+            for _ in 0..nsub {
+                let run = |b: (usize, usize, usize, usize), sc: &mut Scratch| {
+                    // SAFETY: the two boxes are `BOX_PAR_GAP` cells apart, so
+                    // the cells one worker writes are never read or written by
+                    // the other. The join below ends before `h`, `u`, `v` are
+                    // used again.
+                    let (h, u, v) = unsafe { (hp.slice(n), up.slice(n), vp.slice(n)) };
+                    substep(
+                        h, u, v, bed, nu, gate, res, cell, dts, drive, eps, b.0, b.1, b.2, b.3,
+                        solid, banks, true, sc,
+                    );
+                };
+                rayon::join(
+                    || serial_inner(|| run(b0, &mut *sc)),
+                    || serial_inner(|| run(b1, &mut *sc2)),
+                );
+            }
+            return;
+        }
+    }
     for _ in 0..nsub {
         for &(i0, i1, j0, j1) in &boxes {
             substep(
-                h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, sc,
+                h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, banks,
+                true, sc,
             );
         }
     }
+}
+
+/// Cells two work boxes must keep between them to step at the same time.
+/// A substep writes up to 1 cell outside its box and reads up to 2.
+const BOX_PAR_GAP: usize = 6;
+
+/// True when the boxes are at least `gap` cells apart along x or along z.
+fn boxes_apart(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize), gap: usize) -> bool {
+    let apart = |a0: usize, a1: usize, b0: usize, b1: usize| a1 + gap < b0 || b1 + gap < a0;
+    apart(a.0, a.1, b.0, b.1) || apart(a.2, a.3, b.2, b.3)
 }
 
 fn substep(
@@ -1305,11 +1731,25 @@ fn substep(
     j0: usize,
     j1: usize,
     solid: Option<&[u8]>,
+    banks: bool,
+    do_flux: bool,
     sc: &mut Scratch,
 ) {
-    let n = res * res;
-    for idx in 0..n {
-        sc.a[idx] = bed[idx] + h[idx];
+    // Only the box and its 2-cell halo are read below: the 5-tap blurs, the
+    // 5x5 wall lift, and the 3-point laplacian. Refreshing the whole grid for
+    // every box of every substep was the largest memory pass on the sheet.
+    let hi0 = i0.saturating_sub(2);
+    let hi1 = (i1 + 2).min(res - 1);
+    let hj0 = j0.saturating_sub(2);
+    let hj1 = (j1 + 2).min(res - 1);
+    for j in hj0..=hj1 {
+        let row = j * res;
+        let a = &mut sc.a[row + hi0..=row + hi1];
+        let b = &bed[row + hi0..=row + hi1];
+        let hh = &h[row + hi0..=row + hi1];
+        for ((a, b), hh) in a.iter_mut().zip(b).zip(hh) {
+            *a = *b + *hh;
+        }
     }
     // A wall is not a hole in the free surface. Copy the neighbouring water
     // line onto solid cells so the pressure gradient does not fall into the body.
@@ -1379,11 +1819,14 @@ fn substep(
     // The gain stays small: this sheet is a free surface, and the slope force
     // above is what moves the column. The open 2 cm sheet skips that pair of
     // filters: one CFL pass already paid for the pressure blurs, and the
-    // correction is 0.012 of dt. A wall, the coarse sheet, and the wind sheet
-    // keep it.
-    let project = solid.is_some()
-        || cell > FINE_CELL_M + 1.0e-6
-        || !matches!(drive, SheetDrive::Gravity { .. });
+    // correction is 0.012 of dt. A wall, the coarse sheet, and gravity keep it.
+    // Open wind does not. The dust caller rescales each layer to the volume it
+    // passed in, and that 0.012*dt tweak is not what sets the plume.
+    let open_wind = solid.is_none() && matches!(drive, SheetDrive::Wind { .. });
+    let project = !open_wind
+        && (solid.is_some()
+            || cell > FINE_CELL_M + 1.0e-6
+            || !matches!(drive, SheetDrive::Gravity { .. }));
     if project {
         for j in j0..=j1 {
             for i in i0..=i1 {
@@ -1404,6 +1847,10 @@ fn substep(
             }
         }
     }
+    // Neighbouring cells nearly always share one viscosity (the water sheet
+    // has a single value), so the damping exponent is reused until it changes.
+    let mut memo_nu = f32::NAN;
+    let mut memo_decay = 1.0f32;
     for j in j0..=j1 {
         for i in i0..=i1 {
             let idx = j * res + i;
@@ -1417,10 +1864,15 @@ fn substep(
                 u[idx] += 0.012 * dt * qx;
                 v[idx] += 0.012 * dt * qz;
             }
-            let decay = (-sheet_damp(nu[idx]) * dt).exp();
+            let nu_here = nu[idx];
+            if nu_here.to_bits() != memo_nu.to_bits() {
+                memo_nu = nu_here;
+                memo_decay = (-sheet_damp(nu_here) * dt).exp();
+            }
+            let decay = memo_decay;
             let lim = match drive {
-                SheetDrive::Wind { x, z, .. } => x.hypot(z).max(1.6),
-                SheetDrive::Gravity { .. } => 1.6,
+                SheetDrive::Wind { x, z, .. } => x.hypot(z).max(FILM_SPEED_CAP_MPS),
+                SheetDrive::Gravity { .. } => FILM_SPEED_CAP_MPS,
             };
             u[idx] = finite_speed(u[idx] * decay, lim);
             v[idx] = finite_speed(v[idx] * decay, lim);
@@ -1435,16 +1887,24 @@ fn substep(
         block_into_solid(u, v, h, mask, res, i0, i1, j0, j1, eps);
         write_noslip_ghost(u, v, h, mask, res, i0, i1, j0, j1, eps);
     }
-    let banks = if solid.is_some() { Some(bed) } else { None };
+    if !do_flux {
+        return;
+    }
+    let wall_bed = if solid.is_some() { Some(bed) } else { None };
+    let open_bed = if banks { Some(bed) } else { None };
     if solid.is_none() {
-        transport_open(h, u, gate, res, cell, dt, i0, i1, j0, j1, true, sc);
-        transport_open(h, v, gate, res, cell, dt, i0, i1, j0, j1, false, sc);
+        transport_open(
+            h, u, gate, res, cell, dt, i0, i1, j0, j1, true, open_bed, 0.45, sc,
+        );
+        transport_open(
+            h, v, gate, res, cell, dt, i0, i1, j0, j1, false, open_bed, 0.45, sc,
+        );
     } else {
         transport(
-            h, u, v, gate, res, cell, dt, i0, i1, j0, j1, true, solid, banks, sc,
+            h, u, v, gate, res, cell, dt, i0, i1, j0, j1, true, solid, wall_bed, sc,
         );
         transport(
-            h, u, v, gate, res, cell, dt, i0, i1, j0, j1, false, solid, banks, sc,
+            h, u, v, gate, res, cell, dt, i0, i1, j0, j1, false, solid, wall_bed, sc,
         );
     }
     for j in j0..=j1 {
@@ -1477,7 +1937,7 @@ fn force_gravity_solid(
     j1: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && inner_par() {
         force_gravity_solid_par(
             h, u, v, nu, p, mask, res, cell, dt, vorticity, eps, i0, i1, j0, j1,
         );
@@ -1605,7 +2065,7 @@ fn force_gravity_open(
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && inner_par() {
         force_gravity_par(h, u, v, nu, p, res, cell, dt, vorticity, eps, i0, i1, j0, j1);
         return;
     }
@@ -1780,7 +2240,7 @@ fn confine_jacobi(
     let nz = (wzp - wzm) / (2.0 * cell);
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         let idx = j * res + i;
         u[idx] += du;
         v[idx] += dv;
@@ -1839,7 +2299,7 @@ fn jacobi_confine_box(
                 let nz = (wzp - wzm) / two;
                 let du = vorticity * dt * (-nz * omega);
                 let dv = vorticity * dt * (nx * omega);
-                if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+                if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
                     u[idx] += du;
                     v[idx] += dv;
                 }
@@ -1874,7 +2334,7 @@ fn confine_jacobi_interior(
     let nz = (wzp - wzm) / two;
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         let idx = j * res + i;
         u[idx] += du;
         v[idx] += dv;
@@ -1955,8 +2415,16 @@ fn gravity_jacobi_serial(
             snap.v.resize(n, 0.0);
             snap.w.resize(n, 0.0);
         }
-        snap.u[..n].copy_from_slice(&u[..n]);
-        snap.v[..n].copy_from_slice(&v[..n]);
+        let y0 = j0.saturating_sub(2);
+        let y1 = (j1 + 2).min(res - 1);
+        let x0 = i0.saturating_sub(2);
+        let x1 = (i1 + 2).min(res - 1);
+        for j in y0..=y1 {
+            let row = j * res;
+            let end = row + x1 + 1;
+            snap.u[row + x0..end].copy_from_slice(&u[row + x0..end]);
+            snap.v[row + x0..end].copy_from_slice(&v[row + x0..end]);
+        }
         let VelSnap { u: su, v: sv, w } = &mut *snap;
         jacobi_confine_box(
             su, sv, w, h, u, v, res, cell, dt, vorticity, eps, two, i0, i1, j0, j1,
@@ -2032,7 +2500,7 @@ fn force_wind_open(
     j1: usize,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && inner_par() {
         // Dust is stepped on the halved air grid. Same Jacobi confinement as
         // the row workers, without a scope per blur and per layer.
         if res <= SERIAL_SHEET_MAX {
@@ -2194,7 +2662,7 @@ fn confine_interior(
     let nz = (wzp - wzm) / two;
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         let idx = j * res + i;
         u[idx] += du;
         v[idx] += dv;
@@ -2205,6 +2673,13 @@ fn vort_interior(u: &[f32], v: &[f32], res: usize, i: usize, j: usize, two: f32)
     let dvdx = (v[j * res + i + 1] - v[j * res + i - 1]) / two;
     let dudz = (u[(j + 1) * res + i] - u[(j - 1) * res + i]) / two;
     dvdx - dudz
+}
+
+/// A dry cell whose bed stands above the donor's free surface takes no water.
+/// A flat bed never trips this, so a pour on a plane still spreads.
+#[inline(always)]
+fn dry_bank(h: &[f32], bed: &[f32], donor: usize, recv: usize) -> bool {
+    h[recv] <= 1.0e-6 && bed[recv] > bed[donor] + h[donor] + 1.0e-3
 }
 
 fn transport_open(
@@ -2219,13 +2694,17 @@ fn transport_open(
     j0: usize,
     j1: usize,
     along_x: bool,
+    bed: Option<&[f32]>,
+    frac_cap: f32,
     sc: &mut Scratch,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
     // The 2 cm sheet and the halved dust plane stay on this thread. Each row
     // or column still writes the same edges. The coarse window stays split.
-    if i1 - i0 >= 31 && j1 - j0 >= 47 && res != FINE_RES && res > SERIAL_SHEET_MAX {
-        transport_open_par(h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, sc);
+    if i1 - i0 >= 31 && j1 - j0 >= 47 && res != FINE_RES && res > SERIAL_SHEET_MAX && inner_par() {
+        transport_open_par(
+            h, vel, gate, res, cell, dt, i0, i1, j0, j1, along_x, bed, frac_cap, sc,
+        );
         return;
     }
     for j in j0..=j1 {
@@ -2246,7 +2725,13 @@ fn transport_open(
                 if speed.abs() < 1.0e-5 {
                     continue;
                 }
-                flux_open(h, gate, a, b, speed, cell, dt, sc);
+                if let Some(bed) = bed {
+                    let (donor, recv) = if speed > 0.0 { (a, b) } else { (b, a) };
+                    if dry_bank(h, bed, donor, recv) {
+                        continue;
+                    }
+                }
+                flux_open(h, gate, a, b, speed, cell, dt, frac_cap, sc);
             }
         }
     } else {
@@ -2258,7 +2743,13 @@ fn transport_open(
                 if speed.abs() < 1.0e-5 {
                     continue;
                 }
-                flux_open(h, gate, a, b, speed, cell, dt, sc);
+                if let Some(bed) = bed {
+                    let (donor, recv) = if speed > 0.0 { (a, b) } else { (b, a) };
+                    if dry_bank(h, bed, donor, recv) {
+                        continue;
+                    }
+                }
+                flux_open(h, gate, a, b, speed, cell, dt, frac_cap, sc);
             }
         }
     }
@@ -2288,9 +2779,13 @@ fn transport_open_par(
     j0: usize,
     j1: usize,
     along_x: bool,
+    bed: Option<&[f32]>,
+    frac_cap: f32,
     sc: &mut Scratch,
 ) {
     let threads = rayon::current_num_threads().clamp(1, 4);
+    let bed_ptr = bed.map(|b| ShareConst(b.as_ptr()));
+    let bed_len = bed.map(|b| b.len()).unwrap_or(0);
     let removed = ShareMut(sc.removed.as_mut_ptr());
     let added = ShareMut(sc.added.as_mut_ptr());
     let n = sc.removed.len().min(sc.added.len());
@@ -2347,7 +2842,14 @@ fn transport_open_par(
                             if speed.abs() < 1.0e-5 {
                                 continue;
                             }
-                            flux_open_bufs(h, gate, ia, ib, speed, cell, dt, removed, added);
+                            if let Some(ptr) = bed_ptr {
+                                let bed = unsafe { ptr.slice(bed_len) };
+                                let (donor, recv) = if speed > 0.0 { (ia, ib) } else { (ib, ia) };
+                                if dry_bank(h, bed, donor, recv) {
+                                    continue;
+                                }
+                            }
+                            flux_open_bufs(h, gate, ia, ib, speed, cell, dt, frac_cap, removed, added);
                         }
                     }
                 });
@@ -2380,7 +2882,14 @@ fn transport_open_par(
                             if speed.abs() < 1.0e-5 {
                                 continue;
                             }
-                            flux_open_bufs(h, gate, ia, ib, speed, cell, dt, removed, added);
+                            if let Some(ptr) = bed_ptr {
+                                let bed = unsafe { ptr.slice(bed_len) };
+                                let (donor, recv) = if speed > 0.0 { (ia, ib) } else { (ib, ia) };
+                                if dry_bank(h, bed, donor, recv) {
+                                    continue;
+                                }
+                            }
+                            flux_open_bufs(h, gate, ia, ib, speed, cell, dt, frac_cap, removed, added);
                         }
                     }
                 });
@@ -2429,6 +2938,7 @@ fn flux_open_bufs(
     vel: f32,
     cell: f32,
     dt: f32,
+    frac_cap: f32,
     removed: &mut [f32],
     added: &mut [f32],
 ) {
@@ -2440,7 +2950,7 @@ fn flux_open_bufs(
     if gate[recv] == 0 && h[recv] <= 1.0e-6 {
         return;
     }
-    let frac = (vel.abs() * dt / cell).min(0.45);
+    let frac = (vel.abs() * dt / cell).min(frac_cap);
     let dh = (h[donor] * frac).min(room);
     if dh <= 1.0e-8 {
         return;
@@ -2458,6 +2968,7 @@ fn flux_open(
     vel: f32,
     cell: f32,
     dt: f32,
+    frac_cap: f32,
     sc: &mut Scratch,
 ) {
     let (donor, recv) = if vel > 0.0 { (a, b) } else { (b, a) };
@@ -2468,7 +2979,7 @@ fn flux_open(
     if gate[recv] == 0 && h[recv] <= 1.0e-6 {
         return;
     }
-    let frac = (vel.abs() * dt / cell).min(0.45);
+    let frac = (vel.abs() * dt / cell).min(frac_cap);
     let dh = (h[donor] * frac).min(room);
     if dh <= 1.0e-8 {
         return;
@@ -2502,7 +3013,7 @@ fn confine_one(
     // the sheet velocity finite. A small confinement still applies.
     let du = eps * dt * (-nz * w);
     let dv = eps * dt * (nx * w);
-    if du.is_finite() && dv.is_finite() && du.hypot(dv) <= 0.25 {
+    if du.is_finite() && dv.is_finite() && du * du + dv * dv <= 0.0625 {
         u[idx] += du;
         v[idx] += dv;
     }
@@ -2522,6 +3033,18 @@ fn finite0(v: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Thickness-weighted film velocity. The same blend the render contract publishes.
+fn film_uv(water: f32, slurry: f32, uw: f32, vw: f32, us: f32, vs: f32) -> (f32, f32) {
+    let h = water + slurry;
+    if !h.is_finite() || h < 1.0e-5 {
+        return (0.0, 0.0);
+    }
+    (
+        finite0((uw * water + us * slurry) / h),
+        finite0((vw * water + vs * slurry) / h),
+    )
 }
 
 fn vorticity_at(u: &[f32], v: &[f32], res: usize, i: usize, j: usize, cell: f32) -> f32 {
@@ -2578,8 +3101,10 @@ fn blur_box(
     if i0 > i1 || j0 > j1 || res == 0 {
         return;
     }
+    // A tire-sized box is slower with a rayon scope than on one thread.
+    // The full window still splits.
     #[cfg(not(target_arch = "wasm32"))]
-    if j1 - j0 >= 47 && i1 - i0 >= 31 && res != FINE_RES && res > SERIAL_SHEET_MAX {
+    if j1 - j0 >= 47 && i1 - i0 >= 31 && res != FINE_RES && res > SERIAL_SHEET_MAX && inner_par() {
         par_blur_axis(src, tmp, res, i0, i1, j0, j1, k, true);
         par_blur_axis(tmp, dst, res, i0, i1, j0, j1, k, false);
         return;
@@ -2933,17 +3458,19 @@ fn transport(
     sc: &mut Scratch,
 ) {
     #[cfg(not(target_arch = "wasm32"))]
-    if i1 - i0 >= 31 && j1 - j0 >= 47 {
+    if i1 - i0 >= 31 && j1 - j0 >= 47 && inner_par() {
         let speed = if along_x { u } else { v };
         transport_par(
             h, speed, gate, res, cell, dt, i0, i1, j0, j1, along_x, solid, bed, sc,
         );
         return;
     }
-    let n = res * res;
-    for idx in 0..n {
-        sc.removed[idx] = 0.0;
-        sc.added[idx] = 0.0;
+    // Every edge below has both cells inside the box, so the books only
+    // need the box, not the whole grid.
+    for j in j0..=j1 {
+        let row = j * res;
+        sc.removed[row + i0..=row + i1].fill(0.0);
+        sc.added[row + i0..=row + i1].fill(0.0);
     }
     if along_x {
         for j in j0..=j1 {
@@ -2986,9 +3513,11 @@ fn transport(
             }
         }
     }
-    for idx in 0..n {
-        if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
-            h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+    for j in j0..=j1 {
+        for idx in j * res + i0..=j * res + i1 {
+            if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
+                h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+            }
         }
     }
 }
@@ -3478,10 +4007,16 @@ fn redirect_into_walls(
     j1: usize,
     sc: &mut Scratch,
 ) {
-    let n = res * res;
-    for idx in 0..n {
-        sc.removed[idx] = 0.0;
-        sc.added[idx] = 0.0;
+    // Removals sit in the box and additions on its 4-neighbours, so the
+    // books cover the box and a 1-cell rim.
+    let ri0 = i0.saturating_sub(1);
+    let ri1 = (i1 + 1).min(res - 1);
+    let rj0 = j0.saturating_sub(1);
+    let rj1 = (j1 + 1).min(res - 1);
+    for j in rj0..=rj1 {
+        let row = j * res;
+        sc.removed[row + ri0..=row + ri1].fill(0.0);
+        sc.added[row + ri0..=row + ri1].fill(0.0);
     }
     for j in j0..=j1 {
         for i in i0..=i1 {
@@ -3567,9 +4102,11 @@ fn redirect_into_walls(
             }
         }
     }
-    for idx in 0..n {
-        if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
-            h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+    for j in rj0..=rj1 {
+        for idx in j * res + ri0..=j * res + ri1 {
+            if sc.removed[idx] > 0.0 || sc.added[idx] > 0.0 {
+                h[idx] = (h[idx] - sc.removed[idx] + sc.added[idx]).max(0.0);
+            }
         }
     }
 }
@@ -3629,6 +4166,54 @@ fn cylinder_segment_volume(depth: f32, radius: f32, width: f32) -> f32 {
 fn column_sum(h: &[f32], cell: f32) -> f32 {
     let area = cell * cell;
     h.iter().map(|s| s.max(0.0)).sum::<f32>() * area
+}
+
+fn restore_wiped(h: &mut [f32], before: f32, cell: f32) {
+    let lost = before - column_sum(h, cell);
+    if lost <= 1.0e-8 {
+        return;
+    }
+    let Some(idx) = h
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+    else {
+        return;
+    };
+    h[idx] += lost / (cell * cell);
+}
+
+fn hash01(ix: i32, iz: i32, seed: u32) -> f32 {
+    let mut n = (ix as u32)
+        .wrapping_mul(0x27BB_2EE6)
+        .wrapping_add((iz as u32).wrapping_mul(0x1656_67B1))
+        ^ seed;
+    n = n.wrapping_mul(0x9E37_79B1);
+    n ^= n >> 16;
+    n = n.wrapping_mul(0x85EB_CA6B);
+    n ^= n >> 13;
+    (n >> 8) as f32 * (1.0 / 16_777_216.0)
+}
+
+/// Value noise in −1..1. The puddle relief samples this around the shore.
+pub fn relief_value(x: f32, z: f32, seed: u32) -> f32 {
+    let x0 = x.floor();
+    let z0 = z.floor();
+    let fx = x - x0;
+    let fz = z - z0;
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sz = fz * fz * (3.0 - 2.0 * fz);
+    let ix = x0 as i32;
+    let iz = z0 as i32;
+    let v00 = hash01(ix, iz, seed);
+    let v10 = hash01(ix + 1, iz, seed);
+    let v01 = hash01(ix, iz + 1, seed);
+    let v11 = hash01(ix + 1, iz + 1, seed);
+    let a = v00 + (v10 - v00) * sx;
+    let b = v01 + (v11 - v01) * sx;
+    (a + (b - a) * sz) * 2.0 - 1.0
 }
 
 /// A rounded pool. `level_s` is when the relief has fallen under 28% of the
@@ -3735,6 +4320,31 @@ struct Parked {
     /// Pore moisture, 0..1. Stays with the ground cell when the window moves,
     /// so a wet tire track does not slide with the Niva.
     moisture: f32,
+    /// Suspended-solids depth in the water column, metres. Not a second sheet.
+    susp: f32,
+}
+
+/// Sheet times inside one [`FluidCore::step`], milliseconds.
+///
+/// Water and slurry are the fine sheet plus the coarse sheet. Dust is the
+/// column carried in this step. Suspended solids are the plume advection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepParts {
+    pub water_ms: f32,
+    pub slurry_ms: f32,
+    pub dust_ms: f32,
+    pub suspended_ms: f32,
+    pub prep_ms: f32,
+    pub restrict_ms: f32,
+    pub window_ms: f32,
+}
+
+fn park_slot(slot: &Parked, ambient: f32) -> bool {
+    slot.water > 1.0e-8
+        || slot.slurry > 1.0e-8
+        || slot.dust > 1.0e-8
+        || slot.susp > 1.0e-8
+        || (slot.moisture - ambient).abs() > 6.0e-3
 }
 
 /// The moving window. Coarse sheet, fine sheet under the tires, dust column.
@@ -3750,8 +4360,28 @@ pub struct FluidCore {
     vs: Vec<f32>,
     bed: Vec<f32>,
     moisture: Vec<f32>,
+    /// Pore moisture of the pad, the value most cells share after a substrate
+    /// read. A leaving cell that only holds this pad is not parked: the next
+    /// window writes it back. A wet track, which differs, still parks.
+    moisture_ambient: f32,
     grain: Vec<u8>,
     settled: Vec<f32>,
+    /// Suspended-solids depth, metres, on the coarse water column.
+    susp: Vec<f32>,
+    /// Scratch for the suspended advection. Sized once.
+    susp_next: Vec<f32>,
+    /// Solids a neighbour already accepted this pass.
+    susp_taken: Vec<f32>,
+    /// Cells this step where advection booked the column down to the water.
+    last_susp_capped: u32,
+    /// When false, skip wake entrainment and suspended advection. The through-drive
+    /// acceptance test keeps this off so the solver budget is not charged twice.
+    turbidity_enabled: bool,
+    /// Cubic metres lifted into suspension. Not spent twice.
+    entrained_m3: f32,
+    /// Cubic metres that left the live column and stayed in the account.
+    settled_suspended_m3: f32,
+    last_parts: StepParts,
     fine_origin: [f32; 2],
     fine_water: Vec<f32>,
     fine_slurry: Vec<f32>,
@@ -3769,8 +4399,15 @@ pub struct FluidCore {
     dust: Vec<f32>,
     dust_u: Vec<f32>,
     dust_v: Vec<f32>,
+    /// Fog depth, metres, same index as `dust`. Not a second air grid.
+    fog: Vec<f32>,
+    fog_u: Vec<f32>,
+    fog_v: Vec<f32>,
+    /// False while every fog slab is empty, so a step does not scan them.
+    fog_live: bool,
     parked: HashMap<(i32, i32), Parked>,
     parked_dust: HashMap<(i32, i32), f32>,
+    parked_fog: HashMap<(i32, i32), f32>,
     spray_m3: f32,
     /// Drops peeled this pass that are still in the air.
     drops: Vec<LiveSpray>,
@@ -3786,14 +4423,46 @@ pub struct FluidCore {
     eroded_m3: f32,
     scour_hole_m: f32,
     cycle: Option<StreamCycle>,
+    reach: Option<RiverReach>,
+    /// Cubic metres between the outlet and the inlet of the reach.
+    reach_bank_m3: f32,
+    wave: Option<WaveMaker>,
+    /// Seconds since the wave maker was set.
+    wave_t: f32,
+    soak: Option<ShoreSoak>,
+    /// Free-surface diffusion on the coarse water sheet, m²/s. 0 is off.
+    surface_diffusion: f32,
+    /// Full-gravity water with bed friction for an open reach. `None` keeps
+    /// the viscous mobility of the water grain.
+    open_water: Option<OpenWater>,
     /// Scratch for [`Self::seat_rut_water`]. Sized once so a step does not allocate.
     seat_pressed: Vec<f32>,
     seat_is_rut: Vec<bool>,
     seat_floor: Vec<bool>,
     seat_etas: Vec<f32>,
+    /// CFL substep cap on the 2 cm sheet. Eight is the full split. The coarse
+    /// sheet always uses eight.
+    fine_sub_cap: f32,
+    /// Open 2 cm sheet. 0: one pass. 1: adaptive CFL on awake tiles. 2: the
+    /// same split on the whole wet rectangle. 3: one pressure, then the
+    /// transports. A wall ignores this and keeps the body sweep.
+    fine_pace: u8,
     sheet_times: SheetTimes,
     /// Reused by the integer window scroll. Not a second sheet.
     shift_scratch: Vec<f32>,
+    /// Scratch for [`Self::pond_ruts`]. Sized once so a step does not allocate.
+    pond_still: Vec<u8>,
+    pond_eta: Vec<f32>,
+    pond_mark: Vec<f32>,
+    pond_count_p: Vec<f32>,
+    pond_eta_p: Vec<f32>,
+    pond_needs: Vec<(usize, f32)>,
+    pond_donors: Vec<(usize, f32)>,
+    /// Two scratches per walled sheet: fine water, fine slurry, coarse water,
+    /// coarse slurry. Water and slurry step on two workers, and two far-apart
+    /// boxes of one sheet may too, so each keeps its own buffers instead of
+    /// whichever thread-local the worker holds.
+    sheet_scratch: [[Scratch; 2]; 4],
 }
 
 impl FluidCore {
@@ -3817,8 +4486,17 @@ impl FluidCore {
             vs: vec![0.0; n],
             bed: vec![0.0; n],
             moisture: vec![0.0; n],
+            moisture_ambient: 0.0,
             grain: vec![Grain::Other as u8; n],
             settled: vec![0.0; n],
+            susp: vec![0.0; n],
+            susp_next: vec![0.0; n],
+            susp_taken: vec![0.0; n],
+            last_susp_capped: 0,
+            turbidity_enabled: true,
+            entrained_m3: 0.0,
+            settled_suspended_m3: 0.0,
+            last_parts: StepParts::default(),
             fine_origin: [0.0, 0.0],
             fine_water: vec![0.0; fine_n],
             fine_slurry: vec![0.0; fine_n],
@@ -3834,8 +4512,13 @@ impl FluidCore {
             dust: vec![0.0; air_n],
             dust_u: vec![0.0; air_n],
             dust_v: vec![0.0; air_n],
-            parked: HashMap::new(),
-            parked_dust: HashMap::new(),
+            fog: vec![0.0; air_n],
+            fog_u: vec![0.0; air_n],
+            fog_v: vec![0.0; air_n],
+            fog_live: false,
+            parked: HashMap::with_capacity(8192),
+            parked_dust: HashMap::with_capacity(1024),
+            parked_fog: HashMap::new(),
             spray_m3: 0.0,
             drops: Vec::new(),
             last_pushes: Vec::new(),
@@ -3847,12 +4530,29 @@ impl FluidCore {
             eroded_m3: 0.0,
             scour_hole_m: 0.0,
             cycle: None,
+            reach: None,
+            reach_bank_m3: 0.0,
+            wave: None,
+            wave_t: 0.0,
+            soak: None,
+            surface_diffusion: 0.0,
+            open_water: None,
             seat_pressed: vec![0.0; n],
             seat_is_rut: vec![false; n],
             seat_floor: vec![false; n],
             seat_etas: Vec::with_capacity(n),
+            fine_sub_cap: 8.0,
+            fine_pace: 0,
             sheet_times: SheetTimes::default(),
             shift_scratch: Vec::new(),
+            pond_still: vec![0; n],
+            pond_eta: vec![0.0; n],
+            pond_mark: vec![0.0; n],
+            pond_count_p: vec![0.0; (n + 1) * (n + 1)],
+            pond_eta_p: vec![0.0; (n + 1) * (n + 1)],
+            pond_needs: Vec::new(),
+            pond_donors: Vec::new(),
+            sheet_scratch: std::array::from_fn(|_| [Scratch::new(), Scratch::new()]),
         }
     }
 
@@ -3864,6 +4564,42 @@ impl FluidCore {
         self.sheet_times
     }
 
+    /// Cap CFL substeps on the 2 cm sheet. The coarse sheet always splits up
+    /// to eight. The default is eight.
+    pub fn set_fine_sub_cap(&mut self, cap: f32) {
+        self.fine_sub_cap = if cap.is_finite() {
+            cap.clamp(1.0, 8.0)
+        } else {
+            8.0
+        };
+    }
+
+    pub fn fine_sub_cap(&self) -> f32 {
+        self.fine_sub_cap
+    }
+
+    /// How the open 2 cm sheet splits a frame. See [`Self::fine_pace`].
+    pub fn set_fine_pace(&mut self, pace: u8) {
+        self.fine_pace = pace.min(3);
+    }
+
+    pub fn fine_pace(&self) -> u8 {
+        self.fine_pace
+    }
+
+    /// Kept so the plume bench can ask for per-step times. They are always recorded.
+    pub fn set_step_parts(&mut self, _on: bool) {}
+
+    /// Turn wake entrainment and suspended advection on or off.
+    pub fn set_turbidity_enabled(&mut self, on: bool) {
+        self.turbidity_enabled = on;
+    }
+
+    /// Times from the last [`Self::step`].
+    pub fn step_parts(&self) -> StepParts {
+        self.last_parts
+    }
+
     /// Coarse water and slurry are both under a dry film, and the fine patch is off.
     ///
     /// Does not restrict. A live fine patch can still hold water the coarse
@@ -3873,6 +4609,145 @@ impl FluidCore {
             return false;
         }
         self.water.iter().all(|h| *h < 1.0e-5) && self.slurry.iter().all(|h| *h < 1.0e-5)
+    }
+
+    /// Let the water and slurry sheets pool on the bed for `steps` frames of `dt`.
+    ///
+    /// Same gravity step as a frame, with no tire and no dust. A dry cell whose
+    /// bed stands above the donor's free surface stays dry, so the pour finds
+    /// the shoreline of the relief. Returns the water volume left on the coarse
+    /// sheet.
+    pub fn drain_over_bed(&mut self, dt: f32, steps: u32) -> f32 {
+        if !(dt.is_finite() && dt > 0.0) || steps == 0 {
+            return column_sum(&self.water, COARSE_CELL_M);
+        }
+        self.restrict_fine();
+        let mut calm = 0u32;
+        let mut moved = false;
+        for _ in 0..steps {
+            let water_before = column_sum(&self.water, COARSE_CELL_M);
+            let slurry_before = column_sum(&self.slurry, COARSE_CELL_M);
+            self.step_water_drain(dt);
+            self.step_slurry_drain(dt);
+            // Init only. The gravity step itself is unchanged. The extra
+            // friction lets the pour find the bank without sloshing for minutes.
+            let keep = (-0.55 * dt).exp();
+            for slot in [&mut self.uw, &mut self.vw, &mut self.us, &mut self.vs] {
+                for v in slot.iter_mut() {
+                    *v *= keep;
+                }
+            }
+            restore_wiped(&mut self.water, water_before, COARSE_CELL_M);
+            restore_wiped(&mut self.slurry, slurry_before, COARSE_CELL_M);
+            let speed = self.peak_sheet_speed().max(self.peak_slurry_speed());
+            if speed > 0.05 {
+                moved = true;
+            }
+            if moved && speed < 0.008 {
+                calm += 1;
+                if calm >= 24 {
+                    break;
+                }
+            } else {
+                calm = 0;
+            }
+        }
+        column_sum(&self.water, COARSE_CELL_M)
+    }
+
+    fn step_water_drain(&mut self, dt: f32) {
+        let res = WINDOW_RES;
+        let n = res * res;
+        let nu = vec![dynamic_viscosity(Grain::Water, 1.0); n];
+        let gate = vec![1u8; n];
+        let bed = self.bed.clone();
+        soften_border(&mut self.uw, &mut self.vw, res, None);
+        step_sheet_eps(
+            &mut self.water,
+            &mut self.uw,
+            &mut self.vw,
+            &bed,
+            &nu,
+            &gate,
+            res,
+            COARSE_CELL_M,
+            dt,
+            SheetDrive::Gravity { vorticity: 0.0 },
+            1.0e-6,
+            None,
+            true,
+            8.0,
+            2,
+        );
+    }
+
+    fn step_slurry_drain(&mut self, dt: f32) {
+        let res = WINDOW_RES;
+        let n = res * res;
+        let mut nu = vec![0.0f32; n];
+        for idx in 0..n {
+            nu[idx] = dynamic_viscosity(Grain::from_u8(self.grain[idx]), self.moisture[idx]);
+        }
+        let gate = vec![1u8; n];
+        let bed = self.bed.clone();
+        soften_border(&mut self.us, &mut self.vs, res, None);
+        step_sheet_eps(
+            &mut self.slurry,
+            &mut self.us,
+            &mut self.vs,
+            &bed,
+            &nu,
+            &gate,
+            res,
+            COARSE_CELL_M,
+            dt,
+            SheetDrive::Gravity { vorticity: 0.0 },
+            1.0e-6,
+            None,
+            true,
+            8.0,
+            2,
+        );
+    }
+
+    fn peak_sheet_speed(&self) -> f32 {
+        let mut peak = 0.0f32;
+        for (h, (u, v)) in self.water.iter().zip(self.uw.iter().zip(self.vw.iter())) {
+            if *h > 1.0e-4 {
+                peak = peak.max(u.abs()).max(v.abs());
+            }
+        }
+        peak
+    }
+
+    fn peak_slurry_speed(&self) -> f32 {
+        let mut peak = 0.0f32;
+        for (h, (u, v)) in self.slurry.iter().zip(self.us.iter().zip(self.vs.iter())) {
+            if *h > 1.0e-4 {
+                peak = peak.max(u.abs()).max(v.abs());
+            }
+        }
+        peak
+    }
+
+    /// Slurry thickness on cells that already hold water. The drain moves it.
+    pub fn lay_slurry_on_water(&mut self, depth: f32, grain: Grain) -> f32 {
+        if !(depth.is_finite() && depth > 0.0) {
+            return 0.0;
+        }
+        self.restrict_fine();
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut vol = 0.0f32;
+        for idx in 0..self.water.len() {
+            if self.water[idx] <= 0.012 {
+                continue;
+            }
+            self.slurry[idx] = depth;
+            self.grain[idx] = grain as u8;
+            self.moisture[idx] = self.moisture[idx].max(0.90);
+            vol += depth * area;
+        }
+        vol
     }
 
     /// Replace the walls for the next step. An empty slice is open water.
@@ -3888,6 +4763,63 @@ impl FluidCore {
     /// Open-channel lips. `None` leaves the sheet closed at its own banks.
     pub fn set_stream_cycle(&mut self, cycle: Option<StreamCycle>) {
         self.cycle = cycle;
+    }
+
+    /// Open inlet and outlet at the window ends. `None` closes them. Water
+    /// still in the bank stays on the ledger.
+    pub fn set_river_reach(&mut self, reach: Option<RiverReach>) {
+        self.reach = reach;
+    }
+
+    /// Free-surface diffusion between wet coarse cells, m²/s. 0 turns it off.
+    ///
+    /// The collocated height–velocity step leaves a two-cell ripple in the
+    /// free surface of a long open reach. This moves water between wet
+    /// neighbours down the free-surface difference, donor-limited, so the
+    /// column is only moved, never minted. The two-cell mode decays in a few
+    /// steps; a swell a few metres long loses a few percent per second.
+    pub fn set_surface_diffusion(&mut self, m2_s: f32) {
+        self.surface_diffusion = if m2_s.is_finite() { m2_s.max(0.0) } else { 0.0 };
+    }
+
+    /// Open-water mode for the water sheet. `None` restores the default,
+    /// where water shares the viscous mobility curve of the mud sheets (about
+    /// 0.1 of gravity), which is right for a film in a rut and too slow for a
+    /// river: a swell then crawls and never runs up a beach. Slurry keeps its
+    /// own curve either way. See [`OpenWater`].
+    pub fn set_open_water(&mut self, open: Option<OpenWater>) {
+        self.open_water = open
+            .filter(|o| {
+                o.mobility.is_finite() && o.manning_n.is_finite() && o.eddy_m2_s.is_finite()
+            })
+            .map(|o| OpenWater {
+                mobility: o.mobility.clamp(0.0, 1.0),
+                manning_n: o.manning_n.max(0.0),
+                eddy_m2_s: o.eddy_m2_s.max(0.0),
+            });
+    }
+
+    /// Paddle strip in the coarse sheet. `None` turns it off. Restarts the paddle clock.
+    pub fn set_wave_maker(&mut self, wave: Option<WaveMaker>) {
+        self.wave = wave;
+        self.wave_t = 0.0;
+    }
+
+    /// Pore water left behind by the film. `None` leaves moisture to the substrate read.
+    pub fn set_shore_soak(&mut self, soak: Option<ShoreSoak>) {
+        self.soak = soak;
+    }
+
+    /// Grain of the solids per coarse cell. Viscosity and drainage read it.
+    /// Does not move any volume.
+    pub fn map_grain(&mut self, mut f: impl FnMut(f32, f32) -> Grain) {
+        self.restrict_fine();
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = self.coarse_xz(i, j);
+                self.grain[j * WINDOW_RES + i] = f(x, z) as u8;
+            }
+        }
     }
 
     /// Initial bed and water thickness. Returns the water volume now on the sheet.
@@ -3962,10 +4894,17 @@ impl FluidCore {
         self.wind = [x, z];
     }
 
+    /// Track the chase point without sliding the coarse or air windows.
+    pub fn set_center(&mut self, center: [f32; 2]) {
+        self.center = center;
+    }
+
     /// Move the window. Cells that slide off are parked. Cells that slide on
     /// are restored. The sum does not change.
     pub fn recenter(&mut self, center: [f32; 2]) {
-        self.restrict_fine();
+        if self.fine_on {
+            self.restrict_fine();
+        }
         self.center = center;
         let extent = WINDOW_RES as f32 * COARSE_CELL_M;
         let new_origin = snap_origin(center, extent, COARSE_CELL_M);
@@ -4062,32 +5001,53 @@ impl FluidCore {
     /// so the pond is not refilled from nowhere. Berms (a raised bed) are
     /// left alone. Returns the cubic metres moved.
     pub fn pond_ruts(&mut self) -> f32 {
-        self.restrict_fine();
+        if self.fine_on {
+            self.restrict_fine();
+        }
         let n = WINDOW_RES;
+        let nn = n * n;
         let area = COARSE_CELL_M * COARSE_CELL_M;
-        let mut still = vec![false; n * n];
-        let mut eta_of = vec![0.0_f32; n * n];
-        for idx in 0..n * n {
+        let mut any_rut = false;
+        for idx in 0..nn {
+            let bed = self.bed[idx];
+            if bed.is_finite() && bed < -0.012 {
+                any_rut = true;
+                break;
+            }
+        }
+        if !any_rut {
+            return 0.0;
+        }
+        let still = &mut self.pond_still[..nn];
+        let eta_of = &mut self.pond_eta[..nn];
+        still.fill(0);
+        eta_of.fill(0.0);
+        for idx in 0..nn {
             let bed = self.bed[idx];
             let water = self.water[idx];
             if bed.is_finite() && water.is_finite() && bed > -0.008 && bed < 0.03 && water > 0.018 {
-                still[idx] = true;
+                still[idx] = 1;
                 eta_of[idx] = bed + water;
             }
         }
         let rad = 10i32;
-        let mut mark = vec![0.0f32; n * n];
-        for idx in 0..n * n {
-            if still[idx] {
+        let mark = &mut self.pond_mark[..nn];
+        mark.fill(0.0);
+        for idx in 0..nn {
+            if still[idx] != 0 {
                 mark[idx] = 1.0;
             }
         }
         let stride = n + 1;
-        let mut count_p = vec![0.0f32; stride * stride];
-        let mut eta_p = vec![0.0f32; stride * stride];
-        prefix_plane(&mark, n, &mut count_p);
-        prefix_plane(&eta_of, n, &mut eta_p);
-        let mut needs: Vec<(usize, f32)> = Vec::new();
+        let plane = stride * stride;
+        let count_p = &mut self.pond_count_p[..plane];
+        let eta_p = &mut self.pond_eta_p[..plane];
+        count_p.fill(0.0);
+        eta_p.fill(0.0);
+        prefix_plane(mark, n, count_p);
+        prefix_plane(eta_of, n, eta_p);
+        self.pond_needs.clear();
+        let needs = &mut self.pond_needs;
         let mut total_need = 0.0_f32;
         for j in 0..n {
             for i in 0..n {
@@ -4116,10 +5076,11 @@ impl FluidCore {
         if total_need <= 1.0e-8 {
             return 0.0;
         }
-        let mut donors: Vec<(usize, f32)> = Vec::new();
+        self.pond_donors.clear();
+        let donors = &mut self.pond_donors;
         let mut total_room = 0.0_f32;
-        for idx in 0..n * n {
-            if !still[idx] {
+        for idx in 0..nn {
+            if still[idx] == 0 {
                 continue;
             }
             let room = (self.water[idx] - 0.012).max(0.0);
@@ -4133,10 +5094,10 @@ impl FluidCore {
         }
         let scale = (total_room / total_need).min(1.0);
         let moved = total_need * scale;
-        for (idx, extra) in &needs {
+        for (idx, extra) in needs.iter() {
             self.water[*idx] += extra * scale;
         }
-        for (idx, room) in &donors {
+        for (idx, room) in donors.iter() {
             let give = moved * (*room * area) / total_room;
             self.water[*idx] = (self.water[*idx] - give / area).max(0.0);
         }
@@ -4373,18 +5334,35 @@ impl FluidCore {
         mut sample: impl FnMut(usize, usize, f32, f32) -> (f32, f32, Grain),
     ) {
         self.restrict_fine();
+        let mut hist = [0u32; 101];
         for j in 0..WINDOW_RES {
             for i in 0..WINDOW_RES {
                 let (x, z) = self.coarse_xz(i, j);
                 let (bed, moisture, grain) = sample(i, j, x, z);
                 let idx = j * WINDOW_RES + i;
+                let moisture = moisture.clamp(0.0, 1.0);
                 self.bed[idx] = bed;
-                self.moisture[idx] = moisture.clamp(0.0, 1.0);
+                self.moisture[idx] = moisture;
+                // Round half away from zero without the libm call: for
+                // 0..=100 the fraction after truncation is exact.
+                let pct = moisture * 100.0;
+                let whole = pct as usize;
+                let bucket = if pct - whole as f32 >= 0.5 { whole + 1 } else { whole };
+                hist[bucket.min(100)] += 1;
                 if self.slurry[idx] > 1.0e-5 {
                     self.grain[idx] = grain as u8;
                 }
             }
         }
+        let mut best = 0usize;
+        let mut best_n = 0u32;
+        for (i, n) in hist.iter().enumerate() {
+            if *n > best_n {
+                best = i;
+                best_n = *n;
+            }
+        }
+        self.moisture_ambient = best as f32 * 0.01;
     }
 
     pub fn push_tire(&mut self, push: TirePush) {
@@ -4416,6 +5394,38 @@ impl FluidCore {
         vol
     }
 
+    /// Cubic metres of water that left the sheet and entered the fog slab.
+    ///
+    /// Zero when the film is thinner than [`FOG_MIN_WATER_M`], or when the
+    /// offer misses the air window. The missed offer is put back on the sheet.
+    /// This does not touch the dust column or `air_velocity`.
+    pub fn inject_fog(&mut self, inj: FogInject, dt: f32) -> f32 {
+        if !fog_may_lift(inj.water_m) || dt <= 0.0 || !dt.is_finite() || inj.offer_m3_s <= 0.0 {
+            return 0.0;
+        }
+        let want = inj.offer_m3_s * dt;
+        if !want.is_finite() || want <= 1.0e-8 {
+            return 0.0;
+        }
+        let taken = self.take_water_at(inj.x, inj.z, want);
+        if taken <= 1.0e-8 {
+            return 0.0;
+        }
+        let air_cell = self.air_cell();
+        let Some((i, j)) = self.air_ij(inj.x, inj.z) else {
+            self.add_water_at(inj.x, inj.z, taken);
+            return 0.0;
+        };
+        let layer = 1usize.min(AIR_LAYERS - 1);
+        let idx = (layer * AIR_RES + j) * AIR_RES + i;
+        let area = air_cell * air_cell;
+        self.fog[idx] += taken / area;
+        self.fog_u[idx] = self.wind[0];
+        self.fog_v[idx] = self.wind[1];
+        self.fog_live = true;
+        taken
+    }
+
     pub fn step(&mut self, dt: f32) -> Vec<SprayEvent> {
         let wall = ProfTick::start();
         let w0 = self.sheet_times.water_ms;
@@ -4427,33 +5437,68 @@ impl FluidCore {
         let slow = self.frame % SLOW_STRIDE == 0;
         self.frame = self.frame.wrapping_add(1);
         let pushes = std::mem::take(&mut self.pushes);
-        self.last_pushes = pushes.clone();
+        // Lift from the column the tire rolls into, before the sheet shoves it.
+        if self.turbidity_enabled && dt > 0.0 && dt.is_finite() && !pushes.is_empty() {
+            self.entrain_wake(&pushes, dt);
+        }
         self.refine(&pushes);
         self.apply_pushes(&pushes, true);
         self.step_pair(dt, true);
         let mut spray = self.peel_spray(&pushes, true, false);
         self.restrict_fine();
         self.apply_pushes_outside(&pushes);
+        self.drive_waves(dt);
         self.step_pair(dt, false);
+        self.bed_friction(dt);
+        self.diffuse_surface(dt);
         spray.extend(self.peel_spray(&pushes, false, true));
+        self.last_pushes = pushes;
         if !self.solids.is_empty() {
             self.scour_contacts(dt);
         }
         self.cycle_stream();
+        self.feed_reach();
+        self.soak_shore(dt);
+        let sus_tick = ProfTick::start();
+        if self.turbidity_enabled {
+            self.step_suspended(dt);
+        }
+        let suspended_ms = sus_tick.ms() as f32;
         self.step_dust(dt, slow);
+        self.step_fog(dt);
         if slow {
-            self.settle_dust();
+            if self.dust.iter().sum::<f32>() > 1.0e-6 {
+                self.settle_dust();
+            }
+            if self.fog_live {
+                self.settle_fog();
+            }
         }
         for s in &spray {
             self.spray_m3 += s.volume;
         }
         self.keep_spray(&spray, dt);
-        let accounted = (self.sheet_times.water_ms - w0)
-            + (self.sheet_times.slurry_ms - s0)
-            + (self.sheet_times.prep_ms - p0)
-            + (self.sheet_times.restrict_ms - r0)
-            + (self.sheet_times.window_ms - n0)
-            + (self.sheet_times.dust_ms - d0);
+        let water_ms = (self.sheet_times.water_ms - w0) as f32;
+        let slurry_ms = (self.sheet_times.slurry_ms - s0) as f32;
+        let prep_ms = (self.sheet_times.prep_ms - p0) as f32;
+        let restrict_ms = (self.sheet_times.restrict_ms - r0) as f32;
+        let window_ms = (self.sheet_times.window_ms - n0) as f32;
+        let dust_ms = (self.sheet_times.dust_ms - d0) as f32;
+        self.last_parts = StepParts {
+            water_ms,
+            slurry_ms,
+            dust_ms,
+            suspended_ms,
+            prep_ms,
+            restrict_ms,
+            window_ms,
+        };
+        let accounted = f64::from(water_ms)
+            + f64::from(slurry_ms)
+            + f64::from(prep_ms)
+            + f64::from(restrict_ms)
+            + f64::from(window_ms)
+            + f64::from(dust_ms);
         self.sheet_times.rest_ms += (wall.ms() - accounted).max(0.0);
         spray
     }
@@ -4529,6 +5574,12 @@ impl FluidCore {
         self.sample_coarse(x, z)
     }
 
+    /// Cubic metres booked as spray so far. The same value as
+    /// `ledger().spray_m3`, without summing every sheet.
+    pub fn spray_m3(&self) -> f32 {
+        self.spray_m3
+    }
+
     pub fn ledger(&self) -> FluidLedger {
         let mut water = column_sum(&self.water, COARSE_CELL_M);
         let mut slurry = column_sum(&self.slurry, COARSE_CELL_M);
@@ -4538,17 +5589,28 @@ impl FluidCore {
         }
         let dust_air = column_sum(&self.dust, self.air_cell());
         let dust_settled = column_sum(&self.settled, COARSE_CELL_M);
+        let suspended = column_sum(&self.susp, COARSE_CELL_M);
         let mut frozen_water = 0.0f32;
         let mut frozen_slurry = 0.0f32;
         let mut frozen_dust = 0.0f32;
+        let mut frozen_suspended = 0.0f32;
         for p in self.parked.values() {
             let area = COARSE_CELL_M * COARSE_CELL_M;
             frozen_water += p.water * area;
             frozen_slurry += p.slurry * area;
             frozen_dust += p.dust * area;
+            frozen_suspended += p.susp * area;
         }
         for d in self.parked_dust.values() {
             frozen_dust += *d;
+        }
+        let mut fog_air = if self.fog_live {
+            column_sum(&self.fog, self.air_cell())
+        } else {
+            0.0
+        };
+        for d in self.parked_fog.values() {
+            fog_air += *d;
         }
         let total = water
             + slurry
@@ -4557,7 +5619,12 @@ impl FluidCore {
             + frozen_water
             + frozen_slurry
             + frozen_dust
-            + self.spray_m3;
+            + fog_air
+            + self.reach_bank_m3
+            + self.spray_m3
+            + suspended
+            + self.settled_suspended_m3
+            + frozen_suspended;
         FluidLedger {
             water_m3: water,
             slurry_m3: slurry,
@@ -4567,8 +5634,70 @@ impl FluidCore {
             frozen_slurry_m3: frozen_slurry,
             frozen_dust_m3: frozen_dust,
             spray_m3: self.spray_m3,
+            fog_air_m3: fog_air,
+            suspended_m3: suspended,
+            settled_suspended_m3: self.settled_suspended_m3,
+            frozen_suspended_m3: frozen_suspended,
+            entrained_m3: self.entrained_m3,
+            reach_m3: self.reach_bank_m3,
             total_m3: total,
         }
+    }
+
+    /// |column + settled + parked − lifted|. Zero when the suspended account closes.
+    pub fn suspended_gap(&self) -> f32 {
+        let b = self.ledger();
+        (b.suspended_m3 + b.settled_suspended_m3 + b.frozen_suspended_m3 - b.entrained_m3).abs()
+    }
+
+    /// Cells whose suspended column was booked down onto the water this step.
+    ///
+    /// A published 1 that did not come from here is a full column (`susp == water`),
+    /// not the publish clamp of a deeper one.
+    pub fn suspended_capped_cells(&self) -> u32 {
+        self.last_susp_capped
+    }
+
+    /// Raw `susp/water` on the coarse sheet. This is the value before the
+    /// publish clamp, so [`TurbiditySpread::above_water`] is the clamp count.
+    pub fn turbidity_spread(&self) -> TurbiditySpread {
+        let mut out = TurbiditySpread::default();
+        let mut full_water = 0.0f32;
+        let n = self.water.len().min(self.susp.len());
+        for idx in 0..n {
+            let w = self.water[idx];
+            if !w.is_finite() || w < 1.0e-5 {
+                continue;
+            }
+            let s = self.susp[idx];
+            if !s.is_finite() || s <= 1.0e-8 {
+                out.clear += 1;
+                continue;
+            }
+            if s > w + 1.0e-5 {
+                out.above_water += 1;
+            }
+            let ratio = s / w;
+            if ratio.is_finite() {
+                out.max_ratio = out.max_ratio.max(ratio);
+            }
+            if ratio >= 1.0 - 1.0e-4 && s <= w + 1.0e-5 {
+                out.saturated += 1;
+                out.bins[10] += 1;
+                full_water += w;
+            } else if ratio >= 1.0 {
+                out.bins[10] += 1;
+                full_water += w;
+            } else {
+                let b = (ratio.max(0.0) * 10.0).floor() as usize;
+                out.bins[b.min(9)] += 1;
+            }
+        }
+        let full_n = out.bins[10];
+        if full_n > 0 {
+            out.full_water = full_water / full_n as f32;
+        }
+        out
     }
 
     pub fn export_maps(&mut self) -> SurfaceMaps {
@@ -4654,6 +5783,11 @@ impl FluidCore {
             u,
             v,
             settled_dust_m: finite0(self.settled[idx]),
+            turbidity: if water_m < 1.0e-5 {
+                0.0
+            } else {
+                finite0(self.susp[idx] / water_m).clamp(0.0, 1.0)
+            },
         })
     }
 
@@ -4671,6 +5805,16 @@ impl FluidCore {
         }
         let idx = (layer * AIR_RES + iz) * AIR_RES + ix;
         self.dust[idx]
+    }
+
+    /// Fog depth in one air slab, metres. Same index as [`Self::air_depth`].
+    /// The render contract republishes this as a volume fraction. It is not `dust`.
+    pub fn fog_depth(&self, ix: usize, layer: usize, iz: usize) -> f32 {
+        if ix >= AIR_RES || iz >= AIR_RES || layer >= AIR_LAYERS {
+            return 0.0;
+        }
+        let idx = (layer * AIR_RES + iz) * AIR_RES + ix;
+        self.fog[idx]
     }
 
     /// Horizontal dust-sheet velocity in contract order, vertical channel 0.
@@ -4915,32 +6059,55 @@ impl FluidCore {
             )
         };
         let mut mask = vec![0u8; res * res];
-        for j in 0..res {
-            for i in 0..res {
-                let x = origin[0] + (i as f32 + 0.5) * cell;
-                let z = origin[1] + (j as f32 + 0.5) * cell;
-                let idx = j * res + i;
-                // The free surface beside a cell that the body has already
-                // emptied. The wall stays up for as long as that water stands
-                // above the solid's underside.
-                let mut eta = bed[idx] + water[idx];
-                for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
-                    let ni = i as i32 + di;
-                    let nj = j as i32 + dj;
-                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
-                        continue;
-                    }
-                    let nidx = nj as usize * res + ni as usize;
-                    eta = eta.max(bed[nidx] + water[nidx]);
+        // Only cells inside a solid's bounding circle can overlap it. Walls
+        // first, then contacts, so a contact still wins a shared cell. The
+        // per-cell test is the same `solid_overlaps` as a full sweep.
+        for contact in [false, true] {
+            let value = if contact { 1u8 } else { 2u8 };
+            for solid in self.solids.iter().filter(|s| s.contact == contact) {
+                if solid.half_length <= 1.0e-4 || solid.half_width <= 1.0e-4 {
+                    continue;
                 }
-                for solid in self.solids.iter().filter(|s| !s.contact) {
-                    if solid_overlaps(solid, x, z, eta, bed[idx]) {
-                        mask[idx] = 2;
-                    }
+                let reach = solid.half_length.max(0.0).hypot(solid.half_width.max(0.0)) + cell;
+                if !reach.is_finite() || !solid.x.is_finite() || !solid.z.is_finite() {
+                    continue;
                 }
-                for solid in self.solids.iter().filter(|s| s.contact) {
-                    if solid_overlaps(solid, x, z, eta, bed[idx]) {
-                        mask[idx] = 1;
+                let lo_i = ((solid.x - reach - origin[0]) / cell - 0.5).floor();
+                let hi_i = ((solid.x + reach - origin[0]) / cell - 0.5).ceil();
+                let lo_j = ((solid.z - reach - origin[1]) / cell - 0.5).floor();
+                let hi_j = ((solid.z + reach - origin[1]) / cell - 0.5).ceil();
+                let top = (res - 1) as f32;
+                if hi_i < 0.0 || hi_j < 0.0 || lo_i > top || lo_j > top {
+                    continue;
+                }
+                let i0 = lo_i.max(0.0) as usize;
+                let i1 = hi_i.min(top) as usize;
+                let j0 = lo_j.max(0.0) as usize;
+                let j1 = hi_j.min(top) as usize;
+                for j in j0..=j1 {
+                    for i in i0..=i1 {
+                        let idx = j * res + i;
+                        if mask[idx] == value {
+                            continue;
+                        }
+                        let x = origin[0] + (i as f32 + 0.5) * cell;
+                        let z = origin[1] + (j as f32 + 0.5) * cell;
+                        // The free surface beside a cell that the body has already
+                        // emptied. The wall stays up for as long as that water stands
+                        // above the solid's underside.
+                        let mut eta = bed[idx] + water[idx];
+                        for (di, dj) in [(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
+                            let ni = i as i32 + di;
+                            let nj = j as i32 + dj;
+                            if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                                continue;
+                            }
+                            let nidx = nj as usize * res + ni as usize;
+                            eta = eta.max(bed[nidx] + water[nidx]);
+                        }
+                        if solid_overlaps(solid, x, z, eta, bed[idx]) {
+                            mask[idx] = value;
+                        }
                     }
                 }
             }
@@ -5002,6 +6169,361 @@ impl FluidCore {
             self.bed_drop[idx] += dh;
             self.eroded_m3 += dh * area;
             self.scour_hole_m = self.scour_hole_m.max(self.bed_drop[idx]);
+        }
+    }
+
+    /// Pull the water velocity in the paddle strip toward the paddle stroke.
+    /// The pull fades over the outer quarter of the strip on each side so the
+    /// strip edge is not a velocity step.
+    fn drive_waves(&mut self, dt: f32) {
+        let Some(w) = self.wave else {
+            return;
+        };
+        if dt <= 0.0 || w.period_s <= 0.0 {
+            return;
+        }
+        self.wave_t += dt;
+        let len = w.dir_x.hypot(w.dir_z);
+        if len < 1.0e-6 || !len.is_finite() {
+            return;
+        }
+        let (dx, dz) = (w.dir_x / len, w.dir_z / len);
+        let ramp = if w.ramp_s > 0.0 {
+            (self.wave_t / w.ramp_s).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let phase = std::f32::consts::TAU * self.wave_t / w.period_s;
+        let stroke = w.amplitude_m_s * ramp * phase.sin();
+        // Relaxation toward the stroke, a fraction per step that does not
+        // depend on dt for small steps.
+        let pull = 1.0 - (-dt / 0.08).exp();
+        let res = WINDOW_RES;
+        let cell = COARSE_CELL_M;
+        let span_x = (w.x1 - w.x0).max(cell);
+        let span_z = (w.z1 - w.z0).max(cell);
+        let i0 = (((w.x0 - self.origin[0]) / cell).floor() as i32).max(0);
+        let i1 = (((w.x1 - self.origin[0]) / cell).ceil() as i32).min(res as i32);
+        let j0 = (((w.z0 - self.origin[1]) / cell).floor() as i32).max(0);
+        let j1 = (((w.z1 - self.origin[1]) / cell).ceil() as i32).min(res as i32);
+        for j in j0..j1 {
+            for i in i0..i1 {
+                let (x, z) = self.coarse_xz(i as usize, j as usize);
+                if x < w.x0 || x > w.x1 || z < w.z0 || z > w.z1 {
+                    continue;
+                }
+                let idx = j as usize * res + i as usize;
+                if self.water[idx] < 0.02 || !self.water[idx].is_finite() {
+                    continue;
+                }
+                // Taper on the strip's own axes: 0 at the edge, 1 inside the middle half.
+                let tx = ((x - w.x0).min(w.x1 - x) / (0.25 * span_x)).clamp(0.0, 1.0);
+                let tz = ((z - w.z0).min(w.z1 - z) / (0.25 * span_z)).clamp(0.0, 1.0);
+                let k = pull * tx.min(tz);
+                let u = self.uw[idx];
+                let v = self.vw[idx];
+                let along = u * dx + v * dz;
+                let d = (stroke - along) * k;
+                let nu = u + d * dx;
+                let nv = v + d * dz;
+                if nu.is_finite() && nv.is_finite() {
+                    self.uw[idx] = nu;
+                    self.vw[idx] = nv;
+                }
+            }
+        }
+    }
+
+    /// Manning bed friction on the coarse water sheet in open-water mode,
+    /// implicit so a thin swash stops instead of reversing:
+    /// `du/dt = -g n² |u| u / h^(4/3)`.
+    fn bed_friction(&mut self, dt: f32) {
+        let Some(o) = self.open_water else {
+            return;
+        };
+        if dt <= 0.0 {
+            return;
+        }
+        self.eddy_shear(o.eddy_m2_s, dt);
+        if o.manning_n <= 0.0 {
+            return;
+        }
+        let gn2 = GRAVITY * o.manning_n * o.manning_n;
+        for idx in 0..WINDOW_RES * WINDOW_RES {
+            let h = self.water[idx];
+            if !(h > 1.0e-4) {
+                continue;
+            }
+            let (u, v) = (self.uw[idx], self.vw[idx]);
+            let speed = u.hypot(v);
+            if !(speed > 0.0) {
+                continue;
+            }
+            // Thin films are capped at 2 mm so the drag stays finite.
+            let k = gn2 * speed / h.max(0.002).powf(4.0 / 3.0);
+            let keep = 1.0 / (1.0 + dt * k);
+            self.uw[idx] = u * keep;
+            self.vw[idx] = v * keep;
+        }
+    }
+
+    /// Horizontal eddy viscosity on the coarse water velocity, one explicit
+    /// Laplacian from a snapshot. A dry neighbour that stands more than 3 cm
+    /// above the free surface counts as still water (no slip), so a boulder
+    /// or a bank drags the stream beside it. A dry neighbour just above the
+    /// surface is a beach the front is running onto, and is skipped. Moves no
+    /// volume.
+    fn eddy_shear(&mut self, nu_t: f32, dt: f32) {
+        if nu_t <= 0.0 {
+            return;
+        }
+        const WET: f32 = 0.003;
+        const STANDS_OUT: f32 = 0.03;
+        let res = WINDOW_RES;
+        let n = res * res;
+        // Stable for the explicit 5-point Laplacian while k < 0.25.
+        let k = (nu_t * dt / (COARSE_CELL_M * COARSE_CELL_M)).min(0.2);
+        if self.shift_scratch.len() < 2 * n {
+            self.shift_scratch.resize(2 * n, 0.0);
+        }
+        let (du, dv) = self.shift_scratch[..2 * n].split_at_mut(n);
+        for j in 0..res {
+            for i in 0..res {
+                let idx = j * res + i;
+                du[idx] = 0.0;
+                dv[idx] = 0.0;
+                if !(self.water[idx] > WET) {
+                    continue;
+                }
+                let (u0, v0) = (self.uw[idx], self.vw[idx]);
+                let mut lu = 0.0f32;
+                let mut lv = 0.0f32;
+                for (di, dj) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let ni = i as i32 + di;
+                    let nj = j as i32 + dj;
+                    if ni < 0 || nj < 0 || ni >= res as i32 || nj >= res as i32 {
+                        // Window edge: no shear across it.
+                        continue;
+                    }
+                    let nidx = nj as usize * res + ni as usize;
+                    let (un, vn) = if self.water[nidx] > WET {
+                        (self.uw[nidx], self.vw[nidx])
+                    } else if self.bed[nidx] > self.bed[idx] + self.water[idx] + STANDS_OUT {
+                        // Ground standing out of the water: no slip.
+                        (0.0, 0.0)
+                    } else {
+                        // A wet front running onto the beach: free slip.
+                        continue;
+                    };
+                    lu += un - u0;
+                    lv += vn - v0;
+                }
+                du[idx] = k * lu;
+                dv[idx] = k * lv;
+            }
+        }
+        for idx in 0..n {
+            if du[idx] != 0.0 || dv[idx] != 0.0 {
+                let nu = self.uw[idx] + du[idx];
+                let nv = self.vw[idx] + dv[idx];
+                if nu.is_finite() && nv.is_finite() {
+                    self.uw[idx] = nu;
+                    self.vw[idx] = nv;
+                }
+            }
+        }
+    }
+
+    /// See [`Self::set_surface_diffusion`]. Fluxes are computed from one
+    /// snapshot of the surface, then applied, so the sweep order does not matter.
+    fn diffuse_surface(&mut self, dt: f32) {
+        if self.surface_diffusion <= 0.0 || dt <= 0.0 {
+            return;
+        }
+        let res = WINDOW_RES;
+        let k = (self.surface_diffusion * dt / (COARSE_CELL_M * COARSE_CELL_M)).min(0.12);
+        const WET: f32 = 0.003;
+        let n = res * res;
+        if self.shift_scratch.len() < n {
+            self.shift_scratch.resize(n, 0.0);
+        }
+        let delta = &mut self.shift_scratch[..n];
+        delta.fill(0.0);
+        for j in 0..res {
+            for i in 0..res {
+                let a = j * res + i;
+                let ha = self.water[a];
+                if !(ha > WET) {
+                    continue;
+                }
+                let ea = self.bed[a] + ha;
+                // East and north faces; each face is visited once.
+                for b in [
+                    if i + 1 < res { Some(a + 1) } else { None },
+                    if j + 1 < res { Some(a + res) } else { None },
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let hb = self.water[b];
+                    if !(hb > WET) {
+                        continue;
+                    }
+                    let eb = self.bed[b] + hb;
+                    let mut f = k * (ea - eb);
+                    // Donor limit: a face never takes more than a quarter of the column.
+                    if f > 0.0 {
+                        f = f.min(0.25 * ha);
+                    } else {
+                        f = f.max(-0.25 * hb);
+                    }
+                    delta[a] -= f;
+                    delta[b] += f;
+                }
+            }
+        }
+        for idx in 0..n {
+            let d = delta[idx];
+            if d != 0.0 && d.is_finite() {
+                self.water[idx] = (self.water[idx] + d).max(0.0);
+            }
+        }
+    }
+
+    /// Outlet to bank, bank to inlet. See [`RiverReach`].
+    fn feed_reach(&mut self) {
+        let Some(r) = self.reach else {
+            return;
+        };
+        let res = WINDOW_RES;
+        let rows = r.rows.clamp(1, res / 4);
+        let cell = COARSE_CELL_M;
+        let area = cell * cell;
+        let cross_origin = if r.along_z {
+            self.origin[0]
+        } else {
+            self.origin[1]
+        };
+        let c0 = (((r.cross0 - cross_origin) / cell).floor() as i32).max(0) as usize;
+        let c1 = (((r.cross1 - cross_origin) / cell).ceil() as i32).clamp(0, res as i32) as usize;
+        if c1 <= c0 {
+            return;
+        }
+        let at = |along: usize, cross: usize| -> usize {
+            if r.along_z {
+                along * res + cross
+            } else {
+                cross * res + along
+            }
+        };
+        // Along-stream rows, upstream first.
+        let row = |k: usize| -> usize {
+            if r.positive {
+                k
+            } else {
+                res - 1 - k
+            }
+        };
+        let (dx, dz) = match (r.along_z, r.positive) {
+            (false, true) => (1.0f32, 0.0f32),
+            (false, false) => (-1.0, 0.0),
+            (true, true) => (0.0, 1.0),
+            (true, false) => (0.0, -1.0),
+        };
+        // Outlet: hold the stage, copy the interior velocity, bank the excess.
+        let first_out = res - rows;
+        for cross in c0..c1 {
+            let src = at(row(first_out - 1), cross);
+            let (su, sv) = (self.uw[src], self.vw[src]);
+            let along = (su * dx + sv * dz).max(0.0);
+            for k in first_out..res {
+                let idx = at(row(k), cross);
+                let target = (r.outlet_eta - self.bed[idx]).max(0.0);
+                let h = self.water[idx];
+                if !h.is_finite() || target <= 0.0 {
+                    continue;
+                }
+                if h > target {
+                    self.reach_bank_m3 += (h - target) * area;
+                    self.water[idx] = target;
+                } else if self.reach_bank_m3 > 0.0 {
+                    let add = (target - h).min(self.reach_bank_m3 / area);
+                    self.water[idx] = h + add;
+                    self.reach_bank_m3 -= add * area;
+                }
+                if su.is_finite() && sv.is_finite() {
+                    let cross_v = if r.along_z { su } else { sv };
+                    if r.along_z {
+                        self.uw[idx] = cross_v;
+                        self.vw[idx] = along * dz;
+                    } else {
+                        self.uw[idx] = along * dx;
+                        self.vw[idx] = cross_v;
+                    }
+                }
+            }
+        }
+        // Inlet: fill from the bank toward the stage and push the water in.
+        let mut deep = 0.0f32;
+        for cross in c0..c1 {
+            let idx = at(row(0), cross);
+            deep = deep.max((r.inlet_eta - self.bed[idx]).max(0.0));
+        }
+        if deep <= 0.0 {
+            return;
+        }
+        for k in 0..rows {
+            for cross in c0..c1 {
+                let idx = at(row(k), cross);
+                let target = (r.inlet_eta - self.bed[idx]).max(0.0);
+                let h = self.water[idx];
+                if !h.is_finite() || target <= 0.0 {
+                    continue;
+                }
+                if h > target {
+                    self.reach_bank_m3 += (h - target) * area;
+                    self.water[idx] = target;
+                } else if self.reach_bank_m3 > 0.0 {
+                    let add = (target - h).min(self.reach_bank_m3 / area);
+                    self.water[idx] = h + add;
+                    self.reach_bank_m3 -= add * area;
+                }
+                let speed = r.inlet_speed_m_s * (self.water[idx] / deep).clamp(0.0, 1.0).sqrt();
+                self.uw[idx] = speed * dx;
+                self.vw[idx] = speed * dz;
+            }
+        }
+    }
+
+    /// Saturate the ground under the film and drain it once the film has gone.
+    fn soak_shore(&mut self, dt: f32) {
+        let Some(soak) = self.soak else {
+            return;
+        };
+        if dt <= 0.0 {
+            return;
+        }
+        let pad = self.moisture_ambient;
+        let base = soak.drain_s.max(1.0e-3);
+        let keep_sand = (-dt / base).exp();
+        let keep_silt = (-dt / (3.0 * base)).exp();
+        let keep_clay = (-dt / (8.0 * base)).exp();
+        for idx in 0..WINDOW_RES * WINDOW_RES {
+            let film = self.water[idx] + self.slurry[idx];
+            let m = self.moisture[idx];
+            if film >= soak.wet_film_m {
+                self.moisture[idx] = 1.0;
+                continue;
+            }
+            if m <= pad || !m.is_finite() {
+                continue;
+            }
+            let keep = match Grain::from_u8(self.grain[idx]) {
+                Grain::Sand => keep_sand,
+                Grain::Silt | Grain::Other | Grain::Water => keep_silt,
+                Grain::Clay => keep_clay,
+            };
+            self.moisture[idx] = pad + (m - pad) * keep;
         }
     }
 
@@ -5120,7 +6642,12 @@ impl FluidCore {
     }
 
     fn step_pair(&mut self, dt: f32, fine: bool) {
+        if fine && !self.fine_on {
+            return;
+        }
         let prep = ProfTick::start();
+        let cap = if fine { self.fine_sub_cap } else { 8.0 };
+        let pace = if fine { self.fine_pace } else { 0 };
         let (res, cell) = if fine {
             (FINE_RES, FINE_CELL_M)
         } else {
@@ -5173,60 +6700,59 @@ impl FluidCore {
                         &self.grain,
                     )
                 };
-                for idx in 0..n {
-                    scratch.bed[idx] = bed_s[idx];
-                    scratch.nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                scratch.bed[..n].copy_from_slice(&bed_s[..n]);
+                // The water viscosity row is shared by every sheet on this
+                // thread. An open reach writes its mobility and puts the
+                // water value back after the step.
+                if let Some(o) = self.open_water {
+                    scratch.nu_w[..n].fill(-o.mobility.max(1.0e-4));
                 }
-                // Soft edge of the window: slow the velocity, keep the mass.
-                if !fine {
-                    soften_border(uw, vw, res);
-                    soften_border(us, vs, res);
-                }
-                if let Some(mask) = &mask {
-                    displace_occupied(water, uw, vw, mask, res);
-                    displace_occupied(slurry, us, vs, mask, res);
-                }
-                prep_ms = prep.ms();
-                let bed = &scratch.bed[..n];
-                let nu_w = &scratch.nu_w[..n];
-                let nu_s = &scratch.nu_s[..n];
-                let gate = &scratch.gate[..n];
-                if let Some(mask) = &mask {
-                    let tw = ProfTick::start();
-                    step_sheet_eps(
-                        water,
-                        uw,
-                        vw,
-                        bed,
-                        nu_w,
-                        gate,
-                        res,
-                        cell,
-                        dt,
-                        SheetDrive::Gravity { vorticity: 0.08 },
-                        1.0e-6,
-                        Some(mask),
-                    );
-                    water_ms = tw.ms();
-                    let ts = ProfTick::start();
-                    step_sheet_eps(
-                        slurry,
-                        us,
-                        vs,
-                        bed,
-                        nu_s,
-                        gate,
-                        res,
-                        cell,
-                        dt,
-                        SheetDrive::Gravity { vorticity: 0.05 },
-                        1.0e-6,
-                        Some(mask),
-                    );
-                    slurry_ms = ts.ms();
+                // An open reach keeps its current through the window ends.
+                let open = if fine {
+                    None
                 } else {
+                    self.reach.map(|r| {
+                        let o = if r.along_z {
+                            self.origin[0]
+                        } else {
+                            self.origin[1]
+                        };
+                        let c0 = ((r.cross0 - o) / cell).floor().max(0.0) as usize;
+                        let c1 = ((r.cross1 - o) / cell).ceil().max(0.0) as usize;
+                        (r.along_z, c0, c1.min(res))
+                    })
+                };
+                prep_ms = prep.ms();
+                let PairScratch {
+                    nu_w,
+                    nu_s,
+                    gate,
+                    bed,
+                } = &mut *scratch;
+                let bed = &bed[..n];
+                let nu_w = &nu_w[..n];
+                let nu_s = &mut nu_s[..n];
+                let gate = &gate[..n];
+                // Water and slurry are separate sheets: their depth and velocity
+                // arrays do not alias, and both only read the bed, gate, and
+                // mask. Each one steps exactly as it did in series, on its own
+                // worker with its own scratch. The per-sheet preparation (the
+                // slurry viscosity, the soft window edge, the body displacement)
+                // runs inside each worker too.
+                let solid = mask.as_deref();
+                let [fine_w, fine_s, coarse_w, coarse_s] = &mut self.sheet_scratch;
+                let ([sc_w, sc_w2], [sc_s, sc_s2]) =
+                    if fine { (fine_w, fine_s) } else { (coarse_w, coarse_s) };
+                let run_water = || {
                     let tw = ProfTick::start();
-                    step_sheet(
+                    // Soft edge of the window: slow the velocity, keep the mass.
+                    if !fine {
+                        soften_border(uw, vw, res, open);
+                    }
+                    if let Some(mask) = solid {
+                        displace_occupied(water, uw, vw, mask, res);
+                    }
+                    step_sheet_eps_in(
                         water,
                         uw,
                         vw,
@@ -5237,10 +6763,29 @@ impl FluidCore {
                         cell,
                         dt,
                         SheetDrive::Gravity { vorticity: 0.08 },
+                        1.0e-6,
+                        solid,
+                        false,
+                        cap,
+                        pace,
+                        sc_w,
+                        sc_w2,
                     );
-                    water_ms = tw.ms();
+                    tw.ms()
+                };
+                let run_slurry = || {
                     let ts = ProfTick::start();
-                    step_sheet(
+                    for idx in 0..n {
+                        nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                    }
+                    if !fine {
+                        soften_border(us, vs, res, open);
+                    }
+                    if let Some(mask) = solid {
+                        displace_occupied(slurry, us, vs, mask, res);
+                    }
+                    let nu_s = &*nu_s;
+                    step_sheet_eps_in(
                         slurry,
                         us,
                         vs,
@@ -5251,9 +6796,30 @@ impl FluidCore {
                         cell,
                         dt,
                         SheetDrive::Gravity { vorticity: 0.05 },
+                        1.0e-6,
+                        solid,
+                        false,
+                        cap,
+                        pace,
+                        sc_s,
+                        sc_s2,
                     );
-                    slurry_ms = ts.ms();
+                    ts.ms()
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    (water_ms, slurry_ms) =
+                        rayon::join(|| serial_inner(run_water), || serial_inner(run_slurry));
                 }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    water_ms = run_water();
+                    slurry_ms = run_slurry();
+                }
+            }
+            if self.open_water.is_some() {
+                let n = WINDOW_RES * WINDOW_RES;
+                scratch.nu_w[..n].fill(dynamic_viscosity(Grain::Water, 1.0));
             }
             self.sheet_times.prep_ms += prep_ms;
             self.sheet_times.water_ms += water_ms;
@@ -5673,7 +7239,7 @@ impl FluidCore {
                 let h = &mut self.dust[start..start + n];
                 let u = &mut self.dust_u[start..start + n];
                 let v = &mut self.dust_v[start..start + n];
-                soften_border(u, v, AIR_RES);
+                soften_border(u, v, AIR_RES, None);
                 step_down2(
                     h,
                     u,
@@ -5695,6 +7261,94 @@ impl FluidCore {
             }
         });
         self.sheet_times.dust_ms += tick.ms();
+    }
+
+    /// Passive fog on the dust wind step. Empty slabs are not scanned.
+    /// The velocity scratch is not `air_velocity`: that channel stays the dust sheet.
+    fn step_fog(&mut self, dt: f32) {
+        if !self.fog_live || dt <= 0.0 {
+            return;
+        }
+        let tick = ProfTick::start();
+        let cell = self.air_cell();
+        let wind = self.wind;
+        let n = AIR_RES * AIR_RES;
+        DUST_PLANE.with(|plane| {
+            let mut plane = plane.borrow_mut();
+            plane.fit(n);
+            for layer in 0..AIR_LAYERS {
+                let start = layer * n;
+                let h = &mut self.fog[start..start + n];
+                if h.iter().all(|v| *v <= 1.0e-8) {
+                    continue;
+                }
+                let u = &mut self.fog_u[start..start + n];
+                let v = &mut self.fog_v[start..start + n];
+                soften_border(u, v, AIR_RES, None);
+                step_down2(
+                    h,
+                    u,
+                    v,
+                    &plane.bed,
+                    &plane.nu,
+                    &plane.gate,
+                    AIR_RES,
+                    cell,
+                    dt,
+                    SheetDrive::Wind {
+                        x: wind[0],
+                        z: wind[1],
+                        vorticity: 0.35,
+                    },
+                    1.0e-8,
+                    false,
+                );
+            }
+        });
+        self.sheet_times.dust_ms += tick.ms();
+    }
+
+    /// Bottom fog returns to the water column. Upper slabs fall one step.
+    fn settle_fog(&mut self) {
+        if !self.fog_live {
+            return;
+        }
+        let air_cell = self.air_cell();
+        let air_area = air_cell * air_cell;
+        let coarse_area = COARSE_CELL_M * COARSE_CELL_M;
+        let fall = 0.45f32;
+        let mut left = 0.0f32;
+        for j in 0..AIR_RES {
+            for i in 0..AIR_RES {
+                let x = self.air_origin[0] + (i as f32 + 0.5) * air_cell;
+                let z = self.air_origin[1] + (j as f32 + 0.5) * air_cell;
+                for layer in (0..AIR_LAYERS).rev() {
+                    let idx = (layer * AIR_RES + j) * AIR_RES + i;
+                    let drop = self.fog[idx] * fall;
+                    if drop <= 0.0 {
+                        continue;
+                    }
+                    self.fog[idx] -= drop;
+                    if layer == 0 {
+                        if let Some((ci, cj)) = self.coarse_ij(x, z) {
+                            let cidx = cj * WINDOW_RES + ci;
+                            self.water[cidx] += drop * air_area / coarse_area;
+                        } else {
+                            let key = world_key(x, z, COARSE_CELL_M);
+                            let slot = self.parked.entry(key).or_default();
+                            slot.water += drop * air_area / coarse_area;
+                        }
+                    } else {
+                        let below = ((layer - 1) * AIR_RES + j) * AIR_RES + i;
+                        self.fog[below] += drop;
+                    }
+                }
+                for layer in 0..AIR_LAYERS {
+                    left += self.fog[(layer * AIR_RES + j) * AIR_RES + i];
+                }
+            }
+        }
+        self.fog_live = left > 1.0e-8 || !self.parked_fog.is_empty();
     }
 
     fn settle_dust(&mut self) {
@@ -5733,6 +7387,219 @@ impl FluidCore {
                 }
             }
         }
+    }
+
+    /// The lift already ran on the column the tire rolled into. The solids stay
+    /// in that rut. Clear water the open sheet shoves sideways does not take
+    /// them, so the water that remains is muddier. Where that film no longer
+    /// covers the load, the grains settle. Booking the load down to the water
+    /// line would publish turbidity 1. What still fits rides the along-track film.
+    fn step_suspended(&mut self, dt: f32) {
+        self.last_susp_capped = 0;
+        if dt <= 0.0 || !dt.is_finite() {
+            return;
+        }
+        self.advect_suspended(dt);
+    }
+
+    fn entrain_wake(&mut self, pushes: &[TirePush], dt: f32) {
+        let res = WINDOW_RES as i32;
+        let cell = COARSE_CELL_M;
+        let area = cell * cell;
+        let origin = self.origin;
+        for p in pushes {
+            if p.speed < 0.3 {
+                continue;
+            }
+            let fl = (p.forward_x * p.forward_x + p.forward_z * p.forward_z)
+                .sqrt()
+                .max(1.0e-4);
+            let fx = p.forward_x / fl;
+            let fz = p.forward_z / fl;
+            let rx = fz;
+            let rz = -fx;
+            let reach = p.radius * 3.4 + cell;
+            let i0 = (((p.x - reach) - origin[0]) / cell).floor() as i32;
+            let i1 = (((p.x + reach) - origin[0]) / cell).floor() as i32;
+            let j0 = (((p.z - reach) - origin[1]) / cell).floor() as i32;
+            let j1 = (((p.z + reach) - origin[1]) / cell).floor() as i32;
+            let aft = p.radius * 3.2;
+            let half = p.width * 0.55 + 0.08;
+            for j in j0.max(0)..=j1.min(res - 1) {
+                for i in i0.max(0)..=i1.min(res - 1) {
+                    let x = origin[0] + (i as f32 + 0.5) * cell;
+                    let z = origin[1] + (j as f32 + 0.5) * cell;
+                    let dx = x - p.x;
+                    let dz = z - p.z;
+                    let along = dx * fx + dz * fz;
+                    // Positive along is ahead of the tire. The plume is the aft sector.
+                    if along > -0.05 || along < -aft {
+                        continue;
+                    }
+                    let lat = (dx * rx + dz * rz).abs();
+                    if lat > half {
+                        continue;
+                    }
+                    let idx = j as usize * WINDOW_RES + i as usize;
+                    let water = self.water[idx];
+                    if !water.is_finite() || water < 0.004 {
+                        continue;
+                    }
+                    let along_t = ((-along) / aft).clamp(0.0, 1.0);
+                    let lat_t = (lat / half).clamp(0.0, 1.0);
+                    let core = (1.0 - along_t) * (1.0 - lat_t);
+                    let room = (water - self.susp[idx]).max(0.0);
+                    // Per second, so a 30 Hz step and a 60 Hz step lift the same volume.
+                    let add = (4.0 * dt * core * water).min(room);
+                    if add <= 1.0e-8 {
+                        continue;
+                    }
+                    self.susp[idx] += add;
+                    self.entrained_m3 += add * area;
+                }
+            }
+        }
+    }
+
+    fn advect_suspended(&mut self, dt: f32) {
+        let res = WINDOW_RES;
+        let cell = COARSE_CELL_M;
+        let area = cell * cell;
+        let mut i0 = res;
+        let mut i1 = 0usize;
+        let mut j0 = res;
+        let mut j1 = 0usize;
+        for j in 0..res {
+            for i in 0..res {
+                let idx = j * res + i;
+                let mut s = self.susp[idx];
+                if !s.is_finite() || s <= 1.0e-12 {
+                    self.susp[idx] = 0.0;
+                    continue;
+                }
+                let w = self.water[idx];
+                if !w.is_finite() || w < 1.0e-5 {
+                    self.settled_suspended_m3 += s * area;
+                    self.susp[idx] = 0.0;
+                    continue;
+                }
+                if s > w {
+                    // The film no longer covers the load. Booking down to the
+                    // water line would publish turbidity 1 from a deeper load.
+                    self.settled_suspended_m3 += s * area;
+                    self.susp[idx] = 0.0;
+                    continue;
+                }
+                if s > 1.0e-8 {
+                    i0 = i0.min(i);
+                    i1 = i1.max(i);
+                    j0 = j0.min(j);
+                    j1 = j1.max(j);
+                }
+            }
+        }
+        if i0 > i1 {
+            return;
+        }
+        i0 = i0.saturating_sub(1);
+        j0 = j0.saturating_sub(1);
+        i1 = (i1 + 1).min(res - 1);
+        j1 = (j1 + 1).min(res - 1);
+
+        // Copy first so a cell outside the box keeps the solids it already holds.
+        self.susp_next.copy_from_slice(&self.susp);
+        self.susp_taken.fill(0.0);
+        // The open sheet shoves water onto the shoulders. Solids that followed
+        // that shove left the rut near 0.20. They stay in the track column and
+        // ride the along-track film. A neighbour stops at the donor's fraction,
+        // so a thin film cannot publish 1 from a thicker cell.
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                let depth = self.susp[idx];
+                let water = self.water[idx];
+                if depth <= 1.0e-12
+                    || !depth.is_finite()
+                    || !water.is_finite()
+                    || water < 1.0e-5
+                {
+                    continue;
+                }
+                // Clay in the same cell is a second sheet. Blending its
+                // velocity would drag the plume off the water that holds it.
+                let (_, v) = film_uv(water, 0.0, self.uw[idx], self.vw[idx], 0.0, 0.0);
+                if !v.is_finite() || v.abs() < 1.0e-5 {
+                    continue;
+                }
+                let frac = (v.abs() * dt / cell).min(0.45);
+                let give = depth * frac;
+                if give <= 1.0e-12 {
+                    continue;
+                }
+                let recv = if v > 0.0 {
+                    if j + 1 < res {
+                        Some(idx + res)
+                    } else {
+                        None
+                    }
+                } else if j > 0 {
+                    Some(idx - res)
+                } else {
+                    None
+                };
+                let Some(n) = recv else {
+                    self.settled_suspended_m3 += give * area;
+                    self.susp_next[idx] -= give;
+                    continue;
+                };
+                let wr = self.water[n];
+                if !wr.is_finite() || wr < 1.0e-5 {
+                    continue;
+                }
+                let c = depth / water;
+                let have = self.susp[n] + self.susp_taken[n];
+                let room = (c * wr - have).max(0.0);
+                let accept = give.min(room).min((wr - have).max(0.0));
+                if accept <= 1.0e-12 {
+                    continue;
+                }
+                self.susp_next[idx] -= accept;
+                self.susp_taken[n] += accept;
+            }
+        }
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                self.susp_next[idx] += self.susp_taken[idx];
+            }
+        }
+        let mut capped = 0u32;
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let idx = j * res + i;
+                let mut s = self.susp_next[idx];
+                if !s.is_finite() || s <= 0.0 {
+                    self.susp_next[idx] = 0.0;
+                    continue;
+                }
+                let w = self.water[idx];
+                if !w.is_finite() || w < 1.0e-5 {
+                    self.settled_suspended_m3 += s * area;
+                    s = 0.0;
+                } else if s > w {
+                    let excess = s - w;
+                    self.settled_suspended_m3 += excess * area;
+                    if excess > 1.0e-5 {
+                        capped += 1;
+                    }
+                    s = w;
+                }
+                self.susp_next[idx] = s;
+            }
+        }
+        self.last_susp_capped += capped;
+        // Cells outside the box were copied and not rewritten. Swap the whole grid.
+        std::mem::swap(&mut self.susp, &mut self.susp_next);
     }
 
     fn shift_coarse(&mut self, new_origin: [f32; 2]) {
@@ -5774,18 +7641,17 @@ impl FluidCore {
                 vs: self.vs[idx],
                 dust: self.settled[idx],
                 moisture: self.moisture[idx],
+                susp: self.susp[idx],
             };
-            if slot.water > 1.0e-8
-                || slot.slurry > 1.0e-8
-                || slot.dust > 1.0e-8
-                || slot.moisture > 1.0e-4
-            {
+            if park_slot(&slot, self.moisture_ambient) {
                 self.parked.insert(key, slot);
             } else {
                 self.parked.remove(&key);
             }
         });
-        let need = n * 8;
+        let track_susp = self.turbidity_enabled;
+        let planes = if track_susp { 9 } else { 8 };
+        let need = n * planes;
         if self.shift_scratch.len() < need {
             self.shift_scratch.resize(need, 0.0);
         }
@@ -5798,6 +7664,9 @@ impl FluidCore {
         scratch[n * 5..n * 6].copy_from_slice(&self.vs);
         scratch[n * 6..n * 7].copy_from_slice(&self.settled);
         scratch[n * 7..n * 8].copy_from_slice(&self.moisture);
+        if track_susp {
+            scratch[n * 8..n * 9].copy_from_slice(&self.susp);
+        }
         let res_i = res as i32;
         for j in 0..res {
             for i in 0..res {
@@ -5810,6 +7679,7 @@ impl FluidCore {
                         || scratch[n + src] > 1.0e-8
                         || scratch[n * 6 + src] > 1.0e-8
                         || scratch[n * 7 + src] > 1.0e-4
+                        || (track_susp && scratch[n * 8 + src] > 1.0e-8)
                 } else {
                     false
                 };
@@ -5823,6 +7693,11 @@ impl FluidCore {
                     self.vs[dst] = scratch[n * 5 + src];
                     self.settled[dst] = scratch[n * 6 + src];
                     self.moisture[dst] = scratch[n * 7 + src];
+                    self.susp[dst] = if track_susp {
+                        scratch[n * 8 + src]
+                    } else {
+                        0.0
+                    };
                 } else {
                     self.water[dst] = 0.0;
                     self.slurry[dst] = 0.0;
@@ -5831,7 +7706,8 @@ impl FluidCore {
                     self.us[dst] = 0.0;
                     self.vs[dst] = 0.0;
                     self.settled[dst] = 0.0;
-                    self.moisture[dst] = 0.0;
+                    self.moisture[dst] = self.moisture_ambient;
+                    self.susp[dst] = 0.0;
                 }
             }
         }
@@ -5851,6 +7727,7 @@ impl FluidCore {
                 self.vs[idx] = slot.vs;
                 self.settled[idx] = slot.dust;
                 self.moisture[idx] = slot.moisture;
+                self.susp[idx] = slot.susp;
             }
         });
     }
@@ -5864,9 +7741,10 @@ impl FluidCore {
         let mut us = vec![0.0f32; n];
         let mut vs = vec![0.0f32; n];
         let mut bed = vec![0.0f32; n];
-        let mut moisture = vec![0.0f32; n];
+        let mut moisture = vec![self.moisture_ambient; n];
         let mut grain = vec![Grain::Other as u8; n];
         let mut settled = vec![0.0f32; n];
+        let mut susp = vec![0.0f32; n];
         for j in 0..WINDOW_RES {
             for i in 0..WINDOW_RES {
                 let x = self.origin[0] + (i as f32 + 0.5) * COARSE_CELL_M;
@@ -5882,12 +7760,9 @@ impl FluidCore {
                     vs: self.vs[idx],
                     dust: self.settled[idx],
                     moisture: self.moisture[idx],
+                    susp: self.susp[idx],
                 };
-                if slot.water > 1.0e-8
-                    || slot.slurry > 1.0e-8
-                    || slot.dust > 1.0e-8
-                    || slot.moisture > 1.0e-4
-                {
+                if park_slot(&slot, self.moisture_ambient) {
                     self.parked.insert(key, slot);
                 } else {
                     self.parked.remove(&key);
@@ -5910,6 +7785,7 @@ impl FluidCore {
                     vs[idx] = slot.vs;
                     settled[idx] = slot.dust;
                     moisture[idx] = slot.moisture;
+                    susp[idx] = slot.susp;
                 }
                 bed[idx] = self.bed[idx];
                 grain[idx] = self.grain[idx];
@@ -5922,6 +7798,7 @@ impl FluidCore {
         self.us = us;
         self.vs = vs;
         self.settled = settled;
+        self.susp = susp;
         self.bed = bed;
         self.moisture = moisture;
         self.grain = grain;
@@ -5945,6 +7822,9 @@ impl FluidCore {
 
     /// A shift collapses every column onto layer 0. The overlap does that without hashing.
     fn shift_air_scroll(&mut self, new_origin: [f32; 2], cell: f32, di: i32, dj: i32) {
+        if self.fog_live {
+            self.shift_fog_scroll(new_origin, cell, di, dj);
+        }
         let res = AIR_RES;
         let n = res * res;
         let origin = self.air_origin;
@@ -6001,7 +7881,90 @@ impl FluidCore {
         });
     }
 
+    fn shift_fog_scroll(&mut self, new_origin: [f32; 2], cell: f32, di: i32, dj: i32) {
+        let res = AIR_RES;
+        let n = res * res;
+        let origin = self.air_origin;
+        let area = cell * cell;
+        let mut column = vec![0.0f32; n];
+        for j in 0..res {
+            for i in 0..res {
+                let mut vol = 0.0f32;
+                for layer in 0..AIR_LAYERS {
+                    vol += self.fog[(layer * res + j) * res + i];
+                }
+                column[j * res + i] = vol;
+            }
+        }
+        each_leaving(res, di, dj, |i, j| {
+            let vol = column[j * res + i];
+            if vol > 1.0e-8 {
+                let x = origin[0] + (i as f32 + 0.5) * cell;
+                let z = origin[1] + (j as f32 + 0.5) * cell;
+                *self.parked_fog.entry(world_key(x, z, cell)).or_insert(0.0) += vol * area;
+            }
+        });
+        self.fog.fill(0.0);
+        self.fog_u.fill(0.0);
+        self.fog_v.fill(0.0);
+        let res_i = res as i32;
+        for j in 0..res {
+            for i in 0..res {
+                let si = i as i32 + di;
+                let sj = j as i32 + dj;
+                if !(0..res_i).contains(&si) || !(0..res_i).contains(&sj) {
+                    continue;
+                }
+                let vol = column[sj as usize * res + si as usize];
+                if vol > 1.0e-8 {
+                    self.fog[j * res + i] = vol;
+                }
+            }
+        }
+        each_leaving(res, -di, -dj, |i, j| {
+            let x = new_origin[0] + (i as f32 + 0.5) * cell;
+            let z = new_origin[1] + (j as f32 + 0.5) * cell;
+            if let Some(vol) = self.parked_fog.remove(&world_key(x, z, cell)) {
+                self.fog[j * res + i] += vol / area;
+            }
+        });
+        self.fog_live = self.fog.iter().any(|v| *v > 1.0e-8) || !self.parked_fog.is_empty();
+    }
+
+    fn shift_fog_hash(&mut self, new_origin: [f32; 2], cell: f32) {
+        for j in 0..AIR_RES {
+            for i in 0..AIR_RES {
+                let x = self.air_origin[0] + (i as f32 + 0.5) * cell;
+                let z = self.air_origin[1] + (j as f32 + 0.5) * cell;
+                let mut vol = 0.0f32;
+                for layer in 0..AIR_LAYERS {
+                    let idx = (layer * AIR_RES + j) * AIR_RES + i;
+                    vol += self.fog[idx];
+                    self.fog[idx] = 0.0;
+                    self.fog_u[idx] = 0.0;
+                    self.fog_v[idx] = 0.0;
+                }
+                if vol > 1.0e-8 {
+                    *self.parked_fog.entry(world_key(x, z, cell)).or_insert(0.0) += vol * cell * cell;
+                }
+            }
+        }
+        for j in 0..AIR_RES {
+            for i in 0..AIR_RES {
+                let x = new_origin[0] + (i as f32 + 0.5) * cell;
+                let z = new_origin[1] + (j as f32 + 0.5) * cell;
+                if let Some(vol) = self.parked_fog.remove(&world_key(x, z, cell)) {
+                    self.fog[j * AIR_RES + i] = vol / (cell * cell);
+                }
+            }
+        }
+        self.fog_live = self.fog.iter().any(|v| *v > 1.0e-8) || !self.parked_fog.is_empty();
+    }
+
     fn shift_air_hash(&mut self, new_origin: [f32; 2], cell: f32) {
+        if self.fog_live {
+            self.shift_fog_hash(new_origin, cell);
+        }
         for j in 0..AIR_RES {
             for i in 0..AIR_RES {
                 let x = self.air_origin[0] + (i as f32 + 0.5) * cell;
@@ -6198,13 +8161,19 @@ fn rim_scale(h: &[f32], i: usize, j: usize, rad: i32, feather: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn soften_border(u: &mut [f32], v: &mut [f32], res: usize) {
+/// `open` is a reach band `(along_z, cross0, cross1)` in cells. Inside that
+/// band only the banks' window edges soften, not the inlet and the outlet.
+fn soften_border(u: &mut [f32], v: &mut [f32], res: usize, open: Option<(bool, usize, usize)>) {
     let edge = (res / 12).max(2);
     for j in 0..res {
         for i in 0..res {
             let di = i.min(res - 1 - i);
             let dj = j.min(res - 1 - j);
-            let d = di.min(dj);
+            let d = match open {
+                Some((false, c0, c1)) if (c0..c1).contains(&j) => dj,
+                Some((true, c0, c1)) if (c0..c1).contains(&i) => di,
+                _ => di.min(dj),
+            };
             if d >= edge {
                 continue;
             }
@@ -6395,6 +8364,12 @@ pub const WAKE_VORTICITY_MIN: f32 = 6.0;
 /// inject, advect, confine, and the density flux. The proof drive must stay
 /// under 4 ms, which is the budget for the step that feeds the GPU upload.
 pub const AIR_STEP_BUDGET_MS: f32 = 4.0;
+/// Gravity-sheet speed cap, metres per second. Published `vx` and `vz` stay inside it.
+pub const FILM_SPEED_CAP_MPS: f32 = 1.6;
+/// Milliseconds for one [`FluidCore::step`] wall. The plume test times that
+/// call with the clay pond inside it, and asserts the mean and the p95.
+/// Do not raise this, and do not treat a miss as known.
+pub const SOLVER_STEP_BUDGET_MS: f32 = 7.0;
 /// Density flux runs on this many air steps, with `dt` scaled so the mean rate holds.
 pub const AIR_FLUX_STRIDE: u32 = 4;
 /// Velocity substeps. The solve runs on this many dust steps, with `dt` scaled.
