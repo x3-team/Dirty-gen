@@ -94,9 +94,10 @@ fn puddle_wheels_sit_in_a_force_rut() {
             bottom.x, bottom.z, bottom.y
         );
         if water > 0.02 && rut > 0.02 {
+            // 0.15 → 0.16: the 1210 kg Niva sits ~1.5 cm deeper than the 640 kg one.
             assert!(
-                (0.10..=0.15).contains(&seat),
-                "wheel {i} seat {seat:.4} m is outside 0.10–0.15 m"
+                (0.10..=0.16).contains(&seat),
+                "wheel {i} seat {seat:.4} m is outside 0.10–0.16 m"
             );
             surface_sum += surface;
             seat_sum += seat;
@@ -221,9 +222,11 @@ fn assert_puddle_shore(frame: &ContractFrame, label: &str, z: f32, x0: f32) {
 
     // Last cell that still holds the floor column. The bank is the fall from
     // there to a dry cell, and the bed rises over that same run.
+    // The column means the floor bed too: a cell already up the bank that
+    // happens to hold 88% of a wake-lowered floor is not the floor.
     let deep = ray
         .iter()
-        .rposition(|s| s.water > floor.water * 0.88);
+        .rposition(|s| s.water > floor.water * 0.88 && s.bed < floor.bed + 0.01);
     let Some(deep) = deep else {
         panic!("{label}: no deep water on the east shore");
     };
@@ -899,9 +902,11 @@ fn puddle_foam_and_spray_are_finite_on_the_wave() {
         foam_min >= 0.0 && foam_max <= 1.0,
         "foam {foam_min:.4}..{foam_max:.4} left 0..=1"
     );
+    // Crest is placed spoil plus the film above its neighbours. The 1210 kg
+    // Niva cuts a deeper rut and piles more spoil: max 0.345 → 0.458 m.
     assert!(
-        crest_max <= 0.40,
-        "crest max {crest_max:.4} m is above 0.40 m"
+        crest_max <= 0.50,
+        "crest max {crest_max:.4} m is above 0.50 m"
     );
     assert!(flow_min >= 0.0, "flow min {flow_min:.4} m/s");
     assert!(

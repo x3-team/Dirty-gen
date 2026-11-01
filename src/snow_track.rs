@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use glam::{Vec2, Vec3};
 
-use crate::soil::Terramech;
+use crate::soil::{bekker_load, Terramech};
 
 /// Fine cell, metres. One Niva lug is about two cells.
 pub const TRACK_CELL_M: f32 = 0.025;
@@ -50,8 +50,11 @@ pub const RHO_MAX: f32 = 560.0;
 pub const P_COMPACT: f32 = 110_000.0;
 /// Angle of repose of loose snow. tan(48°).
 pub const REPOSE_TAN: f32 = 1.11;
-/// Bekker modulus of fresh snow, Pa/m^n. 2.85 kN on a Niva tire sinks about 15 cm.
-pub const SNOW_K0: f32 = 600_000.0;
+/// Bekker modulus of deep fresh snow for a tire-wide plate, Pa/m^n:
+/// kc/b + kφ with Wong's Harrison snow (kc 4.37 kN/m^2.6, kφ 196.7 kN/m^3.6)
+/// and b ≈ 0.24 m. A shallow layer over a hard bed is stiffer; see
+/// [`layer_modulus`].
+pub const SNOW_K0: f32 = 215_000.0;
 pub const SNOW_N: f32 = 1.6;
 /// Stiffening with density: k = k0 · (ρ/ρ_fresh)^this.
 pub const SNOW_K_EXP: f32 = 2.5;
@@ -108,6 +111,10 @@ const CLUMP_SHARE: f32 = 0.45;
 /// Share of the packing the free edge of the tread still gets. The rest of
 /// that snow shears out past the sidewall instead of densifying.
 const EDGE_PACK: f32 = 0.25;
+/// Stress a free face of fresh snow carries before it shears out, pascals.
+/// The edge of the tread packs no harder than this whatever the car weighs;
+/// the rest of the load pushes snow out past the sidewall.
+const EDGE_FAIL_P: f32 = 40_000.0;
 /// Outer share of the half tread that is not confined, 0..1.
 const CONFINE_BAND: f32 = 0.45;
 /// Slip above which the lugs shear the floor.
@@ -261,6 +268,47 @@ pub fn density_under(pressure: f32, rho0: f32) -> f32 {
 /// Bekker modulus for snow of this density, Pa/m^n.
 pub fn snow_modulus(rho: f32) -> f32 {
     SNOW_K0 * (rho / RHO_FRESH).clamp(1.0, 6.0).powf(SNOW_K_EXP)
+}
+
+/// Contact pressure that sets how far a layer can pack, pascals.
+const SNOW_NOMINAL_P: f32 = 45_000.0;
+
+/// Bekker modulus of a snow layer `depth` metres deep at density `rho` under
+/// a tire of `radius` and `width` carrying a quarter of the Niva.
+///
+/// Deep snow sinks as a Bekker half-space. A layer over a hard bed can at
+/// most pack down to the density the contact pressure reaches,
+/// z_max = D (1 − ρ/ρ_p). The sinkage at the nominal load is a soft
+/// minimum of the two, and the modulus returned is the one that gives it, so
+/// the tire still follows the Bekker load curve around that point.
+pub fn layer_modulus(rho: f32, depth: f32, radius: f32, width: f32) -> f32 {
+    let load = crate::vehicle::MASS * 9.81 / 4.0;
+    let k_deep = snow_modulus(rho);
+    let unit = |z: f32| bekker_load(z, radius, width, 1.0, SNOW_N);
+    let (mut lo, mut hi) = (0.0f32, radius * 0.9);
+    for _ in 0..30 {
+        let mid = 0.5 * (lo + hi);
+        if k_deep * unit(mid) > load {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let z_deep = 0.5 * (lo + hi);
+    let rho_p = density_under(SNOW_NOMINAL_P, rho);
+    let z_max = depth.max(0.0) * (1.0 - rho / rho_p.max(rho + 1.0)).max(0.0);
+    if z_max <= 1.0e-4 {
+        return snow_modulus(RHO_MAX);
+    }
+    // Soft minimum (p-norm, p = 3). The layer feels like a half-space until the
+    // sinkage nears the packing limit, then it bottoms out.
+    let zd = z_deep.max(1.0e-4);
+    let z_eff = (zd.powi(-3) + z_max.powi(-3)).powf(-1.0 / 3.0);
+    let f = unit(z_eff);
+    if f <= 1.0e-9 {
+        return k_deep;
+    }
+    (load / f).max(k_deep)
 }
 
 /// Grip and sinkage of snow for the vehicle's traction model.
@@ -449,6 +497,7 @@ impl SnowTrack {
         // rut it is the packed floor.
         let mut top = 0.0f32;
         let mut rho = 0.0f32;
+        let mut depth = 0.0f32;
         let mut n = 0.0f32;
         let lat_n = 7;
         let long_n = 10;
@@ -456,6 +505,7 @@ impl SnowTrack {
             let lat = ((b as f32 + 0.5) / lat_n as f32 - 0.5) * (width * 0.85);
             let mut best = f32::MIN;
             let mut best_rho = RHO_FRESH;
+            let mut best_depth = 0.0f32;
             for a in 0..long_n {
                 let along = dir * radius * 0.9 * (a as f32 / (long_n - 1) as f32);
                 let p = Vec2::new(center.x, center.z) + fwd * along + right * lat;
@@ -463,17 +513,21 @@ impl SnowTrack {
                 if c.surface() > best {
                     best = c.surface();
                     best_rho = if c.depth > 1.0e-4 { c.rho } else { RHO_MAX };
+                    best_depth = c.depth;
                 }
             }
             top += best;
             rho += best_rho;
+            depth += best_depth;
             n += 1.0;
         }
         let rho = (rho / n).clamp(RHO_FRESH, RHO_MAX);
+        let mut mech = snow_mech(rho);
+        mech.k_eq = layer_modulus(rho, depth / n, radius, width);
         SnowGround {
             surface: top / n,
             density: rho,
-            mech: snow_mech(rho),
+            mech,
         }
     }
 
@@ -574,7 +628,9 @@ impl SnowTrack {
                 let same_pass = cell.pressed_step + 2 >= self.step_no && cell.pressed_step != 0;
                 let rho0 = if same_pass { cell.rho_pass } else { cell.rho };
                 let rho_cap = density_under(pressure, rho0);
-                let reach_rho = rho0 + (rho_cap - rho0).max(0.0) * (EDGE_PACK + (1.0 - EDGE_PACK) * kappa);
+                let rho_edge = density_under(pressure.min(EDGE_FAIL_P), rho0);
+                let edge_rho = rho0 + (rho_edge - rho0).max(0.0) * EDGE_PACK;
+                let reach_rho = edge_rho + (rho_cap - edge_rho).max(0.0) * kappa;
                 let target = reach_rho.max(cell.rho);
                 let mut excess = 0.0;
                 let (depth, rho) = if d_new <= 1.0e-5 {
@@ -1494,5 +1550,32 @@ mod tests {
         // The underside planed the hump flat and packed it.
         assert!(hump.surface() < virgin.surface() - 0.10, "hump {} vs {}", hump.surface(), virgin.surface());
         assert!(hump.rho > virgin.rho + 15.0, "hump density {}", hump.rho);
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    fn sink(rho: f32, depth: f32) -> f32 {
+        let k = layer_modulus(rho, depth, 0.38, 0.28);
+        let load = crate::vehicle::MASS * 9.81 / 4.0;
+        let mut z = 0.0;
+        while bekker_load(z, 0.38, 0.28, k, SNOW_N) < load && z < 0.36 {
+            z += 0.001;
+        }
+        z
+    }
+
+    #[test]
+    fn layer_sinkage_grows_with_depth_and_bottoms_out() {
+        let z: Vec<f32> = [0.25, 0.5, 0.75, 3.0].iter().map(|&d| sink(130.0, d)).collect();
+        eprintln!("sink at rho 130 for 0.25/0.5/0.75/3 m: {z:?}");
+        assert!(z[0] < z[1] && z[1] < z[2] && z[2] <= z[3], "{z:?}");
+        // A shallow layer cannot sink past what it can pack to.
+        let rho_p = density_under(SNOW_NOMINAL_P, 130.0);
+        assert!(z[0] <= 0.25 * (1.0 - 130.0 / rho_p) + 0.002, "{z:?}");
+        // Denser snow carries the same Niva higher.
+        assert!(sink(190.0, 0.75) < z[2]);
     }
 }
