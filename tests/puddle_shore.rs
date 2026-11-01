@@ -681,8 +681,18 @@ fn one_fine_substep_matches_eight() {
         run_full.max_dh,
         run_full.l1_m3
     );
-    assert_eq!(
-        run_prod.tongues, run_full.tongues,
+    // The tongue count is a discrete contour feature: a last-bit change in
+    // the sheet (for example sqrt instead of hypot in #112) moves a 4 mm
+    // tongue across the count while L1, max |dh|, and the books stay inside
+    // their bounds above. Both runs must still be a fingered shore, and agree
+    // to within two tongues.
+    assert!(
+        run_prod.tongues >= 4 && run_full.tongues >= 4,
+        "tongues {} vs {}: a run went back to a lens",
+        run_prod.tongues, run_full.tongues
+    );
+    assert!(
+        run_prod.tongues.abs_diff(run_full.tongues) <= 2,
         "tongues {} vs {}",
         run_prod.tongues, run_full.tongues
     );
