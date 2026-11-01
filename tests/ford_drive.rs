@@ -5,17 +5,12 @@
 //! bow wave ahead of the front wheels, the wake behind, the waves the
 //! crossing sends back onto the beach, and the water ledger.
 
-use glam::Vec3;
 use silt::fluid_core::{CoarseCell, FluidCore, COARSE_CELL_M, WINDOW_RES};
-use silt::ford::{seed_ford, still_waterline_z, CHANNEL_Z0, CHANNEL_Z1};
+use silt::ford::{still_waterline_z, FordDrive, CHANNEL_Z0, CHANNEL_Z1};
 use silt::particles::Particle;
 use silt::render_contract::{publish, ContractFrame};
-use silt::soil::{SoilField, SurfaceKind};
-use silt::vehicle::Vehicle;
 
 const DT: f32 = 1.0 / 60.0;
-/// Ford pace, metres per second: a walking pace to a slow jog.
-const FORD_PACE_M_S: f32 = 1.5;
 
 fn cell_at(fluid: &FluidCore, x: f32, z: f32) -> CoarseCell {
     let (ox, oz, _) = fluid.window_bounds();
@@ -30,82 +25,6 @@ fn cell_at(fluid: &FluidCore, x: f32, z: f32) -> CoarseCell {
 
 fn eta(c: &CoarseCell) -> f32 {
     c.bed_m + c.water_m
-}
-
-fn depth_near(fluid: &FluidCore, x: f32, z: f32) -> f32 {
-    let mut acc = 0.0f32;
-    let mut n = 0.0f32;
-    for k in 0..8 {
-        let a = k as f32 * std::f32::consts::TAU / 8.0;
-        let h = fluid.sample(x + a.cos() * 0.48, z + a.sin() * 0.48).water_m;
-        if h > 0.02 {
-            acc += h;
-            n += 1.0;
-        }
-    }
-    if n > 0.0 {
-        acc / n
-    } else {
-        fluid.sample(x, z).water_m
-    }
-}
-
-/// Copy the sheet's bed and water onto the soil the tires read.
-fn sync_soil(fluid: &FluidCore, soil: &mut SoilField, initial: bool) {
-    let half = soil.size * 0.5;
-    for j in 0..soil.res {
-        for i in 0..soil.res {
-            let x = (i as f32 + 0.5) * soil.cell - half;
-            let z = (j as f32 + 0.5) * soil.cell - half;
-            let s = fluid.sample(x, z);
-            let idx = j * soil.res + i;
-            if initial {
-                soil.initial_height[idx] = s.bed_m;
-                soil.kind[idx] = if z < CHANNEL_Z0 + 0.6 {
-                    SurfaceKind::Sand as u8
-                } else {
-                    SurfaceKind::Gravel as u8
-                };
-                soil.loose[idx] = 0.004;
-                soil.wetness[idx] = 0.2;
-            }
-            soil.bed[idx] = s.bed_m;
-            soil.water[idx] = s.water_m;
-            soil.slurry[idx] = s.slurry_m;
-            soil.placed[idx] = 0.0;
-            soil.height[idx] = s.bed_m + s.slurry_m;
-            if s.water_m > 0.02 {
-                soil.wetness[idx] = 0.35;
-            }
-        }
-    }
-}
-
-fn plant(vehicle: &mut Vehicle, soil: &SoilField, x: f32, z: f32, bed: f32) {
-    vehicle.pos = Vec3::new(x, bed + 0.58, z);
-    vehicle.yaw = 0.0;
-    vehicle.pitch = 0.0;
-    vehicle.roll = 0.0;
-    vehicle.vel = Vec3::ZERO;
-    vehicle.yaw_rate = 0.0;
-    vehicle.pitch_rate = 0.0;
-    vehicle.roll_rate = 0.0;
-    for w in &mut vehicle.wheels {
-        w.compression = 0.08;
-        w.omega = 0.0;
-        w.steer = 0.0;
-    }
-    for _ in 0..24 {
-        let c = vehicle.compute_contacts(soil, 0.0, 1.0, DT);
-        for ct in &c {
-            vehicle.wheels[ct.index].compression = ct.compression;
-        }
-        if c.iter().filter(|ct| ct.active).count() >= 3 {
-            break;
-        }
-        vehicle.pos.y -= 0.015;
-    }
-    vehicle.vel = Vec3::ZERO;
 }
 
 /// Southernmost wet cell along column `x`.
@@ -147,25 +66,18 @@ struct Run {
 }
 
 fn run(drive: bool, seconds: f32) -> Run {
-    let mut fluid = FluidCore::new([0.0, 0.0]);
-    seed_ford(&mut fluid, None);
+    // Let the river settle before the car arrives.
+    let mut ford = FordDrive::new(None, 4.0);
+    if let Some(p) = std::env::var("PACE").ok().and_then(|v| v.parse().ok()) {
+        ford.pace_m_s = p;
+    }
     let held = |f: &FluidCore| {
         let l = f.ledger();
         // Slurry the wheels scoured is bed soil, booked as eroded volume.
         l.water_m3 + l.reach_m3 + l.slurry_m3 + l.spray_m3 + l.fog_air_m3 + l.frozen_water_m3
             - f.hydro_load().eroded_m3
     };
-    // Let the river settle before the car arrives.
-    for _ in 0..(4.0 / DT) as u32 {
-        fluid.step(DT);
-    }
-    let water0 = held(&fluid);
-    let mut soil = SoilField::flat(0.0);
-    sync_soil(&fluid, &mut soil, true);
-    let start_z = still_waterline_z() - 2.5;
-    let bed = fluid.sample(0.0, start_z).bed_m;
-    let mut vehicle = Vehicle::new();
-    plant(&mut vehicle, &soil, 0.0, start_z, bed);
+    let water0 = held(&ford.fluid);
     let mut lo = [f32::MAX; 5];
     let mut hi = [f32::MIN; 5];
     let mut bow = 0.0f32;
@@ -178,33 +90,23 @@ fn run(drive: bool, seconds: f32) -> Run {
     let particles: &[Particle] = &[];
     let steps = (seconds / DT) as u32;
     for s in 0..steps {
-        if drive {
-            let solids = vehicle.hydro_solids(|x, z| depth_near(&fluid, x, z));
-            fluid.set_hydro_solids(&solids);
+        if !drive {
+            ford.fluid.step(DT);
+            beach_stir(&ford.fluid, &mut lo, &mut hi);
+            continue;
         }
-        fluid.step(DT);
-        if drive {
+        ford.step(DT);
+        let fluid = &ford.fluid;
+        let vehicle = &ford.world.vehicle;
+        let soil = &ford.world.soil;
+        {
             let load = fluid.hydro_load();
-            vehicle.water_push_n = Vec3::new(load.force_x, 0.0, load.force_z);
-            vehicle.water_lift_n = load.hull_buoyancy_n;
-            vehicle.water_drag_n = 0.0;
-            sync_soil(&fluid, &mut soil, false);
-            vehicle.update_steer(0.0, DT);
-            // A driver holding ford pace: throttle toward the target speed.
-            let target: f32 = std::env::var("PACE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(FORD_PACE_M_S);
-            let throttle = ((target - vehicle.speed()) * 1.2 + 0.25).clamp(0.0, 1.0);
-            let contacts = vehicle.compute_contacts(&soil, throttle, 0.0, DT);
-            vehicle.integrate(&contacts, &soil, DT);
             max_speed = max_speed.max(vehicle.speed());
             if std::env::var("TRACE").is_ok() && s % 30 == 0 {
-                let act = contacts.iter().filter(|c| c.active).count();
                 println!(
-                    "TRACE t {:.1} z {:.2} y {:.2} v {:.2} fz {:.0} fx {:.0} hull_lift {:.0} wheel_lift {:.0} contacts {} omega {:.1} pitch {:.2}",
+                    "TRACE t {:.1} z {:.2} y {:.2} v {:.2} fz {:.0} fx {:.0} hull_lift {:.0} wheel_lift {:.0} omega {:.1} pitch {:.2}",
                     s as f32 * DT, vehicle.pos.z, vehicle.pos.y, vehicle.speed(), load.force_z, load.force_x,
-                    load.hull_buoyancy_n, load.wheel_buoyancy_n, act, vehicle.wheels[0].omega, vehicle.pitch
+                    load.hull_buoyancy_n, load.wheel_buoyancy_n, vehicle.wheels[0].omega, vehicle.pitch
                 );
             }
             // Bow and wake only while the car is in the channel.
@@ -279,14 +181,14 @@ fn run(drive: bool, seconds: f32) -> Run {
         }
     }
     Run {
-        end_z: vehicle.pos.z,
+        end_z: ford.world.vehicle.pos.z,
         max_speed,
         bow,
         bow_mean: if bow_n > 0.0 { bow_sum / bow_n } else { 0.0 },
         wake,
         stir,
-        gap: held(&fluid) - water0,
-        nans: fluid.non_finite_count(),
+        gap: held(&ford.fluid) - water0,
+        nans: ford.fluid.non_finite_count(),
         tire_foam,
     }
 }
