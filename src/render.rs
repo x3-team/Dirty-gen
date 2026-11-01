@@ -166,6 +166,9 @@ pub struct Renderer {
     pub debug_mode: u32,
     /// Set by [`Renderer::enable_gpu_time`]. Absent for the window and for captures.
     gpu_time: Option<GpuTime>,
+    /// Smoke and fire grid and its march. `None` unless a scene enables it.
+    #[cfg(not(target_arch = "wasm32"))]
+    smoke: Option<crate::smoke_pass::SmokePass>,
 }
 
 pub struct GpuFormats {
@@ -1210,7 +1213,63 @@ impl Renderer {
             debug_contract: false,
             debug_mode: 0,
             gpu_time: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            smoke: None,
         }
+    }
+
+    /// Sun direction of the current lighting preset (towards the sun).
+    pub fn sun_dir(&self) -> Vec3 {
+        if self.daylight {
+            Vec3::new(0.38, 0.88, 0.18).normalize()
+        } else {
+            Vec3::new(0.88, 0.32, 0.24).normalize()
+        }
+    }
+
+    /// Start a smoke and fire grid. False when the device has no compute.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_smoke(&mut self, config: silt::smoke::SmokeConfig) -> bool {
+        if !silt::smoke::supported(&self.device) {
+            return false;
+        }
+        let mut pass = crate::smoke_pass::SmokePass::new(
+            &self.device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            config,
+        );
+        pass.sim.sun = self.sun_dir();
+        pass.sim.reset(&self.queue);
+        self.smoke = Some(pass);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn disable_smoke(&mut self) {
+        self.smoke = None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn smoke_mut(&mut self) -> Option<&mut crate::smoke_pass::SmokePass> {
+        self.smoke.as_mut()
+    }
+
+    /// Advance the smoke grid by `dt`. Sources and wind are set on `smoke_mut().sim`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn step_smoke(&mut self, dt: f32) {
+        let sun = self.sun_dir();
+        if let Some(pass) = self.smoke.as_mut() {
+            pass.sim.sun = sun;
+            pass.sim.step(&self.device, &self.queue, dt);
+        }
+    }
+
+    /// Smoke readback for logs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn smoke_stats(&self) -> Option<silt::smoke::SmokeStats> {
+        self.smoke
+            .as_ref()
+            .map(|p| p.sim.stats(&self.device, &self.queue))
     }
 
     /// Arm timestamp queries. The window leaves this off.
@@ -1353,11 +1412,7 @@ impl Renderer {
         };
         let view_proj = proj * view;
         // The window keeps the low sun. Persist stills ask for daylight.
-        let sun = if self.daylight {
-            Vec3::new(0.38, 0.88, 0.18).normalize()
-        } else {
-            Vec3::new(0.88, 0.32, 0.24).normalize()
-        };
+        let sun = self.sun_dir();
         let light_target = if self.daylight {
             Vec3::new(0.4, 0.0, 0.0)
         } else {
@@ -1599,6 +1654,25 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(smoke) = &self.smoke {
+            if !debug_pass {
+                let depth = self.depth.create_view(&wgpu::TextureViewDescriptor {
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                    ..Default::default()
+                });
+                smoke.encode_draw(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.frame_buf,
+                    &self.color_view,
+                    &depth,
+                    &self.shadow_view,
+                );
+            }
         }
 
         if self.debug_contract {
@@ -2467,7 +2541,8 @@ fn make_targets(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: depth_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // Sampled by the smoke march to stop at the opaque scene.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&Default::default());

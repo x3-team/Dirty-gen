@@ -9,6 +9,8 @@ mod niva;
 #[cfg(not(target_arch = "wasm32"))]
 mod bench;
 mod render;
+#[cfg(not(target_arch = "wasm32"))]
+mod smoke_pass;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
