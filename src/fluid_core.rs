@@ -5711,6 +5711,35 @@ impl FluidCore {
         vol
     }
 
+    /// Add a slurry column of `depth(x, z)` metres on top of what the coarse
+    /// cell holds. Returns the cubic metres added. Cells with no depth keep
+    /// their slurry, grain and moisture.
+    pub fn lay_slurry_mask(
+        &mut self,
+        mut depth: impl FnMut(f32, f32) -> f32,
+        grain: Grain,
+        moisture: f32,
+    ) -> f32 {
+        self.restrict_fine();
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut vol = 0.0f32;
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = self.coarse_xz(i, j);
+                let d = depth(x, z);
+                if !(d.is_finite() && d > 0.0) {
+                    continue;
+                }
+                let idx = j * WINDOW_RES + i;
+                self.slurry[idx] += d;
+                self.grain[idx] = grain as u8;
+                self.moisture[idx] = self.moisture[idx].max(moisture.clamp(0.0, 1.0));
+                vol += d * area;
+            }
+        }
+        vol
+    }
+
     /// Multiply the coarse water and slurry by masks in 0..1. A pour can
     /// start as a box and leave as an oval or a pair of ruts.
     pub fn scale_columns(&mut self, mut mask: impl FnMut(f32, f32) -> (f32, f32)) {
