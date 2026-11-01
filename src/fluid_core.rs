@@ -4446,14 +4446,15 @@ pub struct FluidCore {
     fine_us: Vec<f32>,
     fine_vs: Vec<f32>,
     fine_bed: Vec<f32>,
+    /// The fine bed the slurry sheet reads. It differs from `fine_bed` only on
+    /// closed cells, where each sheet meets a wall at its own coarse surface.
+    fine_bed_slurry: Vec<f32>,
     fine_moisture: Vec<f32>,
     fine_grain: Vec<u8>,
     fine_on: bool,
     /// 1 when this coarse cell's sheet was moved onto the 2 cm patch.
     /// Survives `restrict_fine` so the coarse shove does not hit it twice.
     fine_hold: Vec<u8>,
-    /// 1 on fine cells under a held coarse column. The fine sheet's gate.
-    fine_gate: Vec<u8>,
     dust: Vec<f32>,
     dust_u: Vec<f32>,
     dust_v: Vec<f32>,
@@ -4572,11 +4573,11 @@ impl FluidCore {
             fine_us: vec![0.0; fine_n],
             fine_vs: vec![0.0; fine_n],
             fine_bed: vec![0.0; fine_n],
+            fine_bed_slurry: vec![0.0; fine_n],
             fine_moisture: vec![0.0; fine_n],
             fine_grain: vec![Grain::Other as u8; fine_n],
             fine_on: false,
             fine_hold: vec![0; n],
-            fine_gate: vec![0; FINE_RES * FINE_RES],
             dust: vec![0.0; air_n],
             dust_u: vec![0.0; air_n],
             dust_v: vec![0.0; air_n],
@@ -7407,9 +7408,10 @@ impl FluidCore {
                     bed,
                 } = &mut *scratch;
                 let bed = &bed[..n];
+                let bed_slurry: &[f32] = if fine { &self.fine_bed_slurry[..n] } else { bed };
                 let nu_w = &nu_w[..n];
                 let nu_s = &mut nu_s[..n];
-                let gate = if fine { &self.fine_gate[..n] } else { &gate[..n] };
+                let gate = &gate[..n];
                 // Water and slurry are separate sheets: their depth and velocity
                 // arrays do not alias, and both only read the bed, gate, and
                 // mask. Each one steps exactly as it did in series, on its own
@@ -7466,7 +7468,7 @@ impl FluidCore {
                         slurry,
                         us,
                         vs,
-                        bed,
+                        bed_slurry,
                         nu_s,
                         gate,
                         res,
@@ -7733,11 +7735,6 @@ impl FluidCore {
         self.fine_us.fill(0.0);
         self.fine_vs.fill(0.0);
         self.fine_hold.fill(0);
-        // The 2 cm sheet only moves fluid among the cells it holds. The other
-        // fine cells read as dry ground: open, the held columns would drain
-        // into them every step and leave a hole under the patch in deep water.
-        // The coarse sheet carries the exchange across that rim.
-        self.fine_gate.fill(0);
         let full = ((COARSE_CELL_M / FINE_CELL_M).round() as u32).pow(2);
         let r2 = FINE_TIRE_R_M * FINE_TIRE_R_M;
         let (col, row) = self.fine_coarse_axes();
@@ -7778,15 +7775,19 @@ impl FluidCore {
                 self.fine_moisture[fidx] = self.moisture[cidx];
                 self.fine_grain[fidx] = self.grain[cidx];
                 if self.fine_hold[cidx] != 1 {
-                    // A closed cell is a wall at the free surface of its coarse
-                    // column, not dry ground at the bed left from an older patch
-                    // position. Ground there would pull the held edge outward.
-                    let surface = self.water[cidx].max(self.slurry[cidx]);
-                    self.fine_bed[fidx] = self.bed[cidx] + surface;
+                    // A fine cell the patch does not hold carries no fluid. Its
+                    // ground is the free surface of its coarse column (water and
+                    // slurry each at their own), not the bed left from an older
+                    // patch position. Dry ground there was a slope the held edge
+                    // drained down every step: in deep water a hole followed the
+                    // patch. Fluid a tire throws over the rim still lands there
+                    // and goes back to that coarse column.
+                    self.fine_bed[fidx] = self.bed[cidx] + self.water[cidx];
+                    self.fine_bed_slurry[fidx] = self.bed[cidx] + self.slurry[cidx];
                     continue;
                 }
                 self.fine_bed[fidx] = self.bed[cidx];
-                self.fine_gate[fidx] = 1;
+                self.fine_bed_slurry[fidx] = self.bed[cidx];
                 self.fine_water[fidx] = self.water[cidx];
                 self.fine_slurry[fidx] = self.slurry[cidx];
                 self.fine_uw[fidx] = self.uw[cidx];
