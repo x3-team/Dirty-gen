@@ -73,3 +73,8 @@ Release e2e on this Xeon: slurry depth 0.0555 m, puddle depth 0.0893 m, ledger g
 ## Fog on the shared air grid
 
 Contract version is `RENDER_CONTRACT_VERSION`. Fog is binding 12 and valid bit 13 (`VALID_FOG`). Bits 11 and 12 are not this channel. Caps are not raised: solver frame ≤ 7 ms, ThroughDrive solver sum ≤ 7 ms, step p95 ≤ 7 ms, dust ≤ 1.0 ms, e2e step mean ≤ 11.820 ms, air ≤ 1.5 ms. Assert values live in `tests/e2e_niva.rs`. Fog is not injected on the e2e or the frame bench. An empty fog grid is one compare, outside the air timer. The release CI log is the measurement.
+
+## River ford and beach
+
+`tests/ford_beach.rs` steps the ford in `silt::ford`: an open reach with an inlet and an outlet, full-gravity water with Manning bed friction and eddy viscosity, free-surface diffusion, a paddle swell, and the swash soak. None of these run unless a caller sets them, so `World::demo`, `ThroughDrive`, the e2e step, and the creek take the same path as before and the caps above are unchanged. The release log prints `FORD_RIVER ... step_ms` for one `FluidCore::step` of the ford at dt = 1/30 (coarse sheet only, no tires). Cloud container, 4 cores, which runs about three times slower than the CI runners: 4.2 ms with the rocks, the reach, and the swell.
+

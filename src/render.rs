@@ -172,6 +172,10 @@ pub struct Renderer {
     pub niva_picture: bool,
     /// Draw the solved water column, including a bow above the film range.
     pub water_column: bool,
+    /// River or sea shore: the solved column is drawn as the free surface
+    /// (bed + depth) with sky reflection, instead of a film on the bed.
+    /// Implies the `water_column` pack.
+    pub open_water: bool,
     /// Paint the snow layer. Compaction in the darken channel tints the blanket.
     pub snow: bool,
     /// Radial profile of a turn, added on top of `snow_bed` inside the arc.
@@ -1246,6 +1250,7 @@ impl Renderer {
             show_bike: true,
             niva_picture: false,
             water_column: false,
+            open_water: false,
             snow: false,
             snow_arc: None,
             snow_bed: 0.0,
@@ -1510,7 +1515,13 @@ impl Renderer {
                 world.time,
                 self.shadow_res as f32,
                 if self.height_packed { 1.0 } else { 0.0 },
-                if self.water_column { 1.0 } else { 0.0 },
+                if self.open_water {
+                    2.0
+                } else if self.water_column {
+                    1.0
+                } else {
+                    0.0
+                },
             ],
             tires: tire_frame(&world.vehicle),
             snow_arc: [0.0; 4],
@@ -1878,7 +1889,11 @@ impl Renderer {
             // Free water and the mixed body share this channel. The mesh
             // already sits on the slurry, so the tint is that one surface.
             let liquid = soil.water[i] + soil.slurry[i];
-            let liquid_scale = if self.water_column { 0.90 } else { 0.34 };
+            let liquid_scale = if self.water_column || self.open_water {
+                0.90
+            } else {
+                0.34
+            };
             px[1] = ((liquid / liquid_scale).clamp(0.0, 1.0) * 255.0) as u8;
             px[2] = (soil.darken[i].clamp(0.0, 1.0) * 255.0) as u8;
             px[3] = soil.kind[i];
