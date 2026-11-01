@@ -49,4 +49,4 @@ jobs:
           export CXX=g++ CC=gcc
           unset DISPLAY
           RAYON_NUM_THREADS=1 cargo test --release --test puddle_shore -- --test-threads=1 --nocapture
-          cargo test --release --test e2e_niva --test frame_bench --test fog_air -- --nocapture
+          cargo test --release --test e2e_niva --test frame_bench --test fog_air --test ford_beach -- --nocapture

@@ -63,6 +63,8 @@ Pore moisture, 0 dry to 1 saturated. Not the film thickness.
 
 Writer: the fluid sheet's moisture when the sheet is attached, otherwise the soil wetness. With both, the texel is the greater of the two. That is how a wet tire track painted on the soil stays in this map after the sheet is attached. The sheet keeps its own moisture as well: pore moisture is parked with the ground cell when the window follows the Niva, and a disk raised along the drained track is the same channel. Around the puddle the same channel is a wet band: saturated on the floor, still wet on the bank past the shoreline, then back to the pad. A hard step from saturated to the pad is not that band.
 
+On the river ford and beach (`silt::ford`), the sheet also writes the swash into this channel: a cell under at least 3 mm of film is saturated, and once the film has gone it drains back to the pad, sand fastest, silt three times slower, clay eight times slower. The dark band a receding wave leaves on the sand is this channel, not a picture effect. Same channel, same unit; the version does not change.
+
 Valid: `VALID_MOISTURE` is set on every publish.
 
 ### Water and slurry — binding 3
