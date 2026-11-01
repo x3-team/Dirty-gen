@@ -475,6 +475,9 @@ pub struct SurfaceMaps {
     pub dust: Vec<f32>,
 }
 
+/// How far, in coarse cells, a rut shoves the slurry it scrapes off.
+const SHOVE_RING: i32 = 4;
+
 /// Closed account inside this module. Spray is volume already given to particles.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FluidLedger {
@@ -4841,6 +4844,8 @@ pub struct FluidCore {
     seat_is_rut: Vec<bool>,
     seat_floor: Vec<bool>,
     seat_etas: Vec<f32>,
+    /// Rut slurry shoved off the cut this seat: (cell, metres).
+    seat_shove: Vec<(u32, f32)>,
     /// CFL substep cap on the 2 cm sheet. Eight is the full split. The coarse
     /// sheet always uses eight.
     fine_sub_cap: f32,
@@ -4955,6 +4960,7 @@ impl FluidCore {
             seat_is_rut: vec![false; n],
             seat_floor: vec![false; n],
             seat_etas: Vec::with_capacity(n),
+            seat_shove: Vec::new(),
             fine_sub_cap: 8.0,
             fine_pace: 0,
             sheet_times: SheetTimes::default(),
@@ -5571,6 +5577,7 @@ impl FluidCore {
             .seat_etas
             .select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut excess = 0.0_f32;
+        self.seat_shove.clear();
         let rad = 8i32;
         let cut_wet = (0..n * n).any(|idx| self.seat_is_rut[idx] && self.water[idx] >= 0.012);
         // Reuse the pond scratch planes: a fresh 160 KB pair per step is a
@@ -5612,6 +5619,7 @@ impl FluidCore {
             }
             let slurry_room = (eta - self.seat_pressed[idx] - self.water[idx]).max(0.0);
             if self.slurry[idx] > slurry_room + 0.004 {
+                self.seat_shove.push((idx as u32, self.slurry[idx] - slurry_room));
                 self.slurry[idx] = slurry_room;
             }
         }
@@ -5633,6 +5641,7 @@ impl FluidCore {
                 self.slurry[idx] = slurry_room;
             }
         }
+        self.shove_rut_slurry();
         if excess > 1.0e-8 {
             let mut room = 0.0_f32;
             for idx in 0..n * n {
@@ -5649,6 +5658,55 @@ impl FluidCore {
             }
         }
         Some(eta)
+    }
+
+    /// Slurry scraped off a rut goes to the nearest cells beside the cut, in
+    /// equal shares: the tire shoves mud aside, it does not destroy it.
+    fn shove_rut_slurry(&mut self) {
+        let n = WINDOW_RES as i32;
+        let mut shove = std::mem::take(&mut self.seat_shove);
+        for &(idx, metres) in &shove {
+            let idx = idx as usize;
+            let (i, j) = ((idx % WINDOW_RES) as i32, (idx / WINDOW_RES) as i32);
+            let mut took = false;
+            for d in 1..=SHOVE_RING {
+                let mut count = 0u32;
+                for pass in 0..2 {
+                    let share = if pass == 0 { 0.0 } else { metres / count as f32 };
+                    for jj in (j - d).max(0)..=(j + d).min(n - 1) {
+                        for ii in (i - d).max(0)..=(i + d).min(n - 1) {
+                            if (ii - i).abs().max((jj - j).abs()) != d {
+                                continue;
+                            }
+                            let k = jj as usize * WINDOW_RES + ii as usize;
+                            if self.seat_is_rut[k] {
+                                continue;
+                            }
+                            if pass == 0 {
+                                count += 1;
+                            } else {
+                                if self.slurry[k] <= 1.0e-6 {
+                                    self.grain[k] = self.grain[idx];
+                                }
+                                self.slurry[k] += share;
+                            }
+                        }
+                    }
+                    if count == 0 {
+                        break;
+                    }
+                }
+                if count > 0 {
+                    took = true;
+                    break;
+                }
+            }
+            if !took {
+                self.slurry[idx] += metres;
+            }
+        }
+        shove.clear();
+        self.seat_shove = shove;
     }
 
     fn take_column(&mut self, x: f32, z: f32, volume: f32, water: bool) -> f32 {
@@ -11347,6 +11405,39 @@ mod tests {
             c1 > c0 + 1.5,
             "slurry did not run downhill, centroid {c0:.2} -> {c1:.2}"
         );
+    }
+
+    #[test]
+    fn seat_shoves_rut_slurry_beside_the_cut() {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        fluid.pour_water(-3.0, 3.0, -3.0, 3.0, 0.05);
+        let rut = |x: f32, z: f32| x.abs() < 0.3 && z.abs() < 1.0;
+        fluid.lay_slurry_mask(|x, z| if rut(x, z) { 0.08 } else { 0.0 }, Grain::Clay, 0.6);
+        let before = fluid.ledger().slurry_m3;
+        let eta = fluid
+            .seat_rut_water(|_i, _j, x, z| if rut(x, z) { (-0.05, true) } else { (0.0, false) })
+            .expect("pond floor");
+        assert!((eta - 0.05).abs() < 1.0e-4, "pond surface {eta}");
+        let after = fluid.ledger().slurry_m3;
+        assert!(
+            (after - before).abs() <= 1.0e-5 * before,
+            "seat changed slurry {before} -> {after}"
+        );
+        let mut lip = 0.0f32;
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = fluid.coarse_xz(i, j);
+                let slurry = fluid.slurry[j * WINDOW_RES + i];
+                if rut(x, z) {
+                    assert!((slurry - 0.05).abs() < 1.0e-4, "rut slurry {slurry} at {x} {z}");
+                } else if slurry > 0.0 {
+                    let off = (x.abs() - 0.3).max(z.abs() - 1.0);
+                    assert!(off < 1.0, "slurry {slurry} thrown to {x} {z}");
+                    lip = lip.max(slurry);
+                }
+            }
+        }
+        assert!(lip > 0.01, "nothing shoved beside the cut: {lip}");
     }
 
     #[test]
