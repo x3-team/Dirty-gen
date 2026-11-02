@@ -61,13 +61,15 @@ shot can be lined up with its reference without a rebuild.
 | wade-buoys | ue5-100 | walker, buoys and rock in the shallows |
 | wade-rock | ue5-99 | shallows around a rock, walker close up |
 | turbid-water | ue5-100 | brown river (`river-muddy`: inflow carries silt) with the Niva's plume and foam |
-| smoke-column | ue5-89 | missing: no point-source smoke yet |
+| smoke-column | ue5-89 | two cold smoke vents in still air (`silt::smoke`, wgpu compute) |
+| fire | none | open flame beside the parked Niva (`silt::smoke`) |
 
 A `missing` scene renders a card that names what is missing instead of a
 drawn substitute. When a solver scene lands (ford & beach, dust & fog),
 add a preset in `src/bench.rs` and switch the line from `missing`.
 
-Out of scope: fire, aurora, underwater grass, blood (also in the UE5 set).
+Out of scope: aurora, underwater grass, blood (also in the UE5 set). Smoke
+and fire need compute: on an adapter without it the bench prints a skip.
 
 ## References
 
