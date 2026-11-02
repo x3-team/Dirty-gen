@@ -10,8 +10,9 @@
 //!
 //! * `preset` is `drive` (the Niva through-drive: puddle, slurry ruts, dry
 //!   exit with dust), `snow` (snow blanket with ruts and turn circles) or
-//!   `missing` (no solver scene yet; nothing is rendered and the SBS shows
-//!   the title as the reason).
+//!   `smoke` / `fire` (`silt::smoke` grid beside the parked Niva, `stop` in
+//!   seconds; needs compute, skipped on WebGL2), or `missing` (no solver
+//!   scene yet; nothing is rendered and the SBS shows the title as the reason).
 //! * `stop` is the chassis z where the drive still is taken. Unused for snow.
 //! * `frame` is `car` (x forward, y up, z right of the Niva) or `world`.
 //!
@@ -37,7 +38,7 @@ pub struct BenchScene {
     pub target: Vec3,
 }
 
-pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
+pub(crate) fn parse_scenes(text: &str) -> Vec<BenchScene> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -71,7 +72,7 @@ pub fn parse_scenes(text: &str) -> Vec<BenchScene> {
     out
 }
 
-fn pose(scene: &BenchScene, world: &World) -> CameraPose {
+pub(crate) fn pose(scene: &BenchScene, world: &World) -> CameraPose {
     if !scene.car_frame {
         return CameraPose {
             eye: scene.eye,
@@ -91,7 +92,7 @@ fn pose(scene: &BenchScene, world: &World) -> CameraPose {
 }
 
 /// Camera in the first walker's frame: x forward, y up, z right.
-fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
+pub(crate) fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose {
     let Some(w) = bodies.walkers.first() else {
         return CameraPose {
             eye: scene.eye,
@@ -111,7 +112,7 @@ fn walker_pose(scene: &BenchScene, bodies: &silt::bodies::Bodies) -> CameraPose 
     }
 }
 
-fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
+pub(crate) fn save(path: &Path, width: u32, height: u32, rgba: &[u8], scene: &BenchScene, cam: CameraPose) {
     write_png(path, width, height, rgba).expect("bench png");
     println!(
         "bench {} {} eye=({:.2},{:.2},{:.2}) target=({:.2},{:.2},{:.2})",
@@ -185,7 +186,13 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
 
     // River ford with rocks (`river`) and the same ford with a swell on the
     // beach (`beach`). `stop` is seconds since the Niva started.
-    for (preset, swell) in [("river", None), ("beach", Some(silt::ford::Swell::default()))] {
+    // `river-muddy` is the same ford on a brown river: the inflow carries
+    // silt (RiverReach::inlet_turbidity), the Niva's plume adds to it.
+    for (preset, swell, silt) in [
+        ("river", None, 0.0),
+        ("river-muddy", None, RIVER_MUDDY_TURBIDITY),
+        ("beach", Some(silt::ford::Swell::default()), 0.0),
+    ] {
         let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
         if shots.is_empty() {
             continue;
@@ -196,7 +203,7 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
         renderer.niva_picture = true;
         renderer.water_column = true;
         renderer.open_water = true;
-        let mut ford = silt::ford::FordDrive::new(swell, 4.0);
+        let mut ford = silt::ford::FordDrive::new_turbid(swell, 4.0, silt);
         let dt = 1.0 / 60.0;
         for scene in shots {
             while ford.time_s < scene.stop {
@@ -242,10 +249,76 @@ pub fn run(renderer: &mut Renderer, width: u32, height: u32, out: &Path, scenes_
 
     renderer.open_water = false;
 
+    // Point-source smoke (`smoke`: two cold vents like the UE5 column) and an
+    // open fire (`fire`) beside the parked Niva. `stop` is seconds of smoke.
+    for preset in ["smoke", "fire"] {
+        let mut shots: Vec<&BenchScene> = scenes.iter().filter(|s| s.preset == preset).collect();
+        if shots.is_empty() {
+            continue;
+        }
+        shots.sort_by(|a, b| a.stop.total_cmp(&b.stop));
+        renderer.show_hills = false;
+        renderer.daylight = false;
+        renderer.niva_picture = true;
+        renderer.water_column = false;
+        let world = World::flat(0.12);
+        let (config, sources) = smoke_scene(preset, &world);
+        if !renderer.enable_smoke(config) {
+            println!("bench {preset}: no compute on this adapter, skipped");
+            continue;
+        }
+        if let Some(pass) = renderer.smoke_mut() {
+            pass.sim.sources = sources;
+        }
+        let dt = 1.0 / 30.0;
+        let mut t = 0.0f32;
+        for scene in shots {
+            while t < scene.stop {
+                renderer.step_smoke(dt);
+                t += dt;
+            }
+            if let Some(st) = renderer.smoke_stats() {
+                println!("bench {} smoke {st:?}", scene.id);
+            }
+            let cam = pose(scene, &world);
+            let rgba = renderer.draw(&world, cam, None, true).expect("readback");
+            save(&dir.join(format!("{}.png", scene.id)), width, height, &rgba, scene, cam);
+        }
+        renderer.disable_smoke();
+    }
+
     for scene in scenes.iter().filter(|s| s.preset == "missing") {
         println!("bench {} missing: no solver scene yet", scene.id);
     }
 }
+
+/// Grid and sources for the `smoke` and `fire` presets, 3.6 m left of the
+/// Niva parked at the origin.
+pub fn smoke_scene(
+    preset: &str,
+    world: &World,
+) -> (silt::smoke::SmokeConfig, Vec<silt::smoke::FireSource>) {
+    use silt::smoke::{FireSource, SmokeConfig};
+    let centre = Vec3::new(-3.6, 0.0, 0.0);
+    let ground = world.soil.sample(centre.x, centre.z).height;
+    let c = Vec3::new(centre.x, ground, centre.z);
+    if preset == "fire" {
+        let cfg = SmokeConfig::around(c, 3.6, 5.4, 0.075);
+        (cfg, vec![FireSource::campfire(c + Vec3::new(0.0, 0.12, 0.0))])
+    } else {
+        let cfg = SmokeConfig::around(c, 4.8, 6.0, 0.08);
+        (
+            cfg,
+            vec![
+                FireSource::smoke_vent(c + Vec3::new(1.1, 0.15, 0.2)),
+                FireSource::smoke_vent(c + Vec3::new(-1.0, 0.15, -0.3)),
+            ],
+        )
+    }
+}
+
+/// Silt the `river-muddy` bench river carries, volume of solids per water.
+const RIVER_MUDDY_TURBIDITY: f32 = 0.08;
 
 #[cfg(test)]
 mod tests {
@@ -258,7 +331,7 @@ mod tests {
         assert!(scenes.len() >= 5);
         for s in &scenes {
             assert!(
-                ["drive", "snow", "river", "beach", "wade", "missing"].contains(&s.preset.as_str()),
+                ["drive", "snow", "river", "river-muddy", "beach", "wade", "smoke", "fire", "missing"].contains(&s.preset.as_str()),
                 "{}",
                 s.id
             );

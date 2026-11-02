@@ -32,6 +32,25 @@ it to the coarse ring: a 20 cm hole follows the patch. Tires in deep ford
 water would show the same. A body that is under a tire's patch anyway is
 filled on the fine grid too.
 
+## Foam and drops
+
+Where a body cuts the free surface (`wet_splash`, after the ring is read),
+it foams the waterline once its bow breaks. The sheet derives each body's
+speed from the positions it is handed, takes the ring's current off it and
+forms the body Froude number `U / sqrt(g D)`, with `D` the waterline width.
+The bow sheet of a surface-piercing cylinder breaks from about 0.5 and is
+fully broken and ventilated by about 1.4 (Chaplin & Teigen 2003); below the
+slowest water wave, 0.23 m/s, nothing breaks. A body dropping through the
+surface throws a crown on the same law with its entry speed. The foam goes
+into the #104 tracer field (`add_foam`), whose pass carries and decays it, so
+a wading leg leaves a trail and a buoy riding the swell in place leaves none.
+
+Past 0.6 m/s the broken sheet sheds drops, `Q = 0.02 · D² · (v − 0.6)` m³/s,
+taken from the ring cells as water and booked on `spray_m3`. A 13 cm leg
+swinging at 2 m/s throws about half a litre a second; four seconds of wading
+throw 1.5 l, a 44 cm ball dropped from 60 cm throws 0.8 l. The drops are the
+spray buffer's `kind 0`, so the contract and the renderer already carry them.
+
 ## Ground
 
 `Ground` is what a body stands on: `surface`, `pressure(x, z, y)`, `mu`,
@@ -69,7 +88,9 @@ agreeing with the sheet's displaced volume; a dropped ball's ring at 1.2 m
 (+1.2 cm / −1.1 cm); a rock that sinks and sits in the sand; a bow over the
 trough at a wading leg; prints in damp sand (1.6 cm, rim 5 mm, one per step),
 a groove and berm from a ball in mud, 10 cm boot prints in fresh snow; water,
-imprint and snow ledgers closed; no hole left after a body leaves.
+imprint and snow ledgers closed; no hole left after a body leaves; foam at
+wading legs and in a trail behind, a crown of rising drops from an impact,
+no foam and no drops from a buoy at rest; water plus drops closed.
 
 `capture --bench out --bench-scenes bench/scenes.txt` renders `wade-swash`,
 `wade-buoys`, `wade-rock`. `SILT_BODIES_DUMP=dir cargo test --release --test
@@ -83,6 +104,6 @@ maps.
   any binding yet. Both need a fine window: the prints fit the `track_fine`
   layout of #123 (R surface over ground), the water needs a persistent fine
   sheet (the GPU sheet, M4) or a closed-rim fine patch.
-- Splash and foam from legs and buoys (spray and foam bindings exist; no
-  source from bodies yet).
+- Foam is on the 20 cm grid, so a leg's ring is two or three cells. Main's
+  shader does not draw contract foam yet; #135 does (binding 9 foam).
 - Boxes do not tip; the walker is kinematic above the soles, not a ragdoll.

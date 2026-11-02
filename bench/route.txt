@@ -1,0 +1,30 @@
+# The Niva route: one run, legs in the order the car meets them, one still per
+# segment, Silt left, reference right. Same format as bench/scenes.txt.
+# Run: capture --software --route out/route && python3 tools/bench_sbs.py out/route --scenes bench/route.txt
+#
+# id  preset  stop  frame  eye(x y z)  target(x y z)  ref  title
+#
+# preset: route-drive = leg 1, ThroughDrive (puddle z -19..-11, clay slurry
+#                       ruts z -14..-1, dry exit with dust after z 0); stop = chassis z
+#         route-crust = leg 2, drying pad: cracked clay lanes, grass/sand/gravel
+#                       seams at z 3.4..8; stop unused
+#         route-shore = leg 3, ford with swell: Niva off the beach (starts 2.5 m
+#                       above the waterline) into the river, a walker in the
+#                       shallows to its right; stop = seconds
+#         route-snow  = leg 4, 30 cm snow on the 2.5 cm track, straight, left
+#                       turn, straight; stop = seconds
+# frame: car = x forward, y up, z right of the Niva; world; walker.
+# Snow cameras look +x/+z like the snow-track proof: the ruts have no AO, so
+# with the sun behind the camera they wash out (see docs/ROUTE.md).
+# No SnowRunner shot is in the refs set; every reference is a UE5 fluid-mod frame.
+
+puddle     route-drive  -15.0  car    -5.0 2.2 -3.5    1.0 0.2 0.5    ue5-104.jpg  Puddle: Niva through standing water, bow wave and wake
+mud        route-drive   -7.0  car    -5.0 4.5 -3.0    1.0 0.0 0.5    ue5-105.jpg  Mud: clay slurry ruts behind the wheels
+dust       route-drive   10.0  car     3.0 3.0 -6.5   -5.0 0.8 0.0    ue5-93.jpg   Dust: dry exit, cloud behind the car in the wind
+crust      route-crust    0.0  world  -3.0 3.6 -5.5    0.0 0.3 3.0    ue5-video-mud-10s.jpg  Dried clay: cracked crust in the lanes, grass/sand/gravel seams
+sand       route-shore    2.0  car    -6.0 3.5 -3.0    1.5 0.0 0.0    ue5-98.jpg   Sand shallows: Niva off the beach into the swash, walker beside it
+walker     route-shore    6.0  world  -6.5 1.8 0.0     -2.4 0.4 4.0   ue5-100.jpg  Walker knee-deep in the shallows, buoys, wake of the car
+ford       route-shore    9.0  car    -8.0 2.6 -4.0    1.0 0.3 0.0    ue5-104.jpg  Ford: car mid-river, wake, splash, foam at the wheels
+plume      route-shore   14.0  car    -9.0 4.0 -3.0    3.0 0.0 1.0    ue5-103.jpg  River: brown silt plume drifting downstream, foam at rocks
+snow-ruts     route-snow     4.5  world  -15.5 4.5 -6.5  -10.5 0.3 1.0   ue5-96.jpg   Deep snow: ruts and berms behind the car
+snow-turn     route-snow     9.0  world  -12.6 10.4 -6.2  -6.0 0.3 4.0   ue5-97.jpg   Deep snow: the turn from above, berms and belly cut

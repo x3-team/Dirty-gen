@@ -150,6 +150,18 @@ pub(super) struct WetState {
     pub(super) lift_f: Vec<(u32, f32)>,
     displaced: Vec<f32>,
     loads: Vec<WetLoad>,
+    /// Where each body was when it last moved, and how fast: the sheet
+    /// derives body speed from the positions it is handed.
+    track: Vec<Track>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Track {
+    id: u32,
+    pos: [f32; 3],
+    vel: [f32; 3],
+    /// Seconds since `pos` last changed.
+    since: f32,
 }
 
 impl WetState {
@@ -166,6 +178,7 @@ impl WetState {
         self.occ_cells.clear();
         self.lift_c.clear();
         self.lift_f.clear();
+        self.track.clear();
     }
 }
 
@@ -434,6 +447,189 @@ impl FluidCore {
         if self.wet.bodies.is_empty() {
             self.wet.forget_cells();
         }
+    }
+}
+
+/// Slowest wave on water (capillary-gravity minimum, 0.23 m/s). A body moving
+/// slower than this through the surface makes no breaking bow and no foam.
+const WAVE_MIN_M_S: f32 = 0.23;
+/// Body Froude number `U / sqrt(g D)` where the bow wave at the waterline
+/// starts to break, and where it is fully broken and ventilated (surface
+/// piercing cylinders, Chaplin & Teigen 2003: run-up sheet breaks near 0.5,
+/// the lee cavity opens by about 1.4).
+const BOW_FR_START: f32 = 0.5;
+const BOW_FR_FULL: f32 = 1.4;
+/// Entry Froude number `w / sqrt(g D)` where an impact throws a crown.
+const ENTRY_FR_START: f32 = 0.3;
+const ENTRY_FR_FULL: f32 = 1.2;
+/// Speed past which the waterline sheds drops, m/s.
+const SPLASH_M_S: f32 = 0.6;
+/// Drop flux off a broken waterline, `Q = C · D² · (v − SPLASH_M_S)` m³/s:
+/// a bow sheet about a tenth of the body wide and thick, a fifth of it
+/// leaving as drops. A 13 cm leg swinging at 2 m/s sheds about 0.5 l/s.
+const SPLASH_C: f32 = 0.02;
+/// A position held longer than this means the body stopped.
+const TRACK_STALE_S: f32 = 0.25;
+
+/// Lowest point of a body and its centre height.
+fn shape_heights(shape: &WetShape) -> (f32, f32) {
+    match *shape {
+        WetShape::Sphere { cy, r } => (cy - r, cy),
+        WetShape::Box { bottom, top, .. } | WetShape::Column { bottom, top, .. } => (bottom, 0.5 * (bottom + top)),
+    }
+}
+
+/// Radius of the body's cut through a free surface at `eta`; 0 when it does
+/// not pierce it.
+fn waterline_radius(shape: &WetShape, eta: f32) -> f32 {
+    match *shape {
+        WetShape::Sphere { cy, r } => {
+            let d = eta - cy;
+            if d.abs() >= r {
+                0.0
+            } else {
+                (r * r - d * d).sqrt()
+            }
+        }
+        WetShape::Box { half_l, half_w, bottom, top, .. } => {
+            if eta <= bottom || eta >= top {
+                0.0
+            } else {
+                (4.0 * half_l * half_w / std::f32::consts::PI).sqrt()
+            }
+        }
+        WetShape::Column { r, bottom, top } => {
+            if eta <= bottom || eta >= top {
+                0.0
+            } else {
+                r
+            }
+        }
+    }
+}
+
+impl FluidCore {
+    /// Foam and drops where a body cuts the free surface, after
+    /// [`Self::wet_finish`]. The bow of a moving body breaks once its Froude
+    /// number `U / sqrt(g D)` passes the breaking range, so a slow buoy
+    /// bobbing in place makes none and a striding leg or a rolling ball does.
+    /// An entry through the surface throws a crown the same way. Foam goes
+    /// into the tracer field from #104 and is carried by its pass. Drops are
+    /// water taken from the ring cells, so the book closes on `spray_m3`.
+    pub(super) fn wet_splash(&mut self, dt: f32) -> Vec<SprayEvent> {
+        let mut out = Vec::new();
+        if !(dt > 0.0) || !dt.is_finite() {
+            return out;
+        }
+        let mut track = std::mem::take(&mut self.wet.track);
+        let mut next: Vec<Track> = Vec::with_capacity(self.wet.bodies.len());
+        let bodies = std::mem::take(&mut self.wet.bodies);
+        for b in &bodies {
+            let (lo, cy) = shape_heights(&b.shape);
+            let pos = [b.x, cy, b.z];
+            let t = match track.iter().position(|t| t.id == b.id) {
+                Some(k) => {
+                    let mut t = track.swap_remove(k);
+                    t.since += dt;
+                    if pos != t.pos {
+                        for a in 0..3 {
+                            t.vel[a] = (pos[a] - t.pos[a]) / t.since;
+                        }
+                        t.pos = pos;
+                        t.since = 0.0;
+                    } else if t.since > TRACK_STALE_S {
+                        t.vel = [0.0; 3];
+                    }
+                    t
+                }
+                None => Track { id: b.id, pos, vel: [0.0; 3], since: 0.0 },
+            };
+            next.push(t);
+            let Some(load) = self.wet.loads.iter().find(|l| l.id == b.id).copied() else {
+                continue;
+            };
+            if !load.wet || load.depth_m < 0.004 {
+                continue;
+            }
+            let eta = load.surface_y;
+            let r_wl = waterline_radius(&b.shape, eta);
+            if r_wl <= 1.0e-3 || !t.vel.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let d = 2.0 * r_wl;
+            let ux = t.vel[0] - load.flow_u;
+            let uz = t.vel[2] - load.flow_v;
+            let u = ux.hypot(uz);
+            // Entry: the lowest point just went under, moving down.
+            let w = if t.vel[1] < 0.0 && lo < eta && lo > eta - d { -t.vel[1] } else { 0.0 };
+            let gd = (GRAVITY * d).sqrt();
+            let bow = if u > WAVE_MIN_M_S { smoothstep(BOW_FR_START, BOW_FR_FULL, u / gd) } else { 0.0 };
+            let crown = if w > WAVE_MIN_M_S { smoothstep(ENTRY_FR_START, ENTRY_FR_FULL, w / gd) } else { 0.0 };
+            let prod = bow.max(crown);
+            if prod <= 0.0 {
+                continue;
+            }
+            // The ring the waterline sits in, one cell either side.
+            let inner = (r_wl - 0.5 * COARSE_CELL_M).max(0.0);
+            let outer = r_wl + 1.35 * COARSE_CELL_M;
+            let (i0, i1) = index_span(self.origin[0], COARSE_CELL_M, WINDOW_RES, b.x, outer);
+            let (j0, j1) = index_span(self.origin[1], COARSE_CELL_M, WINDOW_RES, b.z, outer);
+            let mut ring: Vec<(usize, f32, f32, f32)> = Vec::new();
+            for j in j0..j1 {
+                for i in i0..i1 {
+                    let (x, z) = self.coarse_xz(i, j);
+                    let dist = (x - b.x).hypot(z - b.z);
+                    if dist < inner || dist > outer {
+                        continue;
+                    }
+                    let idx = j * WINDOW_RES + i;
+                    if self.water[idx] + self.slurry[idx] < 0.004 {
+                        continue;
+                    }
+                    let band = 1.0 - ((dist - r_wl).abs() / (1.35 * COARSE_CELL_M)).clamp(0.0, 1.0);
+                    self.add_foam(idx, prod * band.max(0.35), dt);
+                    if self.foam_live_mark.get(idx) == Some(&0) && self.foam[idx] > 1.0e-4 {
+                        self.foam_live_mark[idx] = 1;
+                        self.foam_live.push(idx as u32);
+                    }
+                    ring.push((idx, x, z, dist));
+                }
+            }
+            // Drops: the part of the broken bow sheet that leaves the water.
+            let v = u.max(w);
+            if v <= SPLASH_M_S || ring.is_empty() {
+                continue;
+            }
+            let runup = (v * v / (2.0 * GRAVITY)).min(0.5);
+            let total = SPLASH_C * prod * d * d * (v - SPLASH_M_S) * dt;
+            let per = total / ring.len() as f32;
+            let area = COARSE_CELL_M * COARSE_CELL_M;
+            for &(idx, x, z, dist) in &ring {
+                let take = (per / area).min(self.water[idx] * 0.04).min(0.004);
+                if take * area < 1.0e-7 {
+                    continue;
+                }
+                self.water[idx] -= take;
+                let (nx, nz) = if dist > 1.0e-4 { ((x - b.x) / dist, (z - b.z) / dist) } else { (0.0, 0.0) };
+                // Ahead of a moving body the sheet rides up its face; an entry
+                // throws the crown straight out.
+                let fwd = if u > 1.0e-3 { (nx * ux + nz * uz) / u } else { 0.0 };
+                let out_s = 0.5 * v;
+                out.push(SprayEvent {
+                    x: b.x + nx * r_wl,
+                    y: eta + 0.02,
+                    z: b.z + nz * r_wl,
+                    vx: t.vel[0] * 0.6 + nx * out_s,
+                    vy: (2.0 * GRAVITY * runup).sqrt() * (0.6 + 0.4 * fwd.max(0.0)) + 0.4 * w,
+                    vz: t.vel[2] * 0.6 + nz * out_s,
+                    volume: take * area,
+                    kind: 0,
+                });
+            }
+        }
+        self.wet.bodies = bodies;
+        self.wet.track = next;
+        out
     }
 }
 

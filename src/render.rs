@@ -161,6 +161,15 @@ pub struct Renderer {
     water_fx_tex: wgpu::Texture,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    /// Format of `color` and of the scene copies (see [`GpuFormats::scene`]).
+    scene_format: wgpu::TextureFormat,
+    /// Tone-mapped 8-bit copy of `color`. `None` when `color` is already 8-bit.
+    ldr: Option<(wgpu::Texture, wgpu::TextureView)>,
+    tonemap_bg: Option<wgpu::BindGroup>,
+    pipe_tonemap: wgpu::RenderPipeline,
+    /// Post-processing prototype (`SILT_POST=1`, docs/LOOK_GAP.md). When on,
+    /// the blit and the capture readback read its output instead of `color`.
+    post: Option<crate::post::Post>,
     scene_color: wgpu::Texture,
     scene_color_view: wgpu::TextureView,
     reflect_color: wgpu::Texture,
@@ -235,6 +244,10 @@ pub struct Renderer {
     blit_bg: wgpu::BindGroup,
     pipe_blit: wgpu::RenderPipeline,
     pipe_blit_srgb: wgpu::RenderPipeline,
+    /// Blit that tone-maps the HDR target on the way to the window
+    /// (plain, to-sRGB). Saves the separate tonemap pass when nothing
+    /// else needs the 8-bit copy.
+    pipe_blit_hdr: [wgpu::RenderPipeline; 2],
     blit_shader: wgpu::ShaderModule,
     blit_layout: wgpu::PipelineLayout,
     present_format: Option<wgpu::TextureFormat>,
@@ -311,21 +324,59 @@ pub struct Renderer {
     /// The dust and fog march runs at half resolution into this target and
     /// is upsampled over the frame (`pipe_fog_up`): a quarter of the pixels.
     fog_half_view: wgpu::TextureView,
+    /// Group 5 of the dust march: smoke and fire (`SmokePass::volume_group`),
+    /// or an empty volume when no smoke runs.
+    smoke_bgl: wgpu::BindGroupLayout,
+    smoke_empty_bg: wgpu::BindGroup,
     fog_up_bgl: wgpu::BindGroupLayout,
     fog_up_bg: wgpu::BindGroup,
     pipe_fog_up: Option<wgpu::RenderPipeline>,
+    /// `pipe_fog_up` into the HDR target, for `SILT_POST`. Without post the
+    /// cloud goes over the tone-mapped 8-bit picture, as it was tuned.
+    pipe_fog_up_hdr: Option<wgpu::RenderPipeline>,
     /// Top-down debug view of the render contract. Off for the Niva picture.
     pub debug_contract: bool,
     /// Field shown by the debug view. See `docs/RENDER_CONTRACT.md`.
     pub debug_mode: u32,
     /// Set by [`Renderer::enable_gpu_time`]. Absent for the window and for captures.
     gpu_time: Option<GpuTime>,
+    /// Smoke and fire grid and its march. `None` unless a scene enables it.
+    #[cfg(not(target_arch = "wasm32"))]
+    smoke: Option<crate::smoke_pass::SmokePass>,
 }
 
 pub struct GpuFormats {
     pub depth: wgpu::TextureFormat,
     pub height: wgpu::TextureFormat,
     pub height_packed: bool,
+    /// Scene colour target. `Rgba16Float` (linear light, tone curve in the
+    /// tonemap pass) when the adapter can render, blend and filter it;
+    /// otherwise `Rgba8Unorm` with the curve applied in the scene shaders.
+    pub scene: wgpu::TextureFormat,
+}
+
+/// Final 8-bit picture: what the blit, the overlay and the capture read.
+const LDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// `SILT_HDR=0` forces the old 8-bit scene target (A/B checks, odd drivers).
+fn hdr_allowed() -> bool {
+    std::env::var("SILT_HDR").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+fn pick_scene_format(adapter: &wgpu::Adapter) -> wgpu::TextureFormat {
+    let hdr = wgpu::TextureFormat::Rgba16Float;
+    let f = adapter.get_texture_format_features(hdr);
+    let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
+    let flags = wgpu::TextureFormatFeatureFlags::BLENDABLE
+        | wgpu::TextureFormatFeatureFlags::FILTERABLE;
+    if hdr_allowed() && f.allowed_usages.contains(usage) && f.flags.contains(flags) {
+        hdr
+    } else {
+        LDR_FORMAT
+    }
 }
 
 pub fn gpu_formats(adapter: &wgpu::Adapter) -> GpuFormats {
@@ -353,12 +404,14 @@ pub fn gpu_formats(adapter: &wgpu::Adapter) -> GpuFormats {
             depth,
             height: rg,
             height_packed: false,
+            scene: pick_scene_format(adapter),
         }
     } else {
         GpuFormats {
             depth,
             height: wgpu::TextureFormat::Rgba8Unorm,
             height_packed: true,
+            scene: pick_scene_format(adapter),
         }
     }
 }
@@ -1055,11 +1108,15 @@ impl Renderer {
             ],
         });
 
-        let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&device, width, height, formats.depth);
+        let scene_format = formats.scene;
+        let (color, color_view, depth, depth_view, readback, padded_row, ldr) =
+            make_targets(&device, width, height, formats.depth, scene_format);
+        let post = crate::post::enabled().then(|| {
+            crate::post::Post::new(&device, &quality, width, height, &color_view, ldr.is_some())
+        });
         let reflect_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reflect-readback"),
-            size: padded_row as u64 * height as u64,
+            size: reflect_row(width, scene_format) as u64 * height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1076,7 +1133,7 @@ impl Renderer {
             scene_depth_view,
             reflect_depth,
             reflect_depth_view,
-        ) = make_scene_targets(&device, width, height, formats.depth);
+        ) = make_scene_targets(&device, width, height, formats.depth, scene_format);
         let scene_samp = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scene-samp"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -1130,7 +1187,11 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&color_view),
+                    resource: wgpu::BindingResource::TextureView(final_view(
+                        post.as_ref(),
+                        ldr.as_ref(),
+                        &color_view,
+                    )),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1235,7 +1296,7 @@ impl Renderer {
             bind_group_layouts: &water_groups,
             push_constant_ranges: &[],
         });
-        let (scene_copy, scene_copy_view) = make_scene_copy(&device, width, height);
+        let (scene_copy, scene_copy_view) = make_scene_copy(&device, width, height, scene_format);
         let fog_up_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fog-up"),
             entries: &[
@@ -1260,7 +1321,7 @@ impl Renderer {
         let (fog_half_view, fog_up_bg) = make_fog_half(&device, &fog_up_bgl, width, height);
         let (air_noise_view, air_samp) = make_air_noise(&device, &queue);
         let ssr = make_ssr(&device, width, height);
-        let planar = make_planar(&device, width, height, formats.depth);
+        let planar = make_planar(&device, width, height, formats.depth, scene_format);
         let post_bg = make_post_bg(
             &device,
             &post_bgl,
@@ -1299,7 +1360,7 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
-        let color_format = wgpu::TextureFormat::Rgba8Unorm;
+        let color_format = scene_format;
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow-layout"),
             bind_group_layouts: &[&frame_bgl, &height_bgl, &model_bgl],
@@ -1483,7 +1544,7 @@ impl Renderer {
             "vs_shadow_terrain",
             Some("fs_shadow"),
             terrain_buffers(),
-            color_format,
+            LDR_FORMAT,
             Some(shadow_depth_state(formats.depth)),
             false,
             Some(wgpu::Face::Back),
@@ -1531,7 +1592,7 @@ impl Renderer {
             "vs_shadow_terrain_lod",
             Some("fs_shadow"),
             TerrainGeometry::buffers(),
-            color_format,
+            LDR_FORMAT,
             Some(shadow_depth_state(formats.depth)),
             false,
             Some(wgpu::Face::Back),
@@ -1543,7 +1604,7 @@ impl Renderer {
             "vs_shadow_mesh",
             Some("fs_shadow"),
             mesh_buffers(),
-            color_format,
+            LDR_FORMAT,
             Some(shadow_depth_state(formats.depth)),
             false,
             Some(wgpu::Face::Back),
@@ -1555,7 +1616,7 @@ impl Renderer {
             "vs_blit",
             Some("fs_blit"),
             &[],
-            color_format,
+            LDR_FORMAT,
             None,
             false,
             None,
@@ -1567,16 +1628,25 @@ impl Renderer {
             "vs_blit",
             Some("fs_blit_tosrgb"),
             &[],
-            color_format,
+            LDR_FORMAT,
             None,
             false,
             None,
         );
-        // Dust volume. Only with the contract: it marches the dust_fog grid.
+        let (smoke_bgl, smoke_empty_bg) = smoke_volume_slot(&device);
+        // Dust volume. Only with the contract: it marches the dust_fog grid,
+        // the mist, and the smoke grid when one runs (group 5).
         let pipe_fog = contract.as_ref().map(|contract_gpu| {
             let fog_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("fog-layout"),
-                bind_group_layouts: &[&frame_bgl, &tex_bgl, &post_bgl, &paint_bgl, &contract_gpu.layout],
+                bind_group_layouts: &[
+                    &frame_bgl,
+                    &tex_bgl,
+                    &post_bgl,
+                    &paint_bgl,
+                    &contract_gpu.layout,
+                    &smoke_bgl,
+                ],
                 push_constant_ranges: &[],
             });
             pipeline(
@@ -1586,7 +1656,7 @@ impl Renderer {
                 "vs_fog",
                 Some("fs_fog"),
                 &[],
-                color_format,
+                LDR_FORMAT,
                 None,
                 false,
                 None,
@@ -1605,6 +1675,26 @@ impl Renderer {
                 "vs_fog",
                 Some("fs_fog_up"),
                 &[],
+                LDR_FORMAT,
+                None,
+                true,
+                None,
+            )
+        });
+        // Over the linear HDR target (only when SILT_POST reads it).
+        let pipe_fog_up_hdr = contract.as_ref().map(|_| {
+            let up_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fog-up-layout"),
+                bind_group_layouts: &[&fog_up_bgl],
+                push_constant_ranges: &[],
+            });
+            pipeline(
+                &device,
+                &shader,
+                &up_layout,
+                "vs_fog",
+                Some("fs_fog_up_hdr"),
+                &[],
                 color_format,
                 None,
                 true,
@@ -1612,6 +1702,23 @@ impl Renderer {
             )
         });
 
+        let pipe_blit_hdr = blit_hdr_pipes(&device, &blit_shader, &blit_layout, LDR_FORMAT);
+        // HDR scene -> 8-bit picture. Same curve as `aces_fit` in shader.wgsl.
+        let pipe_tonemap = pipeline(
+            &device,
+            &blit_shader,
+            &blit_layout,
+            "vs_blit",
+            Some("fs_tonemap"),
+            &[],
+            LDR_FORMAT,
+            None,
+            false,
+            None,
+        );
+        let tonemap_bg = ldr
+            .as_ref()
+            .map(|_| tonemap_bind_group(&device, &blit_bgl, &color_view, &nearest));
         // Debug view. It reads only the render contract. Compiling it here
         // keeps a contract edit from landing with a shader that does not match.
         let debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1632,7 +1739,7 @@ impl Renderer {
                 "vs_debug",
                 Some("fs_debug"),
                 &[],
-                color_format,
+                LDR_FORMAT,
                 None,
                 false,
                 None,
@@ -1781,6 +1888,11 @@ impl Renderer {
             water_fx_tex,
             color,
             color_view,
+            scene_format,
+            ldr,
+            tonemap_bg,
+            pipe_tonemap,
+            post,
             scene_color,
             scene_color_view,
             reflect_color,
@@ -1847,6 +1959,7 @@ impl Renderer {
             blit_bg,
             pipe_blit,
             pipe_blit_srgb,
+            pipe_blit_hdr,
             blit_shader,
             blit_layout,
             present_format: None,
@@ -1893,7 +2006,10 @@ impl Renderer {
             pipe_debug,
             pipe_fog,
             pipe_fog_up,
+            pipe_fog_up_hdr,
             fog_half_view,
+            smoke_bgl,
+            smoke_empty_bg,
             fog_up_bgl,
             fog_up_bg,
             post_bgl,
@@ -1915,6 +2031,8 @@ impl Renderer {
             quality,
             shadow_res,
             overlay: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            smoke: None,
         }
     }
 
@@ -1953,6 +2071,59 @@ impl Renderer {
         let o = self.overlay.as_mut().unwrap();
         o.visible = true;
         o.write(&self.queue, lines);
+    }
+
+    /// Sun direction of the current lighting preset (towards the sun).
+    pub fn sun_dir(&self) -> Vec3 {
+        if let Some(s) = self.sun_override {
+            s.normalize()
+        } else if self.daylight {
+            // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
+            Vec3::new(0.593, 0.755, 0.281).normalize()
+        } else {
+            Vec3::new(0.88, 0.32, 0.24).normalize()
+        }
+    }
+
+    /// Start a smoke and fire grid. False when the device has no compute.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_smoke(&mut self, config: silt::smoke::SmokeConfig) -> bool {
+        if !silt::smoke::supported(&self.device) {
+            return false;
+        }
+        let mut pass = crate::smoke_pass::SmokePass::new(&self.device, config);
+        pass.sim.sun = self.sun_dir();
+        pass.sim.reset(&self.queue);
+        self.smoke = Some(pass);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn disable_smoke(&mut self) {
+        self.smoke = None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn smoke_mut(&mut self) -> Option<&mut crate::smoke_pass::SmokePass> {
+        self.smoke.as_mut()
+    }
+
+    /// Advance the smoke grid by `dt`. Sources and wind are set on `smoke_mut().sim`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn step_smoke(&mut self, dt: f32) {
+        let sun = self.sun_dir();
+        if let Some(pass) = self.smoke.as_mut() {
+            pass.sim.sun = sun;
+            pass.sim.step(&self.device, &self.queue, dt);
+        }
+    }
+
+    /// Smoke readback for logs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn smoke_stats(&self) -> Option<silt::smoke::SmokeStats> {
+        self.smoke
+            .as_ref()
+            .map(|p| p.sim.stats(&self.device, &self.queue))
     }
 
     /// Arm timestamp queries. The window leaves this off.
@@ -2010,6 +2181,7 @@ impl Renderer {
             false,
             None,
         );
+        self.pipe_blit_hdr = blit_hdr_pipes(&self.device, &self.blit_shader, &self.blit_layout, format);
     }
 
     /// Window size. Internal targets follow at the preset's render scale.
@@ -2029,16 +2201,20 @@ impl Renderer {
         }
         self.width = width;
         self.height = height;
-        let (color, color_view, depth, depth_view, readback, padded_row) =
-            make_targets(&self.device, width, height, self.depth_format);
+        let (color, color_view, depth, depth_view, readback, padded_row, ldr) =
+            make_targets(&self.device, width, height, self.depth_format, self.scene_format);
         self.color = color;
         self.color_view = color_view;
+        self.ldr = ldr;
+        if let Some(post) = self.post.as_mut() {
+            post.resize(&self.device, width, height, &self.color_view);
+        }
         self.depth = depth;
         self.depth_view = depth_view;
         self.readback = readback;
         self.reflect_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reflect-readback"),
-            size: padded_row as u64 * height as u64,
+            size: reflect_row(width, self.scene_format) as u64 * height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2049,14 +2225,14 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let (scene_copy, scene_copy_view) = make_scene_copy(&self.device, width, height);
+        let (scene_copy, scene_copy_view) = make_scene_copy(&self.device, width, height, self.scene_format);
         let (fog_half_view, fog_up_bg) = make_fog_half(&self.device, &self.fog_up_bgl, width, height);
         self.fog_half_view = fog_half_view;
         self.fog_up_bg = fog_up_bg;
         self.scene_copy = scene_copy;
         self.scene_copy_view = scene_copy_view;
         self.ssr = make_ssr(&self.device, width, height);
-        self.planar = make_planar(&self.device, width, height, self.depth_format);
+        self.planar = make_planar(&self.device, width, height, self.depth_format, self.scene_format);
         self.ssr_hist_valid = 0.0;
         self.post_bg = make_post_bg(
             &self.device,
@@ -2082,13 +2258,21 @@ impl Renderer {
         );
         // Rebuild the blit bind group against the new color view. Layout is recovered from the pipeline.
         let blit_bgl = self.pipe_blit.get_bind_group_layout(0);
+        self.tonemap_bg = self.ldr.as_ref().map(|_| {
+            let layout = self.pipe_tonemap.get_bind_group_layout(0);
+            tonemap_bind_group(&self.device, &layout, &self.color_view, &nearest)
+        });
         self.blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit-bg"),
             layout: &blit_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.color_view),
+                    resource: wgpu::BindingResource::TextureView(final_view(
+                        self.post.as_ref(),
+                        self.ldr.as_ref(),
+                        &self.color_view,
+                    )),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -2231,14 +2415,7 @@ impl Renderer {
             None
         };
         // The window keeps the low sun. Persist stills ask for daylight.
-        let sun = if let Some(s) = self.sun_override {
-            s.normalize()
-        } else if self.daylight {
-            // 49 degrees up, the sun's height in assets/hdri/sky.hdr.
-            Vec3::new(0.593, 0.755, 0.281).normalize()
-        } else {
-            Vec3::new(0.88, 0.32, 0.24).normalize()
-        };
+        let sun = self.sun_dir();
         let light_target = if self.daylight {
             Vec3::new(0.4, 0.0, 0.0)
         } else {
@@ -2379,7 +2556,8 @@ impl Renderer {
                 self.quality.water_detail as f32,
                 if self.water_fx_live { 1.0 } else { 0.0 },
                 0.0,
-                0.0,
+                // 1: linear HDR scene target, tone curve in the tonemap pass.
+                if self.scene_format != LDR_FORMAT { 1.0 } else { 0.0 },
             ],
         };
         self.ssr_prev_vp = view_proj.to_cols_array_2d();
@@ -2749,7 +2927,7 @@ impl Renderer {
                 );
                 // Still capture: submit reflect RT before water samples pool_reflect_tex.
                 self.queue.submit(Some(encoder.finish()));
-                self.device.poll(wgpu::Maintain::Wait);
+                silt::gpu_wait::wait_idle(&self.device);
                 self.rebuild_tex_bg_pool_reflect();
                 self.queue.write_buffer(
                     &self.frame_buf,
@@ -2977,7 +3155,15 @@ impl Renderer {
             self.draw_glass(&mut pass);
         }
 
-        let air_pass = fog_volume || self.fog > 0.0;
+        #[cfg(not(target_arch = "wasm32"))]
+        let smoke_bg = self
+            .smoke
+            .as_ref()
+            .map(|smoke| smoke.volume_group(&self.device, &self.queue, &self.smoke_bgl));
+        #[cfg(target_arch = "wasm32")]
+        let smoke_bg: Option<wgpu::BindGroup> = None;
+        let air_pass = fog_volume || self.fog > 0.0 || smoke_bg.is_some();
+        let mut fog_over_ldr = false;
         if let (true, Some(pipe), Some(up), Some(gpu)) =
             (air_pass, &self.pipe_fog, &self.pipe_fog_up, &self.contract)
         {
@@ -2993,7 +3179,7 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: pass_timestamps(clock.as_ref(), "dust-volume"),
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(pipe);
@@ -3002,25 +3188,57 @@ impl Renderer {
                 pass.set_bind_group(2, &self.post_bg, &[]);
                 pass.set_bind_group(3, &self.paint_bg, &[]);
                 pass.set_bind_group(4, &gpu.bind_group, &[]);
+                pass.set_bind_group(5, smoke_bg.as_ref().unwrap_or(&self.smoke_empty_bg), &[]);
                 pass.draw(0..3, 0..1);
             }
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("dust-volume-up"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(up);
-            pass.set_bind_group(0, &self.fog_up_bg, &[]);
-            pass.draw(0..3, 0..1);
+            // Display-space composite over the 8-bit picture after the
+            // tonemap pass, unless post needs the cloud in the HDR target.
+            if self.ldr.is_none() || self.post.is_some() {
+                let up_pipe = if self.ldr.is_some() {
+                    self.pipe_fog_up_hdr.as_ref().unwrap_or(up)
+                } else {
+                    up
+                };
+                self.encode_fog_up(&mut encoder, &self.color_view, up_pipe);
+            } else {
+                fog_over_ldr = true;
+            }
+        }
+
+        // The window alone needs no 8-bit copy: the blit tone-maps on the way.
+        let blit_tonemaps = self.ldr.is_some()
+            && self.post.is_none()
+            && !fog_over_ldr
+            && !self.debug_contract
+            && !readback
+            && present.is_some();
+        if let (Some((_, ldr_view)), Some(bg)) = (self.ldr.as_ref(), self.tonemap_bg.as_ref()) {
+            if !self.debug_contract && !blit_tonemaps {
+                let tonemap_time = pass_timestamps(clock.as_ref(), "tonemap");
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("tonemap"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ldr_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: tonemap_time,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipe_tonemap);
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..3, 0..1);
+                count_draw(3);
+            }
+        }
+        if fog_over_ldr && !self.debug_contract {
+            if let (Some((_, ldr_view)), Some(up)) = (self.ldr.as_ref(), self.pipe_fog_up.as_ref()) {
+                self.encode_fog_up(&mut encoder, ldr_view, up);
+            }
         }
 
         if self.debug_contract {
@@ -3029,7 +3247,7 @@ impl Renderer {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("contract-debug"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.color_view,
+                        view: self.ldr.as_ref().map_or(&self.color_view, |l| &l.1),
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -3055,6 +3273,11 @@ impl Renderer {
             }
         }
 
+        // The debug view writes the final picture itself; post would grade it.
+        if let Some(post) = self.post.as_ref().filter(|_| !self.debug_contract) {
+            post.encode(&mut encoder, clock.as_ref());
+        }
+
         if let Some((view, srgb)) = present {
             let blit_time = pass_timestamps(clock.as_ref(), "blit");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3071,12 +3294,20 @@ impl Renderer {
                 timestamp_writes: blit_time,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(if srgb {
-                &self.pipe_blit_srgb
-            } else {
-                &self.pipe_blit
-            });
-            pass.set_bind_group(0, &self.blit_bg, &[]);
+            match (blit_tonemaps, self.tonemap_bg.as_ref()) {
+                (true, Some(bg)) => {
+                    pass.set_pipeline(&self.pipe_blit_hdr[srgb as usize]);
+                    pass.set_bind_group(0, bg, &[]);
+                }
+                _ => {
+                    pass.set_pipeline(if srgb {
+                        &self.pipe_blit_srgb
+                    } else {
+                        &self.pipe_blit
+                    });
+                    pass.set_bind_group(0, &self.blit_bg, &[]);
+                }
+            }
             pass.draw(0..3, 0..1);
             count_draw(3);
         }
@@ -3098,7 +3329,11 @@ impl Renderer {
         if readback {
             encoder.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture {
-                    texture: &self.color,
+                    texture: match (self.post.as_ref(), self.ldr.as_ref()) {
+                        (Some(p), _) => p.output(),
+                        (None, Some(l)) => &l.0,
+                        (None, None) => &self.color,
+                    },
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -3140,7 +3375,7 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&self.device);
         rx.recv().expect("map").expect("map buffer");
         let padded = slice.get_mapped_range();
         let row = (self.width * 4) as usize;
@@ -3398,6 +3633,32 @@ impl Renderer {
         }
     }
 
+    /// Upsample of the half-resolution dust and fog march over `view`.
+    fn encode_fog_up(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        pipe: &wgpu::RenderPipeline,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("dust-volume-up"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &self.fog_up_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     fn stash_win_demo_reflect_readback(&mut self) {
         let mut encoder = self
             .device
@@ -3415,7 +3676,7 @@ impl Renderer {
                 buffer: &self.reflect_readback,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.padded_row),
+                    bytes_per_row: Some(reflect_row(self.width, self.scene_format)),
                     rows_per_image: Some(self.height),
                 },
             },
@@ -3426,20 +3687,30 @@ impl Renderer {
             },
         );
         self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&self.device);
         let slice = self.reflect_readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&self.device);
         rx.recv().expect("map").expect("map buffer");
         let padded = slice.get_mapped_range();
         let row = (self.width * 4) as usize;
-        let stride = self.padded_row as usize;
+        let stride = reflect_row(self.width, self.scene_format) as usize;
         let mut out = Vec::with_capacity(row * self.height as usize);
+        let hdr = self.scene_format != LDR_FORMAT;
         for y in 0..self.height as usize {
-            out.extend_from_slice(&padded[y * stride..y * stride + row]);
+            if hdr {
+                // Rgba16Float: tone-map to the same 8-bit value the frame shows.
+                let line = &padded[y * stride..y * stride + row * 2];
+                for (i, px) in line.chunks_exact(2).enumerate() {
+                    let v = half_to_f32(u16::from_le_bytes([px[0], px[1]]));
+                    out.push(if i % 4 == 3 { 255 } else { tonemap_u8(v) });
+                }
+            } else {
+                out.extend_from_slice(&padded[y * stride..y * stride + row]);
+            }
         }
         drop(padded);
         self.reflect_readback.unmap();
@@ -4092,6 +4363,7 @@ fn make_targets(
     width: u32,
     height: u32,
     depth_format: wgpu::TextureFormat,
+    scene_format: wgpu::TextureFormat,
 ) -> (
     wgpu::Texture,
     wgpu::TextureView,
@@ -4099,7 +4371,28 @@ fn make_targets(
     wgpu::TextureView,
     wgpu::Buffer,
     u32,
+    Option<(wgpu::Texture, wgpu::TextureView)>,
 ) {
+    let ldr = (scene_format != LDR_FORMAT).then(|| {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("color-ldr"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    });
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("color"),
         size: wgpu::Extent3d {
@@ -4110,7 +4403,7 @@ fn make_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
@@ -4143,7 +4436,7 @@ fn make_targets(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    (color, color_view, depth, depth_view, readback, padded_row)
+    (color, color_view, depth, depth_view, readback, padded_row, ldr)
 }
 
 fn make_scene_targets(
@@ -4151,6 +4444,7 @@ fn make_scene_targets(
     width: u32,
     height: u32,
     depth_format: wgpu::TextureFormat,
+    scene_format: wgpu::TextureFormat,
 ) -> (
     wgpu::Texture,
     wgpu::TextureView,
@@ -4176,7 +4470,7 @@ fn make_scene_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -4189,7 +4483,7 @@ fn make_scene_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -4200,7 +4494,7 @@ fn make_scene_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -4213,7 +4507,7 @@ fn make_scene_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -4574,7 +4868,111 @@ fn fs_blit_tosrgb(in: V) -> @location(0) vec4<f32> {
     let c = textureSample(blit_tex, blit_samp, in.uv);
     return vec4<f32>(pow(c.rgb, vec3<f32>(2.2)), c.a);
 }
+
+// Exposed linear HDR scene -> display value. Must match `aces_fit` in
+// shader.wgsl (Narkowicz ACES fit; exposure is applied by `present`), so a
+// frame looks the same with and without the HDR target.
+fn tonemap(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    let m = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return pow(clamp(m, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+}
+
+@fragment
+fn fs_tonemap(in: V) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(blit_tex));
+    let c = textureLoad(blit_tex, vec2<i32>(in.uv * dims), 0).rgb;
+    return vec4<f32>(tonemap(c), 1.0);
+}
+
+// Window blit straight from the HDR target (no 8-bit copy in between).
+@fragment
+fn fs_blit_tonemap(in: V) -> @location(0) vec4<f32> {
+    return vec4<f32>(tonemap(textureSample(blit_tex, blit_samp, in.uv).rgb), 1.0);
+}
+
+@fragment
+fn fs_blit_tonemap_tosrgb(in: V) -> @location(0) vec4<f32> {
+    let c = tonemap(textureSample(blit_tex, blit_samp, in.uv).rgb);
+    return vec4<f32>(pow(c, vec3<f32>(2.2)), 1.0);
+}
 "#;
+
+fn blit_hdr_pipes(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> [wgpu::RenderPipeline; 2] {
+    ["fs_blit_tonemap", "fs_blit_tonemap_tosrgb"].map(|fs| {
+        pipeline(device, shader, layout, "vs_blit", Some(fs), &[], format, None, false, None)
+    })
+}
+
+/// What the blit and the capture read: post output, else the tone-mapped
+/// copy, else the 8-bit scene target itself.
+fn final_view<'a>(
+    post: Option<&'a crate::post::Post>,
+    ldr: Option<&'a (wgpu::Texture, wgpu::TextureView)>,
+    color_view: &'a wgpu::TextureView,
+) -> &'a wgpu::TextureView {
+    post.map(|p| p.output_view())
+        .or(ldr.map(|l| &l.1))
+        .unwrap_or(color_view)
+}
+
+fn tonemap_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    src: &wgpu::TextureView,
+    samp: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tonemap-bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(src),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+        ],
+    })
+}
+
+/// Padded bytes per row for a readback of a scene-format texture.
+fn reflect_row(width: u32, scene_format: wgpu::TextureFormat) -> u32 {
+    let bpp = scene_format.block_copy_size(None).unwrap_or(4);
+    (width * bpp).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+}
+
+/// IEEE half float to f32 (readback of the HDR reflect copy).
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let man = (h & 0x3ff) as f32;
+    match exp {
+        0 => sign * man * 2f32.powi(-24),
+        31 => {
+            if man == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+/// Same curve as `fs_tonemap`, on the CPU, to 8 bits.
+fn tonemap_u8(c: f32) -> u8 {
+    let x = if c.is_finite() { c.max(0.0) } else { 0.0 };
+    let m = ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0);
+    (m.powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8
+}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[test]
@@ -4604,7 +5002,7 @@ fn debug_contract_view_reads_the_published_maps() {
         false,
         None,
     );
-    let _ = device.poll(wgpu::Maintain::Wait);
+    silt::gpu_wait::wait_idle(&device);
     if let Some(err) = pollster::block_on(device.pop_error_scope()) {
         panic!("debug contract shader: {err}");
     }
@@ -4691,7 +5089,7 @@ fn debug_contract_view_reads_the_published_maps() {
     );
     device.push_error_scope(wgpu::ErrorFilter::Validation);
     queue.submit(Some(encoder.finish()));
-    let _ = device.poll(wgpu::Maintain::Wait);
+    silt::gpu_wait::wait_idle(&device);
     if let Some(err) = pollster::block_on(device.pop_error_scope()) {
         panic!("debug contract draw: {err}");
     }
@@ -4700,7 +5098,7 @@ fn debug_contract_view_reads_the_published_maps() {
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
-    let _ = device.poll(wgpu::Maintain::Wait);
+    silt::gpu_wait::wait_idle(&device);
     rx.recv().expect("map").expect("map buffer");
     let bytes = slice.get_mapped_range();
     let mid = ((height / 2) * padded + (width / 2) * 4) as usize;
@@ -4729,7 +5127,12 @@ fn headlamps(vehicle: &Vehicle, on: f32, sand: bool) -> [[f32; 4]; 3] {
     ]
 }
 
-fn make_scene_copy(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+fn make_scene_copy(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    scene_format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("scene-copy"),
         size: wgpu::Extent3d {
@@ -4740,7 +5143,7 @@ fn make_scene_copy(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Tex
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -4894,7 +5297,13 @@ struct Planar {
     depth_view: wgpu::TextureView,
 }
 
-fn make_planar(device: &wgpu::Device, width: u32, height: u32, depth_format: wgpu::TextureFormat) -> Planar {
+fn make_planar(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    depth_format: wgpu::TextureFormat,
+    scene_format: wgpu::TextureFormat,
+) -> Planar {
     let size = wgpu::Extent3d {
         width,
         height,
@@ -4906,7 +5315,7 @@ fn make_planar(device: &wgpu::Device, width: u32, height: u32, depth_format: wgp
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: scene_format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -4973,3 +5382,80 @@ fn make_ssr(device: &wgpu::Device, width: u32, height: u32) -> SsrTargets {
     let (_depth, depth_view) = tex("ssr-depth", wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::RENDER_ATTACHMENT);
     SsrTargets { width: w, height: h, a, a_view, b, b_view, hist_a, hist_a_view, hist_b, hist_b_view, depth_view }
 }
+
+/// Layout of group 5 of the dust march (the smoke grid of `silt::smoke`) and
+/// an empty volume for frames without smoke: zero draw constants, so the
+/// march reads no smoke, and 1 x 1 x 1 zero textures.
+fn smoke_volume_slot(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let tex3 = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("smoke-volume"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(SMOKE_DRAW_BYTES),
+                },
+                count: None,
+            },
+            tex3(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            tex3(3),
+        ],
+    });
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("smoke-draw-empty"),
+        size: SMOKE_DRAW_BYTES,
+        usage: wgpu::BufferUsages::UNIFORM,
+        mapped_at_creation: false,
+    });
+    let empty = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("smoke-empty"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default());
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("smoke-empty"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("smoke-volume-empty"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&empty) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&samp) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&empty) },
+        ],
+    });
+    (layout, bg)
+}
+
+/// Bytes of `SmokeDraw` in `beauty_contract.wgsl`: 37 vec4.
+const SMOKE_DRAW_BYTES: u64 = 37 * 16;

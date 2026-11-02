@@ -31,9 +31,11 @@ The labels are the render pass labels. The overlay and `silt bench` print the sa
 | `after-water` | 1.0 | 0.8 | 0.7 | Chunks, spray, dust sprites, glass |
 | `dust-volume` | 2.0 | 2.0 | 2.2 | Volumetric dust/fog ray march (at reduced resolution) |
 | `dust-volume-up` | 0.3 | 0.4 | 0.4 | Upsampling the volume to full screen |
-| `blit` | 0.3 | 0.3 | 0.2 | Output to the window, render-scale upsampling |
+| `blit` | 0.3 | 0.3 | 0.2 | Output to the window, render-scale upsampling; tone-maps the `Rgba16Float` scene target on the way (HDR) |
 | `overlay` | 0.1 | 0.1 | 0.1 | F3 overlay |
 | **Sum** | 11.9 | 11.7 | 11.7 | ≤ 12 is asserted by `quality::tests::budget_rows_sum_under_frame` |
+
+The scene target is `Rgba16Float` (linear light) where the adapter can render, blend and filter it, `Rgba8Unorm` otherwise or with `SILT_HDR=0`. The window does not pay for a separate tone-mapping pass: the blit applies the curve. Captures, `SILT_POST=1` and the contract debug view run a `tonemap` pass into an 8-bit copy instead (one full-screen read + write, ~0.1 ms at 1080p, estimate). The half-float targets and the 8-bit copy add about 50 MB of video memory at 1080p (color, scene copy, three reflect copies, 8-bit copy).
 
 On `main`, only the `shadow`, `main`, `contract-debug`, `blit` and `overlay` passes exist today. The other rows are budgets for the passes still in progress: beauty #60, volumetric air, rut geometry #120.
 

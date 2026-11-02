@@ -63,11 +63,51 @@ pub const LUG_PITCH: f32 = 0.055;
 /// Shoulder radius of the carcass, metres.
 const SHOULDER_R: f32 = 0.045;
 
+/// One flat underbody part in body space: half width, rear and front edge,
+/// bottom height below `pos`, and a front skid that ramps up.
+#[derive(Clone, Copy, Debug)]
+pub struct UnderPlate {
+    pub half_w: f32,
+    pub rear_z: f32,
+    pub front_z: f32,
+    pub y: f32,
+    pub skid_len: f32,
+    pub skid_rise: f32,
+}
+
+/// The Niva underside that meets deep snow. Loaded, the wheel centre sits
+/// about 0.23 m below `pos`. The real car has 0.22 m clearance under the axle
+/// housings, so they hang 0.16 m below the hubs on the 0.38 m model tire.
+/// The floor pan and sills are 0.32 m up, between the axles.
+pub const NIVA_UNDERSIDE: [UnderPlate; 3] = [
+    // Rear axle housing, rigid, nearly track wide, diff in the middle.
+    UnderPlate { half_w: 0.60, rear_z: -1.26, front_z: -1.10, y: -0.39, skid_len: 0.08, skid_rise: 0.04 },
+    // Front diff and crossmember.
+    UnderPlate { half_w: 0.24, rear_z: 0.98, front_z: 1.18, y: -0.38, skid_len: 0.10, skid_rise: 0.05 },
+    // Floor pan, transfer case and sills between the axles.
+    UnderPlate { half_w: 0.55, rear_z: -1.00, front_z: 0.95, y: -0.29, skid_len: 0.25, skid_rise: 0.07 },
+];
+/// Bekker plate constants of fresh snow for a wide plate (Wong, Harrison
+/// snow): k = kc/b + kφ with b the plate width, n as for the tire.
+const BELLY_KC: f32 = 4_370.0;
+const BELLY_KPHI: f32 = 196_700.0;
+/// Above this the snow fails in shear ahead of the plate instead of packing
+/// under it: the belly ploughs, Pa.
+const BELLY_P_FAIL: f32 = 25_000.0;
+/// Sliding friction of snow on the underbody.
+const BELLY_MU: f32 = 0.18;
+
+/// Pushed snow ends this much denser than its source, capped at `RHO_LOOSE`.
+/// Disturbed fresh snow settles 15–30 % on breaking (grain rearrangement).
+const PUSHED_DENSIFY: f32 = 1.2;
 /// Share of bulldozed mass that goes out past the sidewall. The rest is
 /// pushed ahead of the contact.
 const SIDE_SHARE: f32 = 0.72;
 /// Share of the sideways mass that breaks into clumps. The rest is a ridge.
 const CLUMP_SHARE: f32 = 0.45;
+/// Share of the packing the free edge of the tread still gets. The rest of
+/// that snow shears out past the sidewall instead of densifying.
+const EDGE_PACK: f32 = 0.25;
 /// Outer share of the half tread that is not confined, 0..1.
 const CONFINE_BAND: f32 = 0.45;
 /// Slip above which the lugs shear the floor.
@@ -114,6 +154,20 @@ pub struct Clod {
     pub pos: Vec3,
     pub vel: Vec3,
     pub mass: f32,
+}
+
+/// What the belly did to the snow and what the snow does back.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BellyReport {
+    pub cells: u32,
+    /// Force on the car, world frame, newtons.
+    pub force: Vec3,
+    /// Torque about the car's `pos`, world frame, N·m.
+    pub torque: Vec3,
+    /// Upward support, newtons.
+    pub lift_n: f32,
+    pub ploughed_kg: f32,
+    pub packed_kg: f32,
 }
 
 /// What one tire did to the snow on this step.
@@ -494,6 +548,8 @@ impl SnowTrack {
         let mut ahead_mass = [0.0f32; 2];
         let mut contact_cells: Vec<(i32, i32)> = Vec::with_capacity(contact as usize);
         let mut front_long = 0.0f32;
+        // Bulldozed mass and the volume it had where it came from.
+        let (mut moved_kg, mut moved_m3) = (0.0f32, 0.0f32);
         for gj in j0..=j1 {
             for gi in i0..=i1 {
                 let p = Vec2::new(cell_center(gi), cell_center(gj));
@@ -518,7 +574,7 @@ impl SnowTrack {
                 let same_pass = cell.pressed_step + 2 >= self.step_no && cell.pressed_step != 0;
                 let rho0 = if same_pass { cell.rho_pass } else { cell.rho };
                 let rho_cap = density_under(pressure, rho0);
-                let reach_rho = rho0 + (rho_cap - rho0).max(0.0) * (0.25 + 0.75 * kappa);
+                let reach_rho = rho0 + (rho_cap - rho0).max(0.0) * (EDGE_PACK + (1.0 - EDGE_PACK) * kappa);
                 let target = reach_rho.max(cell.rho);
                 let mut excess = 0.0;
                 let (depth, rho) = if d_new <= 1.0e-5 {
@@ -544,6 +600,8 @@ impl SnowTrack {
                 if excess > 0.0 {
                     let m = excess * area;
                     rep.bulldozed_kg += m;
+                    moved_kg += m;
+                    moved_m3 += m / rho0.max(1.0);
                     let s = if lat > 0.0 { 1 } else { 0 };
                     let side = m * SIDE_SHARE;
                     // Crabbing: the sidewall that leads sideways is a blade.
@@ -579,6 +637,12 @@ impl SnowTrack {
             self.throw_clods(t, dug, fwd, right);
         }
 
+        // Pushed snow is broken but not pressed: its grains rearrange and it
+        // ends a little denser than where it came from, never denser than
+        // thrown snow.
+        let rho_src = if moved_m3 > 0.0 { moved_kg / moved_m3 } else { RHO_LOOSE };
+        let rho_dep = (rho_src * PUSHED_DENSIFY).clamp(rho_src.min(RHO_LOOSE), RHO_LOOSE);
+
         // Ahead of the contact: the bow the tire meets next step.
         for s in 0..2 {
             if ahead_mass[s] <= 0.0 {
@@ -586,7 +650,7 @@ impl SnowTrack {
             }
             let lat = if s == 1 { half_w * 0.5 } else { -half_w * 0.5 };
             let at = c2 + fwd * (dir * (front_long + 0.04)) + right * lat;
-            self.lay_band(at, fwd, right, half_w * 0.9, 0.05, ahead_mass[s]);
+            self.lay_band(at, fwd, right, half_w * 0.9, 0.05, ahead_mass[s], rho_dep);
         }
 
         // Out past the sidewall: a ridge plus clumps.
@@ -601,7 +665,7 @@ impl SnowTrack {
             // Project the lift point onto the sidewall line.
             let along = (at - c2).dot(fwd);
             let base = edge + fwd * along;
-            self.lay_ridge(base, out, fwd, ridge);
+            self.lay_ridge(base, out, fwd, ridge, rho_dep);
             let b = &mut self.buckets[t.index.min(3) * 2 + s][0];
             let m = side_mass[s] - ridge;
             let tot = b.mass + m;
@@ -620,6 +684,167 @@ impl SnowTrack {
         rep
     }
 
+    /// Press the belly plate of a car at `pos` with orientation `ori` and
+    /// velocity `vel` into the snow. Snow above the plate is packed under it
+    /// as a Bekker plate; what would need more than `BELLY_P_FAIL` fails in
+    /// shear and is ploughed ahead. Returns the support, the friction and the
+    /// plough drag on the car. One step of `dt` seconds.
+    pub fn press_belly(&mut self, pos: Vec3, ori: glam::Quat, vel: Vec3, mass_car: f32, dt: f32) -> BellyReport {
+        let mut rep = BellyReport::default();
+        let mut force = Vec3::ZERO;
+        let mut torque = Vec3::ZERO;
+        for plate in NIVA_UNDERSIDE {
+            let r = self.press_plate(&plate, pos, ori, vel, dt);
+            rep.cells += r.cells;
+            rep.lift_n += r.lift_n;
+            rep.ploughed_kg += r.ploughed_kg;
+            rep.packed_kg += r.packed_kg;
+            force += r.force;
+            torque += r.torque;
+        }
+        // Never more horizontal drag than stops the car this step.
+        let hv = Vec3::new(vel.x, 0.0, vel.z);
+        let hf = Vec3::new(force.x, 0.0, force.z);
+        let cap = mass_car * hv.length() / dt.max(1.0e-4);
+        if hf.length() > cap && hf.length() > 0.0 {
+            let k = cap / hf.length();
+            force.x *= k;
+            force.z *= k;
+        }
+        rep.force = force;
+        rep.torque = torque;
+        rep
+    }
+
+    fn press_plate(&mut self, plate: &UnderPlate, pos: Vec3, ori: glam::Quat, vel: Vec3, dt: f32) -> BellyReport {
+        let mut rep = BellyReport::default();
+        let inv = ori.inverse();
+        let corners = [
+            Vec3::new(-plate.half_w, plate.y, plate.rear_z),
+            Vec3::new(plate.half_w, plate.y, plate.rear_z),
+            Vec3::new(-plate.half_w, plate.y, plate.front_z),
+            Vec3::new(plate.half_w, plate.y, plate.front_z),
+        ]
+        .map(|c| pos + ori * c);
+        let lowest = corners.iter().fold(f32::MAX, |a, c| a.min(c.y));
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for c in corners {
+            lo = lo.min(Vec2::new(c.x, c.z));
+            hi = hi.max(Vec2::new(c.x, c.z));
+        }
+        // Quick out: nothing in the box reaches the lowest corner.
+        let (i0, i1, j0, j1) = (cell_of(lo.x), cell_of(hi.x), cell_of(lo.y), cell_of(hi.y));
+        let up = ori * Vec3::Y;
+        if up.y < 0.3 {
+            return rep;
+        }
+        let area = self.cell_area();
+        let k = BELLY_KC / (2.0 * plate.half_w).min(plate.front_z - plate.rear_z) + BELLY_KPHI;
+        let rho_ref_blanket = self.rho_blanket;
+        let hv = Vec2::new(vel.x, vel.z);
+        let speed = hv.length();
+        let mut ahead = 0.0f32;
+        let mut ahead_kg_m3 = (0.0f32, 0.0f32);
+        let mut lift_at = Vec3::ZERO;
+        let mut front_at = Vec2::ZERO;
+        let mut front_w = 0.0f32;
+        for gj in j0..=j1 {
+            for gi in i0..=i1 {
+                let p2 = Vec2::new(cell_center(gi), cell_center(gj));
+                let cell = self.get(gi, gj);
+                if cell.surface() <= lowest - 0.10 {
+                    continue;
+                }
+                // Plate height over this point: the plane through `pos`.
+                let l = inv * (Vec3::new(p2.x, pos.y, p2.y) - pos);
+                if l.x.abs() > plate.half_w || l.z < plate.rear_z || l.z > plate.front_z {
+                    continue;
+                }
+                let skid = ((l.z - (plate.front_z - plate.skid_len)) / plate.skid_len.max(1.0e-3)).clamp(0.0, 1.0);
+                let ly = plate.y + plate.skid_rise * skid * skid;
+                // Plate height straight above or below this point: the plane
+                // through the body-space point, along the body's up.
+                let q0 = pos + ori * Vec3::new(l.x, ly, l.z);
+                let yb = q0.y - (up.x * (p2.x - q0.x) + up.z * (p2.y - q0.z)) / up.y;
+                if cell.surface() <= yb + 1.0e-4 {
+                    continue;
+                }
+                rep.cells += 1;
+                let m = cell.mass_per_m2();
+                let d_new = (yb - cell.bed).max(0.0);
+                let rho_ref = rho_ref_blanket.min(cell.rho).max(1.0);
+                // Plate sinkage into this column: how far it is pressed below
+                // the height its mass would stand at reference density.
+                let delta_max = (BELLY_P_FAIL / k).powf(1.0 / SNOW_N);
+                let keep_max = (rho_ref * (d_new + delta_max)).min(RHO_MAX * d_new);
+                let kept = m.min(keep_max);
+                let excess = m - kept;
+                let delta = (kept / rho_ref - d_new).max(0.0);
+                let pressure = (k * delta.powf(SNOW_N)).min(BELLY_P_FAIL);
+                let c = self.cell_mut(gi, gj);
+                c.depth = d_new;
+                c.rho = if d_new > 1.0e-6 { (kept / d_new).max(c.rho.min(RHO_MAX)) } else { c.rho };
+                if d_new <= 1.0e-6 {
+                    c.depth = 0.0;
+                }
+                c.loose = 0.0;
+                c.lug = 0.0;
+                let kept_real = c.depth * c.rho;
+                let excess = excess + (kept - kept_real).max(0.0);
+                rep.packed_kg += kept_real.min(m) * area;
+                if excess > 0.0 {
+                    let kg = excess * area;
+                    ahead += kg;
+                    ahead_kg_m3.0 += kg;
+                    ahead_kg_m3.1 += kg / rho_ref;
+                }
+                let f = pressure * area;
+                rep.lift_n += f;
+                lift_at += Vec3::new(p2.x, yb, p2.y) * f;
+                let lead = if speed > 0.05 { p2.dot(hv / speed) } else { 0.0 };
+                let w = (lead * 20.0).exp().min(1.0e30);
+                front_at += p2 * w;
+                front_w += w;
+            }
+        }
+        if rep.cells == 0 {
+            return rep;
+        }
+        // Support along the plate normal, at the pressure centroid.
+        let n = up;
+        let f_n = n * rep.lift_n;
+        let mut force = f_n;
+        let at = if rep.lift_n > 1.0e-3 { lift_at / rep.lift_n } else { pos };
+        // Friction and plough drag against the horizontal motion.
+        if speed > 0.02 {
+            let dir = Vec3::new(hv.x / speed, 0.0, hv.y / speed);
+            let plough = ahead / dt.max(1.0e-4) * speed;
+            let drag = BELLY_MU * rep.lift_n + plough;
+            force -= dir * drag;
+        }
+        rep.force = force;
+        rep.torque = (at - pos).cross(force);
+        // The ploughed snow piles at the leading edge, a little ahead.
+        if ahead > 0.0 {
+            rep.ploughed_kg = ahead;
+            let rho_src = ahead_kg_m3.0 / ahead_kg_m3.1.max(1.0e-9);
+            let rho_dep = (rho_src * PUSHED_DENSIFY).clamp(rho_src.min(RHO_LOOSE), RHO_LOOSE);
+            let fwd3 = if speed > 0.05 {
+                Vec2::new(hv.x, hv.y) / speed
+            } else {
+                let f = ori * Vec3::Z;
+                Vec2::new(f.x, f.z).normalize_or_zero()
+            };
+            let right = Vec2::new(fwd3.y, -fwd3.x);
+            let front = if front_w > 0.0 { front_at / front_w } else { Vec2::new(pos.x, pos.z) };
+            let base = Vec2::new(pos.x, pos.z) + fwd3 * ((front - Vec2::new(pos.x, pos.z)).dot(fwd3) + 0.08);
+            self.lay_band(base, fwd3, right, plate.half_w, 0.08, ahead, rho_dep);
+            let pad = 8;
+            self.relax(i0 - pad, i1 + pad, j0 - pad, j1 + pad, 2);
+        }
+        rep
+    }
+
     /// Lay `mass` kg as loose snow over a rectangle, evenly.
     fn lay_band(
         &mut self,
@@ -629,6 +854,7 @@ impl SnowTrack {
         half_lat: f32,
         half_long: f32,
         mass: f32,
+        rho_dep: f32,
     ) {
         let mut cells: Vec<(i32, i32, f32)> = Vec::new();
         let reach = half_lat.max(half_long) + TRACK_CELL_M;
@@ -646,11 +872,11 @@ impl SnowTrack {
                 wsum += w;
             }
         }
-        self.deposit(&cells, wsum, mass);
+        self.deposit(&cells, wsum, mass, rho_dep);
     }
 
     /// A ridge just outside the sidewall: steep inner face, longer outer tail.
-    fn lay_ridge(&mut self, base: Vec2, out: Vec2, fwd: Vec2, mass: f32) {
+    fn lay_ridge(&mut self, base: Vec2, out: Vec2, fwd: Vec2, mass: f32, rho_dep: f32) {
         if mass <= 0.0 {
             return;
         }
@@ -680,10 +906,10 @@ impl SnowTrack {
                 wsum += w;
             }
         }
-        self.deposit(&cells, wsum, mass);
+        self.deposit(&cells, wsum, mass, rho_dep);
     }
 
-    fn deposit(&mut self, cells: &[(i32, i32, f32)], wsum: f32, mass: f32) {
+    fn deposit(&mut self, cells: &[(i32, i32, f32)], wsum: f32, mass: f32, rho_dep: f32) {
         if cells.is_empty() || wsum <= 1.0e-6 {
             self.held_kg += mass as f64;
             return;
@@ -692,13 +918,13 @@ impl SnowTrack {
         for &(gi, gj, w) in cells {
             let m = mass * w / wsum / area; // kg/m²
             let c = self.cell_mut(gi, gj);
-            let add = m / RHO_LOOSE;
+            let add = m / rho_dep;
             let total = c.depth * c.rho + m;
             c.depth += add;
             c.rho = if c.depth > 1.0e-6 {
                 total / c.depth
             } else {
-                RHO_LOOSE
+                rho_dep
             };
             c.loose += add;
             c.lug = 0.0;
@@ -740,7 +966,7 @@ impl SnowTrack {
             cells.push((cell_of(at.x), cell_of(at.y), 1.0));
             wsum = 1.0;
         }
-        self.deposit(&cells, wsum, mass);
+        self.deposit(&cells, wsum, mass, RHO_LOOSE);
     }
 
     fn drop_clumps(&mut self, slot: usize, fwd: Vec2) {
@@ -967,6 +1193,9 @@ pub fn step_vehicle(
             index: c.index,
         });
     }
+    let belly = track.press_belly(veh.pos, ori, veh.vel, veh.total_mass(), h);
+    veh.snow_belly_force = belly.force;
+    veh.snow_belly_torque = belly.torque;
     track.step_clods(h);
     out
 }
@@ -1130,6 +1359,7 @@ mod tests {
             let x = 0.15 + k as f32 * TRACK_CELL_M;
             crest = crest.max(s.surface_at(x, 1.0));
         }
+        eprintln!("press: crest {crest:.4} floor {floor:?}");
         assert!(crest > 0.31, "crest {crest}");
     }
 
@@ -1196,6 +1426,7 @@ mod tests {
             crest = crest.max(h);
             x += TRACK_CELL_M;
         }
+        eprintln!("niva section: floor {floor:.4} crest {crest:.4} sink {:.4}", log.sink_mean_m);
         assert!(floor < 0.25 - 0.04, "rut floor {floor}");
         assert!(crest > 0.25 + 0.012, "berm crest {crest}");
         let packed = s.get(cell_of(-0.74), cell_of(z));
@@ -1204,5 +1435,64 @@ mod tests {
         let before = s.surface_at(-0.74, z);
         let _ = s.window(Vec2::new(200.0, 200.0));
         assert_eq!(before, s.surface_at(-0.74, z));
+    }
+    #[test]
+    fn old_ruts_in_deep_snow_drag_the_belly_over_the_hump() {
+        use crate::soil::SoilField;
+        use crate::vehicle::Vehicle;
+        // 75 cm of snow with two old packed ruts at the Niva's track, floor
+        // at 30 cm. The tires run in the ruts; the hump between them stands
+        // above the axles.
+        let blanket = 0.75;
+        let mut s = SnowTrack::new(blanket, 0.0);
+        s.drift = 0.0;
+        for gj in cell_of(-8.0)..cell_of(8.0) {
+            for x in [-0.74f32, 0.74] {
+                for gi in cell_of(x - 0.17)..=cell_of(x + 0.17) {
+                    let c = s.cell_mut(gi, gj);
+                    let m = c.depth * c.rho;
+                    c.depth = 0.30;
+                    c.rho = m / 0.30;
+                }
+            }
+        }
+        let (a0, b0) = s.ledger_kg();
+        let shift = b0 - a0;
+        let soil = SoilField::flat(0.1);
+        let mut v = Vehicle::new();
+        v.pos = Vec3::new(0.0, 0.30 + 0.38 + 0.45, -6.0);
+        let seg = DriveSegment { seconds: 6.0, speed: 2.0, steer: 0.0 };
+        let h = 1.0 / 120.0;
+        let (mut lift_sum, mut drag_sum, mut n) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..(seg.seconds / h).round() as i32 {
+            step_vehicle(&mut s, &mut v, &soil, &seg, h);
+            if k > 120 {
+                lift_sum += v.snow_belly_force.y;
+                drag_sum += Vec2::new(v.snow_belly_force.x, v.snow_belly_force.z).length();
+                n += 1.0;
+            }
+        }
+        for _ in 0..360 {
+            s.step_clods(h);
+        }
+        let (m0, m1) = s.ledger_kg();
+        let hump = s.get(cell_of(0.0), cell_of(-3.0));
+        let virgin = s.get(cell_of(0.0), cell_of(7.5));
+        eprintln!(
+            "ruts: lift {:.0} N drag {:.0} N z {:.2} speed {:.2} hump {:.3} rho {:.0} wheels {:.3}",
+            lift_sum / n,
+            drag_sum / n,
+            v.pos.z,
+            v.speed(),
+            hump.surface(),
+            hump.rho,
+            v.wheels[2].sinkage
+        );
+        assert!(((m1 - m0 - shift) / m0).abs() < 1.0e-5, "ledger {m0} -> {m1}");
+        assert!(lift_sum / n > 300.0, "the belly does not bear on the hump: {}", lift_sum / n);
+        assert!(drag_sum / n > 50.0, "no belly drag: {}", drag_sum / n);
+        // The underside planed the hump flat and packed it.
+        assert!(hump.surface() < virgin.surface() - 0.10, "hump {} vs {}", hump.surface(), virgin.surface());
+        assert!(hump.rho > virgin.rho + 15.0, "hump density {}", hump.rho);
     }
 }

@@ -678,7 +678,8 @@ impl Walker {
     }
 
     /// Legs as the sheet sees them, with the drag they took.
-    fn legs(&self) -> [(Vec3, f32); 2] {
+    /// Each leg as (sole position, hip height): the columns the sheet sees.
+    pub fn legs(&self) -> [(Vec3, f32); 2] {
         [0, 1].map(|k| (self.feet[k].pos, self.pos.y))
     }
 
