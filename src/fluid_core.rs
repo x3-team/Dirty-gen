@@ -785,6 +785,39 @@ pub fn step_sheet(
 }
 
 /// [`step_sheet_eps`] on a caller-owned scratch instead of the thread-local one.
+/// Cells past the slurry bounds that get a viscosity before a sheet step.
+/// Work boxes carry a halo of 3 and a substep reads 2 more cells.
+const NU_FILL_MARGIN: usize = 8;
+
+/// Bounding rows and columns of the cells with depth above zero, grown by
+/// `margin` and clamped to the grid. `None` when every cell is dry.
+fn wet_bounds(h: &[f32], res: usize, margin: usize) -> Option<(usize, usize, usize, usize)> {
+    let mut j0 = usize::MAX;
+    let mut j1 = 0usize;
+    let mut i0 = usize::MAX;
+    let mut i1 = 0usize;
+    for j in 0..res {
+        let row = &h[j * res..(j + 1) * res];
+        let Some(first) = row.iter().position(|&x| x > 0.0) else {
+            continue;
+        };
+        let last = row.iter().rposition(|&x| x > 0.0).unwrap_or(first);
+        j0 = j0.min(j);
+        j1 = j;
+        i0 = i0.min(first);
+        i1 = i1.max(last);
+    }
+    if j0 == usize::MAX {
+        return None;
+    }
+    Some((
+        i0.saturating_sub(margin),
+        (i1 + margin).min(res - 1),
+        j0.saturating_sub(margin),
+        (j1 + margin).min(res - 1),
+    ))
+}
+
 fn step_sheet_eps_in(
     h: &mut [f32],
     u: &mut [f32],
@@ -1714,37 +1747,45 @@ fn step_sheet_scratch(
     // Courant slice. Pace 2 repeats the Jacobi sweep every slice. The shore
     // equality test keeps pace 2 as the reference.
     if pace == 3 && whole_wet && nsub > 1 {
-        for &(i0, i1, j0, j1) in &boxes {
+        // One box's pressure solve, Courant slices and dry cut. A box reads
+        // and writes only itself and a 2-cell rim, so two boxes
+        // `BOX_PAR_GAP` apart give the same cells in any order.
+        let run = |h: &mut [f32],
+                   u: &mut [f32],
+                   v: &mut [f32],
+                   (i0, i1, j0, j1): (usize, usize, usize, usize),
+                   sc: &mut Scratch| {
             substep(
                 h, u, v, bed, nu, gate, res, cell, dt, drive, eps, i0, i1, j0, j1, solid, banks,
                 false, sc,
             );
-        }
-        let frac_cap = 0.45f32;
-        for _ in 0..nsub {
-            for &(i0, i1, j0, j1) in &boxes {
-                transport_open(
-                    h, u, gate, res, cell, dts, i0, i1, j0, j1, true, None, frac_cap, sc,
+            pace3_slices(h, u, v, gate, res, cell, dts, nsub, eps, (i0, i1, j0, j1), sc);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(sc2) = sc2 {
+            if boxes.len() == 2 && boxes_apart(boxes[0], boxes[1], BOX_PAR_GAP) {
+                let (b0, b1) = (boxes[0], boxes[1]);
+                let n = res * res;
+                let hp = ShareMut(h.as_mut_ptr());
+                let up = ShareMut(u.as_mut_ptr());
+                let vp = ShareMut(v.as_mut_ptr());
+                let go = |b: (usize, usize, usize, usize), sc: &mut Scratch| {
+                    // SAFETY: the two boxes are `BOX_PAR_GAP` cells apart, so
+                    // the cells one worker writes are never read or written by
+                    // the other. The join below ends before `h`, `u`, `v` are
+                    // used again.
+                    let (h, u, v) = unsafe { (hp.slice(n), up.slice(n), vp.slice(n)) };
+                    run(h, u, v, b, sc);
+                };
+                rayon::join(
+                    || serial_inner(|| go(b0, &mut *sc)),
+                    || serial_inner(|| go(b1, &mut *sc2)),
                 );
-                transport_open(
-                    h, v, gate, res, cell, dts, i0, i1, j0, j1, false, None, frac_cap, sc,
-                );
+                return;
             }
         }
-        if eps > 0.0 {
-            for &(i0, i1, j0, j1) in &boxes {
-                for j in j0..=j1 {
-                    let row = j * res;
-                    for i in i0..=i1 {
-                        let idx = row + i;
-                        if h[idx] < eps {
-                            h[idx] = 0.0;
-                            u[idx] = 0.0;
-                            v[idx] = 0.0;
-                        }
-                    }
-                }
-            }
+        for &b in &boxes {
+            run(h, u, v, b, sc);
         }
         return;
     }
@@ -1785,6 +1826,42 @@ fn step_sheet_scratch(
                 h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, banks,
                 true, sc,
             );
+        }
+    }
+}
+
+/// Pace 3 after the pressure solve: `nsub` open-flux slices on one box, then
+/// cells under `eps` are cut dry.
+#[allow(clippy::too_many_arguments)]
+fn pace3_slices(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dts: f32,
+    nsub: u32,
+    eps: f32,
+    (i0, i1, j0, j1): (usize, usize, usize, usize),
+    sc: &mut Scratch,
+) {
+    let frac_cap = 0.45f32;
+    for _ in 0..nsub {
+        transport_open(h, u, gate, res, cell, dts, i0, i1, j0, j1, true, None, frac_cap, sc);
+        transport_open(h, v, gate, res, cell, dts, i0, i1, j0, j1, false, None, frac_cap, sc);
+    }
+    if eps > 0.0 {
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                let idx = row + i;
+                if h[idx] < eps {
+                    h[idx] = 0.0;
+                    u[idx] = 0.0;
+                    v[idx] = 0.0;
+                }
+            }
         }
     }
 }
@@ -8007,8 +8084,17 @@ impl FluidCore {
                 };
                 let run_slurry = || {
                     let ts = ProfTick::start();
-                    for idx in 0..n {
-                        nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                    // The sheet step reads the viscosity only on its work
+                    // boxes (halo 3) and a 2-cell rim, so the rows and columns
+                    // past the slurry bounds plus that margin are never read.
+                    if let Some((i0, i1, j0, j1)) = wet_bounds(slurry, res, NU_FILL_MARGIN) {
+                        for j in j0..=j1 {
+                            let row = j * res;
+                            for idx in row + i0..=row + i1 {
+                                nu_s[idx] =
+                                    dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                            }
+                        }
                     }
                     if !fine {
                         soften_border(us, vs, res, open);
