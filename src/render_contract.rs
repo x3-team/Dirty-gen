@@ -22,7 +22,7 @@ use crate::snow::{SnowField, RHO_FRESH, SNOW_EMPTY_M};
 use crate::soil::{SoilField, SurfaceKind};
 
 /// Contract version. Bump it when a map, channel, unit, or formula below changes.
-pub const RENDER_CONTRACT_VERSION: u32 = 11;
+pub const RENDER_CONTRACT_VERSION: u32 = 12;
 
 /// Floats per flow texel: vx, vz, speed, turbidity.
 pub const FLOW_CHANNELS: usize = 4;
@@ -81,6 +81,7 @@ pub const VALID_MIX: u32 = 1 << 12;
 pub const VALID_SNOW: u32 = 1 << 14;
 pub const VALID_TRACK_FINE: u32 = 1 << 15;
 pub const VALID_FOG: u32 = 1 << 13;
+pub const VALID_WATER_FINE: u32 = 1 << 16;
 
 pub const BIND_HEADER: u32 = 0;
 pub const BIND_GROUND: u32 = 1;
@@ -98,12 +99,17 @@ pub const BIND_FOG: u32 = 12;
 pub const BIND_MIX: u32 = 13;
 pub const BIND_SNOW: u32 = 14;
 pub const BIND_TRACK_FINE: u32 = 15;
+pub const BIND_WATER_FINE: u32 = 16;
 
 /// Fine deformation window, texels per side. 640 × 2.5 cm = 16 m.
 pub const TRACK_FINE_CELLS: u32 = TRACK_RES as u32;
 pub const TRACK_FINE_CELL_M: f32 = TRACK_CELL_M;
 
-/// Uniform header. 112 bytes. Layout matches `ContractHeader` in the WGSL.
+/// 2 cm water window under the tires (binding 16), texels per side. 160 × 2 cm = 3.2 m.
+pub const WATER_FINE_CELLS: u32 = crate::fluid_core::FINE_RES as u32;
+pub const WATER_FINE_CELL_M: f32 = crate::fluid_core::FINE_CELL_M;
+
+/// Uniform header. 128 bytes. Layout matches `ContractHeader` in the WGSL.
 ///
 /// `debug_mode` is a viewer selector written by the renderer. It is not a
 /// solver map. Adding or retuning a solver map still bumps the version.
@@ -141,6 +147,13 @@ pub struct ContractHeader {
     pub fine_cell_m: f32,
     /// Fine texels per side. 0 when binding 15 is not published.
     pub fine_res: u32,
+    /// 2 cm water window (binding 16) minimum corner, world X and Z, metres.
+    pub water_fine_origin_x: f32,
+    pub water_fine_origin_z: f32,
+    /// Texel size, metres. 0 when binding 16 is not published.
+    pub water_fine_cell_m: f32,
+    /// Texels per side. 0 when binding 16 is not published.
+    pub water_fine_res: u32,
 }
 
 /// One spray slot. 48 bytes. `pos_mass.w` is kilograms. `vel_age.w` is age in seconds.
@@ -176,6 +189,8 @@ pub struct ContractFrame {
     /// Fine deformation window, binding 15. RGBA: surface over contract
     /// ground m, snow depth m, compaction 0..1, print depth m.
     pub track_fine: Vec<f32>,
+    /// 2 cm water window, binding 16. RG: water depth m, slurry depth m.
+    pub water_fine: Vec<f32>,
     pub spray: Vec<SprayGpu>,
 }
 
@@ -199,6 +214,7 @@ impl ContractFrame {
             soil_mix: vec![0.0; n * 4],
             snow: vec![0.0; n * 4],
             track_fine: vec![0.0; (TRACK_FINE_CELLS * TRACK_FINE_CELLS * 4) as usize],
+            water_fine: vec![0.0; (WATER_FINE_CELLS * WATER_FINE_CELLS * 2) as usize],
             spray: vec![SprayGpu::zeroed(); SPRAY_CAPACITY as usize],
         }
     }
@@ -716,6 +732,20 @@ pub fn publish_with_snow(
         write_snow_binding(&mut out.snow, snow, origin_x, origin_z);
         valid |= VALID_SNOW;
     }
+    let water_fine = fluid.and_then(|fluid| fluid.fine_window());
+    out.water_fine.fill(0.0);
+    let (mut wf_origin, mut wf_cell, mut wf_res) = ([0.0f32; 2], 0.0f32, 0u32);
+    if let Some(win) = &water_fine {
+        if win.res as u32 == WATER_FINE_CELLS && win.film.len() == out.water_fine.len() {
+            for (dst, src) in out.water_fine.iter_mut().zip(&win.film) {
+                *dst = finite0(src.max(0.0));
+            }
+            wf_origin = win.origin;
+            wf_cell = win.cell_m;
+            wf_res = WATER_FINE_CELLS;
+            valid |= VALID_WATER_FINE;
+        }
+    }
 
     scrub(&mut out.ground_rut);
     scrub(&mut out.moisture);
@@ -764,6 +794,10 @@ pub fn publish_with_snow(
         fine_origin_z: 0.0,
         fine_cell_m: 0.0,
         fine_res: 0,
+        water_fine_origin_x: wf_origin[0],
+        water_fine_origin_z: wf_origin[1],
+        water_fine_cell_m: wf_cell,
+        water_fine_res: wf_res,
     };
 }
 
@@ -930,6 +964,7 @@ pub fn contract_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
             float_entry(BIND_MIX, wgpu::TextureViewDimension::D2),
             float_entry(BIND_SNOW, wgpu::TextureViewDimension::D2),
             float_entry(BIND_TRACK_FINE, wgpu::TextureViewDimension::D2),
+            float_entry(BIND_WATER_FINE, wgpu::TextureViewDimension::D2),
         ],
     })
 }
@@ -965,6 +1000,7 @@ pub struct ContractGpu {
     soil_mix: Map2,
     snow: Map2,
     track_fine: Map2,
+    water_fine: Map2,
 }
 
 impl ContractGpu {
@@ -1100,6 +1136,13 @@ impl ContractGpu {
             wgpu::TextureFormat::Rgba32Float,
             4,
         )?;
+        let water_fine = map2(
+            device,
+            "contract-water-fine",
+            WATER_FINE_CELLS,
+            wgpu::TextureFormat::Rg32Float,
+            2,
+        )?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("render-contract-bg"),
             layout: &layout,
@@ -1120,6 +1163,7 @@ impl ContractGpu {
                 bind_tex(BIND_MIX, &soil_mix.view),
                 bind_tex(BIND_SNOW, &snow.view),
                 bind_tex(BIND_TRACK_FINE, &track_fine.view),
+                bind_tex(BIND_WATER_FINE, &water_fine.view),
             ],
         });
         Some(Self {
@@ -1140,6 +1184,7 @@ impl ContractGpu {
             soil_mix,
             snow,
             track_fine,
+            water_fine,
         })
     }
 
@@ -1161,6 +1206,10 @@ impl ContractGpu {
         // 6.5 MB. Only when the solver published it this frame.
         if frame.header.valid & VALID_TRACK_FINE != 0 {
             write_map2(queue, &self.track_fine, &frame.track_fine, TRACK_FINE_CELLS);
+        }
+        // 200 KB. Only while a tire holds the 2 cm patch.
+        if frame.header.valid & VALID_WATER_FINE != 0 {
+            write_map2(queue, &self.water_fine, &frame.water_fine, WATER_FINE_CELLS);
         }
     }
 }
@@ -1375,7 +1424,10 @@ mod tests {
             "bump the WGSL constant with the Rust version"
         );
         assert!(wgsl.contains("docs/RENDER_CONTRACT.md"));
-        assert_eq!(std::mem::size_of::<ContractHeader>(), 112);
+        assert_eq!(std::mem::size_of::<ContractHeader>(), 128);
+        assert!(wgsl.contains("@group(0) @binding(16) var water_fine"));
+        assert_eq!(VALID_WATER_FINE, 1 << 16);
+        assert_eq!(BIND_WATER_FINE, 16);
         assert!(wgsl.contains("@group(0) @binding(15)"));
         assert_eq!(VALID_TRACK_FINE, 1 << 15);
         assert_eq!(BIND_TRACK_FINE, 15);
