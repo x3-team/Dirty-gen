@@ -333,6 +333,20 @@ fn write_snow_binding(dst: &mut [f32], snow: &SnowField, origin_x: f32, origin_z
     }
 }
 
+fn spray_slot_holds(piece: &Particle) -> bool {
+    piece.alive && piece.life > 0.0 && piece.kind != KIND_DUST_MARK
+}
+
+/// Spray slots that hold particles. They come first; the fluid core's own
+/// drops follow them, so `spray[..n]` is the particle part.
+pub fn spray_particle_slots(particles: &[Particle]) -> usize {
+    particles
+        .iter()
+        .filter(|p| spray_slot_holds(p))
+        .count()
+        .min(SPRAY_CAPACITY as usize)
+}
+
 /// Fill `out` from the soil heightfield, the live particles, and, when the
 /// through-drive sheet is attached, the fluid window and the dust ledger.
 ///
@@ -631,7 +645,7 @@ pub fn publish_with_snow(
         if spray_count >= SPRAY_CAPACITY {
             break;
         }
-        if !piece.alive || piece.life <= 0.0 || piece.kind == KIND_DUST_MARK {
+        if !spray_slot_holds(piece) {
             continue;
         }
         let density = spray_density_kg_m3(piece.kind);

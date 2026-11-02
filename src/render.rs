@@ -2630,13 +2630,18 @@ impl Renderer {
 
         // Liquid in flight comes from the contract's spray slots; the chunk
         // mesh keeps clods and what lies on the ground.
-        let spray_valid = self.contract_cpu.header.version == 1
+        // The contract is published at the current version; a stale check
+        // for version 1 left this path dead and the picture rut ribbons on.
+        let spray_valid = self.contract_cpu.header.version == silt::render_contract::RENDER_CONTRACT_VERSION
             && self.contract_cpu.header.valid & silt::render_contract::VALID_SPRAY != 0;
         let chunks = mud_chunks_split(&world.particles.items, Some(&world.soil), spray_valid, self.show_mud_drops);
         let spray = if spray_valid {
             spray_from_contract(
                 &self.contract_cpu.spray,
-                self.contract_cpu.header.spray_count as usize,
+                // Particle slots only: the sheet's drops after them are the
+                // splash sprites below.
+                (self.contract_cpu.header.spray_count as usize)
+                    .min(silt::render_contract::spray_particle_slots(&world.particles.items)),
                 cam.eye,
             )
         } else {
