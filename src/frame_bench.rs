@@ -545,7 +545,7 @@ pub fn run_budget(args: &[String]) {
             draws = draws.max(d);
             tris = tris.max(t);
         }
-        let _ = r.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&r.device);
         let c = r.device.get_internal_counters();
         let tex_mib = c.hal.texture_memory.read() as f64 / (1024.0 * 1024.0);
         let buf_mib = c.hal.buffer_memory.read() as f64 / (1024.0 * 1024.0);
