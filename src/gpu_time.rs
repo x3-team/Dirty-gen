@@ -180,7 +180,7 @@ impl GpuTime {
 
     /// Wait for every frame in flight and return the newest.
     pub fn read(&self, device: &wgpu::Device) -> GpuSample {
-        let _ = device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&device);
         self.collect().unwrap_or_default()
     }
 

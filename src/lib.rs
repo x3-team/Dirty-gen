@@ -9,6 +9,7 @@ pub mod bodies;
 pub mod bike;
 pub mod dust;
 pub mod fluid_core;
+pub mod gpu_wait;
 pub mod imprint;
 pub mod ford;
 pub mod lod;
