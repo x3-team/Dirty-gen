@@ -200,6 +200,12 @@ const MIST_SIGMA: f32 = 150000.0;
 // stay where the swirls are.
 const FOG_MARCH_M: f32 = 40.0;
 const DUST_ALBEDO: vec3<f32> = vec3<f32>(0.58, 0.47, 0.34);
+// Dust is the ground it was lifted from: on the beauty sand the warm
+// beige of the grain (the grey-brown read as soot against it).
+const DUST_ALBEDO_SAND: vec3<f32> = vec3<f32>(0.86, 0.72, 0.52);
+fn dust_albedo() -> vec3<f32> {
+    return select(DUST_ALBEDO, DUST_ALBEDO_SAND, sand_field());
+}
 // Water droplets: white, a touch blue from the sky they scatter.
 const FOG_ALBEDO: vec3<f32> = vec3<f32>(0.9, 0.92, 0.95);
 
@@ -642,7 +648,10 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Interleaved gradient noise: neighbours get evenly spread offsets, so the
     // banding breaks into a fine, even grain instead of white-noise speckle.
     let ign_p = frag.xy + vec2<f32>(5.588238 * f32(u32(t_now * 30.0) % 64u));
-    let jitter = fract(52.982918 * fract(dot(ign_p, vec2<f32>(0.06711056, 0.00583715))));
+    // A still has no history to resolve interleaved gradient noise: its
+    // diagonal structure printed as hatching through the upsample. Plain
+    // per-pixel hash noise, which the upsample tent averages to a smooth wash.
+    let jitter = hash12(ign_p * 1.37 + vec2<f32>(0.71, 0.29));
     let fog_h = max(frame.air[1].w, 0.1);
     let ground = frame.air[1].y - 0.5;
     var trans = 1.0;
@@ -657,7 +666,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var t = t_near + range * pow(jitter / fsteps, 2.0);
     var dt = 0.0;
     // Sky light is from above and the sand below bounces the sun.
-    let ground_bounce = DUST_ALBEDO * frame.sun_color.rgb * max(sun.y, 0.0) * 0.12 * frame.env.y;
+    let ground_bounce = dust_albedo() * frame.sun_color.rgb * max(sun.y, 0.0) * 0.12 * frame.env.y;
     for (var k: i32 = 0; k < steps + 16; k = k + 1) {
         t += dt;
         if (t >= t_far) {
@@ -672,6 +681,18 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         var dm = vec2<f32>(0.0);
         if (has_dust) {
             dm = air_sigma_soft(p, bmin, bmax);
+            // Haze at the foot of the plume: the published bottom layers read
+            // over a wide disc, thinning with height over a few decimetres, so
+            // the cloud settles into the ground instead of ending on it.
+            let hg = p.y - ground;
+            if (hg < 0.8) {
+                let foot = vec3<f32>(p.x, ground + 0.15, p.z);
+                let hz = 0.25 * (air_sigma(foot + vec3<f32>(0.9, 0.0, 0.5), bmin, bmax)
+                    + air_sigma(foot - vec3<f32>(0.9, 0.0, 0.5), bmin, bmax)
+                    + air_sigma(foot + vec3<f32>(-0.5, 0.0, 0.9), bmin, bmax)
+                    + air_sigma(foot - vec3<f32>(-0.5, 0.0, 0.9), bmin, bmax));
+                dm.x = max(dm.x, hz.x * 0.45 * exp(-max(hg, 0.0) / 0.22));
+            }
         }
         let dust = dm.x;
         let mist = dm.y;
@@ -722,7 +743,9 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                     // stripes, and widened with distance like the cone of light.
                     let q = p + sun * (s0 + (0.25 + 0.5 * fract(turn.y + f32(j) * 0.618)) * len);
                     let a = air_sigma_cone(q, 0.15 + 0.35 * (s0 + 0.5 * len), turn.x + f32(j) * 0.37, bmin, bmax);
-                    od += (a.x + a.y) * len * select(1.0, detail, j == 0);
+                    // 0.6: dust scatters most light forward and on; the full
+                    // optical depth turned the core of a sunlit plume to soot.
+                    od += (a.x + a.y) * len * select(1.0, detail, j == 0) * 0.6;
                     s0 += len;
                     len *= 2.2;
                 }
@@ -749,11 +772,13 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             // Sky through the plume above the point: dark undersides, bright tops.
             var od_up = 0.0;
             if (has_dust) {
-                let a1 = air_sigma_cone(p + vec3<f32>(0.0, 0.5, 0.0), 0.35, turn.z, bmin, bmax);
-                let a2 = air_sigma_cone(p + vec3<f32>(0.0, 1.5, 0.0), 0.8, turn.z + 0.25, bmin, bmax);
+                // Wide cones: narrow ones read the solver's columns and printed
+                // vertical dark fibres down the plume.
+                let a1 = air_sigma_cone(p + vec3<f32>(0.0, 0.5, 0.0), 0.7, turn.z, bmin, bmax);
+                let a2 = air_sigma_cone(p + vec3<f32>(0.0, 1.5, 0.0), 1.4, turn.z + 0.25, bmin, bmax);
                 od_up = (a1.x + a1.y) * 0.8 + (a2.x + a2.y) * 1.2;
             }
-            let sky_vis = exp(-od_up * 0.9);
+            let sky_vis = exp(-od_up * 0.5);
             // Lifted off the ground so the shadow map's texels do not print as acne.
             // Two taps a step apart along the ray: the map's texels no longer
             // print as bricks through a thin plume.
@@ -769,7 +794,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
             sig_air = sigma;
-            l_air = mix(FOG_ALBEDO, DUST_ALBEDO, wd) * l_in;
+            l_air = mix(FOG_ALBEDO, dust_albedo(), wd) * l_in;
         }
         // Soot: the solver's sun transmittance (.a) through the grid replaces
         // shadow taps; the scene shadow map still cuts the Niva's shadow in.
