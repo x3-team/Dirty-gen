@@ -202,9 +202,19 @@ const FOG_MARCH_M: f32 = 40.0;
 const DUST_ALBEDO: vec3<f32> = vec3<f32>(0.58, 0.47, 0.34);
 // Dust is the ground it was lifted from: on the beauty sand the warm
 // beige of the grain (the grey-brown read as soot against it).
-const DUST_ALBEDO_SAND: vec3<f32> = vec3<f32>(0.86, 0.72, 0.52);
+const DUST_ALBEDO_SAND: vec3<f32> = vec3<f32>(0.80, 0.64, 0.44);
 fn dust_albedo() -> vec3<f32> {
     return select(DUST_ALBEDO, DUST_ALBEDO_SAND, sand_field());
+}
+// The single-scatter albedo of a dense puff is the sand's own: warm ochre.
+// Thin edges scatter more light back out and read paler (the bright rim seen
+// toward the sun). `core` is 0 at a wisp and 1 in the body.
+const DUST_ALBEDO_SAND_DENSE: vec3<f32> = vec3<f32>(0.70, 0.53, 0.34);
+fn dust_albedo_at(core: f32) -> vec3<f32> {
+    if (!sand_field()) {
+        return DUST_ALBEDO;
+    }
+    return mix(DUST_ALBEDO_SAND, DUST_ALBEDO_SAND_DENSE, smoothstep(0.15, 0.85, core));
 }
 // Water droplets: white, a touch blue from the sky they scatter.
 const FOG_ALBEDO: vec3<f32> = vec3<f32>(0.9, 0.92, 0.95);
@@ -409,6 +419,12 @@ fn air_detail(p: vec3<f32>, v: vec3<f32>, t: f32, scale: f32) -> f32 {
     // The billow channel sits around 0.6 with lobes near 1; stretch it so
     // lobes stand out and the gaps between them clear.
     return 2.6 * smoothstep(0.32, 0.95, mix(d1, d0, w0));
+}
+
+// Large lobes of a plume: the billow channel at a metre-scale period,
+// carried by the air like the fine detail. 0 between clumps, about 1.3 on one.
+fn air_billow(p: vec3<f32>, v: vec3<f32>, t: f32) -> f32 {
+    return 0.5 * air_detail(p * 0.42 + vec3<f32>(3.1, 0.0, 1.7), v * 0.42, t, 0.32);
 }
 
 // Picture ground fog: thinning with height, parted by the Niva's body.
@@ -722,9 +738,15 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             // diagonal turn each step into a ramp.
             let o = vec3<f32>(bc_header.air_cell_x * 2.0, bc_header.air_cell_y * 2.0, -bc_header.air_cell_z * 2.0) * 0.5;
             let v = 0.5 * (air_velocity(p + o) + air_velocity(p - o));
-            let detail = air_detail(p, v, t_now, 0.32);
+            // Clumps: the large lobes gate the fine detail, so the body of a
+            // plume breaks into puffs with clear air between them.
+            let big = air_billow(p, v, t_now);
+            let detail = air_detail(p, v, t_now, 0.32) * mix(0.35, 1.35, smoothstep(0.15, 1.0, big));
             let core = 1.0 - exp(-dust * 0.6);
-            let s_dust = dust * mix(detail, 0.6 + 0.4 * detail, core);
+            // A thin plume (the tail) is eroded harder than the body: it
+            // tears into wisps instead of thinning evenly to the frame edge.
+            let thin = 1.0 - core;
+            let s_dust = dust * max(mix(detail, 0.6 + 0.4 * detail, core) - thin * thin * 0.55, 0.0);
             let s_fog = fog * mix(1.0, detail, 0.7);
             let sigma = s_dust + s_fog;
             let wd = s_dust / max(sigma, 1e-6);
@@ -735,6 +757,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             // print as a pixel pattern nor line up along screen rows.
             let turn = textureSampleLevel(air_noise, air_samp, p * 0.12 + vec3<f32>(0.21, 0.47, 0.13), 0.0).xyz * 3.0;
             var od = 0.0;
+            var od_local_up = 0.0;
             if (has_dust) {
                 var s0 = 0.0;
                 var len = 0.4;
@@ -749,6 +772,18 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                     s0 += len;
                     len *= 2.2;
                 }
+            }
+            // Shading inside a clump: the lobe and the detail a step toward
+            // the sun and a step up. Lit tops, darker undersides and seams,
+            // which the grid alone (cells of 12-25 cm, cone-blurred) cannot draw.
+            if (has_dust) {
+                let ps = p + sun * 0.45;
+                let lob_s = air_billow(ps, v, t_now);
+                let pu = p + vec3<f32>(0.0, 0.45, 0.0);
+                let lob_u = air_billow(pu, v, t_now);
+                let d_here = dust * (0.6 + 0.4 * core);
+                od += d_here * smoothstep(0.1, 1.0, lob_s) * 0.35;
+                od_local_up = d_here * smoothstep(0.1, 1.0, lob_u) * 0.3;
             }
             od += ground_fog(p) * fog_h / max(sun.y, 0.08);
             // Multiple scattering, after Wrenninge et al.: each octave sees a
@@ -778,13 +813,17 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                 let a2 = air_sigma_cone(p + vec3<f32>(0.0, 1.5, 0.0), 1.4, turn.z + 0.25, bmin, bmax);
                 od_up = (a1.x + a1.y) * 0.8 + (a2.x + a2.y) * 1.2;
             }
-            let sky_vis = exp(-od_up * 0.5);
+            let sky_vis = exp(-od_up * 0.5 - od_local_up);
             // Lifted off the ground so the shadow map's texels do not print as acne.
             // Two taps a step apart along the ray: the map's texels no longer
             // print as bricks through a thin plume.
             let lit = 0.5 * (shadow_factor(p + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0))
                 + shadow_factor(p - rd * (0.5 * dt) + vec3<f32>(0.0, 0.2, 0.0), vec3<f32>(0.0, 1.0, 0.0)));
-            var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky * mix(0.75, 1.0, 1.0 - wd) * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
+            // The blue sky light on a sand cloud: half of it as its luminance,
+            // so the shaded side stays warm grey-ochre, not cold.
+            let sky_l = dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722));
+            let sky_d = mix(sky, vec3<f32>(sky_l), 0.5 * wd);
+            var l_in = frame.sun_color.rgb * 1.25 * ms * powder * lit + sky_d * mix(0.75, 1.0, 1.0 - wd) * sky_vis + ground_bounce * (1.0 - sky_vis * 0.5);
             if (lamp_on > 0.0) {
                 for (var i: i32 = 0; i < 2; i = i + 1) {
                     let b = lamp_beam(i, p);
@@ -794,7 +833,7 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
             sig_air = sigma;
-            l_air = mix(FOG_ALBEDO, dust_albedo(), wd) * l_in;
+            l_air = mix(FOG_ALBEDO, dust_albedo_at(core), wd) * l_in;
         }
         // Soot: the solver's sun transmittance (.a) through the grid replaces
         // shadow taps; the scene shadow map still cuts the Niva's shadow in.
@@ -834,6 +873,30 @@ fn fs_fog(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let l_far = frame.sun_color.rgb * 1.25 * fog_phase * 0.6 + sky;
         light += trans * FOG_ALBEDO * l_far * (1.0 - step_t);
         trans *= step_t;
+    }
+    // The cloud's shadow on whatever the ray ends on (sand, the sills): sun
+    // light reaching that point through the published dust, as an optical
+    // depth over four cone taps toward the sun. Only the sun's share of the
+    // light dims; the sky still reaches under a cloud. It scales what shows
+    // through the cloud, so it rides on the alpha of the premultiplied blend,
+    // with the warm light the dust scatters down added back.
+    if (has_dust && d < 1.0 && trans > 0.01) {
+        let ph = ro + rd * dist + vec3<f32>(0.0, 0.05, 0.0);
+        var od_g = 0.0;
+        var s0 = 0.1;
+        var len = 0.3;
+        for (var j: i32 = 0; j < 4; j = j + 1) {
+            let q = ph + sun * (s0 + (0.25 + 0.5 * jitter) * len);
+            let a = air_sigma_cone(q, 0.2 + 0.3 * (s0 + 0.5 * len), jitter + f32(j) * 0.37, bmin, bmax);
+            od_g += a.x * len;
+            s0 += len;
+            len *= 2.3;
+        }
+        let sun_share = 0.62 * clamp(sun.y * 2.0, 0.0, 1.0);
+        let dim = sun_share * (1.0 - exp(-od_g * 0.8));
+        let warm = dust_albedo_at(0.5) * frame.sun_color.rgb * 0.06 * frame.env.y * dim;
+        light += trans * warm;
+        trans *= 1.0 - dim;
     }
     let alpha = 1.0 - trans;
     let glow = tonemap(emit);
