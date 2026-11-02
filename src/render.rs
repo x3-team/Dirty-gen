@@ -2861,7 +2861,7 @@ impl Renderer {
                 );
                 // Still capture: submit reflect RT before water samples pool_reflect_tex.
                 self.queue.submit(Some(encoder.finish()));
-                self.device.poll(wgpu::Maintain::Wait);
+                silt::gpu_wait::wait_idle(&self.device);
                 self.rebuild_tex_bg_pool_reflect();
                 self.queue.write_buffer(
                     &self.frame_buf,
@@ -3301,7 +3301,7 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&self.device);
         rx.recv().expect("map").expect("map buffer");
         let padded = slice.get_mapped_range();
         let row = (self.width * 4) as usize;
@@ -3613,13 +3613,13 @@ impl Renderer {
             },
         );
         self.queue.submit(Some(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&self.device);
         let slice = self.reflect_readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        silt::gpu_wait::wait_idle(&self.device);
         rx.recv().expect("map").expect("map buffer");
         let padded = slice.get_mapped_range();
         let row = (self.width * 4) as usize;
@@ -4928,7 +4928,7 @@ fn debug_contract_view_reads_the_published_maps() {
         false,
         None,
     );
-    let _ = device.poll(wgpu::Maintain::Wait);
+    silt::gpu_wait::wait_idle(&device);
     if let Some(err) = pollster::block_on(device.pop_error_scope()) {
         panic!("debug contract shader: {err}");
     }
@@ -5015,7 +5015,7 @@ fn debug_contract_view_reads_the_published_maps() {
     );
     device.push_error_scope(wgpu::ErrorFilter::Validation);
     queue.submit(Some(encoder.finish()));
-    let _ = device.poll(wgpu::Maintain::Wait);
+    silt::gpu_wait::wait_idle(&device);
     if let Some(err) = pollster::block_on(device.pop_error_scope()) {
         panic!("debug contract draw: {err}");
     }
@@ -5024,7 +5024,7 @@ fn debug_contract_view_reads_the_published_maps() {
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
-    let _ = device.poll(wgpu::Maintain::Wait);
+    silt::gpu_wait::wait_idle(&device);
     rx.recv().expect("map").expect("map buffer");
     let bytes = slice.get_mapped_range();
     let mid = ((height / 2) * padded + (width / 2) * 4) as usize;

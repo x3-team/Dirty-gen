@@ -973,7 +973,7 @@ impl ContractGpu {
         let created = Self::create(device);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = device.poll(wgpu::Maintain::Wait);
+            crate::gpu_wait::wait_idle(&device);
             let err = pollster::block_on(device.pop_error_scope());
             if let Some(err) = err {
                 eprintln!("render contract textures unavailable: {err:?}");
