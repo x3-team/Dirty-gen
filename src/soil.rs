@@ -436,7 +436,8 @@ pub fn berm_creep_rate(kind: SurfaceKind, moisture: f32) -> f32 {
 pub fn wet_berm_creep_under_load_rate(kind: SurfaceKind, moisture: f32, load_n: f32) -> f32 {
     let kind = paste_kind(kind);
     let visc = slurry_viscosity(kind, moisture).max(0.05);
-    let load = (load_n / 3000.0).clamp(0.0, 2.6);
+    // Loads are Niva wheel loads; 3 kN was a heavy 640 kg wheel.
+    let load = (load_n / (3000.0 * SOIL_STRENGTH)).clamp(0.0, 2.6);
     (1.35 / visc).clamp(0.0025, 0.058) * (1.0 + 5.2 * load)
 }
 
@@ -824,19 +825,40 @@ fn scale_mech(
     tm
 }
 
+/// Strength of the soil curve against the curve first fitted by eye, 1210/640.
+///
+/// That curve was fitted under a 640 kg model Niva, 1.57 kN per wheel. The
+/// real car (VAZ-2121, 1210 kg) puts 2.97 kN on each wheel. Bekker sinkage
+/// depends on load over modulus, and Janosi shear, Bingham yield and the
+/// rut drag all scale with the soil's strength over the wheel load, so
+/// multiplying modulus, cohesion, yield and drag viscosity by the load ratio
+/// keeps every rut and grip the fitted scenes were built on.
+///
+/// It is also a step toward measured soil, though still softer. Pressure
+/// k·z^n at 10 cm sinkage, against Wong's Bekker tables (Theory of Ground
+/// Vehicles) with b = 0.28 m:
+/// - firm end here 68 kPa (was 36). Lean clay at 32% gives 485 kPa, sandy
+///   loam at 23% 338 kPa.
+/// - deep end here 17 kPa before the bog cut (was 9). Thai clay at 55%
+///   gives 263 kPa. Our deep mud stays a game bog, softer than any table.
+/// - cohesion here 2.6–9.8 kPa. Wong's wet clays and loams give 1.4–4.1 kPa,
+///   heavy clay 21–69 kPa.
+/// Snow has its own Harrison constants in [`crate::snow_track`].
+pub const SOIL_STRENGTH: f32 = crate::vehicle::MASS / 640.0;
+
 /// Soil constants blended by `softness` in 0 (firm damp ground) ..= 1 (deep mud).
 pub fn terramech(softness: f32) -> Terramech {
     let s = softness.clamp(0.0, 1.0);
     // Yield rises faster than cohesion, so extra sinkage eventually bogs the tire.
     let s_yield = s.powf(1.35);
     Terramech {
-        k_eq: lerp(320_000.0, 48_000.0, s),
+        k_eq: lerp(320_000.0, 48_000.0, s) * SOIL_STRENGTH,
         n: lerp(0.95, 0.72, s),
-        cohesion: lerp(1_400.0, 5_200.0, s),
+        cohesion: lerp(1_400.0, 5_200.0, s) * SOIL_STRENGTH,
         phi: lerp(0.58, 0.20, s),
         shear_k: lerp(0.045, 0.018, s),
-        yield_stress: lerp(140.0, 3_600.0, s_yield),
-        viscosity: lerp(18.0, 150.0, s),
+        yield_stress: lerp(140.0, 3_600.0, s_yield) * SOIL_STRENGTH,
+        viscosity: lerp(18.0, 150.0, s) * SOIL_STRENGTH,
     }
 }
 
@@ -876,17 +898,18 @@ pub fn surface_rest(kind: SurfaceKind) -> (f32, f32, f32) {
     }
 }
 
-/// Wheel load used when reporting sink for one surface, newtons.
-pub const SURFACE_WHEEL_LOAD: f32 = 1_600.0;
+/// Wheel load used when reporting sink for one surface, newtons. A quarter
+/// of the Niva, rounded the way the 640 kg model's 1.6 kN was.
+pub const SURFACE_WHEEL_LOAD: f32 = 1_600.0 * SOIL_STRENGTH;
 
 /// Upward soil reaction and horizontal shear for a light pass, newtons.
 /// The bed of that pass is [`rut_depth_from_force`] of this pair.
-pub const LIGHT_PASS_NORMAL: f32 = 650.0;
-pub const LIGHT_PASS_PUSH: f32 = 150.0;
+pub const LIGHT_PASS_NORMAL: f32 = 650.0 * SOIL_STRENGTH;
+pub const LIGHT_PASS_PUSH: f32 = 150.0 * SOIL_STRENGTH;
 
 /// A harder push: more weight on the patch and more shear into the soil.
-pub const HARD_PASS_NORMAL: f32 = 5_400.0;
-pub const HARD_PASS_PUSH: f32 = 4_200.0;
+pub const HARD_PASS_NORMAL: f32 = 5_400.0 * SOIL_STRENGTH;
+pub const HARD_PASS_PUSH: f32 = 4_200.0 * SOIL_STRENGTH;
 
 /// Grip (`tan φ`) and sink (m) of a rested surface under [`SURFACE_WHEEL_LOAD`].
 pub fn surface_grip_sink(kind: SurfaceKind) -> (f32, f32) {
@@ -2808,7 +2831,7 @@ impl SoilField {
             }
         }
 
-        if loaded && normal + push > 350.0 {
+        if loaded && normal + push > 350.0 * SOIL_STRENGTH {
             self.creep_wet_berm_under_patch(
                 center,
                 forward,
@@ -3653,8 +3676,11 @@ impl SoilField {
         let inner_margin = cell * 1.4;
         let rear_z = rear_left.1.min(rear_right.1);
         let front_z = front_hub.1;
-        let bow_near = front_z + 0.18;
-        let bow_far = (front_z + 0.95).min(pool_z1 - lip);
+        // Along the heading from the front hub, stopping short of the far lip.
+        // These were once absolute z, so the window slid with the car and an
+        // extra 20 cm of travel left it empty.
+        let bow_near = 0.18_f32;
+        let bow_far = 0.95_f32.min(pool_z1 - lip - front_z);
         let wake_top = rear_z - 0.14;
         let wake_floor = pool_z0 + inner_margin;
         let on_rut = |cx: f32| {
@@ -3819,7 +3845,7 @@ impl SoilField {
         load_n: f32,
         dt: f32,
     ) {
-        if dt <= 0.0 || load_n < 350.0 {
+        if dt <= 0.0 || load_n < 350.0 * SOIL_STRENGTH {
             return;
         }
         let fwd = horizontal(forward);
@@ -3965,7 +3991,7 @@ impl SoilField {
         rut_z0: f32,
         rut_z1: f32,
     ) {
-        if dt <= 0.0 || load_n < 350.0 {
+        if dt <= 0.0 || load_n < 350.0 * SOIL_STRENGTH {
             return;
         }
         let half = self.size * 0.5;
@@ -5129,8 +5155,11 @@ impl SoilField {
         let front_z = front_hub.1;
         let wake_top = rear_z - 0.14;
         let wake_floor = pool_z0 + inner_margin;
-        let bow_near = front_z + 0.18;
-        let bow_far = (front_z + 0.95).min(pool_z1 - lip);
+        // Along the heading from the front hub, stopping short of the far lip.
+        // These were once absolute z, so the window slid with the car and an
+        // extra 20 cm of travel left it empty.
+        let bow_near = 0.18_f32;
+        let bow_far = 0.95_f32.min(pool_z1 - lip - front_z);
         if bow_far <= bow_near + 0.04 || wake_top <= wake_floor + 0.04 {
             return;
         }
@@ -7458,7 +7487,7 @@ impl SoilField {
         let slurry0 = field.slurry.clone();
         let wet_sample = field.floor_sample(0.96, 0.0);
         let wet_sink = sinkage_on(
-            1_600.0,
+            SURFACE_WHEEL_LOAD,
             wet_sample.kind(),
             wet_sample.wetness,
             wet_sample.loose,
@@ -7477,7 +7506,7 @@ impl SoilField {
             field.lane_crust(0.4);
         let baked = field.floor_sample(0.96, 0.0);
         let crust_sink = sinkage_on(
-            1_600.0,
+            SURFACE_WHEEL_LOAD,
             baked.kind(),
             baked.wetness,
             baked.loose,
@@ -7486,7 +7515,7 @@ impl SoilField {
             0.28,
         );
         let old_sink = sinkage_on_track(
-            1_600.0,
+            SURFACE_WHEEL_LOAD,
             baked.kind(),
             baked.wetness,
             baked.loose,
@@ -7505,8 +7534,8 @@ impl SoilField {
         let wet_cut0 = wet_again.lane_cut(0.96);
         let old_cut0 = old_again.lane_cut(0.96);
         // A load just past the wet rut. The baked floor is already harder than that.
-        let again_n = 1_900.0;
-        let again_p = 180.0;
+        let again_n = 1_900.0 * SOIL_STRENGTH;
+        let again_p = 180.0 * SOIL_STRENGTH;
         wet_again.roll_force_lane(from, to, 0.05, 0.15, again_n, again_p);
         old_again.roll_force_lane(from, to, 0.05, 0.15, again_n, again_p);
         let sand_crust = field.patch_max_crust(6.2, 6.0);

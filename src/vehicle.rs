@@ -8,17 +8,22 @@ use crate::fluid_core::HydroSolid;
 use crate::patch::{contact_patch, step_tread, stuck_compact_breakaway, TreadCoat, TreadStep};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, mech_for_sample, on_launch_crest,
-    rolling_resistance, slurry_motion_drag, slurry_suction_force, stick_scale, terramech_for,
+    rolling_resistance, slurry_motion_drag, SOIL_STRENGTH, slurry_suction_force, stick_scale, terramech_for,
     track_harden_mul, wheel_buoyancy, SoilField, SoilSample,
 };
 
 pub const WHEEL_RADIUS: f32 = 0.38;
 pub const WHEEL_WIDTH: f32 = 0.28;
-pub const MASS: f32 = 640.0;
+/// Sprung and unsprung mass of the Niva (VAZ-2121 curb weight), kg.
+pub const MASS: f32 = 1_210.0;
+/// The chassis gains below were tuned on a 640 kg model. They scale with the
+/// mass so the car keeps its ride, damping and acceleration while every
+/// tire carries the real load into the ground.
+pub const TUNE: f32 = MASS / 640.0;
 pub const REST_LEN: f32 = 0.50;
 pub const SUSP_TRAVEL: f32 = 0.30;
-pub const SUSP_K: f32 = 17_500.0;
-pub const SUSP_PRELOAD: f32 = 280.0;
+pub const SUSP_K: f32 = 17_500.0 * TUNE;
+pub const SUSP_PRELOAD: f32 = 280.0 * TUNE;
 pub const HARD_Y: f32 = 0.22;
 pub const PANEL_COUNT: usize = 12;
 
@@ -35,12 +40,14 @@ pub const PANEL_FENDER_RR: usize = 9;
 pub const PANEL_ENGINE: usize = 10;
 pub const PANEL_SEAT: usize = 11;
 
-const I_YAW: f32 = 720.0;
-const I_PITCH: f32 = 480.0;
-const I_ROLL: f32 = 260.0;
-const WHEEL_INERTIA: f32 = 2.6;
+const I_YAW: f32 = 720.0 * TUNE;
+const I_PITCH: f32 = 480.0 * TUNE;
+const I_ROLL: f32 = 260.0 * TUNE;
+// Wheel plus the drivetrain reflected through the gears. Wheel torques scale
+// with TUNE, so this does too and the spin-up time stays the same.
+const WHEEL_INERTIA: f32 = 2.6 * TUNE;
 const MAX_STEER: f32 = 0.50;
-const ENGINE_TORQUE: f32 = 500.0;
+const ENGINE_TORQUE: f32 = 500.0 * TUNE;
 const MAX_OMEGA: f32 = 34.0;
 const WHEEL_MUD_CAP: f32 = 1.5;
 pub const PANEL_MUD_CAP: f32 = 0.85;
@@ -424,7 +431,7 @@ impl Vehicle {
         }
         let s = soil.sample(self.pos.x, self.pos.z);
         let wet = s.wetness.clamp(0.0, 1.0);
-        (pen * (2_200.0 + 3_800.0 * wet)).min(6_500.0)
+        (pen * (2_200.0 + 3_800.0 * wet) * TUNE).min(6_500.0 * TUNE)
     }
 
     pub fn update_steer(&mut self, steer: f32, dt: f32) {
@@ -531,7 +538,10 @@ impl Vehicle {
             let active = sinkage > 0.003 && normal > 1.0;
             let mut chassis_long = 0.0;
             let mut chassis_lat = 0.0;
-            let mut wheel_torque = engine_torque(throttle, omega);
+            let mut wheel_torque = engine_torque(
+                throttle * spin_governor(self.wheels[i].slip * throttle.signum(), self.wheels[i].sinkage),
+                omega,
+            );
             wheel_torque += brake_torque(brake, omega, v_long);
             let mut stuck = false;
             let mut fling = 0.0;
@@ -548,7 +558,7 @@ impl Vehicle {
                 };
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
-                let sigma = (normal / area).clamp(0.0, 80_000.0);
+                let sigma = (normal / area).clamp(0.0, 80_000.0 * TUNE);
                 let j_long = slip.abs() * length;
                 let slip_angle = if v_long.abs() < 0.2 && v_lat.abs() < 0.2 {
                     0.0
@@ -681,9 +691,11 @@ impl Vehicle {
                         v_long,
                         omega,
                     );
-                    wheel_torque += drag.torque;
+                    // The paste drag was fitted with the same 640 kg model
+                    // as the soil curve, so it takes the same strength.
+                    wheel_torque += drag.torque * SOIL_STRENGTH;
                     if !stuck {
-                        chassis_long += drag.force;
+                        chassis_long += drag.force * SOIL_STRENGTH;
                     }
                 }
 
@@ -705,7 +717,7 @@ impl Vehicle {
                     WHEEL_WIDTH,
                     v_up,
                     self.wheels[i].slurry_lift,
-                )
+                ) * SOIL_STRENGTH
             } else {
                 0.0
             };
@@ -764,7 +776,7 @@ impl Vehicle {
             // Suction pulls down through the seal. It can exceed the spring
             // by a little, which is the tire sticking, and then it is capped
             // so one wheel cannot throw the chassis through the bed.
-            let support = (c.normal - c.suction).max(-1_600.0);
+            let support = (c.normal - c.suction).max(-1_600.0 * TUNE);
             let f_world = Vec3::new(
                 c.forward.x * c.chassis_long + c.right.x * c.chassis_lat,
                 support,
@@ -824,42 +836,42 @@ impl Vehicle {
                 }
                 let r = (self.pos + ori * hp) - self.pos;
                 let v_y = (self.vel + ang_world.cross(r)).y;
-                force.y += -2_600.0 * v_y;
+                force.y += -2_600.0 * TUNE * v_y;
             }
         }
 
         if airborne {
-            force.y += -70.0 * self.vel.y;
-            torque_local.x -= 28.0 * self.pitch_rate;
-            torque_local.z -= 28.0 * self.roll_rate;
+            force.y += -70.0 * TUNE * self.vel.y;
+            torque_local.x -= 28.0 * TUNE * self.pitch_rate;
+            torque_local.z -= 28.0 * TUNE * self.roll_rate;
         } else if climbing {
             let want = self.speed() * slope / (1.0 + slope * slope).sqrt();
             let lift = (want - self.vel.y).max(0.0);
             force.y += lift * MASS * 7.0;
-            force.y += -320.0 * self.vel.y;
+            force.y += -320.0 * TUNE * self.vel.y;
             // Positive pitch is nose-down. The face wants the nose up.
             let target = -slope.atan();
-            torque_local.x += (target - self.pitch) * 2_800.0;
-            torque_local.x -= 70.0 * self.pitch_rate;
-            torque_local.z -= 360.0 * self.roll_rate;
+            torque_local.x += (target - self.pitch) * 2_800.0 * TUNE;
+            torque_local.x -= 70.0 * TUNE * self.pitch_rate;
+            torque_local.z -= 360.0 * TUNE * self.roll_rate;
         } else if tumbling {
-            force.y += -800.0 * self.vel.y;
-            torque_local.x -= wrap_angle(self.pitch) * 3_400.0;
-            torque_local.z -= wrap_angle(self.roll) * 3_400.0;
-            torque_local.x -= 260.0 * self.pitch_rate;
-            torque_local.z -= 260.0 * self.roll_rate;
+            force.y += -800.0 * TUNE * self.vel.y;
+            torque_local.x -= wrap_angle(self.pitch) * 3_400.0 * TUNE;
+            torque_local.z -= wrap_angle(self.roll) * 3_400.0 * TUNE;
+            torque_local.x -= 260.0 * TUNE * self.pitch_rate;
+            torque_local.z -= 260.0 * TUNE * self.roll_rate;
         } else {
-            force.y += -4_500.0 * self.vel.y;
+            force.y += -4_500.0 * TUNE * self.vel.y;
             if self.roll.abs() > 0.42 {
-                torque_local.z -= self.roll.signum() * (self.roll.abs() - 0.42) * 9_000.0;
+                torque_local.z -= self.roll.signum() * (self.roll.abs() - 0.42) * 9_000.0 * TUNE;
             }
             if self.pitch.abs() > 0.38 {
-                torque_local.x -= self.pitch.signum() * (self.pitch.abs() - 0.38) * 7_000.0;
+                torque_local.x -= self.pitch.signum() * (self.pitch.abs() - 0.38) * 7_000.0 * TUNE;
             }
-            torque_local.x -= 900.0 * self.pitch_rate;
-            torque_local.z -= 750.0 * self.roll_rate;
+            torque_local.x -= 900.0 * TUNE * self.pitch_rate;
+            torque_local.z -= 750.0 * TUNE * self.roll_rate;
         }
-        torque_local.y -= 180.0 * self.yaw_rate;
+        torque_local.y -= 180.0 * TUNE * self.yaw_rate;
 
         self.vel += (force / mass) * dt;
         if airborne || climbing {
@@ -962,7 +974,7 @@ impl Vehicle {
                 tread[c.index] = step;
                 let wet = c.sample.wetness * stick_scale(c.sample.kind(), c.sample.wetness);
                 let loose = c.sample.loose;
-                let pressure = (c.normal / 1_500.0).clamp(0.0, 2.5);
+                let pressure = (c.normal / (1_500.0 * TUNE)).clamp(0.0, 2.5);
                 let room = (1.0 - w.mud / WHEEL_MUD_CAP).clamp(0.0, 1.0);
                 let agitate = (c.slip.abs() * 0.85 + (c.speed / 3.0).clamp(0.0, 1.0) * 0.55 + 0.05)
                     .clamp(0.0, 2.2);
@@ -1119,12 +1131,12 @@ fn solve_suspension(
     // Droop stop: the ground is softer than the preloaded spring, so the arm
     // stays extended and only the soil force is passed into the chassis.
     if support(0.0) < spring(0.0) {
-        return (0.0, z_of(0.0), support(0.0).min(22_000.0));
+        return (0.0, z_of(0.0), support(0.0).min(22_000.0 * TUNE));
     }
     // Bump stop: full compression and the soil is still harder than the spring.
     if support(SUSP_TRAVEL) > spring(SUSP_TRAVEL) {
         let z = z_of(SUSP_TRAVEL);
-        return (SUSP_TRAVEL, z, support(SUSP_TRAVEL).min(22_000.0));
+        return (SUSP_TRAVEL, z, support(SUSP_TRAVEL).min(22_000.0 * TUNE));
     }
 
     let mut lo = 0.0;
@@ -1138,7 +1150,7 @@ fn solve_suspension(
         }
     }
     let c = 0.5 * (lo + hi);
-    (c, z_of(c), spring(c).min(22_000.0))
+    (c, z_of(c), spring(c).min(22_000.0 * TUNE))
 }
 
 impl Vehicle {
@@ -1147,6 +1159,25 @@ impl Vehicle {
         WHEEL_INERTIA + mud * WHEEL_RADIUS * WHEEL_RADIUS * 0.55
     }
 }
+
+/// Pedal share the driver keeps on a wheel that slipped by `slip` last step.
+/// A tread spun far past its peak only digs, so the foot lifts until the lugs
+/// bite again, the way a careful driver works a binary key. Below 0.3 slip the
+/// pedal is untouched.
+/// On firm ground (sinkage under 3 cm) a spin is a launch, not digging, so
+/// the foot stays down. `slip` is signed along the pedal: a wheel that last
+/// spun the other way (rocking out of a hole) is not spun past its peak in
+/// the new direction, so the foot stays down there too.
+pub fn spin_governor(slip: f32, sinkage: f32) -> f32 {
+    let x = slip.max(0.0);
+    let t = ((x - SPIN_GOV_START) / (SPIN_GOV_FULL - SPIN_GOV_START)).clamp(0.0, 1.0);
+    let dug = smoothstep(0.03, 0.09, sinkage);
+    lerp(1.0, SPIN_GOV_FLOOR, t * t * (3.0 - 2.0 * t) * dug)
+}
+
+const SPIN_GOV_START: f32 = 0.30;
+const SPIN_GOV_FULL: f32 = 0.65;
+const SPIN_GOV_FLOOR: f32 = 0.12;
 
 fn engine_torque(throttle: f32, omega: f32) -> f32 {
     if throttle >= 0.0 {
@@ -1162,13 +1193,13 @@ fn brake_torque(brake: f32, omega: f32, v_long: f32) -> f32 {
     if brake < 0.01 {
         return 0.0;
     }
-    let mag = brake * 900.0;
+    let mag = brake * 900.0 * TUNE;
     if omega.abs() > 0.6 {
         -omega.signum() * mag
     } else if v_long.abs() > 0.3 {
         -v_long.signum() * mag * 0.35
     } else {
-        -omega * 80.0 * brake
+        -omega * 80.0 * TUNE * brake
     }
 }
 

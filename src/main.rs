@@ -6554,7 +6554,7 @@ fn moisture_clay(soil: &silt::soil::SoilField) -> ClayRead {
     ClayRead {
         mu: grip_mu(kind, s.wetness, s.loose, s.water),
         phi: terramech_for(kind, s.softness, s.water).phi,
-        sink: sinkage_on(1_600.0, kind, s.wetness, s.loose, s.water, 0.38, 0.28),
+        sink: sinkage_on(silt::soil::SURFACE_WHEEL_LOAD, kind, s.wetness, s.loose, s.water, 0.38, 0.28),
         stick: stickiness(kind, s.wetness, s.loose, s.water),
         kind,
         wetness: s.wetness,

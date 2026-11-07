@@ -984,9 +984,12 @@ mod tests {
             vehicle.wheels[0].omega
         );
 
+        // The same share of the car's weight as 0.05 m³ was on the 640 kg
+        // model. The drop below is Newton, extra·g/(M+extra)·dt, so it only
+        // reads the share.
         let mut heavy = Vehicle::new();
         heavy.adhesion.parts[PART_BELLY].mix =
-            compose(SurfaceKind::WetMud, 0.46, 0.0, 0.05);
+            compose(SurfaceKind::WetMud, 0.46, 0.0, 0.05 * MASS / 640.0);
         let extra = heavy.adhesion.mass_kg();
         assert!(extra > 60.0, "mass {extra}");
         assert!((heavy.total_mass() - (MASS + extra)).abs() < 1.0e-2);
