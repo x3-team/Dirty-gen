@@ -4324,6 +4324,11 @@ impl ThroughDrive {
             }
         }
         fluid.drain_over_bed(SHORE_DRAIN_DT, SHORE_DRAIN_STEPS);
+        // Two tracks of clay slurry ahead of the car, from past the bay's north
+        // bank to the exit. Laid after the shore settles so the bay contour is
+        // only the compass pour and its skin. The ledger counts them as opened.
+        let ruts = fluid.lay_slurry_mask(|x, z| 0.08 * slurry_rut_mask(x, z), Grain::Clay, 0.55);
+        let sheet_opened_m3 = sheet_opened_m3 + ruts as f64;
         mirror_fluid(&fluid, &mut world.soil);
         world.vehicle.pos.x = 0.0;
         world.vehicle.pos.z = -20.0;
@@ -5262,6 +5267,27 @@ fn puddle_pore_moisture(x: f32, z: f32, background: f32) -> f32 {
 /// Soft oval, wholly inside the heightfield. 1 in the middle, 0 at the shore.
 fn puddle_mask(x: f32, z: f32) -> f32 {
     smooth01(1.0 - puddle_e(x, z))
+}
+
+/// Two slurry tracks ahead of the car, 0..1 across each tread.
+fn slurry_rut_mask(x: f32, z: f32) -> f32 {
+    // The tracks start past the north bank of the bay (z = -9.2), so the
+    // puddle shore is only the compass pour and its skin.
+    let end = if z < -7.6 {
+        (-7.6 - z) / 1.15
+    } else if z > -1.4 {
+        (z + 0.8) / 1.15
+    } else {
+        0.0
+    };
+    let along = smooth01(1.0 - end);
+    let mut mask = 0.0_f32;
+    for track in [-0.74_f32, 0.74] {
+        let lat = (x - track).abs() / 0.58;
+        let across = smooth01(1.0 - lat);
+        mask = mask.max(across * along);
+    }
+    mask
 }
 
 fn cut_rut_groove(soil: &mut SoilField, x: f32, z: f32) {
