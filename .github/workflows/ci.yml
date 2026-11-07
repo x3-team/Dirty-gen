@@ -73,10 +73,10 @@ jobs:
           cargo test --test win_demo -- --nocapture
       - name: Release solver budget
         env:
-          # d0eeb1b is main with #145 (shore headroom) and #147 merged. The
+          # ad39a39 is main with #153 (beauty base) merged. The
           # gate checks the caps on the median of its paired runs; the single
           # runs below still assert every cap. A base exit 101 is an error.
-          PERF_BASE_SHA: d0eeb1bb96363321d32b270c3dc565101134bb58
+          PERF_BASE_SHA: ad39a39c5faeceac4dd236be7099a605d1126bdf
         run: |
           export LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so)"):${LIBRARY_PATH:-}"
           export CXX=g++ CC=gcc
