@@ -374,6 +374,50 @@ impl Particles {
         carried
     }
 
+    /// Hybrid H2, 2D -> 3D for mud on the tread: slurry the tire carried up
+    /// leaves the rim on the rear side where adhesion gives out. A point at
+    /// angle `phi` from the contact (going up the back of a tire rolling at
+    /// `speed`) moves at `speed * ((1 - cos phi) forward + sin phi up)` over
+    /// the ground, so the pieces rise and trail behind the car. `axle` is the
+    /// hub centre. The volume is already out of the sheet; landing returns
+    /// it to the rut (`returns_to_rut`).
+    pub fn throw_tread_mud(
+        &mut self,
+        axle: Vec3,
+        forward: Vec3,
+        right: Vec3,
+        speed: f32,
+        radius: f32,
+        volume: f32,
+    ) -> f32 {
+        let forward = horizontal_axis(forward, Vec3::Z);
+        let right = horizontal_axis(right, Vec3::X);
+        if volume <= 1.0e-8 || !volume.is_finite() || !speed.is_finite() {
+            return 0.0;
+        }
+        let speed = speed.abs().max(0.5);
+        let radius = radius.clamp(0.2, 0.6);
+        let n = 3usize;
+        let mut carried = 0.0_f32;
+        for i in 0..n {
+            // Release low on the back of the tire: at road speed the rim
+            // pull (v^2 / r is over 15 g at 8 m/s) beats clay adhesion
+            // within the first 15..55 degrees. Higher up, the arch catches it.
+            let phi = (15.0 + 40.0 * (i as f32 + self.rnd()) / n as f32).to_radians();
+            let (s, c) = phi.sin_cos();
+            // Across the tread, a piece leaves anywhere on the 18 cm width
+            // and the sidewall throws a little outwards.
+            let across = (self.rnd() - 0.5) * 0.18;
+            let pos = axle - forward * (radius * s) - Vec3::Y * (radius * c) + right * across;
+            let spread = 1.0 + (self.rnd() - 0.5) * 0.25;
+            let vel = (forward * (1.0 - c) + Vec3::Y * s) * speed * spread
+                + right * across.signum() * speed * 0.06 * self.rnd();
+            let kind = if i == 0 { KIND_SLURRY_DROP } else { KIND_SLURRY_RIBBON };
+            carried += self.spawn_slurry(pos, vel, volume / n as f32, kind, true);
+        }
+        carried
+    }
+
     fn spawn_slurry(
         &mut self,
         pos: Vec3,

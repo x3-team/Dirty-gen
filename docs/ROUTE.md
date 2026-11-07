@@ -80,6 +80,15 @@ The next work plan. Owner is the system the fix belongs in.
 1. **Spray and slurry drawn as tall vertical cards, dark slabs at the wheels**
    (puddle, mud). The worst thing on the route: reads as broken geometry.
    Render: particle cards for spray/slurry sheets.
+   *Fixed (spray/slurry PR):* the "cards" were the water mesh: tire wake rings
+   (`solver_shock_rings`, unit sines per tire) were added to the vertex
+   height and stood the sheet up 2-3 m at the wheels; now they shade the
+   normal only. The slabs were picture-only rut ribbons with no volume; they
+   are gone. Spray and flying slurry follow hybrid H2: drops leave the sheet
+   as bow wings and a rooster tail, land back into the column (volume plus
+   a share of momentum; `spray_m3` is now what is in the air), tread mud
+   leaves the rim by rolling kinematics, and both draw as volume-sized
+   droplet sprites (`mesh::splash_sprites`, `fs_splash`).
 2. **Puddle water does not read at the car** (puddle). Needs a check of sheet
    depth vs water shading at dusk. Physics (puddle pour/drain) or render
    (water column at `daylight = false`); unverified which.

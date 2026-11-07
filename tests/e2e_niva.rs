@@ -188,7 +188,7 @@ fn books_of(
 ) -> Books {
     let b = fluid.ledger();
     let eroded = fluid.hydro_load().eroded_m3 as f64;
-    let water = b.water_m3 as f64 + b.frozen_water_m3 as f64 + b.spray_m3 as f64 + held_water;
+    let water = b.water_m3 as f64 + b.frozen_water_m3 as f64 + b.spray_m3 as f64 + b.spray_soaked_m3 as f64 + held_water;
     let slurry = b.slurry_m3 as f64 + b.frozen_slurry_m3 as f64 + held_slurry;
     let soil = dust.soil_m3() - eroded;
     let dust_v = dust.dust_air_m3() as f64

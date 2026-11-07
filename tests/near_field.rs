@@ -28,7 +28,7 @@ fn tires(z: f32) -> Vec<TirePush> {
 /// Water on the sheets, parked off the window, and handed to spray, cubic metres.
 fn water_book(fluid: &FluidCore) -> f32 {
     let b = fluid.ledger();
-    b.water_m3 + b.frozen_water_m3 + b.spray_m3
+    b.water_m3 + b.frozen_water_m3 + b.spray_m3 + b.spray_soaked_m3
 }
 
 struct Run {

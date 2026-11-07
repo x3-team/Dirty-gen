@@ -239,6 +239,7 @@ pub struct Renderer {
     pipe_dust: wgpu::RenderPipeline,
     #[allow(dead_code)]
     pipe_particle: wgpu::RenderPipeline,
+    pipe_splash: wgpu::RenderPipeline,
     pipe_shadow_terrain: wgpu::RenderPipeline,
     pipe_shadow_mesh: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -1537,6 +1538,22 @@ impl Renderer {
             true,
             None,
         );
+        let pipe_splash = pipeline(
+            &device,
+            &shader,
+            &solo_layout,
+            "vs_particle",
+            Some("fs_splash"),
+            particle_buffers(),
+            color_format,
+            Some(depth_state(
+                formats.depth,
+                false,
+                wgpu::CompareFunction::Less,
+            )),
+            true,
+            None,
+        );
         let pipe_shadow_terrain = pipeline(
             &device,
             &shader,
@@ -1816,7 +1833,7 @@ impl Renderer {
         });
         let particles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("particles"),
-            size: (6144 * std::mem::size_of::<ParticleVertex>()) as u64,
+            size: (SPLASH_MAX_SPRITES * 6 * std::mem::size_of::<ParticleVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1954,6 +1971,7 @@ impl Renderer {
             pipe_mesh_double,
             pipe_dust,
             pipe_particle,
+            pipe_splash,
             pipe_shadow_terrain,
             pipe_shadow_mesh,
             blit_bg,
@@ -2612,13 +2630,18 @@ impl Renderer {
 
         // Liquid in flight comes from the contract's spray slots; the chunk
         // mesh keeps clods and what lies on the ground.
-        let spray_valid = self.contract_cpu.header.version == 1
+        // The contract is published at the current version; a stale check
+        // for version 1 left this path dead and the picture rut ribbons on.
+        let spray_valid = self.contract_cpu.header.version == silt::render_contract::RENDER_CONTRACT_VERSION
             && self.contract_cpu.header.valid & silt::render_contract::VALID_SPRAY != 0;
         let chunks = mud_chunks_split(&world.particles.items, Some(&world.soil), spray_valid, self.show_mud_drops);
         let spray = if spray_valid {
             spray_from_contract(
                 &self.contract_cpu.spray,
-                self.contract_cpu.header.spray_count as usize,
+                // Particle slots only: the sheet's drops after them are the
+                // splash sprites below.
+                (self.contract_cpu.header.spray_count as usize)
+                    .min(silt::render_contract::spray_particle_slots(&world.particles.items)),
                 cam.eye,
             )
         } else {
@@ -2631,6 +2654,21 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.spray_i, 0, bytemuck::cast_slice(&spray.indices));
         }
+        // Drops the sheet threw (H2): sprites from the fluid core's live
+        // spray. Particle liquid in flight is the contract spray above, so
+        // no particles here, or it would draw twice.
+        let splash_count = if self.show_mud_particles {
+            let cap = (silt::quality::active().max_particles as usize).min(SPLASH_MAX_SPRITES);
+            let drops = fluid.map(|f| f.spray_drops()).unwrap_or(&[]);
+            let verts = crate::mesh::splash_sprites(drops, &[], cam.eye, world.vehicle.vel, cap);
+            if !verts.is_empty() {
+                self.queue
+                    .write_buffer(&self.particles, 0, bytemuck::cast_slice(&verts));
+            }
+            verts.len() as u32
+        } else {
+            0
+        };
         let chunk_count = if self.show_mud_particles { chunks.indices.len() as u32 } else { 0 };
         if chunk_count > 0 {
             self.queue
@@ -3153,6 +3191,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipe_mesh_blend);
             pass.set_bind_group(3, &self.paint_bg, &[]);
             self.draw_glass(&mut pass);
+            self.draw_splash(&mut pass, splash_count);
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -3861,6 +3900,19 @@ impl Renderer {
         pass.set_index_buffer(self.chunk_i.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..count, 0, 0..1);
         count_draw(count);
+    }
+
+    /// Splash sprites are world-space quads with the frame group only. The
+    /// caller's pipeline and group 2 are restored after.
+    fn draw_splash(&self, pass: &mut wgpu::RenderPass<'_>, vertices: u32) {
+        if vertices == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipe_splash);
+        pass.set_bind_group(0, &self.frame_bg, &[]);
+        pass.set_vertex_buffer(0, self.particles.slice(..));
+        pass.draw(0..vertices, 0..1);
+        count_draw(vertices);
     }
 
     fn draw_dust(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
@@ -5110,6 +5162,8 @@ fn debug_contract_view_reads_the_published_maps() {
     assert!(px[0] > 0, "ground ramp was empty {px:?}");
 }
 
+/// Splash sprites the vertex buffer holds (the `high` preset cap).
+const SPLASH_MAX_SPRITES: usize = 12000;
 /// Niva headlamps in world space. The body is fitted with the hubs at
 /// y -0.20 and the front axle at z 1.08 (niva.rs); the lamps sit 0.40 m above
 /// the hubs and 0.74 m ahead of the axle, 0.56 m either side.

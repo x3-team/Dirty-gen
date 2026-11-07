@@ -1778,6 +1778,30 @@ mod slurry_shapes {
             mesh.vertices.len()
         );
     }
+
+    /// Sheet spray (H2) is drawn as splash sprites from its volume: clear
+    /// drops as water, murky ones as slurry, and no quad stands as a card
+    /// above its drop.
+    #[test]
+    fn sheet_spray_is_splash_not_cards() {
+        use silt::fluid_core::LiveSpray;
+        let drop = |x: f32, murk: f32| LiveSpray {
+            pos: [x, 0.4, 0.6],
+            vel: [0.5, 2.0, -1.5],
+            volume: 6.0e-5,
+            kind: 0,
+            age: 0.1,
+            murk,
+        };
+        let drops = [drop(0.0, 0.0), drop(0.3, 0.0), drop(0.6, 0.9), drop(0.9, 0.9)];
+        let eye = Vec3::new(4.0, 2.0, 4.0);
+        let sprites = splash_sprites(&drops, &[], eye, Vec3::ZERO, 6000);
+        assert!(sprites.len() >= 6 * 8, "spray not drawn: {} verts", sprites.len());
+        assert!(sprites.iter().any(|v| v.uv[0] >= SPLASH_SLURRY_UV), "murky drops drawn as water");
+        assert!(sprites.iter().any(|v| v.uv[0] < SPLASH_SLURRY_UV), "clear drops drawn as slurry");
+        let top = sprites.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+        assert!(top < 0.4 + 0.3, "sprite stands at {top} over drops at 0.4");
+    }
 }
 
 /// Soft wet mud in world space. Large impacts are a pair of lumps; droplets are
@@ -2266,4 +2290,172 @@ pub fn bodies_mesh(bodies: &silt::bodies::Bodies) -> CpuMesh {
         }
     }
     m
+}
+
+/// Material tag carried in `uv.x` of a splash sprite: water keeps uv in
+/// 0..1, slurry is shifted by 2.
+pub const SPLASH_SLURRY_UV: f32 = 2.0;
+/// Camera shutter for the motion streak, seconds.
+const SPLASH_SHUTTER_S: f32 = 1.0 / 240.0;
+
+/// Hybrid H2 picture of the volume in the air. Each parcel (a sheet drop
+/// from `FluidCore::spray_drops` or a ledger slurry piece) is drawn as a
+/// small cluster of droplets that spreads as it ages, every droplet a
+/// camera-facing sprite stretched along its velocity by the shutter. Only
+/// parcels that carry volume are drawn; the cluster size follows that
+/// volume. No cards, no boxes, nothing taller than the throw.
+pub fn splash_sprites(
+    drops: &[silt::fluid_core::LiveSpray],
+    items: &[silt::particles::Particle],
+    eye: Vec3,
+    cam_vel: Vec3,
+    max_sprites: usize,
+) -> Vec<ParticleVertex> {
+    let mut out: Vec<ParticleVertex> = Vec::with_capacity(max_sprites.min(16384) * 6);
+    // More parcels than the preset can draw: draw every k-th and grow each
+    // sprite by sqrt(k), so the covered area (what the eye reads) stays.
+    let slurry_n = items
+        .iter()
+        .filter(|p| splash_slurry_piece(p))
+        .count();
+    let want = drops.len() + slurry_n;
+    let stride = want.div_ceil(max_sprites.max(1)).max(1);
+    let grow = (stride as f32).sqrt();
+    let mut room = max_sprites;
+    let mut emit = |out: &mut Vec<ParticleVertex>,
+                    room: &mut usize,
+                    pos: Vec3,
+                    vel: Vec3,
+                    volume: f32,
+                    age: f32,
+                    seed: u32,
+                    murk: f32| {
+        if *room == 0 || !pos.is_finite() || !vel.is_finite() || !(volume > 0.0) {
+            return;
+        }
+        let slurry = murk > 0.5;
+        // A parcel of V m3 breaks into drops; draw a handful that stand for
+        // it. The equivalent sphere radius of the parcel sets the size.
+        let r_eq = (volume * 3.0 / (4.0 * std::f32::consts::PI)).cbrt();
+        let n = ((volume / 1.5e-5).round() as usize).clamp(1, 8);
+        let spread = r_eq * 1.5 + age * if slurry { 0.08 } else { 0.20 };
+        let drop_r = if slurry {
+            (r_eq * 0.45).clamp(0.006, 0.02)
+        } else {
+            (r_eq * 0.9).clamp(0.008, 0.03)
+        } * grow;
+        let speed = vel.length();
+        let along = if speed > 1.0e-3 { vel / speed } else { Vec3::Y };
+        for k in 0..n {
+            if *room == 0 {
+                return;
+            }
+            let h = |s: u32| chunk_hash(seed, k as u32 * 7 + s);
+            let off = if n == 1 {
+                Vec3::ZERO
+            } else {
+                Vec3::new(h(1) - 0.5, (h(2) - 0.5) * 0.6, h(3) - 0.5) * 2.0 * spread
+            };
+            let c = pos + off + along * (h(4) - 0.5) * spread;
+            let r = drop_r * (0.6 + 0.8 * h(5));
+            let to_eye = (eye - c).normalize_or_zero();
+            if to_eye == Vec3::ZERO {
+                continue;
+            }
+            // Streak axis: the velocity across the view, seen from the
+            // moving camera (a chase camera rides with the car).
+            let rel = vel - cam_vel;
+            let mut u = rel - to_eye * rel.dot(to_eye);
+            let ul = u.length();
+            let streak = ul * SPLASH_SHUTTER_S;
+            if ul > 1.0e-4 {
+                u /= ul;
+            } else {
+                u = Vec3::Y.cross(to_eye).normalize_or_zero();
+                if u == Vec3::ZERO {
+                    u = Vec3::X;
+                }
+            }
+            let v = to_eye.cross(u).normalize_or_zero();
+            let half_u = r + streak * 0.5;
+            let half_v = r;
+            let g = h(6);
+            let clay = [0.20 + 0.06 * g, 0.13 + 0.04 * g, 0.075 + 0.02 * g];
+            let clear = [0.92, 0.95, 0.97];
+            let m = murk.clamp(0.0, 1.0);
+            let col = [
+                clear[0] + (clay[0] - clear[0]) * m,
+                clear[1] + (clay[1] - clear[1]) * m,
+                clear[2] + (clay[2] - clear[2]) * m,
+            ];
+            let alpha = if slurry {
+                0.95
+            } else {
+                // A long thin streak is fainter than a round drop.
+                let thin = (r / half_u).clamp(0.3, 1.0);
+                0.45 + 0.4 * thin
+            };
+            let tag = if slurry { SPLASH_SLURRY_UV } else { 0.0 };
+            let corners = [
+                (c - u * half_u - v * half_v, [0.0, 0.0]),
+                (c + u * half_u - v * half_v, [1.0, 0.0]),
+                (c + u * half_u + v * half_v, [1.0, 1.0]),
+                (c - u * half_u + v * half_v, [0.0, 1.0]),
+            ];
+            for i in [0usize, 1, 2, 0, 2, 3] {
+                let (p, uv) = corners[i];
+                out.push(ParticleVertex {
+                    pos: p.to_array(),
+                    color: [col[0], col[1], col[2], alpha],
+                    uv: [uv[0] + tag, uv[1]],
+                });
+            }
+            *room -= 1;
+        }
+    };
+    // Slurry first: fewer, heavier, and the eye looks for them on mud.
+    let mut i = 0usize;
+    for p in items {
+        if !splash_slurry_piece(p) {
+            continue;
+        }
+        i += 1;
+        if i % stride != 0 {
+            continue;
+        }
+        let age = (p.max_life - p.life).max(0.0);
+        emit(&mut out, &mut room, p.pos, p.vel, p.volume, age, p.seed, 1.0);
+    }
+    for (i, d) in drops.iter().enumerate() {
+        if i % stride != 0 {
+            continue;
+        }
+        emit(
+            &mut out,
+            &mut room,
+            Vec3::from_array(d.pos),
+            Vec3::from_array(d.vel),
+            d.volume,
+            d.age,
+            0x5EED_0000 ^ i as u32,
+            d.murk,
+        );
+    }
+    out
+}
+
+/// A ledger slurry piece still in the air: kinds 5, 6, 7 with volume.
+fn splash_slurry_piece(p: &silt::particles::Particle) -> bool {
+    p.alive
+        && p.life > 0.0
+        && p.ledger
+        && !p.grounded
+        && !p.deposited
+        && p.volume > 0.0
+        && matches!(
+            p.kind,
+            silt::particles::KIND_SLURRY_RIBBON
+                | silt::particles::KIND_SLURRY_DROP
+                | silt::particles::KIND_SLURRY_SHEET
+        )
 }
