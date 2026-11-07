@@ -13,7 +13,7 @@ Fail when any of these is true:
 
 k_runner is only the paired head/base comparison. It does not scale a cap.
 
-The pinned base is d0eeb1b (main with #145 and #147 merged). Pairs are at
+The pinned base is ad39a39 (main with #153 merged). Pairs are at
 most 9. The paired runs set PERF_GATE_MEDIAN, so the tests skip their own
 cap asserts and the caps are checked on the median here. A base pinned
 before that switch gets this tree's timing harness.
@@ -39,7 +39,7 @@ MAX_PAIRS = 9
 # Release CI run 41319551811 passed the flat caps on this tree (#119 head 40ab33f, EPYC 7763).
 # e2e 10.347, air 0.191, dust 0.748, solver 3.741, water 0.565,
 # solver water 0.450, frame 2.517, fog step 0.766.
-PINNED_BASE_SHA = "d0eeb1bb96363321d32b270c3dc565101134bb58"
+PINNED_BASE_SHA = "ad39a39c5faeceac4dd236be7099a605d1126bdf"
 CAPS = {
     "E2E_MEAN": 11.820,
     "E2E_AIR": 1.5,
@@ -399,16 +399,20 @@ def prove_stretch() -> str:
 GATE_HARNESS = ("tests/e2e_niva.rs", "tests/frame_bench.rs", "tests/fog_air.rs")
 
 
-def borrow_gate_harness(base_dir: Path) -> None:
+def borrow_gate_harness(base_dir: Path) -> bool:
     """A base pinned before PERF_GATE_MEDIAN existed still asserts the caps on
     every run. Its solver is what is measured; the timing harness comes from
-    this tree, so both sides skip the in-test asserts the same way."""
+    this tree, so both sides skip the in-test asserts the same way. Returns
+    whether any file was borrowed."""
+    borrowed = False
     for rel in GATE_HARNESS:
         theirs = base_dir / rel
         if theirs.exists() and "PERF_GATE_MEDIAN" in theirs.read_text():
             continue
         shutil.copyfile(ROOT / rel, theirs)
         print(f"PERF_BASE_HARNESS file={rel} from=head", flush=True)
+        borrowed = True
+    return borrowed
 
 
 def fail_gate(reason: str, detail: str) -> int:
@@ -428,7 +432,7 @@ def run_gate(sha: str) -> int:
     base_dir = Path(tempfile.gettempdir()) / "silt-perf-base"
     try:
         prepare_tree(sha, base_dir)
-        borrow_gate_harness(base_dir)
+        borrowed = borrow_gate_harness(base_dir)
         shared = ROOT / "target"
         head_bins = cargo_bins(ROOT, shared, Path(tempfile.gettempdir()) / "silt-perf-head")
         # The base builds into its own target dir. Sharing ROOT/target let the
@@ -445,7 +449,12 @@ def run_gate(sha: str) -> int:
         run_must_pass(head_bins["fog_air"], "fluid_sheet_fog_is_not_dust_and_closes_the_ledger", plain)
         # A borrowed harness carries this tree's goldens. PERF_GATE_BASE lets a
         # golden this PR re-centres check the base against the value it had.
-        base_env = child_env({"PERF_GATE_MEDIAN": "1", "PERF_GATE_BASE": "1"})
+        # A base with its own harness keeps its own goldens, so it runs them as
+        # they stand ("now" is the base's own value there).
+        base_extra = {"PERF_GATE_MEDIAN": "1"}
+        if borrowed:
+            base_extra["PERF_GATE_BASE"] = "1"
+        base_env = child_env(base_extra)
         base_all, base_fatals = collect_side(
             base_bins,
             "base",

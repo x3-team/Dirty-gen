@@ -1022,6 +1022,40 @@ fn layer_of(kind: u32) -> i32 {
     return 0;
 }
 
+// The ground layer fs_terrain draws for a cell (packed clay draws as the
+// mud round it; on the beauty sand every disturbed kind is the sand).
+fn draw_layer_of(kind: u32) -> i32 {
+    if (kind == 9u) { return 0; }
+    if (sand_field() && kind != 0u && kind != 10u) { return layer_of(0u); }
+    return layer_of(kind);
+}
+
+// Second layer at a seam and its weight. The four cells round a jittered
+// point are read bilinearly: x = the other layer (as f32), y = the share of
+// the cells that are not `layer`. y is 0 away from any seam.
+fn layer_seam(xz: vec2<f32>, layer: i32) -> vec2<f32> {
+    let cell = max(frame.params.z, 1e-4);
+    let jit = vec2<f32>(noise(xz * 2.9), noise(xz * 2.9 + vec2<f32>(19.7, 7.3))) - vec2<f32>(0.5);
+    let ij = world_to_ij(xz + jit * cell * 1.2);
+    let i0 = vec2<i32>(floor(ij));
+    let f = fract(ij);
+    let l00 = draw_layer_of(kind_of(i0));
+    let l10 = draw_layer_of(kind_of(i0 + vec2<i32>(1, 0)));
+    let l01 = draw_layer_of(kind_of(i0 + vec2<i32>(0, 1)));
+    let l11 = draw_layer_of(kind_of(i0 + vec2<i32>(1, 1)));
+    let w00 = (1.0 - f.x) * (1.0 - f.y);
+    let w10 = f.x * (1.0 - f.y);
+    let w01 = (1.0 - f.x) * f.y;
+    let w11 = f.x * f.y;
+    var other = layer;
+    var w = 0.0;
+    if (l00 != layer) { other = l00; w += w00; }
+    if (l10 != layer) { other = l10; w += w10; }
+    if (l01 != layer) { other = l01; w += w01; }
+    if (l11 != layer) { other = l11; w += w11; }
+    return vec2<f32>(f32(other), w);
+}
+
 // Metres per repeat of each ground layer.
 fn layer_uv(layer: i32, xz: vec2<f32>) -> vec2<f32> {
     var tile = 3.2;
@@ -1563,9 +1597,38 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // One fetch from the layer this cell is. Sampling every layer and
     // picking one cost five times the bandwidth for the same texel.
     let luv = layer_uv(layer, xz);
-    let diff = textureSample(ground_diff, ground_samp, luv, layer).rgb;
-    let ntex = textureSample(ground_nor, ground_samp, luv, layer).rgb;
-    let pack = textureSample(ground_pack, ground_samp, luv, layer);
+    var diff = textureSample(ground_diff, ground_samp, luv, layer).rgb;
+    var ntex = textureSample(ground_nor, ground_samp, luv, layer).rgb;
+    var pack = textureSample(ground_pack, ground_samp, luv, layer);
+    // Layer seam. The kind map is 0.20 m cells; picking one layer per
+    // nearest cell drew the edge of a layer as a stair of cell corners (the
+    // bench mud bank). A second layer is fetched only where a neighbouring
+    // cell is another layer, and the two are height-blended (Zylann's
+    // HTerrain blend): the grain of the higher map wins, so the seam follows
+    // the stones and crumbs instead of the cell grid.
+    let seam = layer_seam(xz, layer);
+    let xz_dx = dpdx(xz);
+    let xz_dy = dpdy(xz);
+    var l5 = select(0.0, 1.0, layer == 5);
+    if (seam.y > 0.001) {
+        let lb = i32(seam.x);
+        let luv_b = layer_uv(lb, xz);
+        let gx = layer_uv(lb, xz_dx);
+        let gy = layer_uv(lb, xz_dy);
+        let diff_b = textureSampleGrad(ground_diff, ground_samp, luv_b, lb, gx, gy).rgb;
+        let ntex_b = textureSampleGrad(ground_nor, ground_samp, luv_b, lb, gx, gy).rgb;
+        let pack_b = textureSampleGrad(ground_pack, ground_samp, luv_b, lb, gx, gy);
+        let ha = pack.b + (1.0 - seam.y);
+        let hb = pack_b.b + seam.y;
+        let top = max(ha, hb) - 0.18;
+        let wa = max(ha - top, 0.0);
+        let wb = max(hb - top, 0.0);
+        let t = wb / max(wa + wb, 1e-4);
+        diff = mix(diff, diff_b, t);
+        ntex = mix(ntex, ntex_b, t);
+        pack = mix(pack, pack_b, t);
+        l5 = mix(l5, select(0.0, 1.0, lb == 5), t);
+    }
     let ao = clamp(pack.g, 0.0, 1.0);
     let rough_map = clamp(pack.r * (1.0 - pack.a * 0.2), 0.05, 1.0);
     let n_geo = n;
@@ -1587,7 +1650,7 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     let far = smoothstep(6.0, 22.0, length(in.world - frame.cam_pos.xyz));
     // The beauty mud map is a churned mulch; at full strength every crumb
     // catches the sun.
-    if (layer == 5) { n_gain *= 0.55; }
+    n_gain *= mix(1.0, 0.55, l5);
     ts = vec3<f32>(ts.xy * n_gain * mix(1.0, 0.3, far), ts.z);
     n = normalize(tng * ts.x + btg * ts.y + n * ts.z);
     var albedo = diff * mix(1.0, ao, 0.75);
@@ -1780,10 +1843,8 @@ fn fs_terrain(in: TerrOut) -> @location(0) vec4<f32> {
     // calm sheet: smooth, flat, rippled, and it reflects the sky and the bank.
     let rut_water = select(0.0, smoothstep(0.012, 0.04, water), in_cut);
     film = max(film, rut_water);
-    if (layer == 5) {
-        // Ground048 reads mauve under a blue sky. Pull it to soil brown.
-        albedo *= vec3<f32>(0.98, 0.8, 0.58);
-    }
+    // Ground048 reads mauve under a blue sky. Pull it to soil brown.
+    albedo *= mix(vec3<f32>(1.0), vec3<f32>(0.98, 0.8, 0.58), l5);
     // On the beauty sand the shore band owns the wet look: the coarse
     // moisture cells printed rust-brown blotches over the shallows.
     albedo = mix(albedo, albedo * vec3<f32>(0.52, 0.47, 0.42), damp * porosity * 0.6 * select(1.0, 0.0, sand_field() && (kind == 0u || kind == 10u)));
