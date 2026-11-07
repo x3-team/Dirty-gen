@@ -66,12 +66,12 @@ pub const SETTLED_CELL_M: f32 = 0.5;
 const THROW_AFT_0: f32 = 0.12;
 const THROW_AFT_1: f32 = 1.85;
 const THROW_SIDE: f32 = 0.36;
-const THROW_UP_1: f32 = 1.75;
+const THROW_UP_1: f32 = 0.80;
 const THROW_ALONG_C: f32 = 0.90;
-const THROW_UP_C: f32 = 0.88;
+const THROW_UP_C: f32 = 0.30;
 const THROW_ALONG_R: f32 = 0.62;
 const THROW_SIDE_R: f32 = 0.36;
-const THROW_UP_R: f32 = 0.78;
+const THROW_UP_R: f32 = 0.42;
 
 /// Solver tire radius. Matches the Niva contact used by the rest of the engine.
 pub const WHEEL_RADIUS_M: f32 = 0.38;
@@ -832,7 +832,8 @@ impl Dust {
         let (gu, gv) = self.relative_wind();
         let shift_dt = self.shift_dt(dt);
         let whole = self.roof_whole(0, gu, gv, shift_dt);
-        if shift_layers(&mut self.vol, &mut self.shift_scratch, gu, gv, shift_dt, whole) > 0.0 {
+        let shear = self.wind_shear();
+        if shift_layers(&mut self.vol, &mut self.shift_scratch, gu, gv, shear, shift_dt, whole) > 0.0 {
             self.book_outflow(false);
         }
         if self.frame.is_multiple_of(MIX_STRIDE) {
@@ -905,6 +906,23 @@ impl Dust {
     }
 
     /// Wind relative to the window along `right` and `forward`, m/s.
+    /// The wind alone along `right` and `forward`, m/s. [`shift_layers`]
+    /// takes it off the lee layers by [`wind_profile`].
+    fn wind_shear(&self) -> (f32, f32) {
+        let forward = if self.forward.length_squared() > 1.0e-8 {
+            self.forward.normalize()
+        } else {
+            Vec3::Z
+        };
+        let right = if self.right.length_squared() > 1.0e-8 {
+            self.right.normalize()
+        } else {
+            Vec3::X
+        };
+        let wind = Vec3::new(self.wind_x, 0.0, self.wind_z);
+        (wind.dot(right), wind.dot(forward))
+    }
+
     fn relative_wind(&self) -> (f32, f32) {
         let forward = if self.forward.length_squared() > 1.0e-8 {
             self.forward.normalize()
@@ -1021,7 +1039,8 @@ impl Dust {
         let (gu, gv) = self.relative_wind();
         let shift_dt = self.shift_dt(dt);
         let whole = self.roof_whole(1, gu, gv, shift_dt);
-        if shift_layers(&mut self.fog, &mut self.shift_scratch, gu, gv, shift_dt, whole) > 0.0 {
+        let shear = self.wind_shear();
+        if shift_layers(&mut self.fog, &mut self.shift_scratch, gu, gv, shear, shift_dt, whole) > 0.0 {
             self.book_outflow(true);
         }
         if self.frame.is_multiple_of(MIX_STRIDE) {
@@ -1389,6 +1408,7 @@ fn shift_layers(
     scratch: &mut [f32],
     gu: f32,
     gv: f32,
+    shear: (f32, f32),
     dt: f32,
     whole: (i32, i32),
 ) -> f64 {
@@ -1415,14 +1435,14 @@ fn shift_layers(
                 // indices `at(_, iy, _)`. Layers are disjoint index sets and the
                 // parallel map ends before `field` is used again.
                 let field = unsafe { std::slice::from_raw_parts_mut(ptr.get(), n) };
-                shift_layer(field, iy, gu, gv, dt, whole)
+                shift_layer(field, iy, gu, gv, shear, dt, whole)
             })
             .collect()
     };
     #[cfg(target_arch = "wasm32")]
     let outs: Vec<Vec<(usize, f32)>> = layers
         .iter()
-        .map(|&iy| shift_layer(field, iy, gu, gv, dt, whole))
+        .map(|&iy| shift_layer(field, iy, gu, gv, shear, dt, whole))
         .collect();
     let mut gone = 0.0f64;
     for out in outs {
@@ -1437,12 +1457,34 @@ fn shift_layers(
 /// Lee layers (below the roof) take the fractional per-column shift. Layers
 /// over the roof all ride one uniform wind, so they move by whole cells
 /// (`whole`, from the caller's running offset): a row copy, no smearing.
-fn shift_layer(field: &mut [f32], iy: u32, gu: f32, gv: f32, dt: f32, whole: (i32, i32)) -> Vec<(usize, f32)> {
+fn shift_layer(
+    field: &mut [f32],
+    iy: u32,
+    gu: f32,
+    gv: f32,
+    shear: (f32, f32),
+    dt: f32,
+    whole: (i32, i32),
+) -> Vec<(usize, f32)> {
     if layer_in_lee(iy) {
+        // Under the roof the wind is the surface layer's: slower near the ground.
+        let slow = 1.0 - wind_profile(AIR_Y0_M + (iy as f32 + 0.5) * AIR_DY_M);
+        let (gu, gv) = (gu - slow * shear.0, gv - slow * shear.1);
         SHIFT_PLANE.with(|tmp| shift_one_layer(field, &mut tmp.borrow_mut(), iy, gu, gv, dt))
     } else {
         shift_layer_whole(field, iy, whole.0, whole.1)
     }
+}
+
+/// Roughness length of the dirt road, metres. Bare soil with ruts.
+const WIND_Z0_M: f32 = 0.01;
+
+/// Neutral surface-layer wind at height `y` as a fraction of the wind at the
+/// roof: u(y) = u(roof) · ln(y / z0) / ln(roof / z0). Layers over the roof ride
+/// the full wind.
+fn wind_profile(y: f32) -> f32 {
+    let y = y.max(WIND_Z0_M);
+    ((y / WIND_Z0_M).ln() / (BODY_TOP_M / WIND_Z0_M).ln()).clamp(0.0, 1.0)
 }
 
 fn layer_in_lee(iy: u32) -> bool {
@@ -2213,14 +2255,19 @@ mod tests {
         // window and lands on the wet track behind. The sheet's pressure
         // filter no longer spreads the plume sideways. The 8-layer sheet read
         // air 0.01373, settled 0.00697, wet track 0.000115, lean 1.25 m.
-        approx(dust.air as f32, 0.01085, 2.5e-4);
-        approx(dust.settled as f32, 0.00985, 2.5e-4);
+        // The tire throw centred at 0.88 m stood the plume up as a wall to
+        // 1.75 m: air 0.01085, settled 0.00985, wet track 0.000787, lean 1.0 m.
+        // Now it is thrown low (centre 0.30 m), so more of it falls out near
+        // the tires, and the surface-layer wind under the roof is slower near
+        // the ground, so the plume leans less.
+        approx(dust.air as f32, 0.01039, 2.5e-4);
+        approx(dust.settled as f32, 0.01032, 2.5e-4);
         assert!(
-            (on_wet - 0.000787).abs() < 1.0e-4,
+            (on_wet - 0.000486).abs() < 1.0e-4,
             "wet track settled {on_wet}"
         );
         assert!(
-            (max_lateral - 1.0).abs() < 0.15,
+            (max_lateral - 0.73).abs() < 0.15,
             "plume lean {max_lateral} m"
         );
 

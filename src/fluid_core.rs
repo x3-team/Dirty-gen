@@ -477,6 +477,9 @@ pub struct SurfaceMaps {
     pub dust: Vec<f32>,
 }
 
+/// How far, in coarse cells, a rut shoves the slurry it scrapes off.
+const SHOVE_RING: i32 = 4;
+
 /// Closed account inside this module. Spray is volume already given to particles.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FluidLedger {
@@ -782,6 +785,39 @@ pub fn step_sheet(
 }
 
 /// [`step_sheet_eps`] on a caller-owned scratch instead of the thread-local one.
+/// Cells past the slurry bounds that get a viscosity before a sheet step.
+/// Work boxes carry a halo of 3 and a substep reads 2 more cells.
+const NU_FILL_MARGIN: usize = 8;
+
+/// Bounding rows and columns of the cells with depth above zero, grown by
+/// `margin` and clamped to the grid. `None` when every cell is dry.
+fn wet_bounds(h: &[f32], res: usize, margin: usize) -> Option<(usize, usize, usize, usize)> {
+    let mut j0 = usize::MAX;
+    let mut j1 = 0usize;
+    let mut i0 = usize::MAX;
+    let mut i1 = 0usize;
+    for j in 0..res {
+        let row = &h[j * res..(j + 1) * res];
+        let Some(first) = row.iter().position(|&x| x > 0.0) else {
+            continue;
+        };
+        let last = row.iter().rposition(|&x| x > 0.0).unwrap_or(first);
+        j0 = j0.min(j);
+        j1 = j;
+        i0 = i0.min(first);
+        i1 = i1.max(last);
+    }
+    if j0 == usize::MAX {
+        return None;
+    }
+    Some((
+        i0.saturating_sub(margin),
+        (i1 + margin).min(res - 1),
+        j0.saturating_sub(margin),
+        (j1 + margin).min(res - 1),
+    ))
+}
+
 fn step_sheet_eps_in(
     h: &mut [f32],
     u: &mut [f32],
@@ -1711,37 +1747,45 @@ fn step_sheet_scratch(
     // Courant slice. Pace 2 repeats the Jacobi sweep every slice. The shore
     // equality test keeps pace 2 as the reference.
     if pace == 3 && whole_wet && nsub > 1 {
-        for &(i0, i1, j0, j1) in &boxes {
+        // One box's pressure solve, Courant slices and dry cut. A box reads
+        // and writes only itself and a 2-cell rim, so two boxes
+        // `BOX_PAR_GAP` apart give the same cells in any order.
+        let run = |h: &mut [f32],
+                   u: &mut [f32],
+                   v: &mut [f32],
+                   (i0, i1, j0, j1): (usize, usize, usize, usize),
+                   sc: &mut Scratch| {
             substep(
                 h, u, v, bed, nu, gate, res, cell, dt, drive, eps, i0, i1, j0, j1, solid, banks,
                 false, sc,
             );
-        }
-        let frac_cap = 0.45f32;
-        for _ in 0..nsub {
-            for &(i0, i1, j0, j1) in &boxes {
-                transport_open(
-                    h, u, gate, res, cell, dts, i0, i1, j0, j1, true, None, frac_cap, sc,
+            pace3_slices(h, u, v, gate, res, cell, dts, nsub, eps, (i0, i1, j0, j1), sc);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(sc2) = sc2 {
+            if boxes.len() == 2 && boxes_apart(boxes[0], boxes[1], BOX_PAR_GAP) {
+                let (b0, b1) = (boxes[0], boxes[1]);
+                let n = res * res;
+                let hp = ShareMut(h.as_mut_ptr());
+                let up = ShareMut(u.as_mut_ptr());
+                let vp = ShareMut(v.as_mut_ptr());
+                let go = |b: (usize, usize, usize, usize), sc: &mut Scratch| {
+                    // SAFETY: the two boxes are `BOX_PAR_GAP` cells apart, so
+                    // the cells one worker writes are never read or written by
+                    // the other. The join below ends before `h`, `u`, `v` are
+                    // used again.
+                    let (h, u, v) = unsafe { (hp.slice(n), up.slice(n), vp.slice(n)) };
+                    run(h, u, v, b, sc);
+                };
+                rayon::join(
+                    || serial_inner(|| go(b0, &mut *sc)),
+                    || serial_inner(|| go(b1, &mut *sc2)),
                 );
-                transport_open(
-                    h, v, gate, res, cell, dts, i0, i1, j0, j1, false, None, frac_cap, sc,
-                );
+                return;
             }
         }
-        if eps > 0.0 {
-            for &(i0, i1, j0, j1) in &boxes {
-                for j in j0..=j1 {
-                    let row = j * res;
-                    for i in i0..=i1 {
-                        let idx = row + i;
-                        if h[idx] < eps {
-                            h[idx] = 0.0;
-                            u[idx] = 0.0;
-                            v[idx] = 0.0;
-                        }
-                    }
-                }
-            }
+        for &b in &boxes {
+            run(h, u, v, b, sc);
         }
         return;
     }
@@ -1782,6 +1826,42 @@ fn step_sheet_scratch(
                 h, u, v, bed, nu, gate, res, cell, dts, drive, eps, i0, i1, j0, j1, solid, banks,
                 true, sc,
             );
+        }
+    }
+}
+
+/// Pace 3 after the pressure solve: `nsub` open-flux slices on one box, then
+/// cells under `eps` are cut dry.
+#[allow(clippy::too_many_arguments)]
+fn pace3_slices(
+    h: &mut [f32],
+    u: &mut [f32],
+    v: &mut [f32],
+    gate: &[u8],
+    res: usize,
+    cell: f32,
+    dts: f32,
+    nsub: u32,
+    eps: f32,
+    (i0, i1, j0, j1): (usize, usize, usize, usize),
+    sc: &mut Scratch,
+) {
+    let frac_cap = 0.45f32;
+    for _ in 0..nsub {
+        transport_open(h, u, gate, res, cell, dts, i0, i1, j0, j1, true, None, frac_cap, sc);
+        transport_open(h, v, gate, res, cell, dts, i0, i1, j0, j1, false, None, frac_cap, sc);
+    }
+    if eps > 0.0 {
+        for j in j0..=j1 {
+            let row = j * res;
+            for i in i0..=i1 {
+                let idx = row + i;
+                if h[idx] < eps {
+                    h[idx] = 0.0;
+                    u[idx] = 0.0;
+                    v[idx] = 0.0;
+                }
+            }
         }
     }
 }
@@ -4845,6 +4925,8 @@ pub struct FluidCore {
     seat_is_rut: Vec<bool>,
     seat_floor: Vec<bool>,
     seat_etas: Vec<f32>,
+    /// Rut slurry shoved off the cut this seat: (cell, metres).
+    seat_shove: Vec<(u32, f32)>,
     /// CFL substep cap on the 2 cm sheet. Eight is the full split. The coarse
     /// sheet always uses eight.
     fine_sub_cap: f32,
@@ -4960,6 +5042,7 @@ impl FluidCore {
             seat_is_rut: vec![false; n],
             seat_floor: vec![false; n],
             seat_etas: Vec::with_capacity(n),
+            seat_shove: Vec::new(),
             fine_sub_cap: 8.0,
             fine_pace: 0,
             sheet_times: SheetTimes::default(),
@@ -5576,6 +5659,7 @@ impl FluidCore {
             .seat_etas
             .select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut excess = 0.0_f32;
+        self.seat_shove.clear();
         let rad = 8i32;
         let cut_wet = (0..n * n).any(|idx| self.seat_is_rut[idx] && self.water[idx] >= 0.012);
         // Reuse the pond scratch planes: a fresh 160 KB pair per step is a
@@ -5617,6 +5701,7 @@ impl FluidCore {
             }
             let slurry_room = (eta - self.seat_pressed[idx] - self.water[idx]).max(0.0);
             if self.slurry[idx] > slurry_room + 0.004 {
+                self.seat_shove.push((idx as u32, self.slurry[idx] - slurry_room));
                 self.slurry[idx] = slurry_room;
             }
         }
@@ -5638,6 +5723,7 @@ impl FluidCore {
                 self.slurry[idx] = slurry_room;
             }
         }
+        self.shove_rut_slurry();
         if excess > 1.0e-8 {
             let mut room = 0.0_f32;
             for idx in 0..n * n {
@@ -5654,6 +5740,55 @@ impl FluidCore {
             }
         }
         Some(eta)
+    }
+
+    /// Slurry scraped off a rut goes to the nearest cells beside the cut, in
+    /// equal shares: the tire shoves mud aside, it does not destroy it.
+    fn shove_rut_slurry(&mut self) {
+        let n = WINDOW_RES as i32;
+        let mut shove = std::mem::take(&mut self.seat_shove);
+        for &(idx, metres) in &shove {
+            let idx = idx as usize;
+            let (i, j) = ((idx % WINDOW_RES) as i32, (idx / WINDOW_RES) as i32);
+            let mut took = false;
+            for d in 1..=SHOVE_RING {
+                let mut count = 0u32;
+                for pass in 0..2 {
+                    let share = if pass == 0 { 0.0 } else { metres / count as f32 };
+                    for jj in (j - d).max(0)..=(j + d).min(n - 1) {
+                        for ii in (i - d).max(0)..=(i + d).min(n - 1) {
+                            if (ii - i).abs().max((jj - j).abs()) != d {
+                                continue;
+                            }
+                            let k = jj as usize * WINDOW_RES + ii as usize;
+                            if self.seat_is_rut[k] {
+                                continue;
+                            }
+                            if pass == 0 {
+                                count += 1;
+                            } else {
+                                if self.slurry[k] <= 1.0e-6 {
+                                    self.grain[k] = self.grain[idx];
+                                }
+                                self.slurry[k] += share;
+                            }
+                        }
+                    }
+                    if count == 0 {
+                        break;
+                    }
+                }
+                if count > 0 {
+                    took = true;
+                    break;
+                }
+            }
+            if !took {
+                self.slurry[idx] += metres;
+            }
+        }
+        shove.clear();
+        self.seat_shove = shove;
     }
 
     fn take_column(&mut self, x: f32, z: f32, volume: f32, water: bool) -> f32 {
@@ -5711,6 +5846,35 @@ impl FluidCore {
                     self.moisture[idx] = moisture.clamp(0.0, 1.0);
                 }
                 vol += depth * area;
+            }
+        }
+        vol
+    }
+
+    /// Add a slurry column of `depth(x, z)` metres on top of what the coarse
+    /// cell holds. Returns the cubic metres added. Cells with no depth keep
+    /// their slurry, grain and moisture.
+    pub fn lay_slurry_mask(
+        &mut self,
+        mut depth: impl FnMut(f32, f32) -> f32,
+        grain: Grain,
+        moisture: f32,
+    ) -> f32 {
+        self.restrict_fine();
+        let area = COARSE_CELL_M * COARSE_CELL_M;
+        let mut vol = 0.0f32;
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = self.coarse_xz(i, j);
+                let d = depth(x, z);
+                if !(d.is_finite() && d > 0.0) {
+                    continue;
+                }
+                let idx = j * WINDOW_RES + i;
+                self.slurry[idx] += d;
+                self.grain[idx] = grain as u8;
+                self.moisture[idx] = self.moisture[idx].max(moisture.clamp(0.0, 1.0));
+                vol += d * area;
             }
         }
         vol
@@ -7920,8 +8084,17 @@ impl FluidCore {
                 };
                 let run_slurry = || {
                     let ts = ProfTick::start();
-                    for idx in 0..n {
-                        nu_s[idx] = dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                    // The sheet step reads the viscosity only on its work
+                    // boxes (halo 3) and a 2-cell rim, so the rows and columns
+                    // past the slurry bounds plus that margin are never read.
+                    if let Some((i0, i1, j0, j1)) = wet_bounds(slurry, res, NU_FILL_MARGIN) {
+                        for j in j0..=j1 {
+                            let row = j * res;
+                            for idx in row + i0..=row + i1 {
+                                nu_s[idx] =
+                                    dynamic_viscosity(Grain::from_u8(grain[idx]), moisture[idx]);
+                            }
+                        }
                     }
                     if !fine {
                         soften_border(us, vs, res, open);
@@ -11326,6 +11499,39 @@ mod tests {
             c1 > c0 + 1.5,
             "slurry did not run downhill, centroid {c0:.2} -> {c1:.2}"
         );
+    }
+
+    #[test]
+    fn seat_shoves_rut_slurry_beside_the_cut() {
+        let mut fluid = FluidCore::new([0.0, 0.0]);
+        fluid.pour_water(-3.0, 3.0, -3.0, 3.0, 0.05);
+        let rut = |x: f32, z: f32| x.abs() < 0.3 && z.abs() < 1.0;
+        fluid.lay_slurry_mask(|x, z| if rut(x, z) { 0.08 } else { 0.0 }, Grain::Clay, 0.6);
+        let before = fluid.ledger().slurry_m3;
+        let eta = fluid
+            .seat_rut_water(|_i, _j, x, z| if rut(x, z) { (-0.05, true) } else { (0.0, false) })
+            .expect("pond floor");
+        assert!((eta - 0.05).abs() < 1.0e-4, "pond surface {eta}");
+        let after = fluid.ledger().slurry_m3;
+        assert!(
+            (after - before).abs() <= 1.0e-5 * before,
+            "seat changed slurry {before} -> {after}"
+        );
+        let mut lip = 0.0f32;
+        for j in 0..WINDOW_RES {
+            for i in 0..WINDOW_RES {
+                let (x, z) = fluid.coarse_xz(i, j);
+                let slurry = fluid.slurry[j * WINDOW_RES + i];
+                if rut(x, z) {
+                    assert!((slurry - 0.05).abs() < 1.0e-4, "rut slurry {slurry} at {x} {z}");
+                } else if slurry > 0.0 {
+                    let off = (x.abs() - 0.3).max(z.abs() - 1.0);
+                    assert!(off < 1.0, "slurry {slurry} thrown to {x} {z}");
+                    lip = lip.max(slurry);
+                }
+            }
+        }
+        assert!(lip > 0.01, "nothing shoved beside the cut: {lip}");
     }
 
     #[test]
