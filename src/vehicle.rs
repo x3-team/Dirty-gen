@@ -8,7 +8,7 @@ use crate::fluid_core::HydroSolid;
 use crate::patch::{contact_patch, step_tread, stuck_compact_breakaway, TreadCoat, TreadStep};
 use crate::soil::{
     bekker_load, contact_length, janosi_hanamoto, mech_for_sample, on_launch_crest,
-    rolling_resistance, slurry_motion_drag, slurry_suction_force, stick_scale, terramech_for,
+    rolling_resistance, slurry_motion_drag, SOIL_STRENGTH, slurry_suction_force, stick_scale, terramech_for,
     track_harden_mul, wheel_buoyancy, SoilField, SoilSample,
 };
 
@@ -543,7 +543,7 @@ impl Vehicle {
             let mut chassis_long = 0.0;
             let mut chassis_lat = 0.0;
             let mut wheel_torque = engine_torque(
-                throttle * spin_governor(self.wheels[i].slip, self.wheels[i].sinkage),
+                throttle * spin_governor(self.wheels[i].slip * throttle.signum(), self.wheels[i].sinkage),
                 omega,
             );
             wheel_torque += brake_torque(brake, omega, v_long);
@@ -563,7 +563,7 @@ impl Vehicle {
                 };
                 let length = contact_length(WHEEL_RADIUS, sinkage).max(0.05);
                 let area = (WHEEL_WIDTH * length).max(0.01);
-                let sigma = (normal / area).clamp(0.0, 80_000.0);
+                let sigma = (normal / area).clamp(0.0, 80_000.0 * TUNE);
                 let j_long = slip.abs() * length;
                 let slip_angle = if v_long.abs() < 0.2 && v_lat.abs() < 0.2 {
                     0.0
@@ -697,9 +697,11 @@ impl Vehicle {
                         v_long,
                         omega,
                     );
-                    wheel_torque += drag.torque;
+                    // The paste drag was fitted with the same 640 kg model
+                    // as the soil curve, so it takes the same strength.
+                    wheel_torque += drag.torque * SOIL_STRENGTH;
                     if !stuck {
-                        chassis_long += drag.force;
+                        chassis_long += drag.force * SOIL_STRENGTH;
                     }
                 }
 
@@ -721,7 +723,7 @@ impl Vehicle {
                     WHEEL_WIDTH,
                     v_up,
                     self.wheels[i].slurry_lift,
-                )
+                ) * SOIL_STRENGTH
             } else {
                 0.0
             };
@@ -1183,9 +1185,11 @@ impl Vehicle {
 /// bite again, the way a careful driver works a binary key. Below 0.3 slip the
 /// pedal is untouched.
 /// On firm ground (sinkage under 3 cm) a spin is a launch, not digging, so
-/// the foot stays down.
+/// the foot stays down. `slip` is signed along the pedal: a wheel that last
+/// spun the other way (rocking out of a hole) is not spun past its peak in
+/// the new direction, so the foot stays down there too.
 pub fn spin_governor(slip: f32, sinkage: f32) -> f32 {
-    let x = slip.abs();
+    let x = slip.max(0.0);
     let t = ((x - SPIN_GOV_START) / (SPIN_GOV_FULL - SPIN_GOV_START)).clamp(0.0, 1.0);
     let dug = smoothstep(0.03, 0.09, sinkage);
     lerp(1.0, SPIN_GOV_FLOOR, t * t * (3.0 - 2.0 * t) * dug)

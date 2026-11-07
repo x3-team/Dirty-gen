@@ -73,9 +73,8 @@ fn win_demo_seam_heights_stay_bounded() {
             );
         }
     }
-    // 0.35 → 0.40: the 1210 kg Niva's ruts at the seam are deeper (span 0.376).
     assert!(
-        max_h - min_h < 0.40,
+        max_h - min_h < 0.35,
         "seam pad too rough: span {:.3}",
         max_h - min_h
     );

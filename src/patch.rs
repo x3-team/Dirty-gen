@@ -369,7 +369,7 @@ pub fn contact_patch(
     let moisture = surface_moisture(wetness, water, kind);
     let peak_slip = moisture_peak_slip(kind, moisture);
     let m_scale = moisture_mu_scale(kind, moisture);
-    let sigma = (normal / full).clamp(0.0, 80_000.0);
+    let sigma = (normal / full).clamp(0.0, 80_000.0 * crate::soil::SOIL_STRENGTH);
     let shear = integrated_shear(slip, length, tm.shear_k);
     let clean_mu = (tm.phi.tan().max(0.02)) * m_scale;
     let mu = face_mu((clean_mu.max(0.02)).atan(), coat.smear);
