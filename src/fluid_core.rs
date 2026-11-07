@@ -404,7 +404,11 @@ const SPRAY_LIFE_S: f32 = 1.1;
 /// Horizontal air drag on a spray drop, 1/s.
 const SPRAY_AIR_DRAG: f32 = 0.10;
 /// Share of a cell's water a fast tire throws per step, and the most in metres.
-const SPRAY_PEEL_SHARE: f32 = 0.04;
+/// 0.04 threw ~180 L on one puddle pass; now that spray lands back in the
+/// sheet instead of leaving the books, that much rain lifted the puddle's
+/// shore bays over the 4 mm contour (puddle_shore tongues 5 -> 3 with #154).
+/// 0.035 throws ~150 L.
+const SPRAY_PEEL_SHARE: f32 = 0.035;
 const SPRAY_PEEL_MAX_M: f32 = 0.004;
 /// A drop landing where the film is thinner than this soaks into the ground.
 const SPRAY_SOAK_FILM_M: f32 = 0.001;
@@ -412,6 +416,8 @@ const SPRAY_SOAK_FILM_M: f32 = 0.001;
 const SPRAY_SOAK_PORE_M: f32 = 0.02;
 /// Share of a landing drop's horizontal momentum the column keeps.
 const SPRAY_MOMENTUM_SHARE: f32 = 0.3;
+/// Largest radius a landing parcel spreads over, metres (5 cells).
+const SPRAY_LANDING_SPREAD_M: f32 = 1.0;
 /// A landing never pushes a column faster than this, m/s, unless it already was.
 const SPRAY_LANDING_DRIFT_M_S: f32 = 0.5;
 
@@ -6941,69 +6947,95 @@ impl FluidCore {
             return;
         };
         let cidx = cj * WINDOW_RES + ci;
-        // Where the 2 cm sheet holds the column it is the truth: the drop
-        // goes there. Elsewhere into the 20 cm column. No restrict, so the
-        // fine detail is not flattened by a landing.
-        let held = self.fine_on && self.fine_hold.get(cidx).copied() == Some(1);
-        let fine_at = if held && self.covers_fine(drop.pos[0], drop.pos[2]) {
-            let i = ((drop.pos[0] - self.fine_origin[0]) / FINE_CELL_M).floor() as usize;
-            let j = ((drop.pos[2] - self.fine_origin[1]) / FINE_CELL_M).floor() as usize;
-            (i < FINE_RES && j < FINE_RES).then_some(j * FINE_RES + i)
-        } else {
-            None
-        };
-        // A drop on dry ground (no film in the 20 cm cell) soaks in: it
-        // wets the pore water there and is booked in `spray_soaked_m3`.
-        // Drops never start a new film on a dry shoulder; that spread a
-        // haze of millimetre films the sheet then had to drain (+0.5 ms a
-        // drive step on CI).
-        if fine_at.is_none()
-            && self.water[cidx] + self.slurry[cidx] < SPRAY_SOAK_FILM_M
-        {
-            let dh = drop.volume / (COARSE_CELL_M * COARSE_CELL_M);
-            let m = self.moisture[cidx];
-            if m.is_finite() {
-                self.moisture[cidx] = (m + dh / SPRAY_SOAK_PORE_M).min(1.0);
+        // A parcel is the spray of a whole 20 cm cell (merged in
+        // `keep_spray`), so it lands over a 20 cm footprint. Where the 2 cm
+        // sheet holds the column it is the truth: the parcel is spread over
+        // the 10 x 10 fine cells of that footprint. Dumped into one 2 cm
+        // cell it stood as a column 100 times too deep, and the wave it made
+        // smoothed the shore's tongues into a lens. No restrict, so the fine
+        // detail is not flattened by a landing.
+        let mut rest = drop.volume;
+        if self.fine_on && self.fine_hold.get(cidx).copied() == Some(1) {
+            const SIDE: usize = 10;
+            let share = drop.volume / (SIDE * SIDE) as f32;
+            let half = 0.5 * COARSE_CELL_M;
+            let fi0 = ((drop.pos[0] - half - self.fine_origin[0]) / FINE_CELL_M).round();
+            let fj0 = ((drop.pos[2] - half - self.fine_origin[1]) / FINE_CELL_M).round();
+            for dj in 0..SIDE {
+                for di in 0..SIDE {
+                    let fi = fi0 + di as f32;
+                    let fj = fj0 + dj as f32;
+                    if fi < 0.0 || fj < 0.0 || fi >= FINE_RES as f32 || fj >= FINE_RES as f32 {
+                        continue;
+                    }
+                    let x = self.fine_origin[0] + (fi + 0.5) * FINE_CELL_M;
+                    let z = self.fine_origin[1] + (fj + 0.5) * FINE_CELL_M;
+                    let held = self
+                        .coarse_ij(x, z)
+                        .map(|(i, j)| self.fine_hold.get(j * WINDOW_RES + i).copied() == Some(1))
+                        .unwrap_or(false);
+                    if !held {
+                        continue;
+                    }
+                    let f = fj as usize * FINE_RES + fi as usize;
+                    spray_into_film(
+                        &mut self.fine_water,
+                        &mut self.fine_uw,
+                        &mut self.fine_vw,
+                        f,
+                        share / (FINE_CELL_M * FINE_CELL_M),
+                        drop.vel,
+                    );
+                    rest -= share;
+                }
             }
-            self.spray_soaked_m3 += drop.volume;
-            return;
-        }
-        let (water, uw, vw, area, idx) = match fine_at {
-            Some(f) => (
-                &mut self.fine_water,
-                &mut self.fine_uw,
-                &mut self.fine_vw,
-                FINE_CELL_M * FINE_CELL_M,
-                f,
-            ),
-            None => (
-                &mut self.water,
-                &mut self.uw,
-                &mut self.vw,
-                COARSE_CELL_M * COARSE_CELL_M,
-                cidx,
-            ),
-        };
-        let dh = drop.volume / area;
-        let h = water[idx].max(0.0);
-        let total = h + dh;
-        if total > 0.0 {
-            // A drop hitting a film loses most of its horizontal momentum
-            // in the splash. A share goes into the column, and the result
-            // never runs faster than the column did or a slow drift.
-            let (u0, v0) = (uw[idx], vw[idx]);
-            let mut u = (u0 * h + SPRAY_MOMENTUM_SHARE * drop.vel[0] * dh) / total;
-            let mut v = (v0 * h + SPRAY_MOMENTUM_SHARE * drop.vel[2] * dh) / total;
-            let cap = u0.hypot(v0).max(SPRAY_LANDING_DRIFT_M_S);
-            let sp = u.hypot(v);
-            if sp > cap {
-                u *= cap / sp;
-                v *= cap / sp;
+            if rest <= drop.volume * 1.0e-4 {
+                return;
             }
-            uw[idx] = u;
-            vw[idx] = v;
         }
-        water[idx] = total;
+        // The parcel's drops left with +-25 % jitter on their speed, so they
+        // come down spread over about a quarter of the throw, not in one
+        // cell. Spread over that disc (one cell for a short hop, at most a
+        // metre). A whole parcel dropped in one 20 cm cell lifted the bays
+        // of a shore over the 4 mm contour and smoothed its tongues away.
+        let throw = drop.vel[0].hypot(drop.vel[2]) * drop.age;
+        let reach = (0.25 * throw).clamp(0.0, SPRAY_LANDING_SPREAD_M);
+        let n = (reach / COARSE_CELL_M).floor() as i32;
+        let mut cells: [usize; 121] = [0; 121];
+        let mut count = 0usize;
+        for dj in -n..=n {
+            for di in -n..=n {
+                if (di * di + dj * dj) as f32 > (n * n) as f32 + 0.5 {
+                    continue;
+                }
+                let i = ci as i32 + di;
+                let j = cj as i32 + dj;
+                if i < 0 || j < 0 || i >= WINDOW_RES as i32 || j >= WINDOW_RES as i32 {
+                    continue;
+                }
+                cells[count] = j as usize * WINDOW_RES + i as usize;
+                count += 1;
+            }
+        }
+        let share = rest / count.max(1) as f32;
+        let dh = share / (COARSE_CELL_M * COARSE_CELL_M);
+        for &c in &cells[..count.max(1)] {
+            let c = if count == 0 { cidx } else { c };
+            // A drop on dry ground (no film in the 20 cm cell) soaks in: it
+            // wets the pore water there and is booked in `spray_soaked_m3`.
+            // Drops never start a new film on a dry shoulder; that spread a
+            // haze of millimetre films the sheet then had to drain (+0.5 ms
+            // a drive step on CI).
+            if self.water[c] + self.slurry[c] < SPRAY_SOAK_FILM_M {
+                let m = self.moisture[c];
+                if m.is_finite() {
+                    self.moisture[c] = (m + dh / SPRAY_SOAK_PORE_M).min(1.0);
+                }
+                self.spray_soaked_m3 += share;
+                continue;
+            }
+            spray_into_film(&mut self.water, &mut self.uw, &mut self.vw, c, dh, drop.vel);
+        }
     }
 
     /// Water and slurry thickness, metres. The fine sheet is packed before
@@ -9919,6 +9951,29 @@ fn dist2_segment(px: f32, pz: f32, ax: f32, az: f32, bx: f32, bz: f32) -> f32 {
     let dx = px - (ax + abx * t);
     let dz = pz - (az + abz * t);
     dx * dx + dz * dz
+}
+
+/// Add `dh` metres of landed spray to one column. A drop hitting a film
+/// loses most of its horizontal momentum in the splash: a share goes into
+/// the column, and the result never runs faster than the column did or a
+/// slow drift.
+fn spray_into_film(water: &mut [f32], uw: &mut [f32], vw: &mut [f32], idx: usize, dh: f32, vel: [f32; 3]) {
+    let h = water[idx].max(0.0);
+    let total = h + dh;
+    if total > 0.0 {
+        let (u0, v0) = (uw[idx], vw[idx]);
+        let mut u = (u0 * h + SPRAY_MOMENTUM_SHARE * vel[0] * dh) / total;
+        let mut v = (v0 * h + SPRAY_MOMENTUM_SHARE * vel[2] * dh) / total;
+        let cap = u0.hypot(v0).max(SPRAY_LANDING_DRIFT_M_S);
+        let sp = u.hypot(v);
+        if sp > cap {
+            u *= cap / sp;
+            v *= cap / sp;
+        }
+        uw[idx] = u;
+        vw[idx] = v;
+    }
+    water[idx] = total;
 }
 
 /// 0..1 hash for spray jitter. Deterministic, so goldens stay put.
