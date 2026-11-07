@@ -180,10 +180,6 @@ pub struct Contact {
     pub chassis_long: f32,
     pub chassis_lat: f32,
     pub wheel_torque: f32,
-    /// Share of `wheel_torque` that is the soil shear reacting on the tread.
-    pub shear_nm: f32,
-    /// Spin rate at which the tread rolls without slip, rad/s.
-    pub roll_omega: f32,
     pub slip: f32,
     pub forward: Vec3,
     pub right: Vec3,
@@ -554,7 +550,6 @@ impl Vehicle {
             let mut pull = 0.0;
             let mut patch_length = 0.0;
             let mut soil_push = 0.0;
-            let mut shear_nm = 0.0;
 
             if active {
                 let tm = match snow {
@@ -682,8 +677,7 @@ impl Vehicle {
                 }
 
                 // Shear reacts on the wheel even if Bingham holds the chassis still.
-                shear_nm = -blended_long * WHEEL_RADIUS;
-                wheel_torque += shear_nm;
+                wheel_torque -= blended_long * WHEEL_RADIUS;
 
                 // Deep slurry. Viscosity is the mix under the tire. Translation
                 // and spin are resisted separately, including when only one is moving.
@@ -738,8 +732,6 @@ impl Vehicle {
                 chassis_long,
                 chassis_lat,
                 wheel_torque,
-                shear_nm,
-                roll_omega: v_long / WHEEL_RADIUS,
                 slip,
                 forward: fwd,
                 right,
@@ -797,19 +789,9 @@ impl Vehicle {
                 torque_local += ori.inverse() * r.cross(f_world);
             }
             let inertia = self.wheel_inertia(c.index);
-            // Engine, brake and slurry first. The soil shear can then only pull
-            // the tread back to rolling; it cannot carry it past in one step,
-            // or a heavy tire flips between spin and lock every frame.
-            let omega0 = self.wheels[c.index].omega + (c.wheel_torque - c.shear_nm) / inertia * dt;
-            let rel = omega0 - c.roll_omega;
-            let shear_step = c.shear_nm / inertia * dt;
-            let omega_next = if shear_step * rel < 0.0 && shear_step.abs() > rel.abs() {
-                c.roll_omega
-            } else {
-                omega0 + shear_step
-            };
+            let alpha = c.wheel_torque / inertia;
             let brake = self.adhesion.arch_brake_nm(c.index);
-            let mut omega = omega_next.clamp(-MAX_OMEGA, MAX_OMEGA);
+            let mut omega = (self.wheels[c.index].omega + alpha * dt).clamp(-MAX_OMEGA, MAX_OMEGA);
             if brake > 0.0 && omega.abs() > 1.0e-3 {
                 let kick = brake / inertia * dt;
                 if kick >= omega.abs() {
@@ -1078,8 +1060,6 @@ impl Default for Contact {
             chassis_long: 0.0,
             chassis_lat: 0.0,
             wheel_torque: 0.0,
-            shear_nm: 0.0,
-            roll_omega: 0.0,
             slip: 0.0,
             forward: Vec3::Z,
             right: Vec3::X,

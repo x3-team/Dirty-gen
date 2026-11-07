@@ -436,7 +436,8 @@ pub fn berm_creep_rate(kind: SurfaceKind, moisture: f32) -> f32 {
 pub fn wet_berm_creep_under_load_rate(kind: SurfaceKind, moisture: f32, load_n: f32) -> f32 {
     let kind = paste_kind(kind);
     let visc = slurry_viscosity(kind, moisture).max(0.05);
-    let load = (load_n / 3000.0).clamp(0.0, 2.6);
+    // Loads are Niva wheel loads; 3 kN was a heavy 640 kg wheel.
+    let load = (load_n / (3000.0 * SOIL_STRENGTH)).clamp(0.0, 2.6);
     (1.35 / visc).clamp(0.0025, 0.058) * (1.0 + 5.2 * load)
 }
 
@@ -2830,7 +2831,7 @@ impl SoilField {
             }
         }
 
-        if loaded && normal + push > 350.0 {
+        if loaded && normal + push > 350.0 * SOIL_STRENGTH {
             self.creep_wet_berm_under_patch(
                 center,
                 forward,
@@ -3844,7 +3845,7 @@ impl SoilField {
         load_n: f32,
         dt: f32,
     ) {
-        if dt <= 0.0 || load_n < 350.0 {
+        if dt <= 0.0 || load_n < 350.0 * SOIL_STRENGTH {
             return;
         }
         let fwd = horizontal(forward);
@@ -3990,7 +3991,7 @@ impl SoilField {
         rut_z0: f32,
         rut_z1: f32,
     ) {
-        if dt <= 0.0 || load_n < 350.0 {
+        if dt <= 0.0 || load_n < 350.0 * SOIL_STRENGTH {
             return;
         }
         let half = self.size * 0.5;

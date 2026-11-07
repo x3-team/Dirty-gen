@@ -2226,8 +2226,8 @@ impl World {
         let ori = self.vehicle.orientation();
         let fwd = self.vehicle.forward();
         let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-        let load_n = 5200.0;
-        let push = 980.0;
+        let load_n = 5200.0 * crate::soil::SOIL_STRENGTH;
+        let push = 980.0 * crate::soil::SOIL_STRENGTH;
         for i in 0..4 {
             let center = self.vehicle.pos + ori * self.vehicle.wheel_center_local(i);
             let ground = self.soil.sample(center.x, center.z).height;
